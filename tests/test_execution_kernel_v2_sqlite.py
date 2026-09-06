@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import closing
+
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sqlite3
@@ -860,7 +862,7 @@ class SharedSQLiteIsolationTests(unittest.TestCase):
                 for sql in ("SELECT * FROM runs", "DELETE FROM runs"):
                     with self.assertRaises(sqlite3.DatabaseError):
                         kernel._connection.execute(sql)
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 self.assertEqual(connection.execute("SELECT * FROM runs").fetchall(),
                                  [("application-owned",)])
 

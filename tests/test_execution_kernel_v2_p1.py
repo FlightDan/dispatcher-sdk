@@ -768,7 +768,10 @@ class SchemaAndAuthorizerTests(unittest.TestCase):
             ):
                 kernel = SQLiteKernel(path)
             try:
-                kernel._connection.set_authorizer(None)
+                # Python 3.10 cannot disable an authorizer with None.
+                # Permit this inspection only; the separate denial test keeps
+                # checking the production authorizer's restrictions.
+                kernel._connection.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
                 self.assertEqual(
                     kernel._connection.execute("PRAGMA writable_schema").fetchone()[0], 0
                 )

@@ -198,10 +198,10 @@ class SDKInboundRecoveryIntegrationTests(unittest.TestCase):
     def test_real_orchestrator_recovers_inbound_dead_letter_without_rerunning_execution(self):
         from dispatcher_sdk.orchestrator import Orchestrator
 
-        with tempfile.TemporaryDirectory() as temp:
-            clock = Clock()
-            kernel = SQLiteKernel(Path(temp) / "kernel.db", now=clock, outbox_max_attempts=1)
-            self.addCleanup(kernel.close)
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as temp, SQLiteKernel(
+            Path(temp) / "kernel.db", now=clock, outbox_max_attempts=1
+        ) as kernel:
             sdk = Orchestrator(Path(temp) / "sdk.db", kernel, clock=clock)
             command = ExecutionCommandV2(
                 execution_id="execution", idempotency_key="command", registry_revision="v1",

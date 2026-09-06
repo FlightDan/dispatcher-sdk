@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import closing
+
 from concurrent.futures import ThreadPoolExecutor
 import copy
 from pathlib import Path
@@ -120,7 +122,7 @@ class OrchestratorTests(unittest.TestCase):
         reopened = Orchestrator(self.path, self.runtime.kernel, runtime=self.runtime)
         self.assertEqual(reopened.flush(), 1)
         self.assertEqual(reopened.flush(), 0)
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM kernel_executions").fetchone()[0], 1)
         self.runtime.run_once()
         reopened.sync()
@@ -210,7 +212,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_kernel_reopens_shared_database_without_application_namespace_knowledge(self):
         from dispatcher_sdk.execution_kernel import SQLiteKernel, StorageIsolationError
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("CREATE TABLE customer_owned_state (value TEXT)")
         with SQLiteKernel(self.path) as kernel:
             self.assertIsNotNone(kernel)

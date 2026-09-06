@@ -11,7 +11,7 @@ Discuss changes to persistence or recovery guarantees before implementing them.
 Create and activate a Python 3.10+ virtual environment, then run:
 
 ```sh
-python -m pip install -e . build wheel
+python -m pip install -e . build wheel "setuptools>=68"
 python -m unittest discover -s tests -v
 python scripts/check_docs.py
 python examples/kernel_task.py
