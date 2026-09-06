@@ -55,6 +55,10 @@ release changes before upgrading a running installation.
 ## Platform and lifecycle behavior
 
 Python 3.10+ is required. Runtime code uses only the standard library.
+CI covers Linux and Windows on Python 3.10, 3.11, 3.12 and 3.13.
+Process-specific tests run only where supported; macOS is not in the initial
+CI matrix. Check the candidate's CI results for your platform/version pair.
+
 `isolation_mode="auto"` selects process isolation when POSIX fork is available,
 and thread isolation otherwise. Explicit process mode fails when fork is
 unavailable. Scripts require process isolation and reject thread fallback.
