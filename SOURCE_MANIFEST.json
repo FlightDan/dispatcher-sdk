@@ -1,0 +1,192 @@
+{
+  "source_commit": "9cea4802dc70e01837704f1126a085e115b65499",
+  "includes_working_tree_changes": true,
+  "files": [
+    {
+      "source_path": "agent_dispatcher_sdk/__init__.py",
+      "source_sha256": "d1d21364c794a926633362496b417ea1be3fba2943f84cf63e0ae77508d8c2e0",
+      "path": "src/dispatcher_sdk/__init__.py",
+      "sha256": "d1d21364c794a926633362496b417ea1be3fba2943f84cf63e0ae77508d8c2e0"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/__init__.py",
+      "source_sha256": "deb0eeeb1e7f1da2401635e744b139945f5698cf8ac671a231cb9d142cf71745",
+      "path": "src/dispatcher_sdk/execution_kernel/__init__.py",
+      "sha256": "deb0eeeb1e7f1da2401635e744b139945f5698cf8ac671a231cb9d142cf71745"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/_process_runtime.py",
+      "source_sha256": "fc00b1a57beb8ad917efecbfd99e7f081aee4e1400d75844ebbdf621b9f9f057",
+      "path": "src/dispatcher_sdk/execution_kernel/_process_runtime.py",
+      "sha256": "fc00b1a57beb8ad917efecbfd99e7f081aee4e1400d75844ebbdf621b9f9f057"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/_registry.py",
+      "source_sha256": "c23a1a2daa4021a2fede25bec6ad137ed8d597de95669b268eb8dca70a1759a1",
+      "path": "src/dispatcher_sdk/execution_kernel/_registry.py",
+      "sha256": "c23a1a2daa4021a2fede25bec6ad137ed8d597de95669b268eb8dca70a1759a1"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/_sqlite_base.py",
+      "source_sha256": "53f9275668b4bf81ec4041e0960b20c1af373e378c58b471df560d8385dfd2c0",
+      "path": "src/dispatcher_sdk/execution_kernel/_sqlite_base.py",
+      "sha256": "53f9275668b4bf81ec4041e0960b20c1af373e378c58b471df560d8385dfd2c0"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/_sqlite_completion.py",
+      "source_sha256": "fa1191397b130232e67dd8261466a95196f6caaacacaca64827b0a219f4ea07b",
+      "path": "src/dispatcher_sdk/execution_kernel/_sqlite_completion.py",
+      "sha256": "fa1191397b130232e67dd8261466a95196f6caaacacaca64827b0a219f4ea07b"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/_sqlite_effects.py",
+      "source_sha256": "1bfdc044b8d0d05ac060d89142bf2ffc99e5fb6cb85b576a6241e352c12f0196",
+      "path": "src/dispatcher_sdk/execution_kernel/_sqlite_effects.py",
+      "sha256": "1bfdc044b8d0d05ac060d89142bf2ffc99e5fb6cb85b576a6241e352c12f0196"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/_sqlite_execution.py",
+      "source_sha256": "8cb4cee8b22b49a9bc77aed5ac5217f3a6f8c9e3b2e210f789ad70fb56c29deb",
+      "path": "src/dispatcher_sdk/execution_kernel/_sqlite_execution.py",
+      "sha256": "8cb4cee8b22b49a9bc77aed5ac5217f3a6f8c9e3b2e210f789ad70fb56c29deb"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/_sqlite_outbox.py",
+      "source_sha256": "bccaad195615148c5fcc6c8a07a631777884ede39e914d1c2e71651d0046bf5d",
+      "path": "src/dispatcher_sdk/execution_kernel/_sqlite_outbox.py",
+      "sha256": "bccaad195615148c5fcc6c8a07a631777884ede39e914d1c2e71651d0046bf5d"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/_sqlite_recovery.py",
+      "source_sha256": "84e89f867efec0f3a2fa10b4cae8f194810ad2f5ce3d0378f8edb3548864e096",
+      "path": "src/dispatcher_sdk/execution_kernel/_sqlite_recovery.py",
+      "sha256": "84e89f867efec0f3a2fa10b4cae8f194810ad2f5ce3d0378f8edb3548864e096"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/_sqlite_schema.py",
+      "source_sha256": "0184d253bbd4d76cf89b4a0bda96a966ba16d0edde46665ce3d02736bc246a1d",
+      "path": "src/dispatcher_sdk/execution_kernel/_sqlite_schema.py",
+      "sha256": "0184d253bbd4d76cf89b4a0bda96a966ba16d0edde46665ce3d02736bc246a1d"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/context.py",
+      "source_sha256": "78bdcc443ea923c527d0a87b40f7d8e9109baae43e32dc99c1fb1b96592a45b0",
+      "path": "src/dispatcher_sdk/execution_kernel/context.py",
+      "sha256": "78bdcc443ea923c527d0a87b40f7d8e9109baae43e32dc99c1fb1b96592a45b0"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/contracts.py",
+      "source_sha256": "2ea88feffedad18186b6644859b3f4456a39ff355f9d5783ba0dd688717fd63d",
+      "path": "src/dispatcher_sdk/execution_kernel/contracts.py",
+      "sha256": "2ea88feffedad18186b6644859b3f4456a39ff355f9d5783ba0dd688717fd63d"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/errors.py",
+      "source_sha256": "1f686ca50c2486270efd1d354e1cb59a346a9dd9f0606fd7dce447b8a5ed8325",
+      "path": "src/dispatcher_sdk/execution_kernel/errors.py",
+      "sha256": "1f686ca50c2486270efd1d354e1cb59a346a9dd9f0606fd7dce447b8a5ed8325"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/event.py",
+      "source_sha256": "6c0400dc41a856ba4d036a73a9dc0ec2bd04bf0b8126fdfab71fdbdbae700114",
+      "path": "src/dispatcher_sdk/execution_kernel/event.py",
+      "sha256": "6c0400dc41a856ba4d036a73a9dc0ec2bd04bf0b8126fdfab71fdbdbae700114"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/host.py",
+      "source_sha256": "66260d2488ce9ed8603f9f7a95acf5c05441c7c397327a38eec132d3ec8e2f27",
+      "path": "src/dispatcher_sdk/execution_kernel/host.py",
+      "sha256": "66260d2488ce9ed8603f9f7a95acf5c05441c7c397327a38eec132d3ec8e2f27"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/kernel.py",
+      "source_sha256": "f30086b04e1f16fef74e2926777ae688a2900baefd380b904e29f4b01243ef52",
+      "path": "src/dispatcher_sdk/execution_kernel/kernel.py",
+      "sha256": "f30086b04e1f16fef74e2926777ae688a2900baefd380b904e29f4b01243ef52"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/outbox_status.py",
+      "source_sha256": "c859e5ec7032f9bb9324f4bad9ea17150238f1b7950e6a32b7861a96752503e9",
+      "path": "src/dispatcher_sdk/execution_kernel/outbox_status.py",
+      "sha256": "c859e5ec7032f9bb9324f4bad9ea17150238f1b7950e6a32b7861a96752503e9"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/runtime.py",
+      "source_sha256": "72e4c454ed026a4f40c42a51137a05ceaeed0530c96f8110135f4302db1136b5",
+      "path": "src/dispatcher_sdk/execution_kernel/runtime.py",
+      "sha256": "72e4c454ed026a4f40c42a51137a05ceaeed0530c96f8110135f4302db1136b5"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/scripts.py",
+      "source_sha256": "0ecdb99a948aef428e4eeab2b9f5fabd48e717778258a7475383f2cdfd0441ef",
+      "path": "src/dispatcher_sdk/execution_kernel/scripts.py",
+      "sha256": "0ecdb99a948aef428e4eeab2b9f5fabd48e717778258a7475383f2cdfd0441ef"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/sqlite.py",
+      "source_sha256": "c1da35b74e53d5420e51b10da386352f7f3c6d524c4aecc9decb63c5c9abf3ff",
+      "path": "src/dispatcher_sdk/execution_kernel/sqlite.py",
+      "sha256": "c1da35b74e53d5420e51b10da386352f7f3c6d524c4aecc9decb63c5c9abf3ff"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/execution_kernel/transitions.py",
+      "source_sha256": "278316aac3bb2e774dd3845dde124380d3c8951f2402a4b562b389991dd50064",
+      "path": "src/dispatcher_sdk/execution_kernel/transitions.py",
+      "sha256": "278316aac3bb2e774dd3845dde124380d3c8951f2402a4b562b389991dd50064"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/orchestrator/__init__.py",
+      "source_sha256": "226fd1e68517812158238ce0363d9988047f0fdafc682a2c54e9d261dae4dc56",
+      "path": "src/dispatcher_sdk/orchestrator/__init__.py",
+      "sha256": "226fd1e68517812158238ce0363d9988047f0fdafc682a2c54e9d261dae4dc56"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/orchestrator/contracts.py",
+      "source_sha256": "4ef1992f832947b180bb69e493ac26b75a12cfb5d45ee5c16ba63d7397d4be2d",
+      "path": "src/dispatcher_sdk/orchestrator/contracts.py",
+      "sha256": "4ef1992f832947b180bb69e493ac26b75a12cfb5d45ee5c16ba63d7397d4be2d"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/orchestrator/engine.py",
+      "source_sha256": "e37aa770266ecdccc8d36bd3cd361edfc72f780f6d40617ed3ceb0b653323014",
+      "path": "src/dispatcher_sdk/orchestrator/engine.py",
+      "sha256": "e37aa770266ecdccc8d36bd3cd361edfc72f780f6d40617ed3ceb0b653323014"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/orchestrator/host.py",
+      "source_sha256": "f396427648189b256b90243671eee86ff3b0951464c28077f15b53db7dec47d6",
+      "path": "src/dispatcher_sdk/orchestrator/host.py",
+      "sha256": "f396427648189b256b90243671eee86ff3b0951464c28077f15b53db7dec47d6"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/orchestrator/notifications.py",
+      "source_sha256": "297502132161cd751faa9d27f053af938e08a3cb87a5416e1a3f07b27aad1c48",
+      "path": "src/dispatcher_sdk/orchestrator/notifications.py",
+      "sha256": "297502132161cd751faa9d27f053af938e08a3cb87a5416e1a3f07b27aad1c48"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/orchestrator/reducer.py",
+      "source_sha256": "bb9691e6529229798cba2c746a0ea6ddfb579dd63fd40a4ef49728200088561d",
+      "path": "src/dispatcher_sdk/orchestrator/reducer.py",
+      "sha256": "bb9691e6529229798cba2c746a0ea6ddfb579dd63fd40a4ef49728200088561d"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/orchestrator/results.py",
+      "source_sha256": "e310ab227538b2dd4c03c6fb4f2daeb297096889e953eeceecf9e678e96ed279",
+      "path": "src/dispatcher_sdk/orchestrator/results.py",
+      "sha256": "e310ab227538b2dd4c03c6fb4f2daeb297096889e953eeceecf9e678e96ed279"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/orchestrator/store.py",
+      "source_sha256": "8a8930087155c5f79dd1f29be7ce35af9e10be668d511090f8a58e2aa9de49e9",
+      "path": "src/dispatcher_sdk/orchestrator/store.py",
+      "sha256": "8a8930087155c5f79dd1f29be7ce35af9e10be668d511090f8a58e2aa9de49e9"
+    },
+    {
+      "source_path": "agent_dispatcher_sdk/orchestrator/transport.py",
+      "source_sha256": "d2b54cd16969aa2e69dc051de5d970c7159805acb2e75fbad52c9d0cce2151b9",
+      "path": "src/dispatcher_sdk/orchestrator/transport.py",
+      "sha256": "d2b54cd16969aa2e69dc051de5d970c7159805acb2e75fbad52c9d0cce2151b9"
+    }
+  ]
+}

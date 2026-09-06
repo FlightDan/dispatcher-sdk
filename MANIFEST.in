@@ -1,0 +1,6 @@
+include LICENSE NOTICE README.md README.zh-CN.md CHANGELOG.md CONTRIBUTING.md SECURITY.md PROVENANCE.md
+recursive-include docs *.md
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include scripts *.py
+include SOURCE_MANIFEST.json RELEASING.md

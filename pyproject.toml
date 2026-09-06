@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dispatcher-sdk"
+version = "0.5.1"
+description = "Durable local execution and explicit task orchestration with SQLite"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+license = { file = "LICENSE" }
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: Apache Software License",
+]
+
+[project.urls]
+Repository = "https://github.com/FlightDan/dispatcher-sdk"
+Issues = "https://github.com/FlightDan/dispatcher-sdk/issues"
+Documentation = "https://github.com/FlightDan/dispatcher-sdk#readme"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = false
+license-files = ["LICENSE", "NOTICE"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["dispatcher_sdk", "dispatcher_sdk.*"]
+
+[tool.setuptools.package-data]
+"dispatcher_sdk.execution_kernel" = ["README.md"]

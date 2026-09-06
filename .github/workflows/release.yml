@@ -1,0 +1,37 @@
+name: SDK prerelease
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check tag version
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          with open('pyproject.toml', 'rb') as stream:
+              version = tomllib.load(stream)['project']['version']
+          assert os.environ['GITHUB_REF_NAME'] == f'v{version}'
+          PY
+      - name: Build packages
+        run: |
+          python -m pip install build
+          python -m build
+          cd dist
+          sha256sum *.whl *.tar.gz > SHA256SUMS
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.whl dist/*.tar.gz dist/SHA256SUMS --verify-tag --prerelease --title "Dispatcher SDK $GITHUB_REF_NAME (developer preview)" --notes-file CHANGELOG.md
