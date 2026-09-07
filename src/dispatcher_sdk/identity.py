@@ -223,7 +223,13 @@ def _storage(name: str, path: str | Path, handlers, durability: Durability | Non
     except sqlite3.DatabaseError as error:
         # I/O, lock and permission failures do not prove physical corruption.
         code = getattr(error, "sqlite_errorcode", None)
-        damaged = code is not None and (code & 0xff) in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB)
+        if code is not None:
+            damaged = (code & 0xff) in (11, 26)  # SQLITE_CORRUPT, SQLITE_NOTADB
+        else:
+            # Python 3.10 does not expose SQLite result codes on exceptions.
+            # Match only SQLite's explicit corruption messages, not arbitrary
+            # database errors such as locks, permissions or failed reads.
+            damaged = str(error) in ("database disk image is malformed", "file is not a database")
         status = "damaged" if damaged else "unknown"
         integrity = "failed" if damaged else "unknown"
         read = execute = resume = _verdict("unsupported" if damaged else "unknown", "storage_" + status)

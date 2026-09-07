@@ -110,6 +110,42 @@ class RuntimeIdentityTests(unittest.TestCase):
         self.assertEqual(result.read.status, "unknown")
         self.assertEqual(result.storages[0].integrity, "unknown")
 
+    def test_sqlite_errors_without_result_codes_are_classified_conservatively(self):
+        for message, damaged in (
+            ("file is not a database", True),
+            ("database disk image is malformed", True),
+            ("database is locked", False),
+            ("unable to open database file", False),
+            ("disk I/O error", False),
+            ("attempt to write a readonly database", False),
+            ("unrecognized database failure", False),
+        ):
+            with self.subTest(message=message):
+                # Manually created exceptions also lack codes on newer Python.
+                error = sqlite3.DatabaseError(message)
+                self.assertFalse(hasattr(error, "sqlite_errorcode"))
+                with patch("dispatcher_sdk.identity.inspect_storage", side_effect=error):
+                    storage = runtime_identity(self.path).storages[0]
+                self.assertEqual(storage.status, "damaged" if damaged else "unknown")
+                self.assertEqual(storage.integrity, "failed" if damaged else "unknown")
+                for verdict in (storage.read, storage.execute, storage.resume):
+                    self.assertEqual(verdict.status, "unsupported" if damaged else "unknown")
+
+    def test_sqlite_result_codes_take_precedence_over_messages(self):
+        for code, message, damaged in (
+            (11, "corruption", True),
+            (26, "not a database", True),
+            (11 | (1 << 8), "extended corruption result", True),
+            (5, "file is not a database", False),
+            (10, "database disk image is malformed", False),
+        ):
+            with self.subTest(code=code):
+                error = sqlite3.DatabaseError(message)
+                error.sqlite_errorcode = code
+                with patch("dispatcher_sdk.identity.inspect_storage", side_effect=error):
+                    storage = runtime_identity(self.path).storages[0]
+                self.assertEqual(storage.status, "damaged" if damaged else "unknown")
+
     def test_distribution_does_not_identify_imported_source(self):
         class Distribution:
             version = "0.5.1"

@@ -1,22 +1,24 @@
-# Dispatcher SDK
+# Dispatcher SDK: Durable Task Orchestration for AI Agents
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [Wiki](wiki/Home.md) | [Docs for coding agents](DocsforAgents/README.md) | [API documentation](docs/SDK.md)
 
-[User guide (English / 中文)](wiki/Home.md) | [Docs for coding agents (English)](DocsforAgents/README.md) | [API documentation](docs/SDK.md)
+Dispatcher uses SQLite to persist execution state and adds process isolation, retries, recovery, and durable notifications.
 
-Run tasks for Agent applications with process isolation, durable state, recovery, and task orchestration.
+**The core has no third-party runtime dependencies.**
 
-Dispatcher runs Python functions or scripts that your application submits,
-controls execution timeouts and cancellation, and saves task state in SQLite.
-With task subscriptions, your application can receive a notification when work
-ends or needs recovery, then use the result to continue a conversation, schedule
-another task, or handle an interrupted execution.
+Dispatcher runs submitted Python functions and scripts locally, and can run scripts
+in remote sandboxes. It controls timeouts and cancellation and saves task state in
+SQLite. For sandbox jobs, it collects bounded output and artifacts and keeps the
+lifecycle state needed for cleanup after an interruption. Task subscriptions notify
+your application when work finishes or needs recovery, so it can continue a
+conversation, schedule another task, or handle an interrupted execution.
 
 ## What you can do
 
 | Capability | Where it helps |
 | --- | --- |
 | Execution isolation and control | Run tasks in separate processes. In process mode, timeouts and cancellation terminate the supervised process tree to handle stuck tool calls. |
+| Sandbox execution | Run scripts through a pluggable `SandboxBackend`, collect bounded output and artifacts, and persist lifecycle state for cleanup and recovery. The optional OpenSandbox adapter requires its SDK and a separate sandbox service. |
 | Durable execution | Save tasks, results, and notifications in SQLite. Queued work remains available when you close and reopen the database. |
 | Bounded retries | Configure attempt limits and backoff for retryable failures, avoiding endless reruns. |
 | External effect recovery | Save receipts for file writes and API calls registered through the Effect interface. When an interruption leaves the outcome uncertain, wait for the application to verify and resolve it. |

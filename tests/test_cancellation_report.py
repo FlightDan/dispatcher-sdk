@@ -1,5 +1,6 @@
 """Cancellation evidence must survive restart without inventing cleanup proof."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import replace
 import ctypes
 import json
@@ -152,7 +153,7 @@ class CancellationReportTests(unittest.TestCase):
             def dump():
                 result = []
                 for path in paths:
-                    with sqlite3.connect(path) as connection:
+                    with closing(sqlite3.connect(path)) as connection:
                         result.append(tuple(connection.iterdump()))
                 return result
             before = dump()
@@ -269,7 +270,7 @@ class CancellationReportTests(unittest.TestCase):
             self.assertEqual(report.local_process_tree_reaped.status, "unknown")
             self.assertTrue(report.issues)
             self.assertFalse(missing.parent.exists())
-            with sqlite3.connect(self.root / "cancel.db") as connection:
+            with closing(sqlite3.connect(self.root / "cancel.db")) as connection, connection:
                 connection.execute("CREATE TABLE unexpected(value)")
             before = (self.root / "cancel.db").read_bytes()
             self.assertTrue(self.report(sdk).issues)
@@ -327,7 +328,7 @@ class CancellationReportTests(unittest.TestCase):
                             '{"state":[],"code":"bad"}', '{"state":{},"code":"bad"}',
                             '{"state":"confirmed","code":[]}', '{"state":"confirmed","code":{}}'):
                 with self.subTest(invalid=invalid):
-                    with sqlite3.connect(self.root / "cancel.db") as connection:
+                    with closing(sqlite3.connect(self.root / "cancel.db")) as connection, connection:
                         connection.execute("UPDATE cancellation_stages SET evidence=? WHERE stage='process_cleanup'", (invalid,))
                     with self.assertRaises(ValueError):
                         inspect_cancellation_journal(self.root / "cancel.db", source_id="test-source",
@@ -335,7 +336,7 @@ class CancellationReportTests(unittest.TestCase):
                     report = self.report(sdk)
                     self.assertEqual(report.local_process_tree_reaped.status, "unknown")
                     self.assertTrue(report.issues)
-                    with sqlite3.connect(self.root / "cancel.db") as connection:
+                    with closing(sqlite3.connect(self.root / "cancel.db")) as connection:
                         self.assertEqual(connection.execute("SELECT evidence FROM cancellation_stages WHERE stage='process_cleanup'").fetchone()[0], invalid)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux subreaper and supervisor processes")

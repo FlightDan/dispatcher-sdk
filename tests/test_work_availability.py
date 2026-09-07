@@ -1,3 +1,4 @@
+from contextlib import closing
 from pathlib import Path
 import json
 import sqlite3
@@ -41,7 +42,7 @@ class WorkAvailabilityTests(unittest.TestCase):
         return inspect_work_availability(self.sdk, 'run', **kwargs)
 
     def dump(self):
-        with sqlite3.connect(self.path) as c:
+        with closing(sqlite3.connect(self.path)) as c:
             return list(c.iterdump())
 
     def test_no_tasks_wait_terminal_and_json(self):
@@ -104,7 +105,7 @@ class WorkAvailabilityTests(unittest.TestCase):
         self.add()
         self.sdk.flush()
         # Persist a scheduler fixture without changing strict schema.
-        with sqlite3.connect(self.path) as c:
+        with closing(sqlite3.connect(self.path)) as c, c:
             c.execute('UPDATE kernel_executions SET next_attempt_at=150')
         report = self.report()
         self.assertEqual(report.future_retries, 1)
@@ -118,7 +119,7 @@ class WorkAvailabilityTests(unittest.TestCase):
         original = self.runtime.kernel.current_time
         def concurrent():
             # Both databases are already pinned at this point; WAL permits write.
-            with sqlite3.connect(self.path) as c:
+            with closing(sqlite3.connect(self.path)) as c, c:
                 c.execute("UPDATE sdk_runs SET revision=revision+1 WHERE run_id='run'")
             return original()
         with patch.object(self.runtime.kernel, 'current_time', side_effect=concurrent):
@@ -189,7 +190,7 @@ class WorkAvailabilityTests(unittest.TestCase):
         from dispatcher_sdk.orchestrator.availability import _open_reader, _run_registration_source
         self.add()
         self.sdk.flush()
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             # These registrations are outside the requested Run. They need no
             # matching authority for the index access regression fixture.
             connection.executemany('INSERT INTO sdk_executions VALUES(?,?,?,?,?,?,?)',
@@ -211,7 +212,7 @@ class WorkAvailabilityTests(unittest.TestCase):
     def test_command_identity_preserves_json_types(self):
         self.add()
         self.sdk.flush()
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             command = json.loads(connection.execute('SELECT command_json FROM kernel_executions').fetchone()[0])
             command['payload'] = {'value': True}
             connection.execute('UPDATE kernel_executions SET command_json=?', (json.dumps(command),))
