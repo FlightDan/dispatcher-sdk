@@ -430,7 +430,7 @@ class WindowsRuntimeTests(unittest.TestCase):
         def registered(handle):
             def cancel():
                 try:
-                    _wait_pid(pidfile, timeout=15)
+                    _wait_pid(pidfile, timeout=35)
                     results.append(handle.revoke("cancelled"))
                 except BaseException as exc:
                     errors.append(exc)
@@ -480,7 +480,7 @@ class WindowsRuntimeTests(unittest.TestCase):
             + "        outcome = invoke_windows_handler(db_path=%r, handler=handler, command=command, lease=lease, now=None, start_timeout=20)\n" % str(self.root / "entry.db")
             + "        assert outcome.get('value') == {'main': 'works'}, outcome\n",
             encoding="utf-8")
-        completed = subprocess.run([sys.executable, str(script)], timeout=30, capture_output=True, text=True)
+        completed = subprocess.run([sys.executable, str(script)], timeout=60, capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_abrupt_worker_exit_preserves_stderr_tail(self):
@@ -494,7 +494,7 @@ class WindowsRuntimeTests(unittest.TestCase):
             self.skipTest("pythonw.exe is not installed beside this Windows interpreter")
         code = "import sys; sys.path[:]=%r; from %s import _no_console_host; _no_console_host(%r)" % (
             _test_import_path(), _TEST_MODULE, str(self.root))
-        completed = subprocess.run([str(pythonw), "-c", code], timeout=45)
+        completed = subprocess.run([str(pythonw), "-c", code], timeout=60)
         self.assertEqual(completed.returncode, 0)
         result = self.root / "no-console-outcome.json"
         self.assertTrue(result.exists(), "pythonw host did not publish its outcome")

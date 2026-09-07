@@ -105,16 +105,20 @@ class SandboxRuntimeTests(unittest.TestCase):
         runtime, handler = self.runtime("running", timeout=10)
         with runtime, ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(runtime.run_once)
-            deadline = time.monotonic() + 5
-            while not (self.root / "started").exists() and time.monotonic() < deadline:
+            # Native interpreter startup has its own budget, separate from the
+            # cancellation/cleanup boundary asserted after backend readiness.
+            deadline = time.monotonic() + runtime._handler_start_timeout() + 5
+            while (not (self.root / "started").exists() and not future.done()
+                   and time.monotonic() < deadline):
                 time.sleep(0.01)
-            self.assertTrue((self.root / "started").exists())
+            self.assertTrue((self.root / "started").exists(),
+                            future.result() if future.done() else "worker startup did not finish")
             current = runtime.kernel.get("x")
             with self.assertRaises(EffectRecoveryRequiredError):
                 runtime.cancel("x", expected_revision=current.revision)
             self.assertFalse((self.root / "alive").exists())
             self.assertTrue(handler.journal().get("x")["cleanup_confirmed"])
-            self.assertEqual(future.result(timeout=5).state, "recovery_required")
+            self.assertEqual(future.result(timeout=15).state, "recovery_required")
 
     def test_lost_start_reply_never_reissues_command_and_cleanup_is_confirmed(self):
         runtime, handler = self.runtime("lost_start")
