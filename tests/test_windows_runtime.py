@@ -35,7 +35,9 @@ def _publish_pid(path, pid):
 def _read_pid(path):
     try:
         pid = int(Path(path).read_text(encoding="ascii"))
-    except (FileNotFoundError, ValueError):
+    except (FileNotFoundError, PermissionError, ValueError):
+        # Windows can briefly deny a PID-file open while another process
+        # inspects it. The caller's existing deadline still bounds this wait.
         return None
     return pid if pid > 0 else None
 
