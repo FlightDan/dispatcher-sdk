@@ -148,6 +148,39 @@ class OrchestratorHostTests(unittest.TestCase):
             self.assertEqual(health.last_notification_error, "OSError: database busy")
             self.assertEqual(health.state, "running")
 
+    def test_no_callback_collects_notifications_without_claiming_or_acknowledging(self):
+        orchestrator = Orchestrator()
+        host = self.make_host(orchestrator, None)
+        host.start()
+        try:
+            wait_until(lambda: orchestrator.collect_count > 0
+                       and orchestrator.runtime.calls > 0)
+            self.assertEqual(host.health().notification_deliveries, 0)
+            self.assertFalse(host.health().notification_alive)
+            self.assertEqual(orchestrator.delivery_options, [])
+            self.assertEqual(tuple(orchestrator.notifications),
+                             ({"kind": "terminal", "run_id": "test"},))
+            self.assertTrue(any(call[0] == "flush" for call in orchestrator.calls))
+            self.assertTrue(any(call[0] == "sync" for call in orchestrator.calls))
+        finally:
+            self.assertTrue(host.stop(timeout=1.0))
+
+    def test_no_callback_start_is_idempotent_and_stop_is_repeatable(self):
+        orchestrator = Orchestrator()
+        host = self.make_host(orchestrator, None)
+        self.assertIs(host.start(), host)
+        self.assertIs(host.start(), host)
+        self.assertIsNone(host._thread)
+        self.assertFalse(host.health().notification_alive)
+        self.assertTrue(host.stop(timeout=1.0))
+        self.assertTrue(host.stop(timeout=0.1))
+        self.assertEqual(host.health().state, "stopped")
+
+    def test_none_is_the_only_noncallable_callback_allowed(self):
+        orchestrator = Orchestrator()
+        with self.assertRaisesRegex(TypeError, "callable or None"):
+            self.make_host(orchestrator, object())
+
     def test_missing_or_mismatched_runtime_is_rejected(self):
         orchestrator = Orchestrator()
         orchestrator.runtime = None

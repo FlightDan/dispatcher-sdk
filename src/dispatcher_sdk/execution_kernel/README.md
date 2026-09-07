@@ -4,8 +4,8 @@ Install the `dispatcher-sdk` distribution and import this package as
 `dispatcher_sdk.execution_kernel`. The SDK package root is lightweight;
 importing the Kernel does not load the Orchestrator or host application.
 
-This package is a standalone, standard-library-only execution boundary. Its
-contracts are exact JSON schema version 2 records; callers must treat unknown
+The package provides a standalone execution boundary using only the standard
+library. Its contracts are exact JSON schema version 2 records; callers must treat unknown
 fields, non-finite values, stale leases, and result identity conflicts as hard
 failures.
 
@@ -16,11 +16,13 @@ failures.
 - Application-owned tables may coexist in the SQLite file. Kernel connections
   are authorizer-limited to `kernel_*` and SQLite internals and cannot read or
   write application tables. Partial or altered Kernel schemas and anything except
-  the exact `kernel_schema_meta` v2 marker are rejected; this foundation performs
+  the exact `kernel_schema_meta` v2 marker are rejected; the Kernel performs
   no implicit schema migration.
+- File-backed writers default to WAL and `synchronous=FULL`. The explicit
+  `durability="normal"` profile selects NORMAL on each writer connection.
 - State changes use revision compare-and-swap updates. Terminal execution facts,
-  execution/effect events, and result identity are immutable. Result delivery is
-  at-least-once through the separately fenced result outbox.
+  execution/effect events, and result identity are immutable. The separately
+  fenced result outbox delivers results at least once.
 - Lease timestamps use one comparable, non-decreasing clock domain. A handler
   contract version is bound within a registry revision; changing handler
   bytecode, referenced global state, or callable class data changes the
@@ -28,20 +30,25 @@ failures.
   closed unless the handler exposes a stable non-empty
   `__execution_kernel_revision__` deployment revision.
 - Process isolation requires a file-backed SQLite path; `:memory:` is rejected
-  because a forked child would otherwise open a separate database. The
+  because a child would otherwise open a separate database. On POSIX the
   supervisor is started with Python's safe `spawn` context, so handlers and a
   custom clock must be pickleable and executable entrypoints must use the
   standard `if __name__ == "__main__"` guard. The supervisor then forks only
-  after it is isolated and single-threaded. The
-  independently timed supervisor kills the handler process group on timeout,
+  after it is isolated and single-threaded. The supervisor uses its own timer and kills the handler process group on timeout,
   cancel, and runtime close. On Linux it is also a child subreaper, so
   new-session and double-fork descendants are adopted, killed, and reaped
   before success is published. Other POSIX hosts guarantee process-group
   cleanup only; callers needing detached-descendant containment must use a
   host sandbox with an equivalent process-tree primitive.
+- Native Windows uses `CreateProcessW` with a Job-list attribute and suspended
+  startup, placing the interpreter in a kill-on-close Job before importing user
+  code. A host watchdog thread enforces deadlines; cleanup confirms zero active
+  Job processes before success. Importable, pickleable handlers and guarded
+  entrypoints are required. See the source checkout's
+  [Windows guide](../../../docs/WINDOWS_RUNTIME.md) for validation status and limits.
 - Runtime lifecycle transitions share one finalization lock: active
-  `cancel()` and handler completion have a single atomic winner. A completion
-  cannot validate a running lease, lose a cancellation race, and then attempt
+  `cancel()` and handler completion compete atomically, and only one can succeed.
+  A completion cannot validate a running lease, lose a cancellation race, and then attempt
   to overwrite the cancelled terminal state.
 - `SQLiteKernel.cancel_before_accept(command, reason=...)` atomically records
   an unseen command as cancelled, with the normal result, events and outbox.
@@ -59,6 +66,18 @@ failures.
   caller, but Python cannot kill an uncooperative thread or undo a raw side
   effect already in progress. Use process isolation when hard termination is a
   requirement.
+
+Use `runtime.command(...)` for per-handler implementation binding. Adding an
+unrelated handler preserves these commands' bindings; changing their selected
+handler does not. Manually using `runtime.registry_revision` retains strict
+whole-registry matching for historical commands. Storage/deployment preflight,
+backup and export are available from `dispatcher_sdk.storage`.
+
+`SandboxHandler` adapts a public `SandboxBackend` into this same effect and
+recovery model. The optional `dispatcher_sdk.adapters.OpenSandboxBackend`
+imports its pinned provider SDK lazily; installing the core adds no dependencies.
+The [sandbox Runtime guide](../../../docs/SANDBOX_RUNTIME.md) explains durable
+identities, output collection, disposal and uncertain-operation recovery.
 
 ## Lease expiry and retry budgets
 
@@ -105,7 +124,7 @@ Handlers must wrap the actual external mutation with
 Arbitrary filesystem edits or Git commits bypassing this interface are not
 automatically tracked, rolled back or made idempotent. A crash after mutation
 but before effect commit requires reconciliation; missing output does not prove
-the mutation did not occur, and partial effects cannot be guessed away.
+the mutation did not occur, and partial effects also require reconciliation.
 
 If the effect response is committed but the execution result is not, an allowed
 mechanical retry can reuse that response. Exhausted attempts can still become

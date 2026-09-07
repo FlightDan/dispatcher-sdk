@@ -555,7 +555,7 @@ class SQLiteKernelTests(unittest.TestCase):
             "effect-not-applied", {"sent": True}, second, claimed.claim_id
         )
         self.assertEqual(committed.state, "committed")
-        self.assertEqual(committed.recovery_decision, "not_applied")
+        self.assertIsNone(committed.recovery_decision)
         self.assertEqual(
             [event["event_type"] for event in self.kernel.effect_events(
                 "effect-not-applied"

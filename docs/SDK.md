@@ -1,9 +1,9 @@
 # Dispatcher SDK
 
-`dispatcher-sdk` is an independently installable, standard-library-only
-Python distribution. Its namespace is `dispatcher_sdk`; it does not
-import `agent_dispatcher`, run Git, or invoke a model.
-Applications supply handlers and routing policy.
+`dispatcher-sdk` is an independently installable Python distribution. Its core
+uses only the standard library; an OpenSandbox adapter is optional. The namespace
+is `dispatcher_sdk`. It does not import `agent_dispatcher`, run Git, or invoke a
+model. Applications supply handlers and routing policy.
 
 | Package | Responsibility |
 | --- | --- |
@@ -11,13 +11,22 @@ Applications supply handlers and routing policy.
 | `dispatcher_sdk.orchestrator` | Explicit Run/task operations, dependencies, attempts, waits, events, command receipts and transactional delivery |
 
 The SDK Orchestrator owns `sdk_*` tables; Kernel owns `kernel_*`.
-Use public APIs across these boundaries. SDK methods never choose a next
-business step. Creating a Run starts no task. Observing a successful result
-does not dispatch a successor or finish a Run.
+Use public APIs across these boundaries. The application chooses each business
+step: creating a Run starts no task, and observing a successful result does not
+dispatch a successor or finish a Run.
 
 For lease-aware host loops, retry budgets, repository effects, and evidence
-ownership, see [recovery and integration requirements](SDK_RECOVERY.md). See [public API and compatibility](PUBLIC_API.md) for import paths, versions,
+ownership, see [recovery and integration requirements](SDK_RECOVERY.md).
+[Public API and compatibility](PUBLIC_API.md) covers import paths, versions,
 and platform constraints.
+
+For LLM-backed handlers, the [guide to output contracts, validation and bounded rework](SDK_OUTPUT_CONTRACTS.md)
+covers exact prompt enums, application-owned runtime validation, actionable
+diagnostics and explicit repair routing. Execution success, valid output
+structure and business acceptance are separate checks.
+Agent-to-agent handoff states must use exact contract enums in structured fields.
+Natural-language paragraphs may explain a state, but must not supply the state
+or drive routing; missing or invalid states must fail application validation.
 
 ## Install
 
@@ -28,13 +37,29 @@ python3 -m pip install .
 ```
 
 Build a wheel with `python3 -m pip wheel . --no-deps --wheel-dir dist`.
-Python 3.10+ is required. Runtime code uses the Python standard library.
+Python 3.10+ is required. The core has zero third-party runtime dependencies.
+Install the optional adapter with `python3 -m pip install ".[opensandbox]"`; this
+adds the pinned OpenSandbox SDK and requires a separately deployed service.
+
+## Version 0.6 integration guides
+
+- [Task submission](TASK_SUBMISSION.md): `submit_task()` atomically records task, watch and dispatch intent; `Runtime.command()` binds one handler.
+- [Storage and upgrades](STORAGE_AND_UPGRADES.md): schema 2 upgrade boundaries, FULL/NORMAL profiles, preflight, backup, paged reads and `continue_run()`.
+- [Run storage validation](RUN_STORAGE_VALIDATION.md): incremental historical storage measurements; full snapshot calls still scale with segment size.
+- [Notification inbox](NOTIFICATION_INBOX.md): source-scoped deduplication, fenced leases and application SQL in the consume transaction.
+- [Sandbox runtime](SANDBOX_RUNTIME.md) and [adapter contract](SANDBOX_ADAPTERS.md): persisted remote lifecycle, collection and uncertain disposal recovery.
+- [Windows runtime](WINDOWS_RUNTIME.md): native Job Object execution verified on Windows 11 x64 (build 10.0.26100.9168), Python 3.12.10; includes process/script lifecycle, storage, packaging and installed examples.
+
+Version 0.6 does not automatically migrate old Orchestrator databases. Keep the
+old deployment available to drain its work, preserve a backup and start a new
+store.
+Execution command/result contracts and Kernel storage remain version 2.
 
 ## Command-driven example
 
-This complete example runs a local Python handler. Separate database files make
-the persistence authorities visible. Thread isolation is sufficient for this
-trusted, short handler; it cannot forcibly stop a blocked external call.
+This complete example runs a local Python handler and stores Kernel and
+Orchestrator state in separate database files. Thread isolation is sufficient
+for this short, trusted handler; it cannot forcibly stop a blocked external call.
 
 ```python
 from tempfile import TemporaryDirectory
@@ -88,6 +113,40 @@ Finishing requires settled tasks and released waits. A host schedules `flush`,
 execution workers and `sync`; constructing an Orchestrator does not start a background scheduler.
 Use `OrchestratorHost` for an SDK-managed background execution loop.
 
+### Typed operations and observations
+
+`Operations` provides named constructors for every operation. Their detached
+dictionaries can be mixed with existing handwritten operations and stored or
+replayed using the same JSON protocol:
+
+```python
+from dispatcher_sdk.orchestrator import Operation, Operations, RunSnapshot
+
+operations: list[Operation] = [
+    Operations.add_task("hello", command(runtime, "hello-1")),
+    Operations.dispatch("hello"),
+]
+state: RunSnapshot = sdk.apply_operations(
+    "example", command_id="add-and-dispatch", expected_revision=0,
+    operations=operations,
+)
+```
+
+Constructors validate identifiers, strict JSON and execution commands. Checks
+that need Run state, such as dependency cycles and legal transitions, still occur
+atomically on submission. The `Operation` union, individual `*Operation` types,
+`RunSnapshot`, `TaskSnapshot`, `AttemptSnapshot`, `RunEvent` and `Observation`
+support IDE completion and static checking. `get_run`, `observe`, `read_events`
+and command receipts have annotated return types and retain their dictionary
+shapes.
+Application payloads remain application-defined. Keep the original constructed
+request for exact replay; changing its fields still requires a new command ID.
+
+For polling applications, `with OrchestratorHost(sdk): ...` needs no dummy
+callback. Execution, flush, sync and watch collection continue; notification
+delivery is disabled and queued notifications are preserved. Pass a callback
+when the host should deliver and acknowledge notifications.
+
 ## Decisions, receipts and recovery
 
 Use `observe(run_id, subscription=...)` to read a snapshot, subscription cursor
@@ -101,6 +160,13 @@ need their own durable inbox/outbox protocol.
 without emitting an event or changing the Run revision. It follows the same
 command identity and exact-replay rules as other SDK commands.
 
+An audit consumer needs its own subscription and must commit its destination
+before acknowledging. Duplicates must be distinguished from write failures,
+and terminal Runs still need paginated draining. See the
+[integration FAQ](SDK_INTEGRATION_FAQ.md) and [durable audit example](../examples/durable_audit.py).
+The FAQ also explains why settled dependencies do not imply business approval
+and shows an application-owned success check before dispatch.
+
 An SDK `wait` records an open wait while the Run remains `running`. It does not
 automatically block dispatch. Applications enforce their own wait scope and
 explicitly `release_wait` when the condition is met. Open waits prevent finish.
@@ -111,14 +177,22 @@ and cursor arguments. Replay the original command unchanged to recover its
 original committed response. Reusing its ID with changed content raises
 `CommandConflict`. `get_command_receipt` retrieves that historical response;
 use `get_run` for current state. On `RevisionConflict`, obtain fresh state and
-events, recompute the decision and use a new command identity. Revision checks prevent stale callbacks from advancing
-their cursor or partially applying operations.
+events, recompute the decision and use a new command identity. Revision checks
+prevent stale callbacks from advancing their cursor or partially applying
+operations.
 
 Execution retry and application retry are different. A Kernel `RetryPolicy`
-governs execution attempts for a command. Application rework or an additional
-business attempt requires an explicit `new_attempt` operation. An uncertain
-external effect must follow the Kernel's fenced effect-recovery protocol;
-`resolve_effect` forwards an explicit decision with an expected revision and
+governs execution attempts for a command; it does not interpret application
+output errors or supply corrective feedback. A handler returning a business
+rejection can still have execution state `succeeded`. Application rework requires
+an application-owned budget and explicit `new_attempt` followed by `dispatch`,
+with new execution/idempotency identities, a settled previous attempt and a
+still-running Run. A finished Run cannot accept rework operations. See the
+[output validation and repair flow](SDK_OUTPUT_CONTRACTS.md) for prompt contracts,
+diagnostics and the separate business acceptance check after format repair.
+
+An uncertain external effect must follow the Kernel's fenced effect-recovery
+protocol. `resolve_effect` forwards an explicit decision with an expected revision and
 recovery identity. Retrying a task cannot prove whether an external effect
 already happened. Use durable idempotency keys supported by the external system
 and reconcile uncertain effects. There is no exactly-once guarantee for

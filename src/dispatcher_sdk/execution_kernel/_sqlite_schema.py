@@ -388,7 +388,11 @@ EXPECTED_INDEX_SQL = {
 
 
 def _normalize_sql(value: str) -> str:
-    return re.sub(r"[\s\"`\[\]]+", "", value.lower()).replace("ifnotexists", "")
+    # Normalize syntax only. Quoted values (including spaces and letter case)
+    # participate in CHECK semantics and must survive schema comparison.
+    parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\])", value)
+    return "".join(part if index % 2 else re.sub(r"\s+", "", part.lower()).replace("ifnotexists", "")
+                   for index, part in enumerate(parts))
 
 
 def _expected_object_sql() -> dict[str, str]:

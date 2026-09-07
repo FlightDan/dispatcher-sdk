@@ -1,7 +1,7 @@
 # SDK 接入：恢复、预算与副作用边界
 
 配套文档：[SDK API](SDK.md)、[脚本执行与对话唤醒](SDK_SCRIPT_WAKEUPS.md)、
-[公开 API 与兼容性](PUBLIC_API.md)。
+[公开 API 与兼容性](PUBLIC_API.md)、[可靠审计与业务放行 FAQ](SDK_INTEGRATION_FAQ.md)。
 
 ## 1. 谁负责什么
 
@@ -33,10 +33,10 @@
 普通执行第一次领取后崩溃，若没有未决 Effect 且 `max_attempts=1`，租约到期回收会
 产生 `dead / lease_retry_exhausted`，不会自动再领一次。
 
-需要机械恢复的应用，应在命令首次冻结、注册前配置有限的技术重试额度和退避，且
-先满足副作用安全要求。不能把增大次数当成副作用安全修复，不能修改已接受命令，
-不能用不断创建 `new_attempt` 绕开技术重试上限。耗尽后应明确呈现原因并进入应用
-定义的失败或人工处理路径；具体执行终态不可复活。
+需要机械恢复时，应用应先满足副作用安全要求，再在命令首次冻结、注册前配置
+有限的技术重试额度和退避。增加次数不能修复副作用安全问题；已接受的命令不能
+修改，也不能靠不断创建 `new_attempt` 绕开技术重试上限。预算耗尽后，应说明原因
+并进入应用定义的失败或人工处理路径；具体执行终态不可复活。
 
 当前 API 没有独立的“崩溃重投预算”字段。若产品要求它与执行失败重试分别计费，
 需要单独设计 Kernel 契约、计数和兼容策略；这不是已实现能力，也不是恢复循环
@@ -50,9 +50,9 @@ registry 的任务或线程槽满都可能暂时没有可执行工作。
 `sync()` 返回被查询到的执行数量，不是状态变化数量；它不会回收租约、推进业务
 路由或把整个 Run 自动转为 waiting/succeeded。
 
-宿主应遵循以下可重入循环。现在可使用 SDK 的 `OrchestratorHost` 自动调度
-reap、flush、worker 执行、sync 和通知投递；应用仍须接入自己的业务决策驱动。
-下列步骤描述完整接入职责，不表示宿主会自行选择业务阶段：
+宿主应使用可重入循环。SDK 的 `OrchestratorHost` 可自动调度 reap、flush、
+worker 执行、sync 和通知投递；应用仍须接入自己的业务决策驱动。下列步骤列出
+完整接入职责，业务阶段始终由应用选择：
 
 1. 重开原持久化存储，核对 workflow/handler 版本及冻结输入，恢复原身份和游标。
 2. 调用 `runtime.reap()` 回收真正过期的租约，然后 `sdk.sync()` 同步执行事实。
@@ -114,6 +114,21 @@ Kernel 的同一可比较时钟域。
 `watch_task` 通知会同时捕获进入 recovery_required 的事件，可由
 `OrchestratorHost` 回调唤醒应用处理；登记通知本身不创建业务 wait，也不裁决 Effect。
 
+只读聚合查询可以按 Run 展示待裁决项，应用无需逐层查找 task、execution、effect：
+
+```python
+for recovery in sdk.inspect_recoveries(run_id):
+    print(recovery.task_id, recovery.attempt, recovery.execution.recovery_target_state,
+          recovery.effect.effect_id, recovery.effect.revision, recovery.effect.request)
+```
+
+`attempt` 是从 0 开始的应用尝试索引；`execution.attempt` 是 Kernel 领取次数。
+该接口读取 Kernel 权威状态，不依赖已同步的 Run 状态，但不会主动 reap、sync 或裁决。
+每项含一个当前待裁决 Effect；裁决后重新查询，才能获取同一执行的下一项。
+`run_revision` 是初始 Run 读取的版本，不是跨库原子快照；读取期间持续变化会抛出
+`RevisionConflict`，调用方可稍后重查。实际裁决仍必须使用 `effect.revision`
+作为 `expected_revision`，并提供稳定 `recovery_id` 和外部事实支持的决定。
+
 未决状态包括动作尚未领取的 prepared 与已领取执行的 performing；在外部写入
 完成但提交响应前崩溃，持久记录仍可能是 performing，不能据此断定动作未完成。
 
@@ -139,7 +154,7 @@ Effect 记录不阻止绕过接口的 shell、文件或 Git 操作，也不能�
 
 ## 5. 证据链不能由通用 SDK 代办
 
-应用必须按自己的业务契约验证以下约束，并在失败时关闭式阻止交接：
+应用必须按自己的业务契约验证以下约束，任一约束不满足时都应阻止交接：
 
 - 只选择当前合法依赖/祖先的授权结果；拒绝兄弟分支、旧 attempt 或错误工作区的
 结果，除非业务规则显式允许并记录继承来源。

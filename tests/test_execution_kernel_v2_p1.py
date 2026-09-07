@@ -635,7 +635,8 @@ class EventAndClockTests(unittest.TestCase):
     def test_lease_clock_is_sampled_after_waiting_for_write_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "kernel.sqlite3"
-            kernel = SQLiteKernel(path)
+            clock = Clock(100)
+            kernel = SQLiteKernel(path, now=clock)
             blocker = sqlite3.connect(path, isolation_level=None)
             try:
                 kernel.submit(make_command("lock-wait"))
@@ -652,7 +653,8 @@ class EventAndClockTests(unittest.TestCase):
                     future = executor.submit(claim)
                     self.assertTrue(started.wait(1))
                     time.sleep(0.2)
-                    released_at = time.time()
+                    clock.set(200)
+                    released_at = 200
                     blocker.commit()
                     lease = future.result(timeout=2)
                 self.assertGreater(lease.expires_at, released_at)
@@ -836,6 +838,15 @@ class SchemaAndAuthorizerTests(unittest.TestCase):
             connection.close()
             with self.assertRaises(StorageIsolationError):
                 SQLiteKernel(indexed)
+
+    def test_schema_literal_case_and_whitespace_are_not_normalized_away(self) -> None:
+        for replacement in ("'QUEUED'", "'que ued'"):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "literal.sqlite3"
+                SQLiteKernel(path).close()
+                self._rewrite_schema(path, "kernel_executions", "'queued'", replacement)
+                with self.assertRaises(StorageIsolationError):
+                    SQLiteKernel(path)
 
     def test_clock_metadata_row_is_strict(self) -> None:
         for column, value in (

@@ -4,3 +4,5 @@ recursive-include examples *.py
 recursive-include tests *.py
 recursive-include scripts *.py
 include SOURCE_MANIFEST.json RELEASING.md
+recursive-include wiki *.md
+recursive-include DocsforAgents *.md

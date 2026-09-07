@@ -295,3 +295,23 @@ def registry_revision(handlers: Mapping[Any, Handler]) -> str:
         )
     manifest = {"format": "execution-kernel-handler-registry-v2", "handlers": entries}
     return hashlib.sha256(_canonical_text(manifest).encode("utf-8")).hexdigest()
+
+
+def handler_revision(
+    handlers: Mapping[Any, Handler], handler_id: str, contract_version: int = 1
+) -> str:
+    """Bind one named handler's implementation, contract, and deployment state.
+
+    Unrelated bindings do not contribute to this fingerprint. The prefix keeps
+    this opt-in binding distinct from the existing complete-registry revision.
+    """
+
+    if type(handler_id) is not str or not handler_id.strip():
+        raise TypeError("handler_id must be a non-empty string")
+    if type(contract_version) is not int or contract_version < 1:
+        raise TypeError("handler contract version must be a positive integer")
+    normalized = normalize_handlers(handlers)
+    key = (handler_id, contract_version)
+    if key not in normalized:
+        raise KeyError(f"unknown handler binding {key!r}")
+    return "handler-v1:" + registry_revision({key: normalized[key]})

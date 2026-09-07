@@ -2,11 +2,11 @@
 
 The SDK can run an application script and deliver a Python callback when that
 execution becomes terminal or enters `recovery_required`. The application owns
-the conversation identifier and the operation that starts/resumes its Agent.
-`OrchestratorHost` drives execution and notification delivery in background
-threads; the LLM does not need to poll, wait in a conversation, or spend tokens
-checking progress. This uses the existing Kernel process supervisor and SQLite
-outbox pattern, with no additional service dependency.
+the conversation identifier and supplies the operation that starts or resumes
+its Agent. `OrchestratorHost` drives execution and notification delivery in
+background threads, so the LLM need not poll, wait in a conversation, or spend
+tokens checking progress. It uses the existing Kernel process supervisor and
+SQLite outbox pattern without an additional service dependency.
 
 For lease recovery, application waits, effects and notification handling,
 see the [recovery guide](SDK_RECOVERY.md).
@@ -62,9 +62,10 @@ if __name__ == "__main__":
     main()
 ```
 
-`application_agent_inbox` above is an application integration placeholder.
-The sketch starts a host; the application must keep its process alive and call
-`host.stop()` during shutdown. Process entrypoints need the main guard shown above. A runnable local example with a durable inbox is available at
+`application_agent_inbox` is a placeholder for the application's integration.
+This example starts a host; the application must keep its process alive and call
+`host.stop()` during shutdown. Process entrypoints need the main guard shown
+above. For a runnable local example with a durable inbox, see
 [`examples/sdk_script_wakeup.py`](../examples/sdk_script_wakeup.py).
 
 ## Delivery and recovery contracts
@@ -85,7 +86,7 @@ The sketch starts a host; the application must keep its process alive and call
   not consume the result queue or advance business workflows automatically.
   Each collection reads at most `limit` Kernel events per open watch; startup
   catch-up time grows with event history and watch count.
-- Delivery is **at least once**, with a stable notification ID. A crash after
+- Delivery is at least once, with a stable notification ID. A crash after
   application acceptance and before acknowledgement may deliver again. The
   application must deduplicate durably, ideally in the same transaction that
   enqueues its conversation job. The SDK cannot make a remote conversation
@@ -109,7 +110,9 @@ The sketch starts a host; the application must keep its process alive and call
 working/output paths and output-tail size. Interpreter binaries, environment,
 dependencies and working-directory contents remain application deployment
 inputs. Use trusted scripts: process containment is not an OS security sandbox.
-The helper requires POSIX process isolation and rejects the thread fallback.
+The helper requires process isolation on supported POSIX or native Windows
+platforms and rejects the thread fallback. See [Windows runtime](WINDOWS_RUNTIME.md)
+for Windows requirements and validation scope.
 
 The application supplies the command timeout. Scripts use one execution attempt
 by default. Kernel timeout/cancellation terminates the supervised process tree.
@@ -117,8 +120,8 @@ Because arbitrary scripts can have external side effects, execution runs inside
 an Effect: interruption before the outcome is committed parks the execution in
 `recovery_required`, which triggers a wakeup. The application investigates and
 uses `resolve_effect` to record the outcome before any retry. A timeout with an
-uncertain effect therefore produces a recovery wakeup rather than pretending a
-safe terminal result exists.
+uncertain effect therefore produces a recovery wakeup; the SDK does not assume
+that a safe terminal result exists.
 
 Normal nonzero exits produce `failed` with `error.code="script_exit_nonzero"`.
 Success results and nonzero error details include `exit_code`, source path/hash,

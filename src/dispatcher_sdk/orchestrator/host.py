@@ -43,10 +43,13 @@ class _Transport:
 class OrchestratorHost:
     """Own the Orchestrator's runtime and drive it until explicitly stopped.
 
-    The synchronous callback receives durable notification dictionaries on a
-    separate daemon thread. It never runs on the coordinator or worker pool.
-    Callback failures follow the Orchestrator's durable delivery retry policy;
-    they do not make application decisions or retry executions.
+    When supplied, the synchronous callback receives durable notification
+    dictionaries on a separate daemon thread. It never runs on the coordinator
+    or worker pool. With no callback, the host still runs execution, flush,
+    synchronization, and notification collection, while leaving queued
+    notifications durable for an application-managed consumer. Callback
+    failures follow the Orchestrator's durable delivery retry policy; they do
+    not make application decisions or retry executions.
 
     ``stop`` stops new delivery claims and drains the runtime, leaving unclaimed
     notifications durable for a subsequent host. Its default deadline is five
@@ -56,7 +59,7 @@ class OrchestratorHost:
     succeeds. The Orchestrator itself remains caller-owned.
     """
 
-    def __init__(self, orchestrator, callback: Callable[[dict], object], *,
+    def __init__(self, orchestrator, callback: Callable[[dict], object] | None = None, *,
                  notification_interval: float = 0.05,
                  notification_lease_seconds: float = 30.0,
                  notification_retry_delay: float = 1.0,
@@ -67,8 +70,8 @@ class OrchestratorHost:
             raise ValueError("OrchestratorHost requires an Orchestrator runtime")
         if getattr(runtime, "kernel", None) is not getattr(orchestrator, "kernel", None):
             raise ValueError("runtime and orchestrator must share the Kernel")
-        if not callable(callback):
-            raise TypeError("callback must be callable")
+        if callback is not None and not callable(callback):
+            raise TypeError("callback must be callable or None")
         for name in ("flush", "sync", "collect_notifications", "deliver_notifications"):
             if not callable(getattr(orchestrator, name, None)):
                 raise TypeError(f"orchestrator must provide {name}")
@@ -89,6 +92,7 @@ class OrchestratorHost:
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread = None
+        self._started = False
         self._deliveries = 0
         self._error_count = 0
         self._last_error = None
@@ -99,14 +103,16 @@ class OrchestratorHost:
         with self._lock:
             if self._stop_event.is_set():
                 raise RuntimeError("cannot restart a stopped OrchestratorHost")
-            if self._thread is not None:
+            if self._started:
                 return self
             self.runtime_host.start()
             try:
-                thread = threading.Thread(target=self._deliver, daemon=True,
-                                          name="orchestrator-host-notifications")
-                thread.start()
-                self._thread = thread
+                if self.callback is not None:
+                    thread = threading.Thread(target=self._deliver, daemon=True,
+                                              name="orchestrator-host-notifications")
+                    thread.start()
+                    self._thread = thread
+                self._started = True
             except BaseException as error:
                 self._stop_event.set()
                 try:
@@ -122,10 +128,13 @@ class OrchestratorHost:
         return self.runtime_host.wake(run_id)
 
     def _deliver(self):
+        callback = self.callback
+        if callback is None:
+            return
         while not self._stop_event.is_set():
             try:
                 count = self.orchestrator.deliver_notifications(
-                    self.callback, owner=self.notification_owner,
+                    callback, owner=self.notification_owner,
                     lease_seconds=self.notification_lease_seconds,
                     retry_delay=self.notification_retry_delay, limit=1)
                 with self._lock:

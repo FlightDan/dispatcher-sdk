@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Optional
 import uuid
 
@@ -13,6 +14,42 @@ from ._sqlite_recovery import EffectRecoveryMixin
 from .contracts import ExecutionCommandV2, ExecutionLease, ExecutionSnapshot
 from .errors import IdempotencyConflictError
 from .transitions import reduce_state
+
+
+def _claim_revisions(
+    registry_revision: Optional[str], registry_revisions: Optional[Sequence[str]]
+) -> Optional[tuple[str, ...]]:
+    """Validate before entering the transaction, including its logical clock."""
+
+    if registry_revision is not None:
+        if registry_revisions is not None:
+            raise ValueError("registry_revision and registry_revisions are mutually exclusive")
+        if type(registry_revision) is not str or not registry_revision.strip():
+            raise ValueError("registry_revision must be a non-empty string")
+        return (registry_revision,)
+    if registry_revisions is None:
+        return None
+    if isinstance(registry_revisions, (str, bytes, bytearray)) or not isinstance(registry_revisions, Sequence):
+        raise ValueError("registry_revisions must be a non-empty sequence of non-empty strings")
+    values = tuple(registry_revisions)
+    if not values or any(type(value) is not str or not value.strip() for value in values):
+        raise ValueError("registry_revisions must be a non-empty sequence of non-empty strings")
+    return tuple(dict.fromkeys(values))
+
+
+def _next_claim_row(connection, timestamp: float, revisions: Optional[tuple[str, ...]]):
+    clause = ""
+    parameters = (timestamp,)
+    if revisions is not None:
+        # Only placeholders enter the SQL text. Revision values remain bound
+        # parameters, and one ordered selection spans every accepted revision.
+        clause = " AND registry_revision IN (" + ",".join("?" for _ in revisions) + ")"
+        parameters = (timestamp, *revisions)
+    return connection.execute(
+        "SELECT * FROM kernel_executions WHERE state = 'queued' AND next_attempt_at <= ?"
+        + clause + " ORDER BY created_at, execution_id LIMIT 1",
+        parameters,
+    ).fetchone()
 
 
 class SQLiteKernel(
@@ -207,13 +244,11 @@ class SQLiteKernel(
         *,
         lease_seconds: Optional[float] = None,
         registry_revision: Optional[str] = None,
+        registry_revisions: Optional[Sequence[str]] = None,
     ) -> Optional[ExecutionLease]:
         if type(owner) is not str or not owner.strip():
             raise ValueError("owner must be a non-empty string")
-        if registry_revision is not None and (
-            type(registry_revision) is not str or not registry_revision.strip()
-        ):
-            raise ValueError("registry_revision must be a non-empty string")
+        revisions = _claim_revisions(registry_revision, registry_revisions)
         duration = (
             self.default_lease_seconds
             if lease_seconds is None
@@ -221,21 +256,7 @@ class SQLiteKernel(
         )
         with self._transaction() as (connection, timestamp):
             self._reap_in_transaction(connection, timestamp)
-            if registry_revision is None:
-                row = connection.execute(
-                    """SELECT * FROM kernel_executions
-                       WHERE state = 'queued' AND next_attempt_at <= ?
-                       ORDER BY created_at, execution_id LIMIT 1""",
-                    (timestamp,),
-                ).fetchone()
-            else:
-                row = connection.execute(
-                    """SELECT * FROM kernel_executions
-                       WHERE state = 'queued' AND next_attempt_at <= ?
-                         AND registry_revision = ?
-                       ORDER BY created_at, execution_id LIMIT 1""",
-                    (timestamp, registry_revision),
-                ).fetchone()
+            row = _next_claim_row(connection, timestamp, revisions)
             if row is None:
                 return None
             reduce_state(
@@ -294,6 +315,7 @@ class SQLiteKernel(
         lease_seconds: Optional[float] = None,
         start_safety_seconds: float = 5.0,
         registry_revision: Optional[str] = None,
+        registry_revisions: Optional[Sequence[str]] = None,
     ) -> Optional[ExecutionLease]:
         """Atomically lease and start one queued execution.
 
@@ -304,10 +326,7 @@ class SQLiteKernel(
 
         if type(owner) is not str or not owner.strip():
             raise ValueError("owner must be a non-empty string")
-        if registry_revision is not None and (
-            type(registry_revision) is not str or not registry_revision.strip()
-        ):
-            raise ValueError("registry_revision must be a non-empty string")
+        revisions = _claim_revisions(registry_revision, registry_revisions)
         floor = (
             self.default_lease_seconds
             if lease_seconds is None
@@ -318,21 +337,7 @@ class SQLiteKernel(
         )
         with self._transaction() as (connection, timestamp):
             self._reap_in_transaction(connection, timestamp)
-            if registry_revision is None:
-                row = connection.execute(
-                    """SELECT * FROM kernel_executions
-                       WHERE state = 'queued' AND next_attempt_at <= ?
-                       ORDER BY created_at, execution_id LIMIT 1""",
-                    (timestamp,),
-                ).fetchone()
-            else:
-                row = connection.execute(
-                    """SELECT * FROM kernel_executions
-                       WHERE state = 'queued' AND next_attempt_at <= ?
-                         AND registry_revision = ?
-                       ORDER BY created_at, execution_id LIMIT 1""",
-                    (timestamp, registry_revision),
-                ).fetchone()
+            row = _next_claim_row(connection, timestamp, revisions)
             if row is None:
                 return None
             command = self._command(row["command_json"])

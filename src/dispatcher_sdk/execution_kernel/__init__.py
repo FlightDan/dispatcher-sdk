@@ -39,9 +39,15 @@ from .event import Event
 from .kernel import Kernel
 from .outbox_status import ResultOutboxStatusV2
 from .runtime import Handler, InProcessRuntime, Runtime, registry_revision
+from ._registry import handler_revision
 from .sqlite import ExecutionKernel, SQLiteKernel
 from .host import RuntimeHost, RuntimeHostError, RuntimeHostHealth
 from .scripts import ScriptSpec, script_handler, script_handlers
+from .sandbox import SandboxHandler, SandboxJournal, sandbox_handlers
+from .sandbox_contracts import (
+    SandboxBackend, SandboxBackendError, SandboxObservation, SandboxOutcomeUnknown,
+    SandboxPolicyError, SandboxResourceMissing, SandboxSpec,
+)
 from .transitions import (
     EXECUTION_STATES,
     TERMINAL_STATES,
@@ -51,6 +57,9 @@ from .transitions import (
 )
 
 __all__ = [
+    "SandboxBackend", "SandboxBackendError", "SandboxHandler", "SandboxJournal",
+    "SandboxObservation", "SandboxOutcomeUnknown", "SandboxPolicyError",
+    "SandboxResourceMissing", "SandboxSpec", "sandbox_handlers",
     "RuntimeHost",
     "RuntimeHostError",
     "RuntimeHostHealth",
@@ -98,4 +107,5 @@ __all__ = [
     "can_transition",
     "reduce_state",
     "registry_revision",
+    "handler_revision",
 ]

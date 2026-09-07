@@ -148,6 +148,37 @@ class NotificationsTests(unittest.TestCase):
         self.assertEqual([r['payload']['kind'] for r in self.sdk.list_notifications()],
                          ['recovery_required', 'terminal'])
 
+    def test_completion_between_sync_and_collection_is_visible_to_callback(self):
+        self.add()
+        self.sdk.sync()
+        self.assertEqual(self.sdk.get_task('run', 'task')['latest_attempt']['state'], 'queued')
+        # The host's previous sync cannot have seen this completion.
+        self.runtime.run_once()
+        self.assertEqual(self.sdk.collect_notifications(), 1)
+        observed = []
+        def callback(payload):
+            attempt = self.sdk.get_task('run', 'task')['latest_attempt']
+            observed.append((payload['state'], attempt['state'], attempt['result']))
+        self.assertEqual(self.sdk.deliver_notifications(callback, owner='reader'), 1)
+        self.assertEqual(observed[0][0:2], ('succeeded', 'succeeded'))
+        self.assertEqual(observed[0][2]['value'], {'retry': False})
+
+    def test_old_watch_does_not_overwrite_newer_application_attempt(self):
+        self.add()
+        self.runtime.run_once()
+        self.sdk.sync()
+        command = self.sdk.get_run('run')['tasks']['task']['attempts'][0]['command'].copy()
+        command.update(execution_id='exec-new', idempotency_key='exec-new')
+        self.apply(dict(kind='new_attempt', task_id='task', command=command),
+                   dict(kind='dispatch', task_id='task'))
+        self.sdk.flush()
+        self.sdk.sync()
+        before = self.sdk.get_task('run', 'task')['latest_attempt']
+        self.assertEqual(before['state'], 'queued')
+        self.assertEqual(self.sdk.collect_notifications(), 1)
+        self.assertEqual(self.sdk.list_notifications()[0]['payload']['execution_id'], 'exec')
+        self.assertEqual(self.sdk.get_task('run', 'task')['latest_attempt'], before)
+
     def test_collection_crash_rolls_back_cursor_and_outbox(self):
         self.add()
         self.runtime.run_once()

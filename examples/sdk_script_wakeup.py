@@ -1,8 +1,9 @@
 """After installing the SDK: python examples/sdk_script_wakeup.py.
 
 A durable application inbox demonstrates the callback boundary. Replace its
-consumer with your application's Agent conversation launcher. Requires POSIX.
+consumer with your application's Agent conversation launcher. Requires native Windows or POSIX process isolation.
 """
+from contextlib import closing
 from pathlib import Path
 import json
 import sqlite3
@@ -18,12 +19,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix='sdk-wakeup-') as directory:
         root = Path(directory)
         inbox = root / 'application-inbox.sqlite3'
-        with sqlite3.connect(inbox) as connection:
+        with closing(sqlite3.connect(inbox)) as connection, connection:
             connection.execute('CREATE TABLE inbox (notification_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
         accepted = threading.Event()
 
         def wake_agent(notification):
-            with sqlite3.connect(inbox) as connection:
+            with closing(sqlite3.connect(inbox)) as connection, connection:
                 connection.execute('INSERT OR IGNORE INTO inbox VALUES(?,?)',
                                    (notification['notification_id'], json.dumps(notification)))
             accepted.set()
@@ -44,7 +45,7 @@ def main():
             # Demo process lifetime: wait on a Python event, with no LLM polling.
             if not accepted.wait(15):
                 raise TimeoutError('demo did not receive its callback')
-        with sqlite3.connect(inbox) as connection:
+        with closing(sqlite3.connect(inbox)) as connection, connection:
             notification = json.loads(connection.execute('SELECT payload FROM inbox').fetchone()[0])
         assert notification['state'] == 'succeeded', notification
         assert notification['result']['value']['stdout']['tail'].strip() == 'report ready'

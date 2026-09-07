@@ -2,45 +2,49 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**为 Agent 应用执行任务，提供进程隔离、状态持久化、中断恢复和任务编排。**
+[使用指南（中文 / English）](wiki/Home-zh-CN.md) | [Agent 接入文档（英文）](DocsforAgents/README.md) | [API 文档](docs/SDK.md)
+
+为 Agent 应用执行任务，提供进程隔离、状态持久化、中断恢复和任务编排。
 
 Dispatcher 运行应用提交的 Python 函数或脚本，控制执行超时和取消，
-将任务状态保存在 SQLite 中，并可通过任务订阅在任务结束或需要恢复处理时通知应用。
-应用可以根据结果继续对话、安排后续任务，或处理执行中断。
+并将任务状态保存在 SQLite 中。应用可以订阅任务，在任务结束或需要恢复处理时
+收到通知，再根据结果继续对话、安排后续任务，或处理执行中断。
 
 ## 可以做什么
 
 | 能力 | 用在什么地方 |
 | --- | --- |
-| **执行隔离与控制** | 在进程模式下独立运行任务，超时或取消时终止受监督的进程树，处理卡住的工具调用 |
-| **持久化执行** | 将任务、结果和通知保存到 SQLite；关闭后重开原数据库，已入队的任务仍然存在 |
-| **有限重试** | 为允许重试的执行失败配置次数和退避，避免无限重跑 |
-| **外部操作恢复** | 为通过 Effect 接口登记的文件写入、API 调用保存回执；中断后结果不确定时，等待应用核对并裁决 |
-| **多步任务编排** | 记录任务依赖、业务尝试和等待条件，由应用决定派发、返工或结束 |
-| **结果与通知** | 读取执行结果和脚本日志，将任务状态通知应用，让 Agent 接续流程，无需 LLM 反复查询进度 |
+| 执行隔离与控制 | 在进程模式下独立运行任务，超时或取消时终止受监督的进程树，处理卡住的工具调用 |
+| 持久化执行 | 将任务、结果和通知保存到 SQLite；关闭后重开原数据库，已入队的任务仍然存在 |
+| 有限重试 | 为允许重试的执行失败配置次数和退避，避免无限重跑 |
+| 外部操作恢复 | 为通过 Effect 接口登记的文件写入、API 调用保存回执；中断后结果不确定时，等待应用核对并裁决 |
+| 多步任务编排 | 记录任务依赖、业务尝试和等待条件，由应用决定派发、返工或结束 |
+| 结果与通知 | 读取执行结果和脚本日志，将任务状态通知应用，让 Agent 接续流程，无需 LLM 反复查询进度 |
 
-Dispatcher 是嵌入 Python 应用的 SDK，运行时只依赖标准库和 SQLite，
+Dispatcher 是嵌入 Python 应用的 SDK，核心运行时只依赖标准库和 SQLite，
 无需额外部署队列服务，也不绑定特定模型或 Agent 框架。
 
 ## 适合你的应用吗
 
-如果你的 Agent 应用需要运行工具或脚本、限制执行时长、保留任务状态，
-或将多个任务组织成可恢复的流程，可以按需接入 Dispatcher。
-只运行一个函数任务时也可以使用，不必先接入通知和多步编排。
+Agent 应用需要运行工具或脚本、限制执行时长、保留任务状态，
+或将多个任务组织成可恢复的流程时，都可以接入 Dispatcher。
+只运行一个函数任务也可以使用，不必先接入通知和多步编排。
 
 应用负责决定任务内容、业务验收和下一步操作；Dispatcher 负责执行控制、
 状态记录和可靠传输。后台执行期间，需要保持宿主进程运行。
 
 接入边界：
 
-- **执行隔离**：进程模式用于约束可信代码，提供超时、取消和进程清理；不提供不可信代码所需的文件、网络或权限沙箱。Agent 生成的代码仍需应用审查或额外沙箱。
-- **平台差异**：脚本要求 POSIX 进程隔离。Linux 还会清理脱离原进程组的后代进程，其他 POSIX 平台提供进程组清理。Windows 可用线程模式执行 Python 函数，但不能强制停止阻塞线程。
-- **重启与重试**：恢复需要原数据库和匹配的 handler 部署。重开数据库不会重置重试次数，也不保证中断的任务一定自动重跑。
-- **外部操作**：SDK 不能撤销已经发生的写入或 API 调用；结果不确定时需核对后恢复，不能承诺任意操作只发生一次。
-- **结果与通知**：采用至少一次投递，应用需要按稳定消息 ID 持久化去重。
+- 进程模式用于约束可信代码，提供超时、取消和进程清理；不提供不可信代码所需的文件、网络或权限沙箱。Agent 生成的代码仍需应用审查或额外沙箱。
+- Linux 进程模式通过 subreaper 清理脱离原进程组的后代，其他 POSIX 平台提供进程组清理。Windows 使用 Job Object 执行原生进程和脚本，已在 Windows 11 x64（build 10.0.26100.9168）、Python 3.12.10 上通过原生测试。验证范围与结果见 [Windows 运行时](docs/WINDOWS_RUNTIME.md)。线程模式不能强制停止阻塞处理器。
+- 恢复需要原数据库和匹配的 handler 部署。重开数据库不会重置重试次数，也不保证中断的任务一定自动重跑。
+- SDK 不能撤销已经发生的写入或 API 调用；结果不确定时需核对后恢复，不能承诺任意操作只发生一次。
+- 结果与通知采用至少一次投递，应用需要按稳定消息 ID 持久化去重。
 
-当前为开发者预览，要求 Python 3.10+。API 和持久化格式可能变化，
-升级前请阅读[兼容性说明](docs/PUBLIC_API.md)。
+0.6 版本为开发者预览，要求 Python 3.10+。Orchestrator 持久化布局改为 schema 2，
+不会自动迁移旧版编排数据库。升级前请阅读[存储与升级](docs/STORAGE_AND_UPGRADES.md)
+和[兼容性说明](docs/PUBLIC_API.md)。可选 OpenSandbox 适配器需要额外安装固定版本的
+`opensandbox` 依赖，并连接独立的沙箱服务。
 
 ## 安装
 
@@ -62,8 +66,8 @@ Windows PowerShell 使用 `.venv\Scripts\Activate.ps1` 激活环境。
 
 ### 1. 后台生成报告，完成后接续对话
 
-下面以“后台生成报告”为场景。演示脚本只输出 `report ready`，便于先验证完整链路；
-接入时可替换为自己的报告生成逻辑。
+这个示例用一个只输出 `report ready` 的脚本演示后台生成报告的完整流程。
+接入时，将它替换为自己的报告生成逻辑。
 
 1. 应用提交脚本，并登记接收通知的对话标识。
 2. Dispatcher 在后台执行脚本，把通知交给应用回调。
@@ -88,9 +92,8 @@ report ready
 
 将代码保存为 `demo.py`，安装 SDK 后运行 `python demo.py`。
 
-<!-- example-platform: posix -->
-
 ```python
+from contextlib import closing
 from pathlib import Path
 import json
 import sqlite3
@@ -106,12 +109,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix='sdk-wakeup-') as directory:
         root = Path(directory)
         inbox = root / 'application-inbox.sqlite3'
-        with sqlite3.connect(inbox) as connection:
+        with closing(sqlite3.connect(inbox)) as connection, connection:
             connection.execute('CREATE TABLE inbox (notification_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
         accepted = threading.Event()
 
         def wake_agent(notification):
-            with sqlite3.connect(inbox) as connection:
+            with closing(sqlite3.connect(inbox)) as connection, connection:
                 connection.execute('INSERT OR IGNORE INTO inbox VALUES(?,?)',
                                    (notification['notification_id'], json.dumps(notification)))
             accepted.set()
@@ -132,7 +135,7 @@ def main():
             # Demo process lifetime: wait on a Python event, with no LLM polling.
             if not accepted.wait(15):
                 raise TimeoutError('demo did not receive its callback')
-        with sqlite3.connect(inbox) as connection:
+        with closing(sqlite3.connect(inbox)) as connection, connection:
             notification = json.loads(connection.execute('SELECT payload FROM inbox').fetchone()[0])
         assert notification['state'] == 'succeeded', notification
         assert notification['result']['value']['stdout']['tail'].strip() == 'report ready'
@@ -262,8 +265,8 @@ if __name__ == "__main__":
     main()
 ```
 
-这里运行可信函数，并在临时目录写入 PID 作为检查依据。示例展示进程生命周期控制，
-不限制函数对文件或网络的访问。
+示例运行可信函数，在临时目录写入 PID，用于检查进程是否退出。
+它控制进程生命周期，不限制函数对文件或网络的访问。
 
 </details>
 
@@ -276,14 +279,14 @@ if __name__ == "__main__":
 ### 3. 重启后继续处理任务，中断后核对外部操作
 
 任务提交后应用退出，重新打开同一个数据库，仍可领取之前排队的任务。
-[持久化示例](examples/kernel_task.py)演示“提交 → 关闭 → 重开 → 执行”，输出 `{'total': 60}`：
+[持久化示例](examples/kernel_task.py)提交任务后关闭 runtime，再重开数据库执行任务，输出 `{'total': 60}`：
 
 ```sh
 python examples/kernel_task.py
 ```
 
 如果任务已经写入文件，但还没保存操作回执就崩溃，直接重跑可能重复写入。
-[恢复示例](examples/effect_recovery.py)让 worker 在这个窗口真正退出；应用检查文件，
+[恢复示例](examples/effect_recovery.py)让 worker 在这个时点退出；应用检查文件，
 确认写入已发生，通过 `resolve_effect` 记录裁决，再恢复执行，验证没有第二次写入：
 
 ```sh
@@ -330,10 +333,17 @@ python examples/dependent_tasks.py
 
 ## 深入阅读
 
+- [原子提交单个任务](docs/TASK_SUBMISSION.md)：稳定请求 ID 与单处理器绑定。
+- [存储与升级](docs/STORAGE_AND_UPGRADES.md)：持久化配置、部署预检、备份、Run 分页与分段延续。
+- [Run 存储验证](docs/RUN_STORAGE_VALIDATION.md)：增量历史的实测增长与完整 Run 读取成本。
+- [可靠通知收件箱](docs/NOTIFICATION_INBOX.md)：带租约和 fence 的消费及同事务业务 SQL。
+- [沙箱运行时](docs/SANDBOX_RUNTIME.md)与 [OpenSandbox 适配器](docs/SANDBOX_ADAPTERS.md)：远程执行、产物与销毁恢复。
+- [进程清理验证](docs/PROCESS_CLEANUP_VALIDATION.md)：Linux 清理证据与回退路径的限制。
 - [SDK 操作与示例](docs/SDK.md)：任务、依赖、等待与显式编排。
 - [Kernel 执行契约](src/dispatcher_sdk/execution_kernel/README.md)：隔离、超时、取消和持久化机制。
 - [恢复、重试与外部副作用](docs/SDK_RECOVERY.md)：中断后如何判断、等待和恢复。
 - [脚本执行与应用通知](docs/SDK_SCRIPT_WAKEUPS.md)：脚本、日志、回调和通知重试。
+- [可靠审计与业务放行](docs/SDK_INTEGRATION_FAQ.md)：独立游标、落盘后确认、终态排空和依赖结果检查。
 - [公开 API 与兼容性](docs/PUBLIC_API.md)：接口、平台差异和升级约束。
 
 开发和测试见 [CONTRIBUTING.md](CONTRIBUTING.md)，漏洞报告见

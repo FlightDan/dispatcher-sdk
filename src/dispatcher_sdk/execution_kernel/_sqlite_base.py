@@ -11,6 +11,13 @@ import threading
 import time
 from typing import Any, Iterator, Optional
 
+from ..durability import (
+    Durability,
+    SQLITE_OPEN_TIMEOUT_SECONDS,
+    configure_sqlite_connection,
+    validate_durability,
+)
+
 from ._sqlite_schema import (
     KERNEL_TABLES,
     existing_table_names,
@@ -30,34 +37,6 @@ from .transitions import TERMINAL_STATES
 
 
 MAX_SQLITE_INTEGER = (1 << 63) - 1
-SQLITE_OPEN_TIMEOUT_SECONDS = 30.0
-
-
-def _enable_wal(connection: sqlite3.Connection, db_path: str) -> None:
-    """Negotiate WAL despite SQLite's non-busy-handler PRAGMA race.
-
-    SQLite can return ``database is locked`` immediately from
-    ``PRAGMA journal_mode=WAL`` when two processes open a new database at the
-    same time, even after ``busy_timeout`` has been configured.  Retry only
-    that transient lock class, bounded by the same timeout as the connection.
-    """
-
-    deadline = time.monotonic() + SQLITE_OPEN_TIMEOUT_SECONDS
-    while True:
-        try:
-            row = connection.execute("PRAGMA journal_mode = WAL").fetchone()
-            mode = "" if row is None else str(row[0]).lower()
-            if db_path != ":memory:" and mode != "wal":
-                raise RuntimeError(f"SQLite refused WAL journal mode: {mode or 'unknown'}")
-            return
-        except sqlite3.OperationalError as exc:
-            message = str(exc).lower()
-            if not any(token in message for token in ("locked", "busy")):
-                raise
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise
-            time.sleep(min(0.01, remaining))
 
 
 def encode_json(value: Any) -> str:
@@ -87,7 +66,9 @@ class SQLiteBase:
         now: Any = None,
         default_lease_seconds: float = 30.0,
         outbox_max_attempts: int = 8,
+        durability: Durability = "full",
     ) -> None:
+        self.durability = validate_durability(durability)
         self.db_path = str(db_path)
         self._now = now or time.time
         self.default_lease_seconds = self._positive_duration(
@@ -107,18 +88,9 @@ class SQLiteBase:
         )
         self._connection.row_factory = sqlite3.Row
         try:
-            # Configure lock waiting before the journal-mode negotiation; two
-            # first-open callers can otherwise fail immediately while one is
-            # creating the WAL files.
-            self._connection.execute("PRAGMA busy_timeout = 30000")
-            # WAL+NORMAL preserves atomicity and consistency across the
-            # process-crash model qualified by the Kernel fault matrix while
-            # avoiding one fsync per small fenced state transition.  A host
-            # power-loss durability guarantee would require a separate FULL
-            # durability profile and is not part of this local dispatcher
-            # contract.
-            _enable_wal(self._connection, self.db_path)
-            self._connection.execute("PRAGMA synchronous = NORMAL")
+            configure_sqlite_connection(
+                self._connection, self.db_path, durability=self.durability
+            )
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA writable_schema = OFF")
             self._connection.execute("PRAGMA trusted_schema = OFF")

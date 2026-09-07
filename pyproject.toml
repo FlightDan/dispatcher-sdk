@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dispatcher-sdk"
-version = "0.5.1"
+version = "0.6.0"
 description = "Durable local execution and explicit task orchestration with SQLite"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,9 @@ Repository = "https://github.com/FlightDan/dispatcher-sdk"
 Issues = "https://github.com/FlightDan/dispatcher-sdk/issues"
 Documentation = "https://github.com/FlightDan/dispatcher-sdk#readme"
 
+[project.optional-dependencies]
+opensandbox = ["opensandbox==0.1.16"]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 include-package-data = false
@@ -35,4 +38,5 @@ where = ["src"]
 include = ["dispatcher_sdk", "dispatcher_sdk.*"]
 
 [tool.setuptools.package-data]
+"dispatcher_sdk" = ["py.typed"]
 "dispatcher_sdk.execution_kernel" = ["README.md"]

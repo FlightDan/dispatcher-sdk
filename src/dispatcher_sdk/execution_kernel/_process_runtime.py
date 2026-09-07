@@ -27,6 +27,8 @@ from .sqlite import SQLiteKernel
 
 
 _PR_SET_CHILD_SUBREAPER = 36
+# Linux wait.h: include clone children whose exit signal is not SIGCHLD.
+_WAIT_ALL = 0x40000000
 _CLEANUP_GRACE_SECONDS = 1.0
 _TREE_QUIET_SECONDS = 0.05
 
@@ -123,6 +125,18 @@ def invoke_handler(
         }
 
 
+def _child_process_ids(parent_pid: int) -> tuple[int, ...]:
+    try:
+        with open(
+            f"/proc/{parent_pid}/task/{parent_pid}/children",
+            "r",
+            encoding="ascii",
+        ) as stream:
+            return tuple(int(value) for value in stream.read().split())
+    except (OSError, ValueError):
+        return ()
+
+
 def _descendant_process_ids(root_pid: int) -> tuple[int, ...]:
     if not os.path.isdir("/proc"):
         return ()
@@ -131,16 +145,7 @@ def _descendant_process_ids(root_pid: int) -> tuple[int, ...]:
     discovered: list[int] = []
     while pending:
         parent = pending.pop()
-        try:
-            with open(
-                f"/proc/{parent}/task/{parent}/children",
-                "r",
-                encoding="ascii",
-            ) as stream:
-                children = tuple(int(value) for value in stream.read().split())
-        except (OSError, ValueError):
-            continue
-        for child in children:
+        for child in _child_process_ids(parent):
             if child in seen:
                 continue
             seen.add(child)
@@ -168,14 +173,19 @@ def _kill_descendants(root_pid: int) -> None:
         _kill_pid(descendant)
 
 
-def _reap_children() -> None:
+def _reap_children(*, all_children: bool = False) -> bool:
+    """Reap exited children; true means ECHILD, not merely none ready to reap."""
+
+    options = os.WNOHANG | (_WAIT_ALL if all_children else 0)
     while True:
         try:
-            waited, _status = os.waitpid(-1, os.WNOHANG)
-        except (ChildProcessError, OSError):
-            return
+            waited, _status = os.waitpid(-1, options)
+        except ChildProcessError:
+            return True
+        except OSError:
+            return False
         if waited == 0:
-            return
+            return False
 
 
 def _reap_pid(pid: int) -> bool:
@@ -202,9 +212,34 @@ def _group_exists(process_group: int) -> bool:
     return True
 
 
-def _contain_tree(root_pid: int, worker_pid: int, until: float) -> bool:
+def _contain_tree(
+    root_pid: int, worker_pid: int, until: float, *, subreaper: bool = False
+) -> bool:
     """Kill and reap a worker tree, including subreaper-adopted orphans."""
 
+    if subreaper and sys.platform.startswith("linux"):
+        if root_pid != os.getpid():
+            raise ValueError("only the subreaper can prove its own tree is empty")
+        # This single-threaded supervisor creates no more workers and keeps
+        # SIGCHLD at SIG_DFL. Every surviving descendant therefore has a live
+        # ancestor here, or is adopted here when that ancestor exits. ECHILD
+        # proves the entire tree has gone; an empty /proc read does not.
+        # Kill only our unreaped direct children: their PIDs cannot be reused
+        # between this read and kill. Detached descendants become direct
+        # children on subsequent passes, without using a stale process group.
+        while True:
+            if _reap_children(all_children=True):
+                return True
+            for child in _child_process_ids(root_pid):
+                _kill_pid(child)
+            if _reap_children(all_children=True):
+                return True
+            if time.monotonic() >= until:
+                return False
+            time.sleep(0.002)
+
+    # Platforms without subreaper adoption retain the conservative group and
+    # tree observation window; ECHILD there says nothing about escaped orphans.
     worker_reaped = False
     quiet_since: Optional[float] = None
     while True:
@@ -244,12 +279,13 @@ def _worker_entry(
     lease: ExecutionLease,
     now: Any,
     channel: Any,
+    durability: str = "full",
 ) -> int:
     kernel: Optional[SQLiteKernel] = None
     effects: Optional[HandlerEffects] = None
     try:
         os.setpgid(0, 0)
-        kernel = SQLiteKernel(db_path, now=now)
+        kernel = SQLiteKernel(db_path, now=now, durability=durability)
         effects = HandlerEffects(kernel, lease, lambda: True)
         context = HandlerContext(command, lease, effects)
         _send_packet(channel, {"kind": "worker_ready"})
@@ -295,20 +331,23 @@ def _supervisor_entry(
     lease: ExecutionLease,
     now: Any,
     parent_sender: Any,
+    durability: str = "full",
 ) -> None:
     worker_pid: Optional[int] = None
     worker_channel: Any = None
     previous_alarm: Any = None
+    subreaper = False
     try:
         os.setsid()
-        _enable_linux_subreaper()
+        subreaper = _enable_linux_subreaper()
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         supervisor_channel, child_channel = multiprocessing.Pipe(duplex=True)
         worker_pid = os.fork()
         if worker_pid == 0:
             supervisor_channel.close()
             parent_sender.close()
             status = _worker_entry(
-                db_path, handler, command, lease, now, child_channel
+                db_path, handler, command, lease, now, child_channel, durability
             )
             os._exit(status)
         child_channel.close()
@@ -316,7 +355,8 @@ def _supervisor_entry(
         ready = _receive_packet(worker_channel)
         if ready != {"kind": "worker_ready"}:
             _contain_tree(
-                os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS
+                os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS,
+                subreaper=subreaper,
             )
             _send_packet(
                 parent_sender,
@@ -356,7 +396,7 @@ def _supervisor_entry(
             )
             packet = _receive_packet(worker_channel)
             if packet is None:
-                contained = _contain_tree(os.getpid(), worker_pid, deadline)
+                contained = _contain_tree(os.getpid(), worker_pid, deadline, subreaper=subreaper)
                 if not contained:
                     raise _DeadlineExpired()
                 _send_packet(
@@ -372,7 +412,7 @@ def _supervisor_entry(
                 packet.get("kind") != "worker_completed"
                 or type(packet.get("outcome_json")) is not str
             ):
-                contained = _contain_tree(os.getpid(), worker_pid, deadline)
+                contained = _contain_tree(os.getpid(), worker_pid, deadline, subreaper=subreaper)
                 if not contained:
                     raise _DeadlineExpired()
                 _send_packet(
@@ -386,7 +426,7 @@ def _supervisor_entry(
                     },
                 )
                 return
-            if not _contain_tree(os.getpid(), worker_pid, deadline):
+            if not _contain_tree(os.getpid(), worker_pid, deadline, subreaper=subreaper):
                 raise _DeadlineExpired()
             contained_at = time.monotonic()
             if contained_at >= deadline:
@@ -402,7 +442,8 @@ def _supervisor_entry(
         except _DeadlineExpired:
             signal.setitimer(signal.ITIMER_REAL, 0.0)
             _contain_tree(
-                os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS
+                os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS,
+                subreaper=subreaper,
             )
             _send_packet(parent_sender, {"kind": "handler_timed_out"})
         finally:
@@ -412,7 +453,8 @@ def _supervisor_entry(
     except BaseException as exc:
         if worker_pid is not None:
             _contain_tree(
-                os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS
+                os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS,
+                subreaper=subreaper,
             )
         try:
             _send_packet(
@@ -449,6 +491,11 @@ def _kill_supervisor(process: multiprocessing.Process) -> bool:
         else:
             quiet_since = None
         time.sleep(0.002)
+    # is_alive() can reap the supervisor. Its numeric PID is no longer an
+    # identity after that point and must not be used to look up or kill a group.
+    if not process.is_alive():
+        process.join()
+        return True
     try:
         process_group = os.getpgid(process.pid)
     except (OSError, TypeError):
@@ -498,6 +545,7 @@ def invoke_process_handler(
     start_timeout: float,
     on_started: Optional[Callable[[ProcessSupervisorHandle], bool]] = None,
     on_finished: Optional[Callable[[ProcessSupervisorHandle], None]] = None,
+    durability: str = "full",
 ) -> dict[str, Any]:
     """Run a handler behind an independently timed and reaping supervisor."""
 
@@ -508,7 +556,7 @@ def invoke_process_handler(
     receiver, sender = process_context.Pipe(duplex=False)
     process = process_context.Process(
         target=_supervisor_entry,
-        args=(db_path, handler, command, lease, now, sender),
+        args=(db_path, handler, command, lease, now, sender, durability),
         daemon=False,
     )
     handle = ProcessSupervisorHandle(process)

@@ -334,6 +334,7 @@ class RuntimeTests(unittest.TestCase):
             finally:
                 stack.close()
 
+    @unittest.skipIf(os.name == "nt", "native Windows has process isolation without fork")
     def test_auto_isolation_falls_back_to_thread_without_fork(self) -> None:
         from unittest.mock import patch
 
@@ -346,7 +347,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(runtime.isolation_mode, "thread")
                 runtime.submit(make_command("portable", runtime.registry_revision))
                 self.assertEqual(runtime.run_once().state, "succeeded")
-            with self.assertRaisesRegex(ValueError, "requires POSIX fork support"):
+            with self.assertRaisesRegex(ValueError, "requires POSIX fork or native Windows support"):
                 Kernel.open_sqlite(path, {("echo", 1): echo_handler}, isolation_mode="process")
 
     def test_process_isolation_rejects_in_memory_database(self) -> None:
@@ -595,7 +596,7 @@ class RuntimeTests(unittest.TestCase):
                         self.assertEqual(marker.read_text(encoding="utf-8"), "performed")
                         self.assertEqual(
                             stack.kernel.get_effect(effect_id).recovery_decision,
-                            "not_applied",
+                            None,
                         )
                     execution_events = [
                         event["event_type"]

@@ -15,14 +15,18 @@ class PackagingTests(unittest.TestCase):
     def test_project_metadata_names_dependency_free_sdk(self):
         metadata = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertRegex(metadata, r'(?m)^name = "dispatcher-sdk"$')
-        self.assertRegex(metadata, r'(?m)^version = "0\.5\.1"$')
+        self.assertRegex(metadata, r'(?m)^version = "0\.6\.0"$')
         self.assertRegex(metadata, r'(?m)^dependencies = \[\]$')
 
-    def test_entire_sdk_has_only_standard_library_and_sdk_imports(self):
+    def test_core_is_dependency_free_and_provider_imports_are_lazy(self):
         sources = list(SOURCE.rglob("*.py"))
         self.assertGreater(len(sources), 20, "boundary check must inspect actual SDK sources")
         for source in sources:
             tree = ast.parse(source.read_text(encoding="utf-8"))
+            lazy_provider_nodes = set()
+            if source == SOURCE / "adapters" / "opensandbox.py":
+                sdk_loader = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_sdk")
+                lazy_provider_nodes = set(ast.walk(sdk_loader))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     modules = [alias.name for alias in node.names]
@@ -36,6 +40,9 @@ class PackagingTests(unittest.TestCase):
                 else:
                     continue
                 for module in modules:
+                    if module.split(".")[0] == "opensandbox":
+                        self.assertIn(node, lazy_provider_nodes, "provider SDK imports must stay inside the optional loader")
+                        continue
                     self.assertIn(module.split(".")[0], sys.stdlib_module_names | {"dispatcher_sdk"},
                                   f"external dependency in {source.relative_to(ROOT)}:{node.lineno}: {module}")
 
@@ -46,7 +53,7 @@ class PackagingTests(unittest.TestCase):
                     modules = [alias.name for alias in node.names]
                 elif isinstance(node, ast.ImportFrom):
                     modules = [node.module or ""]
-                    if node.level > 1:
+                    if node.level > 1 and not (node.level == 2 and node.module == "durability"):
                         self.fail(f"Kernel reaches outside its package: {source}:{node.lineno}")
                 else:
                     continue

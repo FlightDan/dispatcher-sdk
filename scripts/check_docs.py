@@ -15,6 +15,8 @@ def main():
     root = Path(__file__).resolve().parents[1]
     documents = list(root.glob("*.md")) + list((root / "docs").glob("*.md"))
     documents += list((root / "src").rglob("README.md"))
+    for directory in ("wiki", "DocsforAgents"):
+        documents += list((root / directory).glob("*.md"))
     failures = []
     links = 0
     for document in documents:

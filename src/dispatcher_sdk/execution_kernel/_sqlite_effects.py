@@ -430,11 +430,16 @@ class EffectStoreMixin:
                 if existing.state == "committed":
                     result = existing
                 elif existing.state == "not_applied":
+                    # A new perform cycle has its own preparation/uncertainty
+                    # timestamps and claim. Prior recovery remains immutable in
+                    # effect_events, rather than leaking into this attempt.
                     cursor = connection.execute(
                         """UPDATE kernel_effects
                            SET state = 'prepared', response_json = NULL, lease_id = ?,
                                claim_id = NULL, attempt = ?, fence = ?, prepared_at = ?,
-                               committed_at = NULL, revision = ?
+                               committed_at = NULL, indeterminate_at = NULL,
+                               recovery_id = NULL, recovery_decision = NULL,
+                               resolved_at = NULL, revision = ?
                            WHERE effect_id = ? AND state = 'not_applied' AND revision = ?""",
                         (
                             lease.lease_id,
@@ -457,7 +462,9 @@ class EffectStoreMixin:
                         record=result,
                         event_type="reprepared_after_not_applied",
                         from_state="not_applied",
-                        data={"attempt": lease.attempt, "fence": lease.fence},
+                        data={"attempt": lease.attempt, "fence": lease.fence,
+                              "prior_recovery_id": existing.recovery_id,
+                              "prior_recovery_revision": existing.revision},
                         timestamp=timestamp,
                     )
                 elif (

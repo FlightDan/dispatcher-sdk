@@ -1,8 +1,10 @@
-"""Local runtime with fenced effects and killable POSIX timeout isolation.
+"""Local runtime with fenced effects and process timeout isolation.
 
 On POSIX, trusted handlers run behind an independently timed supervisor which
 terminates and reaps their process tree on timeout, cancellation, or close.
-On platforms without ``fork``, the fallback is a revocable thread. Calls that
+Windows uses suspended process creation into a kill-on-close Job Object and a
+host watchdog thread. Platforms without either backend use a revocable thread.
+In thread mode, calls that
 begin after timeout and all later durable effect commits are rejected. Python
 cannot kill an arbitrary call already executing in a thread, so an external
 operation already inside ``perform`` may finish after timeout. Its durable
@@ -19,7 +21,10 @@ import os
 import threading
 import time
 from typing import Any, Mapping, Optional
+from types import MappingProxyType
 import uuid
+
+from ..durability import Durability, validate_durability
 
 from .context import HandlerContext, HandlerEffects
 from .contracts import (
@@ -34,14 +39,18 @@ from .errors import (
     HandlerContractMismatchError,
     HandlerUnavailableError,
     RegistryRevisionMismatchError,
+    ExecutionNotFoundError,
 )
-from ._registry import Handler, normalize_handlers, registry_revision
+from ._registry import Handler, handler_revision, normalize_handlers, registry_revision
 from ._process_runtime import (
     ProcessSupervisorHandle,
     invoke_handler,
     invoke_process_handler,
 )
 from .sqlite import SQLiteKernel
+from .sandbox import SandboxHandler, SandboxJournal
+from .sandbox_contracts import SandboxOutcomeUnknown
+from ._sandbox_registry import register_journals, journal_paths
 
 
 class InProcessRuntime:
@@ -58,17 +67,23 @@ class InProcessRuntime:
         isolation_mode: str = "auto",
         outbox_max_attempts: int = 8,
         max_thread_workers: int = 4,
+        durability: Durability = "full",
     ) -> None:
+        self.durability = validate_durability(durability)
         self.handlers = normalize_handlers(handlers)
         self.registry_revision = registry_revision(self.handlers)
+        self.handler_revisions = MappingProxyType({
+            key: handler_revision(self.handlers, *key) for key in self.handlers
+        })
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self._now = now
         fork_available = os.name == "posix" and "fork" in multiprocessing.get_all_start_methods()
+        process_available = fork_available or os.name == "nt"
         if isolation_mode == "auto":
-            isolation_mode = "process" if fork_available else "thread"
-        if isolation_mode == "process" and not fork_available:
-            raise ValueError("process isolation requires POSIX fork support")
+            isolation_mode = "process" if process_available else "thread"
+        if isolation_mode == "process" and not process_available:
+            raise ValueError("process isolation requires POSIX fork or native Windows support")
         if isolation_mode not in {"process", "thread"}:
             raise ValueError("isolation_mode must be auto, process, or thread")
         if isolation_mode != "process" and any(
@@ -76,6 +91,9 @@ class InProcessRuntime:
             for handler in self.handlers.values()
         ):
             raise ValueError("registered handler requires process isolation")
+        for handler in self.handlers.values():
+            if isinstance(handler, SandboxHandler) and handler.durability != self.durability:
+                raise ValueError("sandbox handler and Runtime must use the same durability profile")
         if isolation_mode == "process" and str(db_path) == ":memory:":
             raise ValueError("process isolation requires a file-backed SQLite path; :memory: is not supported")
         if type(max_thread_workers) is not int or max_thread_workers < 1:
@@ -87,7 +105,7 @@ class InProcessRuntime:
         self._close_error: BaseException | None = None
         self._stop_event = threading.Event()
         self._active_runs = 0
-        self._process_supervisors: dict[str, ProcessSupervisorHandle] = {}
+        self._process_supervisors: dict[str, Any] = {}
         # Exists from the moment a claimed execution enters process
         # invocation until its supervisor has been reaped.  Cancellation
         # waits on this marker so a start/register race cannot report success
@@ -108,10 +126,27 @@ class InProcessRuntime:
             self._thread_slots = threading.BoundedSemaphore(max_thread_workers)
         self.kernel = SQLiteKernel(
             db_path,
+            durability=self.durability,
             now=now,
             default_lease_seconds=lease_seconds,
             outbox_max_attempts=outbox_max_attempts,
         )
+        try:
+            sandbox_bindings = [handler for handler in self.handlers.values() if isinstance(handler, SandboxHandler)]
+            self._sandbox_store_id = register_journals(self.kernel.db_path, [],
+                durability=self.durability, initialize_only=bool(sandbox_bindings))
+            registered_paths = journal_paths(self.kernel.db_path)
+            for handler in sandbox_bindings:
+                if handler.journal_path in registered_paths:
+                    # Verify existing registration before a journal constructor
+                    # could initialize a replaced or empty file.
+                    register_journals(self.kernel.db_path, [handler.journal_path], durability=self.durability)
+                handler.journal()._bind_store(self._sandbox_store_id)
+            if sandbox_bindings:
+                register_journals(self.kernel.db_path, [h.journal_path for h in sandbox_bindings], durability=self.durability)
+        except BaseException:
+            self.kernel.close()
+            raise
 
     def close(self) -> None:
         with self._lifecycle_lock:
@@ -133,7 +168,12 @@ class InProcessRuntime:
             with self._lifecycle_condition:
                 while self._active_runs:
                     self._lifecycle_condition.wait()
-            self.kernel.close()
+            try:
+                unresolved = self.recover_sandboxes(all_pages=True)
+                if any(not item["cleanup_confirmed"] for item in unresolved):
+                    raise SandboxOutcomeUnknown("remote cleanup remains pending in the sandbox journal")
+            finally:
+                self.kernel.close()
         except BaseException as exc:
             self._close_error = exc
             raise
@@ -172,12 +212,34 @@ class InProcessRuntime:
             if self._closed:
                 raise RuntimeError("runtime is closed")
         self._assert_registry_current()
-        if command.registry_revision != self.registry_revision:
+        if not self._binding_matches(command):
             raise RegistryRevisionMismatchError(
                 f"command requires registry revision {command.registry_revision}; "
                 f"runtime provides {self.registry_revision}"
             )
         return self.kernel.submit(command)
+
+    def command(self, handler_id: str, *, execution_id: str,
+                idempotency_key: str, correlation_id: str, timeout_seconds: float,
+                payload: Any, handler_contract_version: int = 1,
+                causation_id: str | None = None, retry_policy: Any = None) -> ExecutionCommandV2:
+        """Freeze a command against just its handler's current implementation."""
+        from .contracts import RetryPolicy
+
+        self._assert_registry_current()
+        binding = handler_revision(self.handlers, handler_id, handler_contract_version)
+        return ExecutionCommandV2(
+            execution_id=execution_id, idempotency_key=idempotency_key,
+            correlation_id=correlation_id, causation_id=causation_id,
+            handler_id=handler_id, handler_contract_version=handler_contract_version,
+            registry_revision=binding, timeout_seconds=timeout_seconds,
+            payload=payload, retry_policy=RetryPolicy(max_attempts=1) if retry_policy is None else retry_policy,
+        )
+
+    def _binding_matches(self, command: ExecutionCommandV2) -> bool:
+        return command.registry_revision == self.registry_revision or (
+            command.registry_revision == self.handler_revisions.get(
+                (command.handler_id, command.handler_contract_version)))
 
     def cancel(
         self,
@@ -225,6 +287,11 @@ class InProcessRuntime:
             )
         if thread_authority is not None:
             thread_authority.clear()
+        handler = self.handlers.get((before.command.handler_id, before.command.handler_contract_version))
+        unresolved = self.recover_sandboxes(all_pages=True, execution_id=execution_id,
+                                            max_fence=before.fence)
+        if any(not item["cleanup_confirmed"] for item in unresolved):
+            raise SandboxOutcomeUnknown("cancellation has not confirmed remote sandbox disposal")
         if recovery_error is not None:
             raise recovery_error
         assert cancelled is not None
@@ -242,7 +309,73 @@ class InProcessRuntime:
         with self._lifecycle_lock:
             if self._closed:
                 return []
-            return self.kernel.reap()
+            result = self.kernel.reap()
+        self.recover_sandboxes()
+        return result
+
+    def recover_sandboxes(self, *, limit: int = 100, after_execution_id: str = "",
+                          all_pages: bool = False, execution_id: str | None = None,
+                          max_fence: int | None = None) -> tuple[dict[str, Any], ...]:
+        """Retry disposal for inactive executions; never replay an uncertain launch.
+
+        Effects still need an explicit application recovery decision. The journal
+        retains collected results even when the Kernel effect commit was lost.
+        """
+        reports = []
+        for path in journal_paths(self.kernel.db_path):
+            from pathlib import Path
+            if not Path(path).is_file():
+                reports.append({"execution_id": execution_id, "journal_path": path,
+                                "cleanup_confirmed": False, "error": "sandbox_journal_missing"})
+                continue
+            try:
+                # Never initialize an empty or replaced registered journal.
+                import sqlite3
+                check = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True)
+                try:
+                    bound = check.execute("SELECT store_id FROM sandbox_meta").fetchone()[0]
+                    if bound != self._sandbox_store_id:
+                        raise ValueError("sandbox journal store binding differs")
+                finally:
+                    check.close()
+                journal = SandboxJournal(path, durability=self.durability)
+            except Exception as exc:
+                reports.append({"execution_id": execution_id, "journal_path": path,
+                                "cleanup_confirmed": False, "error": type(exc).__name__})
+                continue
+            cursor = after_execution_id
+            while True:
+                if execution_id is None:
+                    records = journal.pending(after_execution_id=cursor, limit=limit)
+                else:
+                    record = journal.get(execution_id)
+                    records = (record,) if record is not None and not record["cleanup_confirmed"] else ()
+                for record in records:
+                    confirmed, error = False, None
+                    try:
+                        snapshot = self.kernel.get(record["execution_id"])
+                        if snapshot.state in {"leased", "running"}:
+                            continue
+                        handler = self.handlers.get((record["handler_id"], record["handler_contract_version"]))
+                        if not isinstance(handler, SandboxHandler) or handler.journal_path != path:
+                            error = "sandbox_handler_unavailable"
+                        elif (snapshot.command.handler_id, snapshot.command.handler_contract_version) != (
+                                record["handler_id"], record["handler_contract_version"]):
+                            error = "sandbox_execution_binding_mismatch"
+                        elif (handler.backend.name, handler.backend.revision) != (
+                                record["backend_name"], record["backend_revision"]):
+                            error = "sandbox_backend_revision_unavailable"
+                        else:
+                            confirmed = handler.cleanup(record["execution_id"],
+                                operation_key=record["operation_key"], max_fence=max_fence)
+                    except Exception as exc:
+                        error = type(exc).__name__
+                    reports.append({"execution_id": record["execution_id"],
+                                    "cleanup_confirmed": confirmed, "error": error})
+                if execution_id is not None or not all_pages or len(records) < limit:
+                    break
+                cursor = records[-1]["execution_id"]
+        return tuple(reports)
 
     def _assert_registry_current(self) -> None:
         current = registry_revision(self.handlers)
@@ -297,6 +430,12 @@ class InProcessRuntime:
         self, command: ExecutionCommandV2
     ) -> tuple[Optional[Handler], Optional[ExecutionError]]:
         key = (command.handler_id, command.handler_contract_version)
+        if not self._binding_matches(command):
+            return None, ExecutionError(
+                code="registry_revision_mismatch",
+                message="command binding does not match its specific handler",
+                retryable=False, details={"handler_id": command.handler_id},
+            )
         handler = self.handlers.get(key)
         if handler is not None:
             return handler, None
@@ -325,7 +464,7 @@ class InProcessRuntime:
         command: ExecutionCommandV2,
         lease: ExecutionLease,
     ) -> dict[str, Any]:
-        def register(supervisor: ProcessSupervisorHandle) -> bool:
+        def register(supervisor: Any) -> bool:
             with self._lifecycle_lock:
                 reason = self._revoked_executions.pop(command.execution_id, None)
                 if reason is None and (
@@ -342,14 +481,19 @@ class InProcessRuntime:
             supervisor.revoke(reason)
             return False
 
-        def unregister(supervisor: ProcessSupervisorHandle) -> None:
+        def unregister(supervisor: Any) -> None:
             with self._lifecycle_lock:
                 if self._process_supervisors.get(command.execution_id) is supervisor:
                     del self._process_supervisors[command.execution_id]
                 self._revoked_executions.pop(command.execution_id, None)
 
-        return invoke_process_handler(
+        invoke = invoke_process_handler
+        if os.name == "nt":
+            from ._windows_runtime import invoke_windows_handler
+            invoke = invoke_windows_handler
+        outcome = invoke(
             db_path=self.kernel.db_path,
+            durability=self.durability,
             handler=handler,
             command=command,
             lease=lease,
@@ -358,6 +502,38 @@ class InProcessRuntime:
             on_started=register,
             on_finished=unregister,
         )
+        if isinstance(handler, SandboxHandler):
+            try:
+                confirmed = handler.cleanup(command.execution_id, max_fence=lease.fence)
+            except Exception:
+                confirmed = False
+            if not confirmed:
+                if outcome.get("kind") in {"recovery_required", "authority_revoked"}:
+                    return outcome
+                # Disposal can fail after execution was already committed, or
+                # after the worker died in the gap before preparing disposal.
+                # Park a *disposal* effect, never request recovery of a committed
+                # execution effect.
+                current = self.kernel.get(command.execution_id)
+                if current.state != "running" or current.lease is None or current.lease.fence != lease.fence:
+                    return outcome
+                record = handler.journal().get(command.execution_id)
+                if record is None:
+                    raise SandboxOutcomeUnknown("sandbox cleanup failed without a lifecycle record")
+                unfinished = self.kernel.effect_ids_for_attempt(
+                    command.execution_id, lease.attempt, lease.fence,
+                    states={"prepared", "performing", "indeterminate"})
+                if unfinished:
+                    effect_id = unfinished[0]
+                else:
+                    effect_id = handler.effect_id(command.execution_id) + ":dispose:" + record["operation_key"]
+                    effect = self.kernel.prepare_effect(lease, effect_id=effect_id, name="sandbox.dispose",
+                        request={"operation_key": record["operation_key"], "backend_name": handler.backend.name,
+                                 "backend_revision": handler.backend.revision})
+                    if effect.state == "committed":
+                        raise SandboxOutcomeUnknown("committed disposal contradicts the sandbox journal")
+                return {"kind": "recovery_required", "effect_id": effect_id, "effect_ids": []}
+        return outcome
 
     def _invoke_thread(
         self,
@@ -541,7 +717,7 @@ class InProcessRuntime:
                         self.worker_id,
                         lease_seconds=self.lease_seconds,
                         start_safety_seconds=self._handler_start_timeout() + 5.0,
-                        registry_revision=self.registry_revision,
+                        registry_revisions=(self.registry_revision, *self.handler_revisions.values()),
                     )
                     if (
                         running_lease is not None

@@ -13,12 +13,13 @@ import uuid
 from ..execution_kernel import StaleFenceError
 from .contracts import CommandConflict, OrchestrationError, TERMINAL, canonical, digest
 from .results import _identity, _integer, _positive
+from .store import execute_schema
 
 
 class NotificationsMixin:
     @staticmethod
     def _init_notifications(connection):
-        connection.executescript("""
+        execute_schema(connection, """
             CREATE TABLE IF NOT EXISTS sdk_watches (
                 run_id TEXT NOT NULL, watch_id TEXT NOT NULL, task_id TEXT NOT NULL,
                 execution_id TEXT NOT NULL, attempt INTEGER NOT NULL, target TEXT NOT NULL,
@@ -72,7 +73,10 @@ class NotificationsMixin:
         for watch in watches:
             events = self.kernel.events_since(watch['cursor'], limit)
             if any(event.execution_id == watch['execution_id'] for event in events):
-                self.inspect_execution(watch['execution_id'])
+                # The notice must not outrun its attempt's durable projection.
+                # Read/sync after the event page so the projected snapshot is
+                # at least as recent as the facts we are about to publish.
+                self.sync_execution(watch['execution_id'])
             with self._results_transaction() as (connection, now):
                 current = connection.execute(
                     'SELECT * FROM sdk_watches WHERE run_id=? AND watch_id=?',

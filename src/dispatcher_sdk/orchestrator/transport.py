@@ -55,7 +55,7 @@ class TransportMixin:
             if changed:
                 state = self._load(connection, row["run_id"])
                 state["revision"] += 1
-                self._save(connection, state)
+                self._save(connection, state, changes=set())
                 self._event(connection, state, "delivery.failed", {
                     "message_id": row["sequence"], "intent": json.loads(row["payload"]), "error": detail})
 
@@ -165,7 +165,7 @@ class TransportMixin:
                 return self.kernel.get(execution_id)
         raise RevisionError("Kernel cancellation raced repeatedly; retry delivery")
 
-    def sync_execution(self, execution_id):
+    def sync_execution(self, execution_id: str) -> ExecutionSnapshot:
         """Persist only facts read from the bound Kernel, never caller-supplied results."""
         snapshot = self.kernel.get(execution_id)
         if type(snapshot) is not ExecutionSnapshot or snapshot.execution_id != execution_id:
@@ -178,8 +178,13 @@ class TransportMixin:
                 raise OrchestrationError("execution was not registered through this SDK")
             if canonical(snapshot.command.to_dict()) != row["command"]:
                 raise OrchestrationError("Kernel execution command does not match the accepted command")
-            state = self._load(connection, row["run_id"])
-            current = state["tasks"][row["task_id"]]["attempts"][row["attempt"]]
+            item_key = canonical([row["task_id"], row["attempt"]])
+            stored = connection.execute(
+                "SELECT value FROM sdk_run_items WHERE run_id=? AND section='attempt' AND item_key=?",
+                (row["run_id"], item_key)).fetchone()
+            if stored is None:
+                raise OrchestrationError("registered attempt projection is missing")
+            current = json.loads(stored[0])
             if not current["dispatched"]:
                 raise OrchestrationError("execution was not explicitly dispatched")
             if snapshot.revision < current["kernel_revision"]:
@@ -194,17 +199,19 @@ class TransportMixin:
             current.update(state=snapshot.state, kernel_revision=snapshot.revision,
                            result=snapshot.result.to_dict() if snapshot.result else None,
                            kernel_snapshot=snapshot.to_dict())
+            state = self._load(connection, row["run_id"])
+            state["tasks"][row["task_id"]]["attempts"][row["attempt"]] = current
             state["revision"] += 1
-            self._save(connection, state)
+            self._save(connection, state, changes={("attempt", item_key)})
             self._event(connection, state, "execution.observed", {
                 "task_id": row["task_id"], "attempt": row["attempt"],
                 "execution_id": execution_id, "snapshot": snapshot.to_dict()})
         return snapshot
 
-    def get_execution(self, execution_id):
+    def get_execution(self, execution_id: str) -> ExecutionSnapshot:
         return self.sync_execution(execution_id)
 
-    def inspect_execution(self, execution_id):
+    def inspect_execution(self, execution_id: str) -> ExecutionSnapshot:
         """Read registered Kernel authority without ingestion or a state write.
 
         Administrative inspection remains available when result ingestion needs
@@ -228,7 +235,7 @@ class TransportMixin:
         """Poll known dispatched executions without making any application decision."""
         connection = self._connect()
         try:
-            rows = connection.execute("SELECT execution_id FROM sdk_executions").fetchall()
+            rows = connection.execute("SELECT execution_id FROM sdk_executions WHERE active=1").fetchall()
         finally:
             connection.close()
         count = 0
