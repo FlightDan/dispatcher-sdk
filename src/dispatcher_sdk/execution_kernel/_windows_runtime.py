@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -324,6 +325,25 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
+@contextmanager
+def _worker_directory():
+    directory = tempfile.TemporaryDirectory(prefix="dispatcher-windows-")
+    try:
+        yield directory.name
+    finally:
+        # Containment is checked before leaving this scope. A separate process
+        # (for example a file scanner) can still briefly hold a diagnostic file.
+        deadline = time.monotonic() + _CLEANUP_SECONDS
+        while True:
+            try:
+                directory.cleanup()
+                break
+            except PermissionError as error:
+                if getattr(error, "winerror", None) not in (32, 33) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(_POLL_SECONDS)
+
+
 def _worker_main(directory: str) -> None:
     root = Path(directory)
     kernel = None
@@ -417,7 +437,7 @@ def invoke_windows_handler(
         raise ValueError("start_timeout must be finite and positive")
     api = _WinAPI()
     start_deadline = time.monotonic() + start_timeout
-    with tempfile.TemporaryDirectory(prefix="dispatcher-windows-") as directory:
+    with _worker_directory() as directory:
         root = Path(directory)
         main = sys.modules.get("__main__")
         main_path = getattr(main, "__file__", None)

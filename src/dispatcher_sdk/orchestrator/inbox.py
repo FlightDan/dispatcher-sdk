@@ -400,7 +400,10 @@ class NotificationInbox:
                             returned.close()
                         raise TypeError("mutation must be synchronous")
                 finally:
-                    connection.set_authorizer(None)
+                    # Passing None only disables the authorizer on Python 3.11+.
+                    # This connection is private to the current operation and
+                    # closes after the SDK finishes settlement or rollback.
+                    connection.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
             now = clock()
             self._active(connection, lease, now)
             connection.execute(

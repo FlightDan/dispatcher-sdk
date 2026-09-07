@@ -115,6 +115,16 @@ test fixture import/PID-publication errors. The cleanup and recovery
 assertions remain intact. The core adds no Windows-specific Python
 dependency.
 
+GitHub CI also exposed intermittent sharing violations when deleting private
+diagnostic logs after worker containment. Cleanup now retries only Windows
+sharing/lock errors for up to five seconds, then reports any remaining failure.
+The Job termination checks still run first, and the retry does not extend the
+handler's execution deadline. Native regression tests hold a log open from a
+separate process and check both release-and-delete and persistent-lock failure.
+After this fix, the native runtime, notification inbox and sandbox recovery
+modules passed together: 59 tests in 44.992 s, with only the non-Windows refusal
+test skipped.
+
 The CI matrix runs Linux and Windows with Python 3.10 through 3.13, including
 the script-notification example on both operating systems. The local evidence
 above covers Windows 11/Python 3.12.10; it does not claim a completed matrix run

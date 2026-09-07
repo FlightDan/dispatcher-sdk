@@ -6,6 +6,7 @@ from ctypes import wintypes
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -295,6 +296,68 @@ for fd in (0, 1, 2):
                 else:
                     self.assertEqual(outcome, {"kind": "authority_revoked",
                         "reason": "execution_cancelled", "effect_ids": []})
+
+
+@unittest.skipUnless(os.name == "nt", "requires real Windows file sharing")
+class WindowsDirectoryCleanupTests(unittest.TestCase):
+    def lock_file(self, path):
+        path.write_text("diagnostic", encoding="utf-8")
+        process = subprocess.Popen(
+            [sys.executable, "-u", "-c",
+             "import sys\nwith open(sys.argv[1], 'rb') as stream:\n"
+             " print('locked', flush=True)\n sys.stdin.readline()\n", str(path)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.close_locker, process)
+        self.assertEqual(process.stdout.readline().strip(), "locked")
+        return process
+
+    @staticmethod
+    def close_locker(process):
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=10)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+
+    def test_external_log_lock_is_retried_until_directory_is_removed(self):
+        cleanup = tempfile.TemporaryDirectory.cleanup
+        observed = []
+        locker = None
+
+        def release_after_sharing_error(directory):
+            try:
+                cleanup(directory)
+            except PermissionError as error:
+                if not observed:
+                    observed.append(error.winerror)
+                    locker.stdin.write("release\n")
+                    locker.stdin.flush()
+                raise
+
+        with patch.object(tempfile.TemporaryDirectory, "cleanup", release_after_sharing_error):
+            with windows_runtime._worker_directory() as directory:
+                root = Path(directory)
+                locker = self.lock_file(root / "stderr.log")
+        self.assertEqual(observed, [32])
+        self.assertFalse(root.exists())
+        self.assertEqual(locker.wait(timeout=10), 0)
+
+    def test_persistent_log_lock_propagates_cleanup_failure(self):
+        root = None
+        locker = None
+        try:
+            with patch.object(windows_runtime, "_CLEANUP_SECONDS", 0):
+                with self.assertRaises(PermissionError) as raised:
+                    with windows_runtime._worker_directory() as directory:
+                        root = Path(directory)
+                        locker = self.lock_file(root / "stderr.log")
+            self.assertEqual(raised.exception.winerror, 32)
+            self.assertTrue(root.exists())
+        finally:
+            if locker is not None:
+                self.close_locker(locker)
+            if root is not None:
+                shutil.rmtree(root)
 
 
 @unittest.skipUnless(os.name == "nt", "requires real native Windows Job Objects")
