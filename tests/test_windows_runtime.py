@@ -320,7 +320,7 @@ class WindowsDirectoryCleanupTests(unittest.TestCase):
             stream.close()
 
     def test_external_log_lock_is_retried_until_directory_is_removed(self):
-        cleanup = tempfile.TemporaryDirectory.cleanup
+        cleanup = shutil.rmtree
         observed = []
         locker = None
 
@@ -334,7 +334,7 @@ class WindowsDirectoryCleanupTests(unittest.TestCase):
                     locker.stdin.flush()
                 raise
 
-        with patch.object(tempfile.TemporaryDirectory, "cleanup", release_after_sharing_error):
+        with patch.object(shutil, "rmtree", release_after_sharing_error):
             with windows_runtime._worker_directory() as directory:
                 root = Path(directory)
                 locker = self.lock_file(root / "stderr.log")

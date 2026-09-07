@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import pickle
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -327,16 +328,18 @@ def _atomic_write(path: Path, text: str) -> None:
 
 @contextmanager
 def _worker_directory():
-    directory = tempfile.TemporaryDirectory(prefix="dispatcher-windows-")
+    directory = tempfile.mkdtemp(prefix="dispatcher-windows-")
     try:
-        yield directory.name
+        yield directory
     finally:
         # Containment is checked before leaving this scope. A separate process
         # (for example a file scanner) can still briefly hold a diagnostic file.
         deadline = time.monotonic() + _CLEANUP_SECONDS
         while True:
             try:
-                directory.cleanup()
+                # Older TemporaryDirectory cleanup can replace a sharing
+                # violation with NotADirectoryError while handling the error.
+                shutil.rmtree(directory)
                 break
             except PermissionError as error:
                 if getattr(error, "winerror", None) not in (32, 33) or time.monotonic() >= deadline:
