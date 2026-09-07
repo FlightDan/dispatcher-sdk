@@ -143,6 +143,8 @@ class OrchestratorHostTests(unittest.TestCase):
         received = []
         with self.make_host(orchestrator, received.append) as host:
             wait_until(lambda: host.health().notification_deliveries == 1)
+            # Notification delivery and coordinator startup run independently.
+            wait_until(lambda: host.health().state == "running")
             health = host.health()
             self.assertEqual(health.notification_error_count, 1)
             self.assertEqual(health.last_notification_error, "OSError: database busy")
