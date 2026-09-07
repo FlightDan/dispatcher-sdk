@@ -61,43 +61,27 @@ def execute_schema(connection, script):
 
 
 class StoreMixin:
-    def _connect(self):
+    def _connect(self, *, configure=True):
         connection = sqlite3.connect(self.db_path, timeout=30)
         try:
             connection.row_factory = sqlite3.Row
-            configure_sqlite_connection(connection, self.db_path, durability=self.durability)
+            if configure:
+                configure_sqlite_connection(connection, self.db_path, durability=self.durability)
         except BaseException:
             connection.close()
             raise
         return connection
 
     def _initialize_store(self):
-        connection = self._connect()
+        connection = self._connect(configure=False)
         try:
+            # Do not change the persistent WAL setting on an unsupported store.
+            connection.execute("BEGIN")
+            self._validate_existing_store(connection)
+            connection.rollback()
+            configure_sqlite_connection(connection, self.db_path, durability=self.durability)
             connection.execute("BEGIN IMMEDIATE")
-            tables = {row[0] for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'sdk_*'")}
-            if tables:
-                if "sdk_schema_meta" not in tables:
-                    raise OrchestrationError(
-                        "unsupported unversioned orchestration store; preserve the old database "
-                        "and deployment, or use a new database for schema v2")
-                marker = connection.execute("SELECT component,version FROM sdk_schema_meta").fetchall()
-                if len(marker) != 1 or tuple(marker[0]) != ("orchestrator", ORCHESTRATOR_SCHEMA_VERSION):
-                    raise OrchestrationError("unsupported orchestration schema version")
-                # Validate before any CREATE IF NOT EXISTS could conceal damage.
-                reference = sqlite3.connect(":memory:")
-                try:
-                    execute_schema(reference, SCHEMA)
-                    self._init_results(reference)
-                    self._init_notifications(reference)
-                    expected = self._schema_objects(reference)
-                    actual = self._schema_objects(connection)
-                    if actual != expected:
-                        raise OrchestrationError("orchestration schema differs from its declared version")
-                finally:
-                    reference.close()
-            else:
+            if not self._validate_existing_store(connection):
                 execute_schema(connection, SCHEMA)
                 self._init_results(connection)
                 self._init_notifications(connection)
@@ -109,6 +93,29 @@ class StoreMixin:
             raise
         finally:
             connection.close()
+
+    def _validate_existing_store(self, connection):
+        tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'sdk_*'")}
+        if not tables:
+            return False
+        if "sdk_schema_meta" not in tables:
+            raise OrchestrationError(
+                "unsupported unversioned orchestration store; preserve the old database "
+                "and deployment, or use a new database for schema v2")
+        marker = connection.execute("SELECT component,version FROM sdk_schema_meta").fetchall()
+        if len(marker) != 1 or tuple(marker[0]) != ("orchestrator", ORCHESTRATOR_SCHEMA_VERSION):
+            raise OrchestrationError("unsupported orchestration schema version")
+        reference = sqlite3.connect(":memory:")
+        try:
+            execute_schema(reference, SCHEMA)
+            self._init_results(reference)
+            self._init_notifications(reference)
+            if self._schema_objects(connection) != self._schema_objects(reference):
+                raise OrchestrationError("orchestration schema differs from its declared version")
+        finally:
+            reference.close()
+        return True
 
     @staticmethod
     def _schema_objects(connection):

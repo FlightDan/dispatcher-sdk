@@ -88,9 +88,6 @@ class SQLiteBase:
         )
         self._connection.row_factory = sqlite3.Row
         try:
-            configure_sqlite_connection(
-                self._connection, self.db_path, durability=self.durability
-            )
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA writable_schema = OFF")
             self._connection.execute("PRAGMA trusted_schema = OFF")
@@ -98,7 +95,12 @@ class SQLiteBase:
             kernel_names = {name for name in names if name.startswith("kernel_")}
             if kernel_names:
                 validate_schema(self._connection, kernel_names)
-            else:
+            # WAL is a persistent setting. Reject unsupported existing schema
+            # before configuring it, not merely before the first data write.
+            configure_sqlite_connection(
+                self._connection, self.db_path, durability=self.durability
+            )
+            if not kernel_names:
                 initialize_schema(self._connection)
                 validate_schema(self._connection, KERNEL_TABLES)
             self._authorizer = install_authorizer(self._connection)

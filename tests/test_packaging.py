@@ -17,6 +17,8 @@ class PackagingTests(unittest.TestCase):
         self.assertRegex(metadata, r'(?m)^name = "dispatcher-sdk"$')
         self.assertRegex(metadata, r'(?m)^version = "0\.6\.0"$')
         self.assertRegex(metadata, r'(?m)^dependencies = \[\]$')
+        source_version = (SOURCE / "_version.py").read_text(encoding="utf-8")
+        self.assertRegex(source_version, r'(?m)^SOURCE_VERSION = "0\.6\.0"$')
 
     def test_core_is_dependency_free_and_provider_imports_are_lazy(self):
         sources = list(SOURCE.rglob("*.py"))

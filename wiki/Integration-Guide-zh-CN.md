@@ -4,6 +4,10 @@
 
 选择满足应用需求的最少接入步骤。
 
+接入实际工作前，请先阅读[接入工程原则](Engineering-Principles-zh-CN.md)。
+其中说明版本身份、受监督生命周期、证据等级、候选冻结和安全发现，
+不会把业务策略移入 SDK。
+
 | 目标 | 先读 | 可运行示例 |
 | --- | --- | --- |
 | 持久化执行函数 | [SDK](../docs/SDK.md) 与[公共 API](../docs/PUBLIC_API.md) | [重开后执行排队任务](../examples/kernel_task.py) |

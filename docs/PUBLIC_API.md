@@ -4,7 +4,7 @@ Import execution and orchestration APIs from `dispatcher_sdk.execution_kernel`
 or `dispatcher_sdk.orchestrator`. Storage utilities live in
 `dispatcher_sdk.storage`, durability helpers in `dispatcher_sdk.durability`, and
 the optional OpenSandbox adapter in `dispatcher_sdk.adapters`. The package root
-has no convenience re-exports. Each of the two subpackages defines its exported
+exports `runtime_identity` and its report types. Each public package defines its exported
 names in `__all__`; underscore-prefixed modules are implementation details.
 
 | Entry point | Use |
@@ -26,6 +26,14 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 | `RunSnapshot`, `TaskSnapshot`, `AttemptSnapshot`, `WaitSnapshot`, `RunEvent`, `Observation` | Typed views of existing Run/event dictionaries |
 | `RunState`, `TerminalRunState`, `AttemptState` | Literal state names for static checking |
 | `RecoveryDetails` | Run/task identity plus authoritative execution and current effect from `inspect_recoveries(run_id)` |
+| `runtime_identity`, `RuntimeIdentityReport` (package root or identity module) | Read-only package, source, storage and deployment compatibility observations |
+| `ProjectionConsumer`, `ProjectionDrainReport`, `ProjectionEventIdentity` | Persist-before-ACK event projection with bounded retries and fixed high-water draining |
+| `inspect_work_availability`, `WorkAvailabilityReport` | Read-only Run-scoped scheduling reasons; also available as an Orchestrator method |
+| `inspect_cancellation`, `CancellationRecoveryReport`, `ExecutionCancellationReport`, `CancellationFact` | Read-only phase and generation evidence; also available as an Orchestrator method |
+| `CancellationJournal`, `inspect_cancellation_journal`, `CancellationReceipt` (execution package) | Explicit, separate durable cancellation evidence component and its read-only reader |
+
+See [diagnostics and projections](SDK_DIAGNOSTICS_AND_PROJECTIONS.md) for complete
+signatures, failure semantics, evidence limits and runnable examples.
 
 Kernel exception types, `SCHEMA_VERSION`, `EXECUTION_STATES`, `TERMINAL_STATES`,
 `TRANSITION_MATRIX`, `can_transition` and `reduce_state` are also exported.

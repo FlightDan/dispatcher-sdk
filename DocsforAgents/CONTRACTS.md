@@ -15,6 +15,8 @@ and parameter definitions.
 | Notifications | Durably deduplicate by stable source and notification identity before acknowledging delivery. Keep callback acceptance separate from processing. | [Notification inbox](../docs/NOTIFICATION_INBOX.md) |
 | Result consumers | Delivery is at least once. Deduplicate immutable result identities. One SDK state store owns the bound Kernel result queue; independent stores must not compete for it. | [SDK operations](../docs/SDK.md) |
 | Event consumers | Commit the destination before acknowledging the observed batch. Use a dedicated subscription, stable source identity, and event sequence; drain pages even after Run completion. | [Integration FAQ](../docs/SDK_INTEGRATION_FAQ.md) |
+| Projection helper | Use explicit persisted/already_present confirmation after the destination transaction commits. Replay failed pages, bound callback I/O, and handle conflict/interrupted reports. | [Diagnostics and projections](../docs/SDK_DIAGNOSTICS_AND_PROJECTIONS.md) |
+| Cancellation evidence | Distinguish committed request, delivered command, revoked authority and cleanup proof. Missing evidence is unknown; check the exact execution fence and Run state separately. | [Cancellation evidence](../docs/CANCELLATION_EVIDENCE.md) |
 | Isolation | Process mode is execution control, not a filesystem/network permission sandbox. Thread cancellation cannot stop a blocked thread. | [Public API](../docs/PUBLIC_API.md) |
 | Restart and upgrade | Retain the database and matching handler deployment. Run compatibility/preflight checks before replacing it; do not assume automatic migration of old Orchestrator stores. | [Storage and upgrades](../docs/STORAGE_AND_UPGRADES.md) |
 
@@ -30,4 +32,3 @@ business decisions. Use the inspection and recovery interfaces described in
 Interrupted scripts can enter `recovery_required` because script execution
 records an Effect. Verify external state before assuming a timeout or cancellation
 made the script safe to repeat. See [script wakeups](../docs/SDK_SCRIPT_WAKEUPS.md).
-

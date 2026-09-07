@@ -12,11 +12,14 @@ Dispatcher 负责执行与投递。
 2. [核心概念](Core-Concepts-zh-CN.md)：理解 Runtime、Run、任务和宿主的职责。
 3. [接入指南](Integration-Guide-zh-CN.md)：选择函数、脚本或工作流接入路径。
 4. [常见问题](Troubleshooting-zh-CN.md)：排查待执行任务、重复通知和恢复状态。
+5. [接入工程原则](Engineering-Principles-zh-CN.md)：准备可恢复的部署和可审查的证据。
+6. [诊断与事件投影](Diagnostics-and-Projections-zh-CN.md)：检查部署身份、持久化事件，以及排查工作可用性和取消状态。
 
 编程 Agent 请先阅读英文 [DocsforAgents](../DocsforAgents/README.md)。
 详细 API 契约统一维护在 [docs/SDK.md](../docs/SDK.md) 和
 [公共 API 文档](../docs/PUBLIC_API.md)。部分详细指南目前为中文；
 Wiki 的两种语言版本均链接到同一份权威文档。
+关于版本、证据、候选冻结和安全发现的通用规则，见[接入工程原则](Engineering-Principles-zh-CN.md)。
 
 ## 版本与范围
 

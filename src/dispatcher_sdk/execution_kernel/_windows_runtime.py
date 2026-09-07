@@ -431,6 +431,7 @@ def invoke_windows_handler(
     durability: Durability = "full",
     on_started: Optional[Callable[[WindowsProcessHandle], bool]] = None,
     on_finished: Optional[Callable[[WindowsProcessHandle], None]] = None,
+    on_cleanup_confirmed: Optional[Callable[[], None]] = None,
 ) -> dict[str, Any]:
     """Spawn one native Windows worker and publish only after Job containment."""
     profile = validate_durability(durability)
@@ -485,6 +486,8 @@ def invoke_windows_handler(
                 if not handle.terminate():
                     raise RuntimeError("Windows Job did not reach zero active processes")
                 contained_at = time.monotonic()
+                if on_cleanup_confirmed is not None:
+                    on_cleanup_confirmed()
             finally:
                 try:
                     if watchdog is not None:

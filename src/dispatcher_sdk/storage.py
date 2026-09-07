@@ -53,6 +53,14 @@ def inspect_storage(path: str | Path, *, handlers: Mapping[Any, Handler] | None 
         if integrity != ["ok"]:
             report["issues"].append({"component": "sqlite", "message": "; ".join(integrity)})
         tables = existing_table_names(connection)
+        if any(name.startswith("cancellation_") for name in tables):
+            from .execution_kernel.cancellation import validate_cancellation_schema
+            report["cancellation_schema"] = "unsupported"
+            try:
+                report["cancellation_identity"] = validate_cancellation_schema(connection)
+                report["cancellation_schema"] = 1
+            except (ValueError, sqlite3.Error) as error:
+                report["issues"].append({"component": "cancellation", "message": str(error)})
         kernel_tables = {name for name in tables if name.startswith("kernel_")}
         kernel_valid = False
         if kernel_tables:

@@ -3,7 +3,9 @@
 Publish developer previews on GitHub Releases. PyPI publishing is not configured.
 The release workflow uses the repository's temporary GitHub token.
 
-1. Update `pyproject.toml`, the changelog and versioned install examples together.
+1. Update `pyproject.toml`, `src/dispatcher_sdk/_version.py`, the changelog and
+   versioned install examples together. The package source-version declaration
+   must agree with distribution metadata in a release artifact.
 2. Run the test matrix and review the candidate. A local test run only verifies
    the Python/platform pair on which it ran.
 3. Inspect the staged source and release artifacts for secrets and private data.

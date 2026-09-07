@@ -12,6 +12,7 @@ from ._sqlite_effects import EffectStoreMixin
 from ._sqlite_outbox import ResultOutboxMixin
 from ._sqlite_recovery import EffectRecoveryMixin
 from .contracts import ExecutionCommandV2, ExecutionLease, ExecutionSnapshot
+from .claiming import claim_predicate
 from .errors import IdempotencyConflictError
 from .transitions import reduce_state
 
@@ -38,16 +39,9 @@ def _claim_revisions(
 
 
 def _next_claim_row(connection, timestamp: float, revisions: Optional[tuple[str, ...]]):
-    clause = ""
-    parameters = (timestamp,)
-    if revisions is not None:
-        # Only placeholders enter the SQL text. Revision values remain bound
-        # parameters, and one ordered selection spans every accepted revision.
-        clause = " AND registry_revision IN (" + ",".join("?" for _ in revisions) + ")"
-        parameters = (timestamp, *revisions)
+    predicate, parameters = claim_predicate(timestamp, revisions)
     return connection.execute(
-        "SELECT * FROM kernel_executions WHERE state = 'queued' AND next_attempt_at <= ?"
-        + clause + " ORDER BY created_at, execution_id LIMIT 1",
+        "SELECT * FROM kernel_executions WHERE " + predicate + " ORDER BY created_at, execution_id LIMIT 1",
         parameters,
     ).fetchone()
 
@@ -229,13 +223,7 @@ class SQLiteKernel(
             raise ValueError("registry_revision must be a non-empty string")
         with self._transaction() as (connection, timestamp):
             self._reap_in_transaction(connection, timestamp)
-            row = connection.execute(
-                """SELECT * FROM kernel_executions
-                   WHERE state = 'queued' AND next_attempt_at <= ?
-                     AND registry_revision = ?
-                   ORDER BY created_at, execution_id LIMIT 1""",
-                (timestamp, registry_revision),
-            ).fetchone()
+            row = _next_claim_row(connection, timestamp, (registry_revision,))
             return None if row is None else self._snapshot(row)
 
     def claim(

@@ -4,6 +4,10 @@
 
 Choose the fewest integration steps that meet your application's needs.
 
+Before connecting real work, review the [integration engineering principles](Engineering-Principles.md).
+They cover version identity, supervised lifetime, evidence levels, candidate
+freezing and safe discovery without moving business policy into the SDK.
+
 | Goal | Start with | Working example |
 | --- | --- | --- |
 | Execute a function with persisted state | [SDK](../docs/SDK.md) and [public API](../docs/PUBLIC_API.md) | [Queued work after reopen](../examples/kernel_task.py) |

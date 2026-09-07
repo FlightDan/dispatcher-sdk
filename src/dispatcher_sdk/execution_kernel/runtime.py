@@ -51,6 +51,13 @@ from .sqlite import SQLiteKernel
 from .sandbox import SandboxHandler, SandboxJournal
 from .sandbox_contracts import SandboxOutcomeUnknown
 from ._sandbox_registry import register_journals, journal_paths
+from .cancellation import CancellationJournal
+
+
+class _ProcessRegistration(threading.Event):
+    """Completion alone is not a cleanup proof when invocation raises."""
+
+    cleanup_confirmed = False
 
 
 class InProcessRuntime:
@@ -68,7 +75,11 @@ class InProcessRuntime:
         outbox_max_attempts: int = 8,
         max_thread_workers: int = 4,
         durability: Durability = "full",
+        cancellation_journal_path: str | None = None,
+        source_id: str | None = None,
     ) -> None:
+        if (cancellation_journal_path is None) != (source_id is None):
+            raise ValueError("cancellation_journal_path and source_id must be provided together")
         self.durability = validate_durability(durability)
         self.handlers = normalize_handlers(handlers)
         self.registry_revision = registry_revision(self.handlers)
@@ -105,19 +116,19 @@ class InProcessRuntime:
         self._close_error: BaseException | None = None
         self._stop_event = threading.Event()
         self._active_runs = 0
-        self._process_supervisors: dict[str, Any] = {}
+        self._process_supervisors: dict[tuple[str, int, int], Any] = {}
         # Exists from the moment a claimed execution enters process
         # invocation until its supervisor has been reaped.  Cancellation
         # waits on this marker so a start/register race cannot report success
         # while a process tree is still becoming visible to the runtime.
-        self._process_registration_events: dict[str, threading.Event] = {}
-        self._revoked_executions: dict[str, str] = {}
+        self._process_registration_events: dict[tuple[str, int, int], _ProcessRegistration] = {}
+        self._revoked_executions: dict[tuple[str, int, int], str] = {}
         self._thread_lock = threading.RLock()
         self._closed = False
         self._thread_executor: Optional[ThreadPoolExecutor] = None
         self._thread_slots: Optional[threading.BoundedSemaphore] = None
         self._thread_authorities: set[threading.Event] = set()
-        self._thread_authority_by_execution: dict[str, threading.Event] = {}
+        self._thread_authority_by_execution: dict[tuple[str, int, int], threading.Event] = {}
         if isolation_mode == "thread":
             self._thread_executor = ThreadPoolExecutor(
                 max_workers=max_thread_workers,
@@ -132,6 +143,12 @@ class InProcessRuntime:
             outbox_max_attempts=outbox_max_attempts,
         )
         try:
+            self.cancellation_journal: CancellationJournal | None = None
+            if cancellation_journal_path is not None:
+                assert source_id is not None
+                self.cancellation_journal = CancellationJournal(
+                    cancellation_journal_path, source_id=source_id, kernel_path=self.kernel.db_path,
+                    durability=self.durability)
             sandbox_bindings = [handler for handler in self.handlers.values() if isinstance(handler, SandboxHandler)]
             self._sandbox_store_id = register_journals(self.kernel.db_path, [],
                 durability=self.durability, initialize_only=bool(sandbox_bindings))
@@ -248,14 +265,33 @@ class InProcessRuntime:
         expected_revision: int,
         reason: str = "execution cancelled",
     ):
-        """Externally cancel one execution with revision-CAS authority."""
+        """Externally cancel one execution with revision-CAS authority.
+
+        An explicitly configured cancellation journal preserves stage evidence
+        across restart. Evidence failures after the Kernel commit do not skip
+        process cleanup and are surfaced after cleanup is attempted.
+        """
 
         registration: Optional[threading.Event] = None
         recovery_error: EffectRecoveryRequiredError | None = None
+        receipt_id = None
+        evidence_errors: list[Exception] = []
+
+        def record(stage, evidence):
+            if receipt_id is not None:
+                try:
+                    self.cancellation_journal._record(receipt_id, stage, evidence)
+                except Exception as exc:
+                    evidence_errors.append(exc)
+
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("runtime is closed")
             before = self.kernel.get(execution_id)
+            if self.cancellation_journal is not None:
+                receipt_id = self.cancellation_journal._begin(
+                    before, expected_revision=expected_revision, reason=reason,
+                    isolation_mode=self.isolation_mode)
             try:
                 cancelled = self.kernel.cancel(
                     execution_id,
@@ -268,30 +304,57 @@ class InProcessRuntime:
                 # before the Bridge may acknowledge the intent.
                 cancelled = None
                 recovery_error = exc
-            if self.isolation_mode == "process" and before.state in {"leased", "running"}:
-                self._revoked_executions[execution_id] = "execution_cancelled"
-            supervisor = self._process_supervisors.get(execution_id)
-            registration = self._process_registration_events.get(execution_id)
+            except BaseException as exc:
+                record("failure", {"phase": "kernel_cancel", "type": type(exc).__name__})
+                raise
+            authority = cancelled if cancelled is not None else self.kernel.get(execution_id)
+            record("authority_revoked", {"state": "confirmed", "execution_revision": authority.revision,
+                   "execution_state": authority.state, "attempt": before.attempt, "fence": before.fence})
+            generation = (execution_id, before.attempt, before.fence)
+            registration = self._process_registration_events.get(generation)
+            if registration is not None:
+                self._revoked_executions[generation] = "execution_cancelled"
+            supervisor = self._process_supervisors.get(generation)
             with self._thread_lock:
-                thread_authority = self._thread_authority_by_execution.get(execution_id)
-        if supervisor is not None:
-            if not supervisor.revoke("execution_cancelled"):
+                thread_authority = self._thread_authority_by_execution.get(generation)
+        phase = "process_cleanup"
+        try:
+            if supervisor is not None:
+                if not supervisor.revoke("execution_cancelled"):
+                    raise RuntimeError(
+                        f"process supervisor for {execution_id} did not terminate"
+                    )
+            if registration is not None and not registration.wait(
+                self._handler_start_timeout()
+            ):
                 raise RuntimeError(
-                    f"process supervisor for {execution_id} did not terminate"
+                    f"process registration for {execution_id} did not settle after cancellation"
                 )
-        if registration is not None and not registration.wait(
-            self._handler_start_timeout()
-        ):
-            raise RuntimeError(
-                f"process registration for {execution_id} did not settle after cancellation"
-            )
-        if thread_authority is not None:
-            thread_authority.clear()
-        handler = self.handlers.get((before.command.handler_id, before.command.handler_contract_version))
-        unresolved = self.recover_sandboxes(all_pages=True, execution_id=execution_id,
-                                            max_fence=before.fence)
-        if any(not item["cleanup_confirmed"] for item in unresolved):
-            raise SandboxOutcomeUnknown("cancellation has not confirmed remote sandbox disposal")
+            if thread_authority is not None:
+                thread_authority.clear()
+            if thread_authority is not None:
+                local_state, local_code = "not_applicable", "thread_authority_is_not_thread_termination"
+            elif getattr(registration, "cleanup_confirmed", False):
+                local_state, local_code = "confirmed", "runtime_supervisor_reaped"
+            elif before.attempt == 0:
+                local_state, local_code = "not_applicable", "execution_never_claimed"
+            else:
+                local_state, local_code = "unknown", "no_local_supervisor_evidence"
+            record(phase, {"state": local_state, "code": local_code})
+            phase = "remote_cleanup"
+            unresolved = self.recover_sandboxes(all_pages=True, execution_id=execution_id,
+                                               max_fence=before.fence)
+            failed = any(not item["cleanup_confirmed"] for item in unresolved)
+            record(phase, {"state": "pending" if failed else "confirmed" if unresolved else "unknown",
+                           "code": "sandbox_cleanup_checked", "reports": list(unresolved)})
+            if failed:
+                raise SandboxOutcomeUnknown("cancellation has not confirmed remote sandbox disposal")
+        except BaseException as exc:
+            record("failure", {"phase": phase, "type": type(exc).__name__})
+            raise
+        if evidence_errors:
+            record("failure", {"phase": "evidence_write", "type": type(evidence_errors[0]).__name__})
+            raise RuntimeError("cancellation changed authority but its durable evidence could not be saved") from evidence_errors[0]
         if recovery_error is not None:
             raise recovery_error
         assert cancelled is not None
@@ -384,15 +447,15 @@ class InProcessRuntime:
                 "handler implementation state changed after registry binding"
             )
 
-    def _begin_process_execution(self, execution_id: str) -> None:
+    def _begin_process_execution(self, lease: ExecutionLease) -> None:
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("runtime is closed")
-            self._process_registration_events[execution_id] = threading.Event()
+            self._process_registration_events[(lease.execution_id, lease.attempt, lease.fence)] = _ProcessRegistration()
 
-    def _finish_process_execution(self, execution_id: str) -> None:
+    def _finish_process_execution(self, lease: ExecutionLease) -> None:
         with self._lifecycle_lock:
-            registration = self._process_registration_events.pop(execution_id, None)
+            registration = self._process_registration_events.pop((lease.execution_id, lease.attempt, lease.fence), None)
             if registration is not None:
                 registration.set()
 
@@ -412,14 +475,14 @@ class InProcessRuntime:
                 self._thread_slots.release()
 
     def _thread_finished(
-        self, authority: threading.Event, execution_id: str
+        self, authority: threading.Event, generation: tuple[str, int, int]
     ) -> None:
         with self._thread_lock:
             if authority not in self._thread_authorities:
                 return
             self._thread_authorities.remove(authority)
-            if self._thread_authority_by_execution.get(execution_id) is authority:
-                del self._thread_authority_by_execution[execution_id]
+            if self._thread_authority_by_execution.get(generation) is authority:
+                del self._thread_authority_by_execution[generation]
             if self._thread_slots is not None:
                 self._thread_slots.release()
 
@@ -464,15 +527,17 @@ class InProcessRuntime:
         command: ExecutionCommandV2,
         lease: ExecutionLease,
     ) -> dict[str, Any]:
+        generation = (lease.execution_id, lease.attempt, lease.fence)
+
         def register(supervisor: Any) -> bool:
             with self._lifecycle_lock:
-                reason = self._revoked_executions.pop(command.execution_id, None)
+                reason = self._revoked_executions.pop(generation, None)
                 if reason is None and (
                     self._closed or self._stop_event.is_set()
                 ):
                     reason = "runtime_closed"
                 if reason is None:
-                    self._process_supervisors[command.execution_id] = supervisor
+                    self._process_supervisors[generation] = supervisor
                     return True
             # The caller that requested cancellation waits for the outer
             # invocation to finish.  Do the kill synchronously here so a
@@ -483,9 +548,15 @@ class InProcessRuntime:
 
         def unregister(supervisor: Any) -> None:
             with self._lifecycle_lock:
-                if self._process_supervisors.get(command.execution_id) is supervisor:
-                    del self._process_supervisors[command.execution_id]
-                self._revoked_executions.pop(command.execution_id, None)
+                if self._process_supervisors.get(generation) is supervisor:
+                    del self._process_supervisors[generation]
+                self._revoked_executions.pop(generation, None)
+
+        def cleanup_confirmed() -> None:
+            with self._lifecycle_lock:
+                registration = self._process_registration_events.get(generation)
+                if registration is not None:
+                    registration.cleanup_confirmed = True
 
         invoke = invoke_process_handler
         if os.name == "nt":
@@ -501,6 +572,7 @@ class InProcessRuntime:
             start_timeout=self._handler_start_timeout(),
             on_started=register,
             on_finished=unregister,
+            on_cleanup_confirmed=cleanup_confirmed,
         )
         if isinstance(handler, SandboxHandler):
             try:
@@ -541,6 +613,7 @@ class InProcessRuntime:
         command: ExecutionCommandV2,
         lease: ExecutionLease,
     ) -> dict[str, Any]:
+        generation = (lease.execution_id, lease.attempt, lease.fence)
         active = threading.Event()
         active.set()
         effects = HandlerEffects(self.kernel, lease, active.is_set)
@@ -559,18 +632,18 @@ class InProcessRuntime:
                 active.clear()
                 raise RuntimeError("runtime is closed")
             self._thread_authorities.add(active)
-            self._thread_authority_by_execution[command.execution_id] = active
+            self._thread_authority_by_execution[generation] = active
         try:
             future = executor.submit(invoke_started)
         except BaseException:
             with self._thread_lock:
                 self._thread_authorities.discard(active)
-                if self._thread_authority_by_execution.get(command.execution_id) is active:
-                    del self._thread_authority_by_execution[command.execution_id]
+                if self._thread_authority_by_execution.get(generation) is active:
+                    del self._thread_authority_by_execution[generation]
             active.clear()
             raise
         future.add_done_callback(
-            lambda _future: self._thread_finished(active, command.execution_id)
+            lambda _future: self._thread_finished(active, generation)
         )
         try:
             if not started.wait(self._handler_start_timeout()):
@@ -727,7 +800,7 @@ class InProcessRuntime:
                         # claim-and-start.  Cancellation cannot observe a
                         # running row without also seeing its registration
                         # marker.
-                        self._begin_process_execution(running_lease.execution_id)
+                        self._begin_process_execution(running_lease)
                         process_execution_started = True
                 if running_lease is None:
                     return last_rejected
@@ -797,7 +870,7 @@ class InProcessRuntime:
                     return self.kernel.complete(running_lease, result)
             finally:
                 if process_execution_started:
-                    self._finish_process_execution(running_lease.execution_id)
+                    self._finish_process_execution(running_lease)
                 if thread_slot_owned:
                     self._release_thread_slot()
 

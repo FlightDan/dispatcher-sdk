@@ -20,6 +20,12 @@ ownership, see [recovery and integration requirements](SDK_RECOVERY.md).
 [Public API and compatibility](PUBLIC_API.md) covers import paths, versions,
 and platform constraints.
 
+The [durable integration engineering principles](INTEGRATION_PRINCIPLES.md)
+collect application-level rules for version identity, supervised service
+lifetime, evidence closure, candidate freezing and safe discovery. They explain
+how to make and report integration decisions without turning domain policy into
+an SDK state.
+
 For LLM-backed handlers, the [guide to output contracts, validation and bounded rework](SDK_OUTPUT_CONTRACTS.md)
 covers exact prompt enums, application-owned runtime validation, actionable
 diagnostics and explicit repair routing. Execution success, valid output
@@ -43,6 +49,8 @@ adds the pinned OpenSandbox SDK and requires a separately deployed service.
 
 ## Version 0.6 integration guides
 
+- [Diagnostics and projections](SDK_DIAGNOSTICS_AND_PROJECTIONS.md): deployment identity, durable event consumption, work availability and cancellation reports.
+- [Cancellation evidence](CANCELLATION_EVIDENCE.md): optional journal configuration, cleanup evidence, backup and compatibility.
 - [Task submission](TASK_SUBMISSION.md): `submit_task()` atomically records task, watch and dispatch intent; `Runtime.command()` binds one handler.
 - [Storage and upgrades](STORAGE_AND_UPGRADES.md): schema 2 upgrade boundaries, FULL/NORMAL profiles, preflight, backup, paged reads and `continue_run()`.
 - [Run storage validation](RUN_STORAGE_VALIDATION.md): incremental historical storage measurements; full snapshot calls still scale with segment size.

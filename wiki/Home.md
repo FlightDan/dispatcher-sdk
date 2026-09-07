@@ -13,11 +13,15 @@ handles execution and delivery.
 2. [Core concepts](Core-Concepts.md): understand Runtime, Run, task and host ownership.
 3. [Integration guide](Integration-Guide.md): choose a path for functions, scripts or workflows.
 4. [Troubleshooting](Troubleshooting.md): diagnose pending work, duplicates and recovery.
+5. [Integration engineering principles](Engineering-Principles.md): prepare durable deployments and evidence that can be reviewed.
+6. [Diagnostics and projections](Diagnostics-and-Projections.md): inspect deployment identity, persist events, and check work availability or cancellation.
 
 Coding agents should start with [DocsforAgents](../DocsforAgents/README.md).
 Detailed API contracts are maintained in [docs/SDK.md](../docs/SDK.md) and the
 [public API guide](../docs/PUBLIC_API.md). Some detailed guides are currently in
 Chinese; both language editions of this Wiki link to the same authoritative files.
+For reusable rules about versions, evidence, candidate freezing and safe object
+discovery, see the [integration engineering principles](Engineering-Principles.md).
 
 ## Version and scope
 

@@ -354,7 +354,7 @@ def _supervisor_entry(
         worker_channel = supervisor_channel
         ready = _receive_packet(worker_channel)
         if ready != {"kind": "worker_ready"}:
-            _contain_tree(
+            contained = _contain_tree(
                 os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS,
                 subreaper=subreaper,
             )
@@ -362,6 +362,7 @@ def _supervisor_entry(
                 parent_sender,
                 {
                     "kind": "handler_start_failed",
+                    "cleanup_confirmed": contained and subreaper,
                     "message": "handler worker did not become ready",
                 },
             )
@@ -403,6 +404,7 @@ def _supervisor_entry(
                     parent_sender,
                     {
                         "kind": "handler_failed",
+                        "cleanup_confirmed": subreaper,
                         "code": "handler_process_exit",
                         "message": "handler process exited before reporting an outcome",
                     },
@@ -419,6 +421,7 @@ def _supervisor_entry(
                     parent_sender,
                     {
                         "kind": "handler_failed",
+                        "cleanup_confirmed": subreaper,
                         "code": "handler_process_exit",
                         "message": str(
                             packet.get("message", "handler worker failed internally")
@@ -435,24 +438,26 @@ def _supervisor_entry(
                 parent_sender,
                 {
                     "kind": "handler_completed",
+                    "cleanup_confirmed": subreaper,
                     "contained_monotonic": contained_at,
                     "outcome_json": packet["outcome_json"],
                 },
             )
         except _DeadlineExpired:
             signal.setitimer(signal.ITIMER_REAL, 0.0)
-            _contain_tree(
+            contained = _contain_tree(
                 os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS,
                 subreaper=subreaper,
             )
-            _send_packet(parent_sender, {"kind": "handler_timed_out"})
+            _send_packet(parent_sender, {"kind": "handler_timed_out", "cleanup_confirmed": contained and subreaper})
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0.0)
             if previous_alarm is not None:
                 signal.signal(signal.SIGALRM, previous_alarm)
     except BaseException as exc:
+        contained = worker_pid is None
         if worker_pid is not None:
-            _contain_tree(
+            contained = _contain_tree(
                 os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS,
                 subreaper=subreaper,
             )
@@ -461,6 +466,7 @@ def _supervisor_entry(
                 parent_sender,
                 {
                     "kind": "handler_start_failed",
+                    "cleanup_confirmed": contained and subreaper,
                     "message": f"supervisor {type(exc).__name__}: {exc}",
                 },
             )
@@ -545,6 +551,7 @@ def invoke_process_handler(
     start_timeout: float,
     on_started: Optional[Callable[[ProcessSupervisorHandle], bool]] = None,
     on_finished: Optional[Callable[[ProcessSupervisorHandle], None]] = None,
+    on_cleanup_confirmed: Optional[Callable[[], None]] = None,
     durability: str = "full",
 ) -> dict[str, Any]:
     """Run a handler behind an independently timed and reaping supervisor."""
@@ -607,6 +614,12 @@ def invoke_process_handler(
     if not reaped:
         raise RuntimeError("handler supervisor could not be terminated")
 
+    # A dead supervisor alone cannot prove that orphaned descendants are gone.
+    # Only its explicit post-containment packet supports a durable tree receipt.
+    if (type(terminal) is dict and terminal.get("cleanup_confirmed") is True
+            and on_cleanup_confirmed is not None):
+        on_cleanup_confirmed()
+
     revocation_reason = handle.revocation_reason
     if revocation_reason is not None:
         return {
@@ -631,7 +644,7 @@ def invoke_process_handler(
         if type(outcome) is dict:
             return outcome
     if started and (
-        terminal == {"kind": "handler_timed_out"}
+        (type(terminal) is dict and terminal.get("kind") == "handler_timed_out")
         or (deadline is not None and observed_at >= deadline)
     ):
         return {"kind": "timeout", "effect_ids": []}

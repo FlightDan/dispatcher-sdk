@@ -6,6 +6,15 @@ from .engine import Orchestrator
 from .host import OrchestratorHost, OrchestratorHostHealth
 from .operations import Operations
 from .recovery import RecoveryDetails
+from .availability import WorkAvailabilityReport, WorkExecutionSummary, inspect_work_availability
+from .projection import (
+    ProjectionConsumer, ProjectionSource, ProjectionDisposition, ProjectionStatus,
+    ProjectionEventIdentity, ProjectionFailure, ProjectionDrainReport,
+)
+from .cancellation import (
+    EvidenceStatus, CancellationFact, ExecutionCancellationReport,
+    CancellationRecoveryReport, inspect_cancellation,
+)
 from .inbox import NotificationInbox, InboxLease, InboxRecord, InboxState
 from .types import (
     AddTaskOperation, AttemptSnapshot, AttemptState, CancelOperation,
@@ -16,6 +25,11 @@ from .types import (
 )
 
 __all__ = [
+    "WorkAvailabilityReport", "WorkExecutionSummary", "inspect_work_availability",
+    "ProjectionConsumer", "ProjectionSource", "ProjectionDisposition", "ProjectionStatus",
+    "ProjectionEventIdentity", "ProjectionFailure", "ProjectionDrainReport",
+    "EvidenceStatus", "CancellationFact", "ExecutionCancellationReport",
+    "CancellationRecoveryReport", "inspect_cancellation",
     "NotificationInbox", "InboxLease", "InboxRecord", "InboxState",
     "Orchestrator", "OrchestratorHost", "OrchestratorHostHealth", "OrchestrationError",
     "RevisionConflict", "CommandConflict", "canonical_json", "Operations", "RecoveryDetails",

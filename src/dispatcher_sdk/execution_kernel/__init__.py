@@ -6,6 +6,10 @@ the restart-safe global execution-event sequence.
 """
 
 from .context import HandlerContext, HandlerEffects
+from .cancellation import (
+    CancellationJournal, CancellationReceipt, CancellationJournalPage,
+    CANCELLATION_SCHEMA_VERSION, inspect_cancellation_journal,
+)
 from .contracts import (
     ContractValidationError,
     EffectRecord,
@@ -57,6 +61,8 @@ from .transitions import (
 )
 
 __all__ = [
+    "CancellationJournal", "CancellationReceipt", "CancellationJournalPage",
+    "CANCELLATION_SCHEMA_VERSION", "inspect_cancellation_journal",
     "SandboxBackend", "SandboxBackendError", "SandboxHandler", "SandboxJournal",
     "SandboxObservation", "SandboxOutcomeUnknown", "SandboxPolicyError",
     "SandboxResourceMissing", "SandboxSpec", "sandbox_handlers",

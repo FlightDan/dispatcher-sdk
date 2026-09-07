@@ -3,6 +3,30 @@
 Run commands from the checkout after installing the SDK in an activated virtual
 environment. Select checks for the integration you are implementing.
 
+## General integration discipline
+
+Use the [durable integration engineering principles](../docs/INTEGRATION_PRINCIPLES.md)
+when preparing a release or investigating a failed Run. The final report should
+show:
+
+- package release, imported module origin, contract and storage schemas, registry
+  and deployment identity;
+- a supervised host owner, heartbeat and last successful queue pump or sync;
+- separate states for structural reuse, independent review, current-Run
+  validation and product acceptance;
+- the question, closure criteria and affected gate for each evidence item;
+- knowledge blockers separated from verification obligations that can only run
+  after implementation;
+- exact execution and candidate identity, first fatal condition, lifecycle
+  milestone and authenticated test coverage;
+- the evidence level for every assertion and every skipped capability;
+- a frozen candidate and clean installed artifact for final verification;
+- a read-only identity match before any durable Run or deployment mutation.
+
+Do not convert a stable hash, green fixture count, Agent self-report or failed
+search into a stronger claim than its evidence supports. Keep the first failure
+and rerun the final checks when the candidate changes.
+
 ## Runnable behavior references
 
 | Command | Evidence to expect |

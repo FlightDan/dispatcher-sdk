@@ -2,6 +2,15 @@
 
 ## 0.6.0 (developer preview, unreleased)
 
+- Runtime identity and independent storage read/execute/resume preflight verdicts;
+  unsupported Kernel/Orchestrator schemas are checked before configuring WAL.
+- Synchronous `ProjectionConsumer` persists complete pages before ACK, safely
+  replays idempotent effects, and drains to a fixed high-water boundary.
+- Read-only work-availability and cancellation reports expose scheduling causes,
+  pending delivery, execution generations, uncertainty and cleanup evidence.
+- Opt-in cancellation journal schema 1 is a separate file; core schemas remain
+  unchanged. Runtime process/thread registrations are fenced by invocation
+  generation so older invocations cannot supply newer cleanup evidence.
 - Typed operation constructors and Run/event views, with a packaged `py.typed` marker.
 - Optional notification callback for `OrchestratorHost`: omitted callbacks leave
   notifications queued while execution and synchronization continue.

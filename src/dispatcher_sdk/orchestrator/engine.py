@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import time
-from typing import Any, TypeVar, cast
+from typing import Any, Sequence, TypeVar, cast
 
 from ..durability import Durability, validate_durability
 from .contracts import (RevisionConflict, OrchestrationError, canonical, clone,
@@ -19,6 +19,8 @@ from .recovery import RecoveryMixin
 from .runs import RunHistoryMixin
 from .convenience import ConvenienceMixin
 from .types import Observation, Operation, RunEvent, RunSnapshot
+from .availability import WorkAvailabilityReport, inspect_work_availability
+from .cancellation import CancellationRecoveryReport, inspect_cancellation
 
 
 _UNSET = object()
@@ -60,6 +62,13 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
         """Open one durable stack; this Orchestrator owns its Runtime lifetime."""
         from ..execution_kernel import Runtime
 
+        # Runtime initializes the Kernel in this same file. Check existing
+        # Orchestrator schema before Runtime could switch WAL or add its tables.
+        if str(path) != ":memory:" and Path(path).exists():
+            from ..storage import _read_only
+            with _read_only(path) as connection:
+                connection.execute("BEGIN")
+                cls.__new__(cls)._validate_existing_store(connection)
         runtime_options.setdefault("now", clock)
         runtime = Runtime(str(path), handlers, durability=durability, **runtime_options)
         try:
@@ -122,6 +131,22 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             return self._receipt(connection, row["response"]) if row else None
         finally:
             connection.close()
+
+    def inspect_work_availability(self, run_id: str, *, registry_revision: str | None = None,
+                                  registry_revisions: Sequence[str] | None = None,
+                                  sample_limit: int = 20, effect_scan_limit: int = 1000) -> WorkAvailabilityReport:
+        """Read bounded scheduling facts without syncing, reaping or changing clocks."""
+        return inspect_work_availability(self, run_id, registry_revision=registry_revision,
+            registry_revisions=registry_revisions, sample_limit=sample_limit, effect_scan_limit=effect_scan_limit)
+
+    def inspect_cancellation(self, run_id: str, *, task_id: str | None = None,
+                             execution_id: str | None = None, source_id: str | None = None,
+                             cancellation_journal_path: str | Path | None = None,
+                             limit: int = 100, after_task_id: str | None = None) -> CancellationRecoveryReport:
+        """Read cancellation facts with their execution and recovery generations."""
+        return inspect_cancellation(self, run_id, task_id=task_id, execution_id=execution_id,
+            source_id=source_id, cancellation_journal_path=cancellation_journal_path,
+            limit=limit, after_task_id=after_task_id)
 
     def apply_operations(self, run_id: str, *, command_id: str, expected_revision: int,
                          operations: list[_OperationInput],
