@@ -103,6 +103,7 @@ class _AttemptRequired(TypedDict):
 class AttemptSnapshot(_AttemptRequired, total=False):
     dependency_attempts: dict[str, int]
     cancel_reason: str
+    generation: int
 
 
 class TaskSnapshot(TypedDict):
@@ -120,6 +121,7 @@ class RunSnapshot(TypedDict):
     run_id: str
     revision: int
     state: RunState
+    generation: int
     input: Any
     definition: Any
     application_state: Any

@@ -193,7 +193,9 @@ class WorkAvailabilityTests(unittest.TestCase):
         with closing(sqlite3.connect(self.path)) as connection, connection:
             # These registrations are outside the requested Run. They need no
             # matching authority for the index access regression fixture.
-            connection.executemany('INSERT INTO sdk_executions VALUES(?,?,?,?,?,?,?)',
+            connection.executemany(
+                'INSERT INTO sdk_executions(execution_id,run_id,task_id,attempt,command,idempotency_key,active) '
+                'VALUES(?,?,?,?,?,?,?)',
                 [(f'other-{i}', 'other', f'task-{i}', 0, '{}', f'key-{i}', 1) for i in range(5000)])
         connection = _open_reader(str(self.path))
         try:

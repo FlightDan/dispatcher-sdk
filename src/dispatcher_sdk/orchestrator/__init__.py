@@ -5,7 +5,7 @@ from .contracts import canonical as canonical_json
 from .engine import Orchestrator
 from .host import OrchestratorHost, OrchestratorHostHealth
 from .operations import Operations
-from .recovery import RecoveryDetails
+from .recovery import RecoveryDetails, RecoveryRecord
 from .availability import WorkAvailabilityReport, WorkExecutionSummary, inspect_work_availability
 from .projection import (
     ProjectionConsumer, ProjectionSource, ProjectionDisposition, ProjectionStatus,
@@ -32,7 +32,7 @@ __all__ = [
     "CancellationRecoveryReport", "inspect_cancellation",
     "NotificationInbox", "InboxLease", "InboxRecord", "InboxState",
     "Orchestrator", "OrchestratorHost", "OrchestratorHostHealth", "OrchestrationError",
-    "RevisionConflict", "CommandConflict", "canonical_json", "Operations", "RecoveryDetails",
+    "RevisionConflict", "CommandConflict", "canonical_json", "Operations", "RecoveryDetails", "RecoveryRecord",
     "Operation", "AddTaskOperation", "SetDependenciesOperation", "DispatchOperation",
     "NewAttemptOperation", "CancelOperation", "WaitOperation", "SignalOperation",
     "ReleaseWaitOperation", "FinishOperation", "WatchTaskOperation", "AttemptSnapshot",

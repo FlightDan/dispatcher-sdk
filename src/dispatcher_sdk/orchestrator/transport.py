@@ -35,6 +35,7 @@ class TransportMixin:
                 continue
             records.append({"message_id": row["sequence"], "run_id": row["run_id"],
                             "command_id": row["command_id"], "execution_id": intent["execution_id"],
+                            "generation": int(intent.get("generation", 0)),
                             "kind": intent["kind"], "intent": intent,
                             "state": "delivered" if row["delivered"] else
                                 "failed" if row["last_error"] is not None else "pending",
@@ -93,12 +94,16 @@ class TransportMixin:
             raise OrchestrationError("limit must be positive")
         connection = self._connect()
         try:
+            blocked_runs = {row[0] for row in connection.execute(
+                "SELECT run_id FROM sdk_recoveries WHERE status IN ('preparing','prepared','committed')"
+            )}
             pending = connection.execute(
                 "SELECT sequence,run_id,payload FROM sdk_outbox WHERE delivered=0 "
                 "ORDER BY attempts,sequence").fetchall()
         finally:
             connection.close()
-        messages = [(row, json.loads(row["payload"])) for row in pending]
+        messages = [(row, json.loads(row["payload"])) for row in pending
+                    if row["run_id"] not in blocked_runs]
         cancellations = {intent["execution_id"] for _, intent in messages
                          if intent["kind"] == "cancel"}
         # A durable cancel supersedes an as-yet-undelivered dispatch for the
@@ -205,7 +210,8 @@ class TransportMixin:
             self._save(connection, state, changes={("attempt", item_key)})
             self._event(connection, state, "execution.observed", {
                 "task_id": row["task_id"], "attempt": row["attempt"],
-                "execution_id": execution_id, "snapshot": snapshot.to_dict()})
+                "execution_id": execution_id, "snapshot": snapshot.to_dict(),
+                "generation": int(current.get("generation", 0))})
         return snapshot
 
     def get_execution(self, execution_id: str) -> ExecutionSnapshot:

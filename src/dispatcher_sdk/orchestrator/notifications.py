@@ -22,7 +22,8 @@ class NotificationsMixin:
         execute_schema(connection, """
             CREATE TABLE IF NOT EXISTS sdk_watches (
                 run_id TEXT NOT NULL, watch_id TEXT NOT NULL, task_id TEXT NOT NULL,
-                execution_id TEXT NOT NULL, attempt INTEGER NOT NULL, target TEXT NOT NULL,
+                execution_id TEXT NOT NULL, attempt INTEGER NOT NULL, generation INTEGER NOT NULL DEFAULT 0,
+                target TEXT NOT NULL,
                 max_deliveries INTEGER NOT NULL, cursor INTEGER NOT NULL DEFAULT 0,
                 completed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(run_id,watch_id));
             CREATE TABLE IF NOT EXISTS sdk_notifications (
@@ -42,6 +43,10 @@ class NotificationsMixin:
         task = state['tasks'].get(op['task_id'])
         if task is None:
             raise OrchestrationError('unknown task')
+        attempt = task['attempts'][-1]
+        generation = int(attempt.get('generation', 0))
+        if generation != int(state.get('generation', 0)):
+            raise OrchestrationError('watch must bind the current Run generation')
         maximum = _integer(op.get('max_deliveries', 5), 'max_deliveries')
         target = canonical(op['target'])
         if op['target'] is None:
@@ -50,11 +55,11 @@ class NotificationsMixin:
                               (state['run_id'], op['watch_id'])).fetchone():
             raise CommandConflict('watch already exists; replay the original command')
         connection.execute(
-            'INSERT INTO sdk_watches(run_id,watch_id,task_id,execution_id,attempt,target,max_deliveries) '
-            'VALUES(?,?,?,?,?,?,?)',
+            'INSERT INTO sdk_watches(run_id,watch_id,task_id,execution_id,attempt,generation,target,max_deliveries) '
+            'VALUES(?,?,?,?,?,?,?,?)',
             (state['run_id'], op['watch_id'], op['task_id'],
-             task['attempts'][-1]['command']['execution_id'], len(task['attempts']) - 1,
-             target, maximum))
+             attempt['command']['execution_id'], len(task['attempts']) - 1,
+             generation, target, maximum))
 
     def collect_notifications(self, *, limit=100):
         """Read at most limit Kernel events per open watch; atomically queue/cursor.
@@ -98,6 +103,7 @@ class NotificationsMixin:
                         'notification_id': digest([watch['run_id'], watch['watch_id'], event.event_id]),
                         'run_id': watch['run_id'], 'task_id': watch['task_id'],
                         'attempt': watch['attempt'], 'execution_id': event.execution_id,
+                        'generation': watch['generation'],
                         'watch_id': watch['watch_id'], 'target': json.loads(watch['target']),
                         'kind': 'terminal' if terminal else 'recovery_required',
                         'state': event.to_state, 'event': event.to_dict(),
@@ -113,6 +119,7 @@ class NotificationsMixin:
                         'notification_id': digest([watch['run_id'], watch['watch_id'], 'planned_cancel']),
                         'run_id': watch['run_id'], 'task_id': watch['task_id'],
                         'attempt': watch['attempt'], 'execution_id': watch['execution_id'],
+                        'generation': watch['generation'],
                         'watch_id': watch['watch_id'], 'target': json.loads(watch['target']),
                         'kind': 'terminal', 'state': 'cancelled', 'event': None, 'result': None,
                         'reason': attempt['cancel_reason'],
@@ -137,6 +144,7 @@ class NotificationsMixin:
     def _notification_record(row):
         value = dict(row)
         value['payload'] = json.loads(value['payload'])
+        value['payload'].setdefault('generation', 0)
         value['last_error'] = json.loads(value['last_error']) if value['last_error'] else None
         return value
 

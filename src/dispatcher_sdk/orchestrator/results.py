@@ -83,7 +83,28 @@ class ResultsMixin:
             connection.close()
 
     @staticmethod
-    def _result_record(row):
+    def _result_generation(connection, execution_id):
+        """Derive the application generation when an Orchestrator is present.
+
+        ResultsMixin is also used by standalone delivery harnesses that do
+        not have the SDK execution-registration table; those records are
+        generation zero.
+        """
+        try:
+            row = connection.execute(
+                "SELECT generation FROM sdk_executions WHERE execution_id=?",
+                (execution_id,)).fetchone()
+        except sqlite3.OperationalError:
+            return 0
+        return 0 if row is None or row[0] is None else int(row[0])
+
+    @classmethod
+    def _result_record(cls, row, *, generation=None):
+        if generation is None:
+            try:
+                generation = int(row["generation"])
+            except (IndexError, KeyError, TypeError):
+                generation = 0
         return {
             "result_id": row["result_id"], "execution_id": row["execution_id"],
             "result": ExecutionResultV2.from_dict(json.loads(row["result_json"])),
@@ -94,6 +115,7 @@ class ResultsMixin:
             "next_attempt_at": row["next_attempt_at"],
             "last_error": None if row["last_error_json"] is None else
                 ExecutionError.from_dict(json.loads(row["last_error_json"])),
+            "generation": generation,
             "revision": row["revision"], "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -208,7 +230,8 @@ class ResultsMixin:
                 claims.append({"result": json.loads(row["result_json"]),
                                "kernel_revision": row["kernel_revision"], "lease_id": lease_id,
                                "owner": owner, "fence": row["fence"] + 1, "lease_until": expires,
-                               "attempts": row["attempts"] + 1})
+                               "attempts": row["attempts"] + 1,
+                               "generation": self._result_generation(connection, row["execution_id"])})
             return tuple(claims)
 
     def acknowledge_result(self, result_id: str, *, lease_id: str, fence: int) -> dict:
@@ -221,16 +244,19 @@ class ResultsMixin:
                 raise KeyError(result_id)
             same = row["lease_id"] == lease_id and row["fence"] == fence
             if same and row["state"] == "delivered":
-                return self._result_record(row)
+                return self._result_record(
+                    row, generation=self._result_generation(connection, row["execution_id"]))
             if not same or row["state"] != "delivering" or row["lease_expires_at"] <= now:
                 raise StaleFenceError("SDK result delivery lease is stale")
             connection.execute(
                 "UPDATE sdk_results SET state='delivered',lease_expires_at=NULL,revision=revision+1,"
                 "updated_at=? WHERE result_id=?", (now, result_id),
             )
-            return self._result_record(connection.execute(
+            current = connection.execute(
                 "SELECT * FROM sdk_results WHERE result_id=?", (result_id,),
-            ).fetchone())
+            ).fetchone()
+            return self._result_record(
+                current, generation=self._result_generation(connection, current["execution_id"]))
 
     def load_result_outbox(self, result_id: str) -> dict:
         _identity(result_id, "result_id")
@@ -239,7 +265,8 @@ class ResultsMixin:
             row = connection.execute("SELECT * FROM sdk_results WHERE result_id=?", (result_id,)).fetchone()
             if row is None:
                 raise KeyError(result_id)
-            return self._result_record(row)
+            return self._result_record(
+                row, generation=self._result_generation(connection, row["execution_id"]))
         finally:
             connection.close()
 
@@ -273,7 +300,8 @@ class ResultsMixin:
                 raise KeyError(result_id)
             if (row["state"] == "pending" and row["revision"] == expected_revision + 1
                     and row["attempts"] == 0 and row["last_error_json"] is None):
-                return self._result_record(row)
+                return self._result_record(
+                    row, generation=self._result_generation(connection, row["execution_id"]))
             if row["revision"] != expected_revision:
                 raise StaleFenceError("SDK result retry revision is stale")
             if row["state"] != "dead":
@@ -283,6 +311,8 @@ class ResultsMixin:
                 "attempts=0,next_attempt_at=?,last_error_json=NULL,revision=revision+1,updated_at=? WHERE result_id=?",
                 (now, now, result_id),
             )
-            return self._result_record(connection.execute(
+            current = connection.execute(
                 "SELECT * FROM sdk_results WHERE result_id=?", (result_id,),
-            ).fetchone())
+            ).fetchone()
+            return self._result_record(
+                current, generation=self._result_generation(connection, current["execution_id"]))

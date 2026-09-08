@@ -65,9 +65,20 @@ class RunHistoryMixin:
                                           (run_id,)).fetchone()
             following = connection.execute("SELECT next_run_id FROM sdk_run_links WHERE previous_run_id=?",
                                            (run_id,)).fetchone()
+            generation_row = connection.execute(
+                "SELECT value FROM sdk_run_items WHERE run_id=? AND section='root' AND item_key='generation'",
+                (run_id,)).fetchone()
+            recovery = connection.execute(
+                "SELECT recovery_id,status,target_generation FROM sdk_recoveries "
+                "WHERE run_id=? ORDER BY created_at DESC LIMIT 1",
+                (run_id,)).fetchone()
             count = connection.execute(
                 "SELECT COUNT(*) FROM sdk_run_items WHERE run_id=? AND section='task'", (run_id,)).fetchone()[0]
-            return {**dict(row), "task_count": count,
+            return {**dict(row), "generation": 0 if generation_row is None else json.loads(generation_row[0]),
+                    "recovery_id": recovery[0] if recovery else None,
+                    "recovery_status": recovery[1] if recovery else None,
+                    "recovery_target_generation": recovery[2] if recovery else None,
+                    "task_count": count,
                     "previous_run_id": previous[0] if previous else None,
                     "next_run_id": following[0] if following else None}
         finally:
@@ -147,7 +158,8 @@ class RunHistoryMixin:
             connection.close()
 
     def continue_run(self, run_id: str, next_run_id: str, *, command_id: str,
-                     expected_revision: int, input=None) -> dict:
+                     expected_revision: int, input=None,
+                     expected_generation: int | None = None) -> dict:
         """Create the next segment of a finished Run without copying its history.
 
         The application finishes the predecessor and supplies the next segment's
@@ -158,22 +170,37 @@ class RunHistoryMixin:
         identifier(next_run_id, "next_run_id")
         identifier(command_id, "command_id")
         integer(expected_revision, "expected_revision")
-        fingerprint = digest({"kind": "continue_run", "next_run_id": next_run_id,
-                              "expected_revision": expected_revision, "input": input})
+        if expected_generation is not None:
+            integer(expected_generation, "expected_generation")
+        request = {"kind": "continue_run", "next_run_id": next_run_id,
+                   "expected_revision": expected_revision, "input": input}
+        if expected_generation is not None:
+            request["expected_generation"] = expected_generation
+        fingerprint = digest(request)
         with self._transaction() as connection:
             replay = self._replay(connection, run_id, command_id, fingerprint)
             if replay is not None:
                 return replay
             previous = self._load(connection, run_id)
+            active_recovery = self._active_recovery(connection, run_id)
+            if active_recovery is not None:
+                raise OrchestrationError(
+                    f"Run recovery {active_recovery['recovery_id']} is still activating")
             if previous["revision"] != expected_revision:
                 raise RevisionConflict("run revision changed")
+            previous_generation = int(previous.get("generation", 0))
+            if previous_generation and expected_generation is None:
+                raise RevisionConflict("expected_generation is required after Run recovery")
+            if expected_generation is not None and expected_generation != previous_generation:
+                raise RevisionConflict("run generation changed")
             if previous["state"] not in RUN_TERMINAL:
                 raise OrchestrationError("finish the current Run before continuing it")
             if connection.execute("SELECT 1 FROM sdk_runs WHERE run_id=?", (next_run_id,)).fetchone():
                 raise CommandConflict("next Run identity already exists")
             if connection.execute("SELECT 1 FROM sdk_run_links WHERE previous_run_id=?", (run_id,)).fetchone():
                 raise CommandConflict("Run already has a continuation; replay the original command")
-            state = {"run_id": next_run_id, "revision": 0, "state": "running", "input": clone(input),
+            state = {"run_id": next_run_id, "revision": 0, "state": "running", "generation": 0,
+                     "input": clone(input),
                      "definition": clone(previous["definition"]), "application_state": None,
                      "tasks": {}, "waits": {}, "signals": {}}
             connection.execute("INSERT INTO sdk_runs VALUES(?,?,?)", (next_run_id, 0, "running"))

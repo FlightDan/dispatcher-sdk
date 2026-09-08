@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS sdk_events (
 CREATE INDEX IF NOT EXISTS sdk_events_run ON sdk_events(run_id,sequence);
 CREATE TABLE IF NOT EXISTS sdk_executions (
  execution_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, task_id TEXT NOT NULL,
- attempt INTEGER NOT NULL, command TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+ attempt INTEGER NOT NULL, generation INTEGER NOT NULL DEFAULT 0,
+ command TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
  active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
  UNIQUE(run_id,task_id,attempt));
 CREATE INDEX IF NOT EXISTS sdk_executions_active ON sdk_executions(active,execution_id);
@@ -50,6 +51,29 @@ CREATE INDEX IF NOT EXISTS sdk_outbox_delivery ON sdk_outbox(delivered,attempts,
 CREATE TABLE IF NOT EXISTS sdk_subscriptions (
  run_id TEXT NOT NULL, name TEXT NOT NULL, cursor INTEGER NOT NULL,
  PRIMARY KEY(run_id,name));
+CREATE TABLE IF NOT EXISTS sdk_recoveries (
+ recovery_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, command_id TEXT NOT NULL,
+ request_digest TEXT NOT NULL, source_generation INTEGER NOT NULL,
+ target_generation INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN (
+   'preparing','prepared','committed','activated','aborted','failed')),
+ actor TEXT NOT NULL, authorization_source TEXT NOT NULL, reason TEXT NOT NULL,
+ target_deployment TEXT NOT NULL, decision TEXT NOT NULL,
+ application_state TEXT, owner_id TEXT NOT NULL, owner_fence INTEGER NOT NULL,
+ lease_until REAL NOT NULL, waiters INTEGER NOT NULL DEFAULT 0,
+ manifest TEXT NOT NULL, error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+ committed_at REAL, activated_at REAL,
+ UNIQUE(run_id,command_id),
+ CHECK(source_generation >= 0 AND target_generation = source_generation + 1),
+ CHECK(length(trim(recovery_id)) > 0 AND length(trim(run_id)) > 0),
+ CHECK(length(trim(command_id)) > 0 AND length(trim(request_digest)) > 0),
+ CHECK(length(trim(actor)) > 0 AND length(trim(authorization_source)) > 0),
+ CHECK(length(trim(reason)) > 0 AND length(trim(target_deployment)) > 0),
+ CHECK(owner_fence >= 1 AND waiters >= 0));
+CREATE INDEX IF NOT EXISTS sdk_recoveries_run_status ON sdk_recoveries(run_id,status);
+CREATE TABLE IF NOT EXISTS sdk_recovery_waiters (
+ recovery_id TEXT NOT NULL, waiter_id TEXT NOT NULL, lease_until REAL NOT NULL,
+ PRIMARY KEY(recovery_id,waiter_id));
+CREATE INDEX IF NOT EXISTS sdk_recovery_waiters_expiry ON sdk_recovery_waiters(recovery_id,lease_until);
 """
 
 
@@ -149,7 +173,8 @@ class StoreMixin:
 
     @staticmethod
     def _inflate(run_id, revision, rows):
-        state = {"run_id": run_id, "revision": revision, "tasks": {}, "waits": {}, "signals": {}}
+        state = {"run_id": run_id, "revision": revision, "generation": 0,
+                 "tasks": {}, "waits": {}, "signals": {}}
         attempts = []
         for row in rows:
             section, key, value = row[0], row[1], json.loads(row[2])
@@ -168,6 +193,10 @@ class StoreMixin:
             task = state["tasks"].get(task_id)
             if task is None or index != len(task["attempts"]):
                 raise OrchestrationError("stored attempt history is incomplete")
+            # Historical attempts belong to the original generation unless
+            # they explicitly carry the field.  Never infer a new generation
+            # from the current Run view during a reopen.
+            value.setdefault("generation", 0)
             task["attempts"].append(value)
         return state
 
@@ -215,6 +244,9 @@ class StoreMixin:
 
     @staticmethod
     def _event(connection, state, kind, payload):
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            payload.setdefault("generation", int(state.get("generation", 0)))
         connection.execute(
             "INSERT INTO sdk_events(run_id,revision,kind,payload) VALUES(?,?,?,?)",
             (state["run_id"], state["revision"], kind, canonical(payload)))
@@ -266,9 +298,10 @@ class StoreMixin:
         for task_id, index, value in registrations:
             command = canonical(value["command"])
             execution_id = value["command"]["execution_id"]
-            expected = (state["run_id"], task_id, index, command)
+            generation = int(value.get("generation", state.get("generation", 0)))
+            expected = (state["run_id"], task_id, index, generation, command)
             existing = connection.execute(
-                "SELECT run_id,task_id,attempt,command FROM sdk_executions WHERE execution_id=?",
+                "SELECT run_id,task_id,attempt,generation,command FROM sdk_executions WHERE execution_id=?",
                 (execution_id,)).fetchone()
             if existing is not None:
                 if tuple(existing) != expected:
@@ -278,5 +311,6 @@ class StoreMixin:
                                   (value["command"]["idempotency_key"],)).fetchone():
                 raise CommandConflict("Kernel idempotency key is already bound to another execution")
             connection.execute(
-                "INSERT INTO sdk_executions(execution_id,run_id,task_id,attempt,command,idempotency_key) VALUES(?,?,?,?,?,?)",
+                "INSERT INTO sdk_executions(execution_id,run_id,task_id,attempt,generation,command,idempotency_key) "
+                "VALUES(?,?,?,?,?,?,?)",
                 (execution_id, *expected, value["command"]["idempotency_key"]))

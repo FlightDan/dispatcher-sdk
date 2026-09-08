@@ -155,6 +155,68 @@ callback. Execution, flush, sync and watch collection continue; notification
 delivery is disabled and queued notifications are preserved. Pass a callback
 when the host should deliver and acknowledge notifications.
 
+### Reopen a failed Run in place
+
+`inspect_reopen()` is a read-only check of the terminal Run, historical attempt
+settlement, SDK and Kernel delivery queues, active notification leases, and
+continuation links. Treat its result as a diagnostic observation: the commit
+path checks the same facts again.
+
+```python
+failed = sdk.get_run("example")
+preflight = sdk.inspect_reopen("example", expected_revision=failed["revision"])
+if not preflight["complete"]:
+    raise RuntimeError(preflight["blockers"])
+
+recovery = sdk.reopen_run(
+    "example",
+    command_id="repair-2026-09-08",
+    expected_revision=failed["revision"],
+    actor="operator@example.com",
+    authorization_source="incident-123",
+    reason="restart from the repaired contract stage",
+    target_deployment={"registry_revision": sdk.runtime.registry_revision},
+    decision={
+        "start_stage": "contract_repair_plan",
+        "reused_artifacts": ["diagnosis"],
+        "invalidated_artifacts": ["repair-plan"],
+    },
+    operations=[],
+)
+```
+
+The original `run_id`, history and command bindings remain intact. The Run is
+assigned the next `generation` only after the persisted recovery decision is
+committed. Pass `expected_generation` to `apply_operations`, `submit_task`,
+`continue_run`, and `acknowledge_events` after that point; omitting it is
+rejected. A `cancelled` Run additionally requires a separate authorization
+object, and a Run with an existing continuation or a successful terminal state
+cannot be reopened.
+
+New `add_task` and `new_attempt` commands must use fresh execution and
+idempotency identities. Their registry binding must match
+`target_deployment.registry_revision`; when `handler_revisions` is supplied,
+the command's handler binding is checked against that declaration. Old result,
+notification, inbox, and execution-delivery views retain their source
+generation so a late consumer cannot be mistaken for the reopened work.
+
+Recovery records are idempotent by `(run_id, command_id)` and can be queried or
+advanced after a caller crash:
+
+```python
+record = sdk.get_recovery(recovery["recovery_id"])
+record = sdk.advance_recovery(recovery["recovery_id"])
+```
+
+The host advances prepared or committed records before flushing new execution
+intents. `committed` is a durable point between the Run transaction and local
+activation; a later `advance_recovery()` safely completes it. With separate
+Orchestrator and Kernel databases, this is a recoverable SDK boundary rather
+than one transaction across both databases. Use
+`Orchestrator.upgrade_schema(path)` once on an existing declared Orchestrator
+schema 2 database before opening it with this version; the upgrade preserves
+Run history and is idempotent.
+
 ## Decisions, receipts and recovery
 
 Use `observe(run_id, subscription=...)` to read a snapshot, subscription cursor

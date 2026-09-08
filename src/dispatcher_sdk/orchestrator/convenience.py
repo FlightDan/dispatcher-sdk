@@ -13,9 +13,12 @@ from .types import RunSnapshot
 _UNSET = object()
 
 
-def _submission_ids(run_id: str, task_id: str, request_id: str) -> dict[str, str]:
-    identity = digest(["dispatcher-sdk.submit-task.v1", run_id, task_id, request_id])
-    return {kind: f"sdk-submit-v1:{kind}:{identity}"
+def _submission_ids(run_id: str, task_id: str, request_id: str, generation: int = 0) -> dict[str, str]:
+    identity = digest(["dispatcher-sdk.submit-task.v1", run_id, task_id, request_id]
+                      if generation == 0 else
+                      ["dispatcher-sdk.submit-task.v2", run_id, generation, task_id, request_id])
+    version = "v1" if generation == 0 else "v2"
+    return {kind: f"sdk-submit-{version}:{kind}:{identity}"
             for kind in ("execution", "idempotency", "watch", "command")}
 
 
@@ -26,6 +29,7 @@ class ConvenienceMixin:
         timeout_seconds: float, handler_contract_version: int = 1,
         dependencies: list[str] | None = None, watch_target: Any = _UNSET,
         dispatch: bool = True, retry_policy: RetryPolicy | None = None,
+        expected_generation: int | None = None,
     ) -> RunSnapshot:
         """Add a task, optionally watch it, and enqueue dispatch atomically.
 
@@ -37,10 +41,35 @@ class ConvenienceMixin:
         for label, value in (("run_id", run_id), ("task_id", task_id), ("request_id", request_id)):
             identifier(value, label)
         integer(expected_revision, "expected_revision")
+        if expected_generation is not None:
+            integer(expected_generation, "expected_generation")
         if type(dispatch) is not bool:
             raise OrchestrationError("dispatch must be a boolean")
         policy = RetryPolicy(max_attempts=1) if retry_policy is None else retry_policy
-        identities = _submission_ids(run_id, task_id, request_id)
+        # A generation-0 receipt remains replayable after a Run is reopened.
+        # Find that legacy identity before enforcing the new-generation CAS;
+        # a replay is resolved by apply_operations before it reads current Run
+        # state and cannot create another execution.
+        identities = _submission_ids(run_id, task_id, request_id, 0)
+        # A generation-0 command predates the recovery fence.  Treat an
+        # explicit ``expected_generation=0`` as the same legacy identity so a
+        # caller can safely add the new argument while replaying an old
+        # response after reopen.
+        receipt = (self.get_command_receipt(run_id, identities["command"])
+                   if expected_generation in (None, 0) else None)
+        replay_generation = None if receipt is not None else expected_generation
+        if receipt is None:
+            current_generation = int(self.get_run(run_id).get("generation", 0))
+            if current_generation and expected_generation is None:
+                raise OrchestrationError("expected_generation is required after Run recovery")
+            if expected_generation is not None and expected_generation != current_generation:
+                raise OrchestrationError("run generation changed")
+            identities = _submission_ids(run_id, task_id, request_id, current_generation)
+            receipt = self.get_command_receipt(run_id, identities["command"])
+            # Generation zero remains compatible with the pre-fence request
+            # digest, regardless of whether the caller supplied the optional
+            # zero explicitly.
+            replay_generation = None if current_generation == 0 else expected_generation
 
         def operations(receipt):
             fields = dict(
@@ -74,11 +103,10 @@ class ConvenienceMixin:
                 values.append(Operations.dispatch(task_id))
             return values
 
-        receipt = self.get_command_receipt(run_id, identities["command"])
         try:
             return self.apply_operations(
                 run_id, command_id=identities["command"], expected_revision=expected_revision,
-                operations=operations(receipt))
+                operations=operations(receipt), expected_generation=replay_generation)
         except CommandConflict:
             if receipt is not None:
                 raise
@@ -90,4 +118,4 @@ class ConvenienceMixin:
                 raise
             return self.apply_operations(
                 run_id, command_id=identities["command"], expected_revision=expected_revision,
-                operations=operations(committed))
+                operations=operations(committed), expected_generation=replay_generation)

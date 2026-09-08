@@ -16,6 +16,7 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 | `RuntimeHost`, `RuntimeHostHealth`, `RuntimeHostError` | Run workers and transport with a background host and inspect its health |
 | `ScriptSpec`, `script_handler`, `script_handlers` | Freeze inline scripts and register the process-only script handler |
 | `Orchestrator` | Explicit Run/task operations, atomic `submit_task`, paged reads, historical revisions, linked continuation, receipts and delivery |
+| `Orchestrator.reopen_run`, `inspect_reopen`, `get_recovery`, `advance_recovery`, `abort_recovery`, `renew_recovery`, `resume_recoveries`, `Orchestrator.upgrade_schema` | Same-Run terminal recovery with generation fencing, durable decision/activation progress, idempotent replay and explicit schema upgrade |
 | `NotificationInbox`, `InboxLease`, `InboxRecord`, `InboxState` | Durable application acceptance and fenced transactional processing |
 | `SandboxSpec`, `SandboxBackend`, `SandboxHandler`, `SandboxJournal`, `sandbox_handlers` | Frozen remote execution inputs, backend contract and persistent lifecycle recovery |
 | `inspect_storage`, `backup_database`, `export_database` (storage module) | Read-only deployment preflight, SQLite backup and SQL export |
@@ -26,6 +27,7 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 | `RunSnapshot`, `TaskSnapshot`, `AttemptSnapshot`, `WaitSnapshot`, `RunEvent`, `Observation` | Typed views of existing Run/event dictionaries |
 | `RunState`, `TerminalRunState`, `AttemptState` | Literal state names for static checking |
 | `RecoveryDetails` | Run/task identity plus authoritative execution and current effect from `inspect_recoveries(run_id)` |
+| `RecoveryRecord` | Typed durable same-Run recovery decision, generation, deployment, lease and progress view |
 | `runtime_identity`, `RuntimeIdentityReport` (package root or identity module) | Read-only package, source, storage and deployment compatibility observations |
 | `ProjectionConsumer`, `ProjectionDrainReport`, `ProjectionEventIdentity` | Persist-before-ACK event projection with bounded retries and fixed high-water draining |
 | `inspect_work_availability`, `WorkAvailabilityReport` | Read-only Run-scoped scheduling reasons; also available as an Orchestrator method |

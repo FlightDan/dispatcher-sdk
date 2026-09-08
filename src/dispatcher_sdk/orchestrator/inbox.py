@@ -271,6 +271,8 @@ class NotificationInbox:
         value = dict(row)
         value.pop("settlement")
         value["payload"] = json.loads(value["payload"])
+        if isinstance(value["payload"], dict):
+            value["payload"].setdefault("generation", 0)
         value["last_error"] = None if value["last_error"] is None else json.loads(value["last_error"])
         return cast(InboxRecord, value)
 

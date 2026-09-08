@@ -30,6 +30,9 @@ class _Transport:
         self.wake_notifications = wake_notifications
 
     def pump(self, *, limit=100):
+        resume = getattr(self.orchestrator, "resume_recoveries", None)
+        if callable(resume):
+            resume(limit=min(limit, 20))
         delivered = self.orchestrator.flush(limit=limit)
         self.orchestrator.sync()
         if self.orchestrator.collect_notifications(limit=limit):

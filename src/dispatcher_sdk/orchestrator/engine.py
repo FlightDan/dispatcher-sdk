@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 import time
 from typing import Any, Sequence, TypeVar, cast
 
@@ -11,7 +12,7 @@ from ..durability import Durability, validate_durability
 from .contracts import (RevisionConflict, OrchestrationError, canonical, clone,
                         digest, identifier, integer, validate_operation)
 from .reducer import reduce_operation
-from .store import SCHEMA, StoreMixin
+from .store import SCHEMA, StoreMixin, execute_schema
 from .transport import TransportMixin
 from .results import ResultsMixin
 from .notifications import NotificationsMixin
@@ -25,6 +26,13 @@ from .cancellation import CancellationRecoveryReport, inspect_cancellation
 
 _UNSET = object()
 _OperationInput = TypeVar("_OperationInput", bound=Operation | dict[str, Any])
+
+
+def _event_payload(raw: str):
+    payload = json.loads(raw)
+    if isinstance(payload, dict):
+        payload.setdefault("generation", 0)
+    return payload
 
 
 class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin, RecoveryMixin, RunHistoryMixin, ConvenienceMixin):
@@ -55,6 +63,79 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
         """Close a runtime created by open_sqlite; injected runtimes stay caller-owned."""
         if self._owns_runtime:
             self.runtime.close()
+
+    @classmethod
+    def upgrade_schema(cls, path, *, durability: Durability = "full") -> dict:
+        """Explicitly add recovery tables to an existing orchestrator v2 store.
+
+        The operation is idempotent and never recreates or rewrites Run history.
+        Older binaries continue to reject the upgraded store because the exact
+        schema now contains recovery coordination objects.
+        """
+        if str(path) == ":memory:":
+            raise OrchestrationError("schema upgrade requires a durable SQLite file")
+        from ..durability import configure_sqlite_connection
+        database = str(Path(path).resolve())
+        if not Path(database).exists():
+            raise OrchestrationError("cannot upgrade a missing orchestration database")
+        connection = sqlite3.connect(database, timeout=30)
+        try:
+            connection.row_factory = sqlite3.Row
+            configure_sqlite_connection(connection, database, durability=durability)
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                marker = connection.execute(
+                    "SELECT component,version FROM sdk_schema_meta").fetchall()
+            except sqlite3.DatabaseError as error:
+                raise OrchestrationError("database has no declared orchestrator schema") from error
+            if len(marker) != 1 or tuple(marker[0]) != ("orchestrator", 2):
+                raise OrchestrationError("only a declared orchestrator schema v2 can be upgraded")
+            execute_schema(connection, SCHEMA)
+            cls._init_notifications(connection)
+            executions = {row[1] for row in connection.execute("PRAGMA table_info(sdk_executions)")}
+            if executions and "generation" not in executions:
+                # Preserve every registration while upgrading the exact v2 DDL.
+                # The legacy active index follows the renamed table and is
+                # recreated after that table is dropped.
+                connection.execute("ALTER TABLE sdk_executions RENAME TO sdk_executions_legacy")
+                connection.execute(
+                    "CREATE TABLE sdk_executions (\n"
+                    " execution_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, task_id TEXT NOT NULL,\n"
+                    " attempt INTEGER NOT NULL, generation INTEGER NOT NULL DEFAULT 0,\n"
+                    " command TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,\n"
+                    " active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),\n"
+                    " UNIQUE(run_id,task_id,attempt))")
+                connection.execute(
+                    "INSERT INTO sdk_executions(execution_id,run_id,task_id,attempt,generation,command,"
+                    "idempotency_key,active) SELECT execution_id,run_id,task_id,attempt,0,command,"
+                    "idempotency_key,active FROM sdk_executions_legacy")
+                connection.execute("DROP TABLE sdk_executions_legacy")
+                connection.execute(
+                    "CREATE INDEX sdk_executions_active ON sdk_executions(active,execution_id)")
+            watches = {row[1] for row in connection.execute("PRAGMA table_info(sdk_watches)")}
+            if watches and "generation" not in watches:
+                # Rebuild instead of ALTER ADD: schema validation compares the
+                # declared DDL, including column order, after an upgrade.
+                connection.execute("ALTER TABLE sdk_watches RENAME TO sdk_watches_legacy")
+                connection.execute("""CREATE TABLE sdk_watches (
+                run_id TEXT NOT NULL, watch_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                execution_id TEXT NOT NULL, attempt INTEGER NOT NULL, generation INTEGER NOT NULL DEFAULT 0,
+                target TEXT NOT NULL,
+                max_deliveries INTEGER NOT NULL, cursor INTEGER NOT NULL DEFAULT 0,
+                completed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(run_id,watch_id))""")
+                connection.execute(
+                    "INSERT INTO sdk_watches(run_id,watch_id,task_id,execution_id,attempt,generation,target,"
+                    "max_deliveries,cursor,completed) SELECT run_id,watch_id,task_id,execution_id,attempt,0,target,"
+                    "max_deliveries,cursor,completed FROM sdk_watches_legacy")
+                connection.execute("DROP TABLE sdk_watches_legacy")
+            connection.commit()
+            return {"path": database, "from_schema": 2, "to_schema": 2,
+                    "recovery_tables": True, "run_history_preserved": True}
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     @classmethod
     def open_sqlite(cls, path, handlers, *, durability: Durability = "full",
@@ -101,6 +182,7 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             if connection.execute("SELECT 1 FROM sdk_runs WHERE run_id=?", (run_id,)).fetchone():
                 raise OrchestrationError("run already exists")
             state: RunSnapshot = {"run_id": run_id, "revision": 0, "state": "running",
+                     "generation": 0,
                      "input": clone(input), "definition": clone(definition),
                      "application_state": None, "tasks": {}, "waits": {}, "signals": {}}
             connection.execute("INSERT INTO sdk_runs VALUES(?,?,?)", (run_id, 0, "running"))
@@ -151,10 +233,13 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
     def apply_operations(self, run_id: str, *, command_id: str, expected_revision: int,
                          operations: list[_OperationInput],
                          application_state=_UNSET, subscription=None,
-                         expected_cursor=None, advance_to=None) -> RunSnapshot:
+                         expected_cursor=None, advance_to=None,
+                         expected_generation: int | None = None) -> RunSnapshot:
         identifier(run_id, "run_id")
         identifier(command_id, "command_id")
         integer(expected_revision, "expected_revision")
+        if expected_generation is not None:
+            integer(expected_generation, "expected_generation")
         if type(operations) is not list:
             raise OrchestrationError("operations must be a list")
         values = [validate_operation(value) for value in operations]
@@ -169,6 +254,8 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
                    "operations": values, "subscription": subscription,
                    "expected_cursor": expected_cursor, "advance_to": advance_to,
                    "has_application_state": application_state is not _UNSET}
+        if expected_generation is not None:
+            request["expected_generation"] = expected_generation
         if application_state is not _UNSET:
             request["application_state"] = clone(application_state)
         fingerprint = digest(request)
@@ -177,8 +264,17 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             if replay is not None:
                 return replay
             state = self._load(connection, run_id)
+            active_recovery = self._active_recovery(connection, run_id)
+            if active_recovery is not None:
+                raise OrchestrationError(
+                    f"Run recovery {active_recovery['recovery_id']} is still activating")
             if state["revision"] != expected_revision:
                 raise RevisionConflict("run revision changed")
+            generation = int(state.get("generation", 0))
+            if generation and expected_generation is None:
+                raise RevisionConflict("expected_generation is required after Run recovery")
+            if expected_generation is not None and expected_generation != generation:
+                raise RevisionConflict("run generation changed")
             if subscription is not None:
                 row = connection.execute(
                     "SELECT cursor FROM sdk_subscriptions WHERE run_id=? AND name=?",
@@ -210,6 +306,7 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
                         if op["kind"] in {"add_task", "set_dependencies"}:
                             changes.add(("task", task_id))
                         if op["kind"] in {"add_task", "new_attempt"}:
+                            task["attempts"][index]["generation"] = generation
                             registrations.append((task_id, index, task["attempts"][index]))
                     elif "wait_id" in op:
                         changes.add(("waits", op["wait_id"]))
@@ -219,6 +316,7 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
                 state["application_state"] = clone(application_state)
             self._register_executions(connection, state, registrations)
             for ordinal, intent in enumerate(intents):
+                intent["generation"] = generation
                 connection.execute(
                     "INSERT INTO sdk_outbox(run_id,command_id,ordinal,payload) VALUES(?,?,?,?)",
                     (run_id, command_id, ordinal, canonical(intent)))
@@ -239,12 +337,16 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             rows = connection.execute(
                 "SELECT * FROM sdk_events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?",
                 (run_id, after, limit)).fetchall()
-            return [cast(RunEvent, {**dict(row), "payload": json.loads(row["payload"])}) for row in rows]
+            values = []
+            for row in rows:
+                values.append(cast(RunEvent, {**dict(row), "payload": _event_payload(row["payload"])}))
+            return values
         finally:
             connection.close()
 
     def acknowledge_events(self, run_id: str, *, command_id: str, expected_revision: int,
-                           subscription: str, expected_cursor: int, advance_to: int) -> RunSnapshot:
+                           subscription: str, expected_cursor: int, advance_to: int,
+                           expected_generation: int | None = None) -> RunSnapshot:
         """Commit cursor-only progress without producing another event to consume.
 
         A read-only application decision still checks the observed Run revision
@@ -257,16 +359,30 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
         integer(expected_revision, "expected_revision")
         integer(expected_cursor, "expected_cursor")
         integer(advance_to, "advance_to")
-        fingerprint = digest({"kind": "acknowledge_events", "expected_revision": expected_revision,
-                              "subscription": subscription, "expected_cursor": expected_cursor,
-                              "advance_to": advance_to})
+        if expected_generation is not None:
+            integer(expected_generation, "expected_generation")
+        request = {"kind": "acknowledge_events", "expected_revision": expected_revision,
+                   "subscription": subscription, "expected_cursor": expected_cursor,
+                   "advance_to": advance_to}
+        if expected_generation is not None:
+            request["expected_generation"] = expected_generation
+        fingerprint = digest(request)
         with self._transaction() as connection:
             replay = self._replay(connection, run_id, command_id, fingerprint)
             if replay is not None:
                 return replay
             state = self._load(connection, run_id)
+            active_recovery = self._active_recovery(connection, run_id)
+            if active_recovery is not None:
+                raise OrchestrationError(
+                    f"Run recovery {active_recovery['recovery_id']} is still activating")
             if state["revision"] != expected_revision:
                 raise RevisionConflict("run revision changed")
+            generation = int(state.get("generation", 0))
+            if generation and expected_generation is None:
+                raise RevisionConflict("expected_generation is required after Run recovery")
+            if expected_generation is not None and expected_generation != generation:
+                raise RevisionConflict("run generation changed")
             row = connection.execute(
                 "SELECT cursor FROM sdk_subscriptions WHERE run_id=? AND name=?",
                 (run_id, subscription)).fetchone()
@@ -315,7 +431,8 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             last = connection.execute(
                 "SELECT COALESCE(MAX(sequence),0) FROM sdk_events WHERE run_id=?", (run_id,)).fetchone()[0]
             return {"snapshot": state, "cursor": cursor, "event_high_watermark": last,
-                    "events": [cast(RunEvent, {**dict(value), "payload": json.loads(value["payload"])})
+                    "events": [cast(RunEvent, {**dict(value),
+                                                "payload": _event_payload(value["payload"])})
                                for value in rows]}
         finally:
             connection.rollback()

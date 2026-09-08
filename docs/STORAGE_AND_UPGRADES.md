@@ -11,6 +11,27 @@ The notification inbox has its own schema version 1, recorded in
 including the version marker and clock row. Opening a partial, unversioned, or
 incompatible inbox fails without filling in missing tables.
 
+## Adding same-Run recovery to a schema 2 store
+
+An Orchestrator database created by an earlier schema 2 build needs an explicit
+upgrade before this version can open it:
+
+```python
+from dispatcher_sdk.orchestrator import Orchestrator
+
+Orchestrator.upgrade_schema("application.db")
+```
+
+The upgrade adds recovery coordination tables and generation columns. Existing
+execution and watch registrations are assigned generation 0. SQLite applies the
+upgrade in one transaction. Repeating it after a successful run makes no further
+changes, and Run history remains unchanged.
+
+`upgrade_schema()` accepts only a durable database with an Orchestrator schema 2
+marker. It does not convert an unversioned store, repair damaged tables, or
+upgrade the notification inbox. Back up the database and stop its writers before
+running a deployment upgrade.
+
 ## Moving from an older orchestration store
 
 1. Keep the old database, application deployment, handler implementations, and
@@ -25,9 +46,9 @@ incompatible inbox fails without filling in missing tables.
 
 A backup or SQL dump preserves the source layout; restoring it does not convert
 an old Orchestrator schema into schema 2. There is no built-in in-place migration
-or automatic replay of the old store into a new one. If Kernel and Orchestrator
-tables share one file, an unchanged Kernel schema does not make that file's old
-Orchestrator tables compatible with the new Orchestrator.
+for an unversioned store and no automatic replay into a new one. If Kernel and
+Orchestrator tables share one file, an unchanged Kernel schema does not make that
+file's old Orchestrator tables compatible with the new Orchestrator.
 
 ## Durability is configured on every writer
 
