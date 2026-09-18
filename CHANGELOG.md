@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.0.dev0 (in development)
+
+- `Dispatcher` is the primary managed application entry point: stable request
+  submission, startup binding checks, owned Host lifecycle and durable inbox.
+- Background result callbacks retry independently of execution; transactional
+  local SQL consumption hides notification leases and commits with its ACK.
+- Read-only operational diagnostics and reproducible multiprocess SQLite
+  contention measurements expose backlog, capacity and verification limits.
+- Explicit authenticated local snapshot activation retires participating source
+  writers before enabling a single successor. It is not cross-machine failover.
+- README quick starts use the managed API and document Orchestrator schema 3.
+  See [0.7 design, compatibility and validation](docs/DEV_0_7.md).
+
 ## 0.6.0 (developer preview, unreleased)
 
 - Structured shutdown reports preserve stop/error contracts and expose worker,

@@ -42,10 +42,10 @@ Dispatcher 是一个嵌入 Python 应用的 SDK。它在本地运行应用提交
 - Linux 进程模式通过 subreaper（用于回收子进程的机制）清理脱离原进程组的后代；其他 POSIX（类 Unix 系统标准）平台提供进程组清理。Windows 使用 Job Object（Windows 的进程容器）执行原生进程和脚本，已在 Windows 11 x64（build 10.0.26100.9168）、Python 3.12.10 上通过原生测试。验证范围与结果见 [Windows 运行时](docs/WINDOWS_RUNTIME.md)。线程模式不能强制停止阻塞处理器。
 - 恢复时必须使用原数据库和匹配的 handler（任务处理函数）部署。重开数据库不会重置重试次数，也不保证中断的任务一定自动重跑。
 - SDK 不能撤销已经发生的写入或 API 调用。结果不确定时必须先核对再恢复；不能保证任意操作只发生一次。
-- 结果和通知采用至少一次投递（同一消息可能到达多次）。应用需要按稳定的消息 ID 持久化去重。
+- `Dispatcher` 内置收件箱负责通知的持久化接收和去重。业务回调仍为至少一次调用；外部请求需要幂等键。本地业务 SQL 可用 `consume_results` 与消费标记一起提交。
 
-0.6 是开发者预览版，要求 Python 3.10+。Orchestrator（负责多步编排的组件）的
-持久化布局改为 schema 2（数据库结构版本 2），不会自动迁移旧版编排数据库。
+0.7 正在开发中，要求 Python 3.10+。当前 Orchestrator（负责多步编排的组件）的
+持久化布局为 schema 3（数据库结构版本 3），不会自动迁移旧版编排数据库。
 升级前请阅读[存储与升级](docs/STORAGE_AND_UPGRADES.md)和[兼容性说明](docs/PUBLIC_API.md)。
 可选的 OpenSandbox 适配器需要额外安装固定版本的 `opensandbox` 依赖，并连接独立的沙箱服务。
 
@@ -65,7 +65,51 @@ python -m pip install .
 也可以从 [GitHub Releases](https://github.com/FlightDan/dispatcher-sdk/releases) 下载 wheel 包，
 再用 `python -m pip install <wheel文件路径>` 安装。
 
-## 使用案例
+## 快速开始：一个托管任务
+
+`Dispatcher` 统一管理运行时、后台 Host、启动部署检查和通知收件箱。
+普通任务只需理解处理函数、任务和稳定请求 ID；复杂编排仍可使用下方的底层接口。
+
+```python
+from pathlib import Path
+import tempfile
+
+from dispatcher_sdk import Dispatcher
+
+
+def double(payload, context):
+    return payload * 2
+
+
+def main():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "tasks.sqlite3"
+        with Dispatcher(path, {"double": double}) as app:
+            task = app.submit("double", 21, request_id="message-42")
+            result = task.wait(timeout=10)
+            print(result["value"])
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```text
+42
+```
+
+实际应用应使用固定数据库路径；临时目录仅用于示例。重启后打开同一路径，
+通过 `app.task("message-42")` 取回任务。相同请求 ID 和内容会返回原任务；
+内容改变则报冲突。上下文运行期间仍需维持应用进程，默认使用进程隔离。
+
+后台接收结果时，向 `Dispatcher` 传入 `on_result=callback`。SDK 先可靠接收通知，
+再调用业务回调；回调失败只重试消费，不重跑任务。本地业务 SQL 可改用
+`app.consume_results(mutation)`，回调接收 `(connection, notification)`，业务 SQL
+与消费标记在一个事务中提交。外部 API 调用仍需业务幂等；执行成功也不代替业务验收。
+
+参见 [0.7 开发设计与迁移说明](docs/DEV_0_7.md)和[统一应用接口](docs/MANAGED_APPLICATION.md)。
+
+## 高级接入案例
 
 ### 1. 后台生成报告，完成后接续对话
 

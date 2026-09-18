@@ -6,7 +6,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-from .maintenance import storage_participant
+from .maintenance import _assert_not_retired, storage_participant
 
 
 class _ParticipatingConnection(sqlite3.Connection):
@@ -51,9 +51,11 @@ def connect(
         return sqlite3.connect(database, **options)
     if os.path.lexists(Path(database).resolve().parent / ".sdk-snapshot-readonly"):
         raise PermissionError("authenticated snapshot requires explicit activation; SDK writers are disabled")
+    _assert_not_retired(Path(database).expanduser().resolve(strict=False))
     participation = storage_participant(database)
     participation.__enter__()
     try:
+        _assert_not_retired(Path(database).expanduser().resolve(strict=False))
         connection = sqlite3.connect(database, factory=_ParticipatingConnection, **options)
         connection._participation = participation
         return connection

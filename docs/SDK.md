@@ -52,7 +52,10 @@ adds the pinned OpenSandbox SDK and requires a separately deployed service.
 - [Diagnostics and projections](SDK_DIAGNOSTICS_AND_PROJECTIONS.md): deployment identity, durable event consumption, work availability and cancellation reports.
 - [Cancellation evidence](CANCELLATION_EVIDENCE.md): optional journal configuration, cleanup evidence, backup and compatibility.
 - [Task submission](TASK_SUBMISSION.md): `submit_task()` atomically records task, watch and dispatch intent; `Runtime.command()` binds one handler.
-- [Storage and upgrades](STORAGE_AND_UPGRADES.md): schema 2 upgrade boundaries, FULL/NORMAL profiles, preflight, backup, paged reads and `continue_run()`.
+- [Managed application API](MANAGED_APPLICATION.md): unified lifecycle, task submission and durable result consumption.
+- [Storage and upgrades](STORAGE_AND_UPGRADES.md): schema 3 copy upgrades, FULL/NORMAL profiles, preflight, backup, paged reads and `continue_run()`.
+- [Local restore activation](LOCAL_RECOVERY.md): authenticated stopped-source handoff and recovery boundaries.
+- [SQLite operations](SQLITE_OPERATIONS.md): backlog diagnostics and multiprocess capacity measurements.
 - [Run storage validation](RUN_STORAGE_VALIDATION.md): incremental historical storage measurements; full snapshot calls still scale with segment size.
 - [Notification inbox](NOTIFICATION_INBOX.md): source-scoped deduplication, fenced leases and application SQL in the consume transaction.
 - [Sandbox runtime](SANDBOX_RUNTIME.md) and [adapter contract](SANDBOX_ADAPTERS.md): persisted remote lifecycle, collection and uncertain disposal recovery.

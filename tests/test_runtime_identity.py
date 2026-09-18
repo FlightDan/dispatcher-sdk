@@ -187,7 +187,7 @@ class RuntimeIdentityTests(unittest.TestCase):
         with patch("dispatcher_sdk.identity.metadata.distribution", return_value=Distribution()):
             result = runtime_identity()
         self.assertEqual(result.module.distribution_version, "0.5.1")
-        self.assertEqual(result.module.source_version, "0.6.0")
+        self.assertEqual(result.module.source_version, "0.7.0.dev0")
         self.assertEqual(result.module.version_agreement, "mismatch")
         self.assertEqual(len(result.module.source_sha256), 64)
         self.assertEqual(result.module.distribution_record, "unknown")

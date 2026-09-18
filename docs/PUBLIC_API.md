@@ -1,6 +1,8 @@
 # Public API and compatibility
 
-Import execution and orchestration APIs from `dispatcher_sdk.execution_kernel`
+Start with `Dispatcher` and `Task` from `dispatcher_sdk` for managed local tasks.
+See [the application API](MANAGED_APPLICATION.md) and [0.7 migration](DEV_0_7.md).
+Import advanced execution and orchestration APIs from `dispatcher_sdk.execution_kernel`
 or `dispatcher_sdk.orchestrator`. Storage utilities live in
 `dispatcher_sdk.storage`, durability helpers in `dispatcher_sdk.durability`, and
 the optional OpenSandbox adapter in `dispatcher_sdk.adapters`. The package root
@@ -9,6 +11,11 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 
 | Entry point | Use |
 | --- | --- |
+| `Dispatcher`, `Task` (package root) | Managed lifecycle, replay-safe submission, built-in inbox and result consumption |
+| `DeploymentMismatchError`, `RecoveryRequiredError` (package root) | Structured startup and effect-recovery boundaries |
+| `SubmissionConflictError` (package root) | Stable submission identity reused with different content |
+| `inspect_diagnostics` (diagnostics module) | Read-only backlog, recovery and file-size observations |
+| `activate_restored_snapshot`, `ActivationResult` (storage_activation module) | Explicit same-host, source-retiring restore activation |
 | `Kernel.open_sqlite` | Open SQLite persistence and a handler runtime |
 | `Runtime`, `InProcessRuntime`, `SQLiteKernel`, `ExecutionKernel` | Runtime and persistence interfaces for integrations |
 | `ExecutionCommandV2`, `ExecutionResultV2`, `ExecutionSnapshot`, `ExecutionLease`, `ExecutionError`, `RetryPolicy`, `EffectRecord`, `Event`, `ResultOutboxStatusV2` | Validated execution, effect, event and delivery records |

@@ -47,10 +47,10 @@ Integration boundaries:
 - Linux process mode uses subreaper cleanup for detached descendants; other POSIX platforms use process-group cleanup. Native Windows process and script execution uses Job Objects and has passed native tests on Windows 11 x64 (build 10.0.26100.9168) with Python 3.12.10. See [Windows runtime](docs/WINDOWS_RUNTIME.md) for scope and results. Thread mode cannot forcibly stop a blocked handler.
 - Resume with the original database and matching handler deployment. Reopening the database does not reset retry budgets or guarantee that interrupted tasks will automatically rerun.
 - The SDK cannot undo a write or API call that has already happened. Uncertain outcomes require verification before recovery; arbitrary operations are not guaranteed to happen exactly once.
-- Results and notifications are delivered at least once. The application must deduplicate durably using stable message IDs.
+- `Dispatcher` durably accepts and deduplicates notifications in its built-in inbox. User callbacks remain at-least-once; external calls need idempotency. Use `consume_results` for atomic local SQL and receipt settlement.
 
-Version 0.6 is a developer preview requiring Python 3.10+. It changes the
-Orchestrator storage layout to schema 2 and does not automatically migrate older
+Version 0.7 is under development and requires Python 3.10+. The current
+Orchestrator storage layout is schema 3 and does not automatically migrate older
 Orchestrator databases. Read [storage and upgrades](docs/STORAGE_AND_UPGRADES.md)
 and the [compatibility guide](docs/PUBLIC_API.md) before upgrading.
 
@@ -71,7 +71,57 @@ You can also download a wheel from
 [GitHub Releases](https://github.com/FlightDan/dispatcher-sdk/releases)
 and install it with `python -m pip install <path-to-wheel>`.
 
-## Examples
+## Quick start: one managed task
+
+`Dispatcher` owns the runtime, background host, startup deployment checks and
+notification inbox. Start with handlers, tasks and stable request IDs. Advanced
+workflows can still use the Kernel and Orchestrator APIs below.
+
+```python
+from pathlib import Path
+import tempfile
+
+from dispatcher_sdk import Dispatcher
+
+
+def double(payload, context):
+    return payload * 2
+
+
+def main():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "tasks.sqlite3"
+        with Dispatcher(path, {"double": double}) as app:
+            task = app.submit("double", 21, request_id="message-42")
+            result = task.wait(timeout=10)
+            print(result["value"])
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```text
+42
+```
+
+Use a persistent database path in your application; the temporary directory is
+only for this demo. Reopen the same path and call `app.task("message-42")` to
+recover the handle. Repeating the same submission and request ID returns the
+original task; changing its content raises a conflict. Keep the application
+process alive while the context is running. The default is process isolation.
+
+For background results, pass `on_result=callback` to `Dispatcher`. Notifications
+are durably accepted before callback processing, and callback failures retry
+without rerunning the task. For local application SQL, use
+`app.consume_results(mutation)` instead: its `(connection, notification)` callback
+commits SQL and the consumed marker together. Neither API promises exactly-once
+external API calls. Execution success does not decide business acceptance.
+
+See the [0.7 design and migration notes](docs/DEV_0_7.md) and
+[managed application API](docs/MANAGED_APPLICATION.md).
+
+## Advanced integration examples
 
 ### 1. Generate a report in the background, then continue a conversation
 

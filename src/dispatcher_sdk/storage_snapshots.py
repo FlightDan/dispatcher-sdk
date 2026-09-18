@@ -4,7 +4,8 @@ The descriptor is an explicit ownership declaration, not resource discovery.
 Snapshotting obtains maintenance exclusion for every registered SQLite member,
 but it does not prove business terminal state or quiesce resources which were
 not registered.  Snapshot and restored directories carry
-``.sdk-snapshot-readonly``; there is intentionally no activation API yet.
+``.sdk-snapshot-readonly``.  Local activation copies a completed restore to a
+separately fenced destination; it never makes the authenticated artifact writable.
 """
 
 from __future__ import annotations
@@ -90,6 +91,7 @@ class VerifiedSnapshot:
     manifest_path: Path
     group_id: str
     components: Mapping[str, Path]
+    source_components: Mapping[str, Path]
     blobs: Mapping[str, Path]
     manifest: Mapping[str, Any]
     requires_explicit_activation: bool = True
@@ -97,7 +99,7 @@ class VerifiedSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class RestoreResult:
-    """A verified restored copy which remains blocked from writer activation."""
+    """A verified restored copy which remains permanently read-only."""
 
     path: Path
     manifest_path: Path
@@ -434,9 +436,48 @@ def _sqlite_details(path: Path) -> dict[str, Any]:
             "schema_sha256": schema_digest,
             "schema_markers": markers,
             "sequence_highwater": highwater,
+            "logical_sha256": _sqlite_logical_digest(connection, schema_rows),
         }
     finally:
         connection.close()
+
+
+def _sqlite_logical_digest(
+    connection: sqlite3.Connection, schema_rows: list[tuple[Any, ...]] | None = None
+) -> str:
+    """Hash schema and typed table contents independently of SQLite page layout."""
+    if schema_rows is None:
+        schema_rows = connection.execute(
+            "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_schema ORDER BY type,name"
+        ).fetchall()
+    logical_pragmas = {
+        name: int(connection.execute(f"PRAGMA {name}").fetchone()[0])
+        for name in ("application_id", "user_version")
+    }
+    digest = hashlib.sha256(
+        _canonical({"schema": schema_rows, "pragmas": logical_pragmas})
+    )
+    tables = sorted(
+        row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    )
+    for table in tables:
+        row_digests: list[str] = []
+        for row in connection.execute(f"SELECT * FROM {_quote_identifier(table)}"):
+            encoded = [_json_scalar(value) for value in row]
+            row_digests.append(hashlib.sha256(_canonical({"row": encoded})).hexdigest())
+        digest.update(_canonical({"table": table, "rows": sorted(row_digests)}))
+    sequence = connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='sqlite_sequence'"
+    ).fetchone()
+    if sequence is not None:
+        rows = sorted(
+            (_json_scalar(name), _json_scalar(value))
+            for name, value in connection.execute("SELECT name,seq FROM sqlite_sequence")
+        )
+        digest.update(_canonical({"table": "sqlite_sequence", "rows": rows}))
+    return digest.hexdigest()
 
 
 def _json_scalar(value: Any) -> Any:
@@ -650,7 +691,13 @@ def snapshot_store_group(
                 "activation": {
                     "requires_explicit_activation": True,
                     "marker": _READ_ONLY_MARKER,
+                    # The artifact itself is never made writable.  Activation
+                    # is a fenced copy into a fresh successor directory.
                     "activation_api_available": False,
+                    "copy_activation_api_available": True,
+                    "source_components": {
+                        name: str(path) for name, path in sorted(group.components.items())
+                    },
                 },
                 "consistency": {
                     "storage_maintenance_exclusion": True,
@@ -803,7 +850,16 @@ def verify_snapshot(
                     del connection
             if check != ["ok"]:
                 raise SnapshotValidationError(f"snapshot SQLite member failed quick_check: {name}")
-            if member.get("sqlite") != _sqlite_details(member_path):
+            expected_details = member.get("sqlite")
+            actual_details = _sqlite_details(member_path)
+            # Format v1 snapshots created before local activation did not
+            # carry the full logical-content digest.  They remain verifiable
+            # and restorable, but activation separately refuses them because
+            # it cannot prove that their original source is unchanged.
+            if isinstance(expected_details, dict) and "logical_sha256" not in expected_details:
+                actual_details = dict(actual_details)
+                actual_details.pop("logical_sha256", None)
+            if expected_details != actual_details:
                 raise SnapshotValidationError(f"snapshot SQLite metadata mismatch: {name}")
             component_paths[name] = member_path
         elif kind == "blob":
@@ -849,6 +905,20 @@ def verify_snapshot(
         or _READ_ONLY_MARKER not in declared_paths
     ):
         raise SnapshotValidationError("snapshot activation gate is invalid")
+    raw_sources = activation.get("source_components")
+    source_components: dict[str, Path] = {}
+    if raw_sources is not None:
+        if activation.get("copy_activation_api_available") is not True:
+            raise SnapshotValidationError("snapshot copy activation capability is invalid")
+        if not isinstance(raw_sources, dict) or set(raw_sources) != set(component_paths):
+            raise SnapshotValidationError("snapshot source component binding is invalid")
+        for name, raw_path in raw_sources.items():
+            if not isinstance(raw_path, str) or not raw_path or not Path(raw_path).is_absolute():
+                raise SnapshotValidationError("snapshot source component path is invalid")
+            path = Path(os.path.abspath(raw_path))
+            if ".." in Path(raw_path).parts:
+                raise SnapshotValidationError("snapshot source component path is unsafe")
+            source_components[name] = path
     marker_member = next(
         (member for member in members if member.get("kind") == "activation-marker"), None
     )
@@ -863,6 +933,7 @@ def verify_snapshot(
         manifest_path=manifest_path,
         group_id=group["id"],
         components=MappingProxyType(component_paths),
+        source_components=MappingProxyType(source_components),
         blobs=MappingProxyType(blob_paths),
         manifest=MappingProxyType(manifest),
     )

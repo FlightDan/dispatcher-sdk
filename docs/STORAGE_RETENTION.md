@@ -173,9 +173,11 @@ Snapshot and restored component files sit beside `.sdk-snapshot-readonly`.
 SDK write connections and maintenance leases reject such artifacts, including
 a dangling marker symlink; read-only inspection remains
 available. Restore only targets a new directory, never overwrites an existing
-store, and does not activate execution. There is no activation API yet. Do not
-remove this marker as a substitute for resolving source ownership and recovery
-requirements.
+store, and does not activate execution. Version 0.7 adds a separate
+`activate_restored_snapshot` API that publishes a new writable successor only
+after authenticated source binding, deployment checks and source retirement.
+See [local recovery](LOCAL_RECOVERY.md) for its conservative same-host scope.
+Do not remove the read-only marker manually.
 
 The descriptor is a caller-declared closed set, not an automatically discovered
 cross-Run provenance graph. Files not registered in it are not covered.

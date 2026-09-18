@@ -23,13 +23,15 @@ jobs:
       - name: Install candidate and build tools
         run: python -m pip install . build wheel "setuptools>=68" mypy
       - name: Check typed SDK consumer compatibility
-        run: python -m mypy --python-version 3.10 --follow-imports=silent --warn-unused-ignores tests/typing/orchestrator_consumer.py tests/typing/capability_consumer.py tests/typing/reliability_consumer.py
+        run: python -m mypy --python-version 3.10 --follow-imports=silent --warn-unused-ignores tests/typing/orchestrator_consumer.py tests/typing/capability_consumer.py tests/typing/reliability_consumer.py tests/typing/application_consumer.py
       - name: Run SDK tests, source rebuild and isolated wheel consumers
         run: python -m unittest discover -s tests -v
       - name: Check documentation and README examples
         run: python scripts/check_docs.py
       - name: Run portable examples
         run: |
+          python examples/managed_task.py
+          python examples/local_restore.py
           python examples/kernel_task.py
           python examples/capability_diagnostics.py
           python examples/projection_consumer.py

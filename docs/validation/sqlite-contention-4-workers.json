@@ -1,0 +1,123 @@
+{
+  "busy_errors": 0,
+  "capacity_limit_exercise": {
+    "commit_after_capacity_returned": true,
+    "initial_page_limit": 23,
+    "mechanism": "SQLite max_page_count",
+    "ok": true,
+    "rejected_error": "OperationalError: database or disk is full",
+    "rejected_execution_absent": true,
+    "simulates_power_loss": false,
+    "simulates_real_disk_full": false,
+    "transaction_rejected": true
+  },
+  "correctness": {
+    "duplicate_execution_ids": 0,
+    "execution_count": 100,
+    "execution_states": {
+      "succeeded": 100
+    },
+    "missing_execution_ids": [],
+    "ok": true,
+    "outbox_delivered": 100,
+    "outbox_states": {
+      "delivered": 100
+    },
+    "public_get_succeeded": 100,
+    "succeeded": 100,
+    "worker_counts": {
+      "completed": 100,
+      "outbox_acked": 100,
+      "submitted": 100
+    }
+  },
+  "elapsed_seconds": 4.890027295004984,
+  "environment": {
+    "cpu_count": 12,
+    "database": "/tmp/dispatcher-sqlite-contention-4fac5gdb/contention.sqlite3",
+    "durability": "full",
+    "implementation_sha256": "fd33ea31e310b3eca3531030910549581cf0d5b3a578006dfbbaadbb1a04a479",
+    "items_per_worker": 25,
+    "multiprocessing_start_method": "spawn",
+    "payload_bytes": 256,
+    "platform": "Linux-6.8.0-139-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "sqlite": "3.45.1",
+    "workers": 4
+  },
+  "format_version": 1,
+  "latency_is_direct_lock_wait": false,
+  "operation_latency_under_contention": {
+    "claim": {
+      "busy_errors": 0,
+      "calls": 104,
+      "empty_polls": 4,
+      "max_ms": 1940.2848960016854,
+      "other_errors": 0,
+      "p50_ms": 4.905925998173188,
+      "p95_ms": 16.15345499885734,
+      "p99_ms": 1835.7838790034293,
+      "successful_calls": 100
+    },
+    "complete": {
+      "busy_errors": 0,
+      "calls": 100,
+      "empty_polls": 0,
+      "max_ms": 235.02923900377937,
+      "other_errors": 0,
+      "p50_ms": 5.334219000360463,
+      "p95_ms": 13.460196001688018,
+      "p99_ms": 59.63809600507375,
+      "successful_calls": 100
+    },
+    "outbox_ack": {
+      "busy_errors": 0,
+      "calls": 100,
+      "empty_polls": 0,
+      "max_ms": 22.645356999419164,
+      "other_errors": 0,
+      "p50_ms": 4.805927994311787,
+      "p95_ms": 5.907710001338273,
+      "p99_ms": 12.57560900558019,
+      "successful_calls": 100
+    },
+    "outbox_claim": {
+      "busy_errors": 0,
+      "calls": 104,
+      "empty_polls": 4,
+      "max_ms": 1235.379876998195,
+      "other_errors": 0,
+      "p50_ms": 4.879626001638826,
+      "p95_ms": 8.40347199846292,
+      "p99_ms": 1135.5473900039215,
+      "successful_calls": 100
+    },
+    "start": {
+      "busy_errors": 0,
+      "calls": 100,
+      "empty_polls": 0,
+      "max_ms": 38.62981400015997,
+      "other_errors": 0,
+      "p50_ms": 4.848627002502326,
+      "p95_ms": 12.048816999595147,
+      "p99_ms": 37.97462499642279,
+      "successful_calls": 100
+    },
+    "submit": {
+      "busy_errors": 0,
+      "calls": 100,
+      "empty_polls": 0,
+      "max_ms": 1246.2323169966112,
+      "other_errors": 0,
+      "p50_ms": 12.243814002431463,
+      "p95_ms": 16.34925299731549,
+      "p99_ms": 845.1375939985155,
+      "successful_calls": 100
+    }
+  },
+  "throughput": {
+    "executions_per_second": 20.44978360389665,
+    "successful_sdk_mutations_per_second": 122.69870162337989
+  },
+  "worker_errors": []
+}

@@ -30,6 +30,7 @@ _FORMAT_VERSION = 1
 _LOCK_SUFFIX = ".sdk-lock"
 _LOCK_ANCHOR_SUFFIX = ".sdk-lock-anchor"
 _METADATA_SUFFIX = ".sdk-maintenance.json"
+_RETIRED_SUFFIX = ".sdk-retired.json"
 _SNAPSHOT_READ_ONLY_MARKER = ".sdk-snapshot-readonly"
 _MAX_METADATA_BYTES = 64 * 1024
 _RETRY_INTERVAL_SECONDS = 0.01
@@ -53,6 +54,10 @@ class MaintenanceMetadataError(MaintenanceError):
 
 class SnapshotReadOnlyError(MaintenanceError):
     """A snapshot or restored artifact has not been explicitly activated."""
+
+
+class StorageRetiredError(MaintenanceError):
+    """The local store was durably fenced in favor of a restored successor."""
 
 
 class UnsupportedLockingError(MaintenanceError):
@@ -626,6 +631,46 @@ def _assert_not_snapshot_artifact(database: Path) -> None:
     )
 
 
+def _retirement_path(database: Path) -> Path:
+    return database.with_name(database.name + _RETIRED_SUFFIX)
+
+
+def _assert_not_retired(database: Path) -> None:
+    marker = _retirement_path(database)
+    try:
+        result = marker.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise StorageRetiredError(f"cannot verify storage retirement marker: {marker}") from error
+    if stat.S_ISLNK(result.st_mode) or not stat.S_ISREG(result.st_mode):
+        raise StorageRetiredError(f"storage retirement marker is unsafe: {marker}")
+    raise StorageRetiredError(
+        "storage was retired by local snapshot activation and cannot be reopened"
+    )
+
+
+def _assert_retirement_allows(database: Path, operation_id: str | None) -> None:
+    if operation_id is None:
+        _assert_not_retired(database)
+        return
+    marker = _retirement_path(database)
+    try:
+        raw = _read_bytes_no_follow(marker)
+    except MaintenanceMetadataError as error:
+        raise StorageRetiredError(f"storage retirement marker is unsafe: {marker}") from error
+    if raw is None:
+        return
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StorageRetiredError(f"storage retirement marker is invalid: {marker}") from error
+    if not isinstance(document, dict) or document.get("operation_id") != operation_id:
+        raise StorageRetiredError(
+            "storage was retired by a different local snapshot activation"
+        )
+
+
 @contextmanager
 def storage_participant(
     database_path: str | os.PathLike[str],
@@ -644,6 +689,7 @@ def storage_participant(
         lease.check(database)
         yield
         return
+    _assert_not_retired(database)
     wait = _timeout_seconds(timeout)
     descriptor = _open_lock_file(lock_path)
     acquired = False
@@ -651,6 +697,7 @@ def storage_participant(
         _acquire(descriptor, exclusive=False, timeout=wait, path=lock_path)
         acquired = True
         _validate_lock_descriptor(descriptor, lock_path)
+        _assert_not_retired(database)
         yield
     finally:
         try:
@@ -701,6 +748,7 @@ def maintenance_lease(
     purpose: str,
     lease_seconds: float = 30,
     timeout: float = 0,
+    _retired_operation_id: str | None = None,
 ) -> Iterator[Lease]:
     """Acquire an exclusive, fenced maintenance lease for an existing database."""
     if not isinstance(owner_id, str) or not owner_id.strip():
@@ -711,12 +759,14 @@ def maintenance_lease(
     wait = _timeout_seconds(timeout)
     database, lock_path, metadata_path = _coordination_paths(database_path)
     _assert_not_snapshot_artifact(database)
+    _assert_retirement_allows(database, _retired_operation_id)
     _existing_database(database)
     descriptor = _open_lock_file(lock_path)
     try:
         _acquire(descriptor, exclusive=True, timeout=wait, path=lock_path)
         _validate_lock_descriptor(descriptor, lock_path)
         _assert_not_snapshot_artifact(database)
+        _assert_retirement_allows(database, _retired_operation_id)
     except BaseException:
         os.close(descriptor)
         raise
@@ -790,6 +840,7 @@ __all__ = [
     "MaintenanceInspection",
     "MaintenanceMetadataError",
     "SnapshotReadOnlyError",
+    "StorageRetiredError",
     "UnsupportedLockingError",
     "inspect_maintenance",
     "maintenance_lease",

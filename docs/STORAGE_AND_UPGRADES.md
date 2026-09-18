@@ -42,7 +42,7 @@ upgrade the notification inbox. This helper deliberately leaves the source at
 schema 2; it does not enable the schema 3 reader. Back up the database and stop
 its writers before running it, then use `upgrade_storage` to publish a new file.
 
-## Moving from an older orchestration store
+## Moving from an older unversioned orchestration store
 
 1. Keep the old database, application deployment, handler implementations, and
    runtime dependencies available. Stop routing new work to that deployment.
@@ -55,7 +55,7 @@ its writers before running it, then use `upgrade_storage` to publish a new file.
    input or state that the application explicitly chooses to carry forward.
 
 A backup or SQL dump preserves the source layout; restoring it does not convert
-an old Orchestrator schema into schema 2. There is no built-in in-place migration
+an old Orchestrator schema into schema 3. There is no built-in in-place migration
 for an unversioned store and no automatic replay into a new one. If Kernel and
 Orchestrator tables share one file, an unchanged Kernel schema does not make that
 file's old Orchestrator tables compatible with the new Orchestrator.
@@ -128,6 +128,11 @@ bindings. Keep a matching old deployment available to drain or recover those
 commands. Do not rewrite persisted revisions to bypass a mismatch.
 
 ## Backups and SQL exports
+
+For an authenticated snapshot and explicit recovery into a writable successor,
+see [local restore activation](LOCAL_RECOVERY.md). The local handoff requires
+stopped, unchanged source databases and participating 0.7 writers; it does not
+authorize running an arbitrary historical backup after losing its source host.
 
 `backup_database(source, destination)` uses SQLite's online backup API, so its
 single-database snapshot includes committed WAL data. It checks the backup's
