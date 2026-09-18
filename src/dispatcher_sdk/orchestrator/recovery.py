@@ -16,6 +16,7 @@ from ..execution_kernel import EffectRecord, ExecutionKernel, ExecutionNotFoundE
 from ..execution_kernel._sandbox_registry import journal_paths
 from ..execution_kernel.sandbox import validate_sandbox_schema
 from ..storage import _read_only
+from ..content import decode_value, encode_value
 from .contracts import (CommandConflict, OrchestrationError, RevisionConflict,
                         TERMINAL, canonical, clone, digest,
                         identifier, integer, validate_operation)
@@ -64,11 +65,11 @@ def _json(value, name):
         raise OrchestrationError(f"{name} must be strict JSON") from error
 
 
-def _record(row, *, waiters=None):
+def _record(connection, row, *, waiters=None):
     value = dict(row)
     for field in ("target_deployment", "decision", "manifest", "application_state", "error"):
         if value.get(field) is not None:
-            value[field] = json.loads(value[field])
+            value[field] = decode_value(connection, value[field])
     if waiters is not None:
         value["waiters"] = waiters
     manifest = value.get("manifest")
@@ -137,7 +138,7 @@ class RecoveryMixin:
         connection = self._connect()
         try:
             row = self._recovery_row(connection, recovery_id)
-            return _record(row, waiters=self._recovery_waiters(connection, recovery_id, _now(self)))
+            return _record(connection, row, waiters=self._recovery_waiters(connection, recovery_id, _now(self)))
         finally:
             connection.close()
 
@@ -523,7 +524,7 @@ class RecoveryMixin:
         with self._transaction() as connection:
             replay = self._check_reopen_identity(connection, run_id, command_id, request_digest)
             if replay is not None:
-                record = _record(replay, waiters=self._recovery_waiters(connection, replay["recovery_id"], now))
+                record = _record(connection, replay, waiters=self._recovery_waiters(connection, replay["recovery_id"], now))
                 if record["status"] in _RECOVERY_ACTIVE and owner_id != record["owner_id"]:
                     self._register_recovery_waiter(connection, record["recovery_id"], owner_id,
                                                     now + float(lease_seconds))
@@ -578,9 +579,9 @@ class RecoveryMixin:
                         "INSERT INTO sdk_recoveries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (recovery_id, run_id, command_id, request_digest, generation, generation + 1,
                          "preparing", actor, authorization_source, reason, deployment_json,
-                         _json(decision, "decision"),
-                         None if application_state is _UNSET else _json(application_state, "application_state"),
-                         owner_id, prior + 1, now + float(lease_seconds), 0, _json(manifest, "manifest"),
+                         encode_value(connection, decision),
+                         None if application_state is _UNSET else encode_value(connection, application_state),
+                         owner_id, prior + 1, now + float(lease_seconds), 0, encode_value(connection, manifest),
                          None, now, now, None, None))
                     connection.execute("UPDATE sdk_recoveries SET status='prepared',updated_at=? WHERE recovery_id=?",
                                        (now, recovery_id))
@@ -601,13 +602,14 @@ class RecoveryMixin:
         if row["owner_id"] != owner_id or row["lease_until"] <= now:
             raise OrchestrationError("recovery owner lease is stale")
         if row["status"] == "activated":
-            return _record(row, waiters=self._recovery_waiters(connection, recovery_id, now))
+            return _record(connection, row, waiters=self._recovery_waiters(connection, recovery_id, now))
         if row["status"] == "aborted":
-            return _record(row)
+            return _record(connection, row)
         if state is None:
             state = self._load(connection, row["run_id"])
+        manifest = decode_value(connection, row["manifest"])
         if values is None:
-            values = json.loads(row["manifest"])["operations"]
+            values = manifest["operations"]
         if row["status"] == "preparing":
             connection.execute("UPDATE sdk_recoveries SET status='prepared',updated_at=? WHERE recovery_id=?",
                                (now, recovery_id))
@@ -618,9 +620,8 @@ class RecoveryMixin:
             self._validate_deployment(json.loads(row["target_deployment"]))
             if state["state"] not in {"failed", "cancelled"}:
                 raise OrchestrationError("Run changed while recovery was preparing")
-            if state["revision"] != json.loads(row["manifest"])["source_revision"]:
+            if state["revision"] != manifest["source_revision"]:
                 raise RevisionConflict("Run revision changed while recovery was preparing")
-            manifest = json.loads(row["manifest"])
             blockers = self._reopen_facts(connection, state)
             if manifest.get("authorization") is not None:
                 blockers = [item for item in blockers
@@ -631,12 +632,11 @@ class RecoveryMixin:
             target_generation = row["target_generation"]
             state["state"] = "running"
             state["generation"] = target_generation
-            manifest = json.loads(row["manifest"])
             if application_state is not _UNSET:
                 state["application_state"] = clone(application_state)
             elif manifest.get("has_application_state"):
                 state["application_state"] = (None if row["application_state"] is None
-                                                else json.loads(row["application_state"]))
+                                                else decode_value(connection, row["application_state"]))
             target_deployment = json.loads(row["target_deployment"])
             target_revision = target_deployment["registry_revision"]
             allowed_bindings = {target_revision}
@@ -691,7 +691,7 @@ class RecoveryMixin:
             self._save(connection, state, changes=changes)
             self._event(connection, state, "run.reopened", {
                 "recovery_id": recovery_id, "source_generation": row["source_generation"],
-                "target_generation": target_generation, "decision": json.loads(row["decision"]),
+                "target_generation": target_generation, "decision": decode_value(connection, row["decision"]),
                 "source_deployment": manifest.get("source_deployment", {"registry_revisions": []}),
                 "target_deployment": json.loads(row["target_deployment"]),
             })
@@ -700,7 +700,7 @@ class RecoveryMixin:
                 (now, now, recovery_id))
             self._write_receipt(connection, row["run_id"], row["command_id"], row["request_digest"], state)
             row = self._recovery_row(connection, recovery_id)
-        return _record(row, waiters=self._recovery_waiters(connection, recovery_id, now))
+        return _record(connection, row, waiters=self._recovery_waiters(connection, recovery_id, now))
 
     @staticmethod
     def _reduce_reopen_operation(state, op):
@@ -730,7 +730,7 @@ class RecoveryMixin:
                     (now, now, recovery_id))
                 connection.execute("DELETE FROM sdk_recovery_waiters WHERE recovery_id=?", (recovery_id,))
                 row = self._recovery_row(connection, recovery_id)
-            return _record(row, waiters=self._recovery_waiters(connection, recovery_id, _now(self)))
+            return _record(connection, row, waiters=self._recovery_waiters(connection, recovery_id, _now(self)))
 
     def advance_recovery(self, recovery_id: str, *, owner_id: str | None = None) -> dict:
         identifier(recovery_id, "recovery_id")
@@ -756,7 +756,7 @@ class RecoveryMixin:
                 self._advance_recovery_locked(connection, recovery_id, owner_id, now)
                 row = self._recovery_row(connection, recovery_id)
             committed = row["status"] == "committed"
-            result = _record(row, waiters=self._recovery_waiters(connection, recovery_id, now))
+            result = _record(connection, row, waiters=self._recovery_waiters(connection, recovery_id, now))
         if committed:
             # The decision and Run mutation are already durable.  If this
             # fails, the persisted committed record is safe for host resume.
@@ -779,7 +779,7 @@ class RecoveryMixin:
             connection.execute("UPDATE sdk_recoveries SET status='aborted',error=?,updated_at=? WHERE recovery_id=?",
                                (canonical({"code": "aborted", "message": reason}), now, recovery_id))
             connection.execute("DELETE FROM sdk_recovery_waiters WHERE recovery_id=?", (recovery_id,))
-            return _record(self._recovery_row(connection, recovery_id), waiters=0)
+            return _record(connection, self._recovery_row(connection, recovery_id), waiters=0)
 
     def renew_recovery(self, recovery_id: str, *, owner_id: str,
                        lease_seconds: float = 30.0) -> dict:
@@ -794,10 +794,10 @@ class RecoveryMixin:
             if row["owner_id"] != owner_id or row["lease_until"] <= now:
                 raise OrchestrationError("recovery owner lease is stale")
             if row["status"] not in _RECOVERY_ACTIVE:
-                return _record(row)
+                return _record(connection, row)
             connection.execute("UPDATE sdk_recoveries SET lease_until=?,updated_at=? WHERE recovery_id=?",
                                (now + float(lease_seconds), now, recovery_id))
-            return _record(self._recovery_row(connection, recovery_id),
+            return _record(connection, self._recovery_row(connection, recovery_id),
                            waiters=self._recovery_waiters(connection, recovery_id, now))
 
     def resume_recoveries(self, *, limit: int = 20, owner_id: str = "recovery-host") -> int:

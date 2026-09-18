@@ -1,0 +1,67 @@
+{
+  "configuration": {
+    "counts": [
+      100,
+      1000,
+      10000
+    ],
+    "databases_retained": false,
+    "durability": "full",
+    "modes": [
+      "changing-sibling"
+    ],
+    "payload_bytes": 524288,
+    "payload_generation": "deterministic SHAKE-256 bytes encoded as base64"
+  },
+  "created_at_utc": "2026-09-18T08:57:55.596678+00:00",
+  "environment": {
+    "platform": "Linux-6.8.0-139-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "sqlite": "3.45.1"
+  },
+  "modes": {
+    "changing-sibling": {
+      "measurements": [
+        {
+          "allocated_page_bytes": 1040384,
+          "commits": 100,
+          "elapsed_seconds": 9.975758593001956,
+          "files": {
+            "journal": 0,
+            "main": 1028096,
+            "shm": 32768,
+            "wal": 4165352
+          },
+          "free_page_bytes": 0,
+          "physical_total_bytes": 5226216
+        },
+        {
+          "allocated_page_bytes": 2383872,
+          "commits": 1000,
+          "elapsed_seconds": 82.53904739497375,
+          "files": {
+            "journal": 0,
+            "main": 2318336,
+            "shm": 32768,
+            "wal": 4231272
+          },
+          "free_page_bytes": 0,
+          "physical_total_bytes": 6582376
+        },
+        {
+          "allocated_page_bytes": 15736832,
+          "commits": 10000,
+          "elapsed_seconds": 802.4907219080014,
+          "files": {
+            "journal": 0,
+            "main": 15708160,
+            "shm": 32768,
+            "wal": 4235392
+          },
+          "free_page_bytes": 0,
+          "physical_total_bytes": 19976320
+        }
+      ]
+    }
+  }
+}

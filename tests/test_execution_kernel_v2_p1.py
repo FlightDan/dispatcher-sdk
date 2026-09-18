@@ -762,11 +762,11 @@ class SchemaAndAuthorizerTests(unittest.TestCase):
             path = Path(temp) / "kernel.sqlite3"
             real_connect = sqlite3.connect
             connection = real_connect(
-                path, timeout=30, isolation_level=None, check_same_thread=False
+                path, timeout=30, isolation_level=None, check_same_thread=False,
             )
             connection.execute("PRAGMA writable_schema = ON")
             with patch.object(
-                sqlite_base_module.sqlite3, "connect", return_value=connection
+                sqlite_base_module, "storage_connect", return_value=connection
             ):
                 kernel = SQLiteKernel(path)
             try:

@@ -9,10 +9,12 @@ import time
 from typing import Any, Sequence, TypeVar, cast
 
 from ..durability import Durability, validate_durability
+from ..content import decode_value
+from ..storage_connection import connect as storage_connect
 from .contracts import (RevisionConflict, OrchestrationError, canonical, clone,
                         digest, identifier, integer, validate_operation)
 from .reducer import reduce_operation
-from .store import SCHEMA, StoreMixin, execute_schema
+from .store import SCHEMA, LEGACY_SCHEMA, StoreMixin, execute_schema
 from .transport import TransportMixin
 from .results import ResultsMixin
 from .notifications import NotificationsMixin
@@ -28,8 +30,8 @@ _UNSET = object()
 _OperationInput = TypeVar("_OperationInput", bound=Operation | dict[str, Any])
 
 
-def _event_payload(raw: str):
-    payload = json.loads(raw)
+def _event_payload(connection, raw: str):
+    payload = decode_value(connection, raw)
     if isinstance(payload, dict):
         payload.setdefault("generation", 0)
     return payload
@@ -78,7 +80,7 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
         database = str(Path(path).resolve())
         if not Path(database).exists():
             raise OrchestrationError("cannot upgrade a missing orchestration database")
-        connection = sqlite3.connect(database, timeout=30)
+        connection = storage_connect(database, timeout=30)
         try:
             connection.row_factory = sqlite3.Row
             configure_sqlite_connection(connection, database, durability=durability)
@@ -90,7 +92,7 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
                 raise OrchestrationError("database has no declared orchestrator schema") from error
             if len(marker) != 1 or tuple(marker[0]) != ("orchestrator", 2):
                 raise OrchestrationError("only a declared orchestrator schema v2 can be upgraded")
-            execute_schema(connection, SCHEMA)
+            execute_schema(connection, LEGACY_SCHEMA)
             cls._init_notifications(connection)
             executions = {row[1] for row in connection.execute("PRAGMA table_info(sdk_executions)")}
             if executions and "generation" not in executions:
@@ -207,6 +209,7 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
         identifier(command_id, "command_id")
         connection = self._connect()
         try:
+            self._assert_not_disposed(connection, run_id)
             row = connection.execute(
                 "SELECT response FROM sdk_commands WHERE run_id=? AND command_id=?",
                 (run_id, command_id)).fetchone()
@@ -282,9 +285,7 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
                 cursor = row["cursor"] if row else 0
                 if cursor != expected_cursor:
                     raise RevisionConflict("subscription cursor changed")
-                last = connection.execute(
-                    "SELECT COALESCE(MAX(sequence),0) FROM sdk_events WHERE run_id=?",
-                    (run_id,)).fetchone()[0]
+                last = self._event_high_water(connection, run_id, cursor)
                 if not cursor <= advance_to <= last:
                     raise OrchestrationError("invalid subscription advancement")
                 connection.execute(
@@ -326,20 +327,32 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             self._write_receipt(connection, run_id, command_id, fingerprint, state)
             return state
 
-    def read_events(self, run_id: str, *, after: int = 0, limit: int = 100) -> list[RunEvent]:
+    def read_events(self, run_id: str, *, after: int = 0, limit: int = 100,
+                    allow_expired: bool = False) -> list[RunEvent]:
+        """Read retained events after a sequence cursor.
+
+        By default, a cursor older than the Run's retention watermark raises
+        :class:`EventCursorExpired`. Pass ``allow_expired=True`` to read only
+        the surviving events after such a cursor; deleted events remain absent
+        and sequence gaps are expected.
+        """
         integer(after, "after")
         integer(limit, "limit")
         if not 1 <= limit <= 10000:
             raise OrchestrationError("limit must be between 1 and 10000")
+        if type(allow_expired) is not bool:
+            raise OrchestrationError("allow_expired must be a boolean")
         connection = self._connect()
         try:
+            connection.execute("BEGIN")
             self._require_run(connection, run_id)
+            self._event_high_water(connection, run_id, None if allow_expired else after)
             rows = connection.execute(
                 "SELECT * FROM sdk_events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?",
                 (run_id, after, limit)).fetchall()
             values = []
             for row in rows:
-                values.append(cast(RunEvent, {**dict(row), "payload": _event_payload(row["payload"])}))
+                values.append(cast(RunEvent, {**dict(row), "payload": _event_payload(connection, row["payload"])}))
             return values
         finally:
             connection.close()
@@ -389,8 +402,7 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             cursor = row["cursor"] if row else 0
             if cursor != expected_cursor:
                 raise RevisionConflict("subscription cursor changed")
-            last = connection.execute(
-                "SELECT COALESCE(MAX(sequence),0) FROM sdk_events WHERE run_id=?", (run_id,)).fetchone()[0]
+            last = self._event_high_water(connection, run_id, cursor)
             if not cursor <= advance_to <= last:
                 raise OrchestrationError("invalid subscription advancement")
             connection.execute(
@@ -428,11 +440,10 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             rows = connection.execute(
                 "SELECT * FROM sdk_events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?",
                 (run_id, cursor, limit)).fetchall()
-            last = connection.execute(
-                "SELECT COALESCE(MAX(sequence),0) FROM sdk_events WHERE run_id=?", (run_id,)).fetchone()[0]
+            last = self._event_high_water(connection, run_id, cursor)
             return {"snapshot": state, "cursor": cursor, "event_high_watermark": last,
                     "events": [cast(RunEvent, {**dict(value),
-                                                "payload": _event_payload(value["payload"])})
+                                                "payload": _event_payload(connection, value["payload"])})
                                for value in rows]}
         finally:
             connection.rollback()

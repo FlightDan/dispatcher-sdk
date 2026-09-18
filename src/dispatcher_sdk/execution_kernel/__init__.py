@@ -45,7 +45,7 @@ from .outbox_status import ResultOutboxStatusV2
 from .runtime import Handler, InProcessRuntime, Runtime, registry_revision
 from ._registry import handler_revision
 from .sqlite import ExecutionKernel, SQLiteKernel
-from .host import RuntimeHost, RuntimeHostError, RuntimeHostHealth
+from .host import RuntimeHost, RuntimeHostError, RuntimeHostHealth, StopPhase, StopReport
 from .scripts import ScriptSpec, script_handler, script_handlers
 from .sandbox import SandboxHandler, SandboxJournal, sandbox_handlers
 from .sandbox_contracts import (
@@ -69,6 +69,8 @@ __all__ = [
     "RuntimeHost",
     "RuntimeHostError",
     "RuntimeHostHealth",
+    "StopPhase",
+    "StopReport",
     "ScriptSpec",
     "script_handler",
     "script_handlers",

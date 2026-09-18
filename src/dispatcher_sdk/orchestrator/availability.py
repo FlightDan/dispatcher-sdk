@@ -136,10 +136,12 @@ def inspect_work_availability(
         versions = tuple(connection.execute(f"PRAGMA {db}.data_version").fetchone()[0]
                          for db in ("main", "authority"))
         connection.execute("BEGIN")
-        if tuple(connection.execute("SELECT component,version FROM sdk_schema_meta").fetchone() or ()) != ("orchestrator", 2):
+        from .store import ORCHESTRATOR_SCHEMA_VERSION, StoreMixin
+        if tuple(connection.execute("SELECT component,version FROM sdk_schema_meta").fetchone() or ()) != ("orchestrator", ORCHESTRATOR_SCHEMA_VERSION):
             raise OrchestrationError("unsupported orchestration schema")
         if tuple(connection.execute("SELECT component,schema_version FROM authority.kernel_schema_meta").fetchone() or ()) != ("execution_kernel", 2):
             raise OrchestrationError("unsupported Kernel schema")
+        StoreMixin._assert_not_disposed(connection, run_id)
         run = connection.execute("SELECT revision,state FROM sdk_runs WHERE run_id=?", (run_id,)).fetchone()
         if run is None:
             raise OrchestrationError("unknown run")

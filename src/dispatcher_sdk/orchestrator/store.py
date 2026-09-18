@@ -7,14 +7,22 @@ import sqlite3
 from contextlib import contextmanager
 
 from ..durability import configure_sqlite_connection
-from .contracts import CommandConflict, OrchestrationError, TERMINAL, canonical
+from ..storage_connection import connect as storage_connect
+from ..content import CONTENT_SCHEMA, decode_value, encode_value
+from .contracts import CommandConflict, OrchestrationError, HistoryExpired, EventCursorExpired, RunDisposed, TERMINAL, canonical
 
 
-ORCHESTRATOR_SCHEMA_VERSION = 2
-SCHEMA = """
+ORCHESTRATOR_SCHEMA_VERSION = 3
+def _schema_marker(version: int) -> str:
+    return f"""
 CREATE TABLE IF NOT EXISTS sdk_schema_meta (
  component TEXT PRIMARY KEY CHECK(component='orchestrator'),
- version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version=2));
+ version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version={version}));
+"""
+
+
+# These table definitions are shared by the supported v2 and v3 layouts.
+_COMMON_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sdk_runs (
  run_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, state TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sdk_run_revisions (
@@ -76,17 +84,61 @@ CREATE TABLE IF NOT EXISTS sdk_recovery_waiters (
 CREATE INDEX IF NOT EXISTS sdk_recovery_waiters_expiry ON sdk_recovery_waiters(recovery_id,lease_until);
 """
 
+# Keep the previous exact DDL available to the explicit copy-upgrade tool.
+LEGACY_SCHEMA = _schema_marker(2) + _COMMON_SCHEMA
+SCHEMA = _schema_marker(ORCHESTRATOR_SCHEMA_VERSION) + _COMMON_SCHEMA + CONTENT_SCHEMA + """
+CREATE TABLE IF NOT EXISTS sdk_storage_identity (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL,
+ incarnation TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_retention_times (
+ category TEXT NOT NULL, record_key TEXT NOT NULL, created_at REAL NOT NULL,
+ PRIMARY KEY(category,record_key));
+CREATE TABLE IF NOT EXISTS sdk_storage_clock (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), mutation INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_event_watermarks (
+ run_id TEXT PRIMARY KEY, high_water INTEGER NOT NULL CHECK(high_water>=0),
+ expired_through INTEGER NOT NULL CHECK(expired_through>=0 AND expired_through<=high_water));
+CREATE TABLE IF NOT EXISTS sdk_expired_revisions (
+ run_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(run_id,revision));
+CREATE TABLE IF NOT EXISTS sdk_disposed_runs (
+ run_id TEXT PRIMARY KEY, tombstone TEXT NOT NULL, authentication TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_maintenance_receipts (
+ operation_id TEXT PRIMARY KEY, plan_digest TEXT NOT NULL, result TEXT NOT NULL);
+"""
+
 
 def execute_schema(connection, script):
     """Execute our fixed DDL without executescript's implicit transaction commit."""
-    for statement in script.split(";"):
-        if statement.strip():
-            connection.execute(statement)
+    statement = ""
+    for fragment in script.split(";"):
+        statement += fragment + ";"
+        if sqlite3.complete_statement(statement):
+            if statement.strip("; \n\t"):
+                connection.execute(statement)
+            statement = ""
+    if statement.strip("; \n\t"):
+        raise ValueError("incomplete SDK schema statement")
+
+
+def initialize_storage_tracking(connection):
+    """Install change tracking after all component-owned sdk tables exist."""
+    tables = [row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'sdk_*' "
+        "AND name != 'sdk_storage_clock'")]
+    for table in tables:
+        for action in ("INSERT", "UPDATE", "DELETE"):
+            # Table names originate in the fixed SDK DDL, never an application.
+            if not table.replace("_", "").isalnum():
+                raise OrchestrationError("invalid SDK table name")
+            connection.execute(
+                f'CREATE TRIGGER IF NOT EXISTS "{table}_track_{action.lower()}" '
+                f'AFTER {action} ON "{table}" BEGIN '
+                'UPDATE sdk_storage_clock SET mutation=mutation+1 WHERE singleton=1; END')
 
 
 class StoreMixin:
     def _connect(self, *, configure=True):
-        connection = sqlite3.connect(self.db_path, timeout=30)
+        connection = storage_connect(self.db_path, timeout=30)
         try:
             connection.row_factory = sqlite3.Row
             if configure:
@@ -109,8 +161,14 @@ class StoreMixin:
                 execute_schema(connection, SCHEMA)
                 self._init_results(connection)
                 self._init_notifications(connection)
+                initialize_storage_tracking(connection)
+                connection.execute("INSERT INTO sdk_storage_clock VALUES(1,0)")
                 connection.execute("INSERT INTO sdk_schema_meta VALUES('orchestrator',?)",
                                    (ORCHESTRATOR_SCHEMA_VERSION,))
+                import time
+                import uuid
+                connection.execute("INSERT INTO sdk_storage_identity VALUES(1,?,?,?)",
+                                   (uuid.uuid4().hex, uuid.uuid4().hex, time.time()))
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -126,19 +184,26 @@ class StoreMixin:
         if "sdk_schema_meta" not in tables:
             raise OrchestrationError(
                 "unsupported unversioned orchestration store; preserve the old database "
-                "and deployment, or use a new database for schema v2")
+                "and deployment, or use an explicit copy upgrade")
         marker = connection.execute("SELECT component,version FROM sdk_schema_meta").fetchall()
         if len(marker) != 1 or tuple(marker[0]) != ("orchestrator", ORCHESTRATOR_SCHEMA_VERSION):
-            raise OrchestrationError("unsupported orchestration schema version")
+            raise OrchestrationError("unsupported orchestration schema version; use an explicit copy upgrade")
         reference = sqlite3.connect(":memory:")
         try:
             execute_schema(reference, SCHEMA)
             self._init_results(reference)
             self._init_notifications(reference)
+            initialize_storage_tracking(reference)
             if self._schema_objects(connection) != self._schema_objects(reference):
                 raise OrchestrationError("orchestration schema differs from its declared version")
         finally:
             reference.close()
+        identity = connection.execute(
+            "SELECT store_id,incarnation FROM sdk_storage_identity WHERE singleton=1").fetchone()
+        clock = connection.execute("SELECT mutation FROM sdk_storage_clock WHERE singleton=1").fetchone()
+        if (identity is None or any(type(value) is not str or not value for value in identity)
+                or clock is None or type(clock[0]) is not int or clock[0] < 0):
+            raise OrchestrationError("orchestration storage identity or mutation clock is missing or damaged")
         return True
 
     @staticmethod
@@ -165,19 +230,25 @@ class StoreMixin:
             connection.close()
 
     @staticmethod
+    def _assert_not_disposed(connection, run_id):
+        if connection.execute("SELECT 1 FROM sdk_disposed_runs WHERE run_id=?", (run_id,)).fetchone():
+            raise RunDisposed(f"Run {run_id} has been permanently disposed")
+
+    @staticmethod
     def _require_run(connection, run_id):
+        StoreMixin._assert_not_disposed(connection, run_id)
         row = connection.execute("SELECT revision FROM sdk_runs WHERE run_id=?", (run_id,)).fetchone()
         if row is None:
             raise OrchestrationError("unknown run")
         return row[0]
 
     @staticmethod
-    def _inflate(run_id, revision, rows):
+    def _inflate(connection, run_id, revision, rows):
         state = {"run_id": run_id, "revision": revision, "generation": 0,
                  "tasks": {}, "waits": {}, "signals": {}}
         attempts = []
         for row in rows:
-            section, key, value = row[0], row[1], json.loads(row[2])
+            section, key, value = row[0], row[1], decode_value(connection, row[2])
             if section == "root":
                 state[key] = value
             elif section == "task":
@@ -205,12 +276,16 @@ class StoreMixin:
         revision = cls._require_run(connection, run_id)
         rows = connection.execute(
             "SELECT section,item_key,value FROM sdk_run_items WHERE run_id=?", (run_id,)).fetchall()
-        return cls._inflate(run_id, revision, rows)
+        return cls._inflate(connection, run_id, revision, rows)
 
     @classmethod
     def _load_at(cls, connection, run_id, revision):
+        cls._assert_not_disposed(connection, run_id)
         if connection.execute("SELECT 1 FROM sdk_run_revisions WHERE run_id=? AND revision=?",
                               (run_id, revision)).fetchone() is None:
+            if connection.execute("SELECT 1 FROM sdk_expired_revisions WHERE run_id=? AND revision=?",
+                                  (run_id, revision)).fetchone():
+                raise HistoryExpired(f"Run revision {revision} for {run_id} expired")
             raise OrchestrationError("unknown historical Run revision")
         rows = connection.execute(
             "SELECT h.section,h.item_key,h.value FROM sdk_run_history h JOIN "
@@ -218,7 +293,18 @@ class StoreMixin:
             "WHERE run_id=? AND revision<=? GROUP BY section,item_key) last "
             "ON h.section=last.section AND h.item_key=last.item_key AND h.revision=last.revision "
             "WHERE h.run_id=?", (run_id, revision, run_id)).fetchall()
-        return cls._inflate(run_id, revision, rows)
+        return cls._inflate(connection, run_id, revision, rows)
+
+    @staticmethod
+    def _event_high_water(connection, run_id, cursor=None):
+        row = connection.execute(
+            "SELECT high_water,expired_through FROM sdk_event_watermarks WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise OrchestrationError("Run event watermark is missing")
+        if cursor is not None and cursor < row[1]:
+            raise EventCursorExpired(run_id, cursor, row[1])
+        return row[0]
 
     @classmethod
     def _receipt(cls, connection, response):
@@ -233,6 +319,7 @@ class StoreMixin:
 
     @classmethod
     def _replay(cls, connection, run_id, command_id, fingerprint):
+        cls._assert_not_disposed(connection, run_id)
         row = connection.execute(
             "SELECT digest,response FROM sdk_commands WHERE run_id=? AND command_id=?",
             (run_id, command_id)).fetchone()
@@ -247,9 +334,15 @@ class StoreMixin:
         if isinstance(payload, dict):
             payload = dict(payload)
             payload.setdefault("generation", int(state.get("generation", 0)))
-        connection.execute(
+        cursor = connection.execute(
             "INSERT INTO sdk_events(run_id,revision,kind,payload) VALUES(?,?,?,?)",
-            (state["run_id"], state["revision"], kind, canonical(payload)))
+            (state["run_id"], state["revision"], kind, encode_value(connection, payload)))
+        connection.execute(
+            "INSERT INTO sdk_retention_times VALUES('event',?,(julianday('now')-2440587.5)*86400.0)",
+            (str(cursor.lastrowid),))
+        connection.execute(
+            "INSERT INTO sdk_event_watermarks VALUES(?,?,0) ON CONFLICT(run_id) "
+            "DO UPDATE SET high_water=excluded.high_water", (state["run_id"], cursor.lastrowid))
 
     @staticmethod
     def _item_values(state, changes=None):
@@ -277,8 +370,13 @@ class StoreMixin:
                            (state["revision"], state["state"], state["run_id"]))
         connection.execute("INSERT INTO sdk_run_revisions VALUES(?,?)",
                            (state["run_id"], state["revision"]))
+        connection.execute(
+            "INSERT INTO sdk_retention_times VALUES('revision',?,(julianday('now')-2440587.5)*86400.0)",
+            (canonical([state["run_id"], state["revision"]]),))
         for section, key, value in cls._item_values(state, changes):
-            encoded = canonical(value)
+            encoded = (encode_value(connection, value)
+                       if section == "root" and key in {"application_state", "input", "definition"}
+                       else canonical(value))
             before = connection.execute(
                 "SELECT value FROM sdk_run_items WHERE run_id=? AND section=? AND item_key=?",
                 (state["run_id"], section, key)).fetchone()

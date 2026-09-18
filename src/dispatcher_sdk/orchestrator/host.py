@@ -8,7 +8,12 @@ import time
 from typing import Callable
 from uuid import uuid4
 
-from ..execution_kernel.host import RuntimeHost, RuntimeHostHealth
+from ..execution_kernel.host import (
+    RuntimeHost,
+    RuntimeHostHealth,
+    StopPhase,
+    StopReport,
+)
 
 
 @dataclass(frozen=True)
@@ -17,6 +22,14 @@ class OrchestratorHostHealth(RuntimeHostHealth):
     notification_deliveries: int
     notification_error_count: int
     last_notification_error: str | None
+
+
+class OrchestratorHostTimeoutError(TimeoutError):
+    """A bounded host stop expired; ``report`` describes observed progress."""
+
+    def __init__(self, message: str, report: StopReport) -> None:
+        super().__init__(message)
+        self.report = report
 
 
 @dataclass(frozen=True)
@@ -99,6 +112,17 @@ class OrchestratorHost:
         self._deliveries = 0
         self._error_count = 0
         self._last_error = None
+        self._stop_started_at = None
+        self._stop_finished_at = None
+        self._stop_timeout = None
+        self._stop_status = "not_started"
+        self._notification_phase = {
+            "status": "not_started",
+            "started_at": None,
+            "finished_at": None,
+            "error_type": None,
+            "error_message": None,
+        }
         self.runtime_host = RuntimeHost(
             runtime, _Transport(orchestrator, self._wake_event), **runtime_options)
 
@@ -164,6 +188,122 @@ class OrchestratorHost:
                 notification_error_count=self._error_count,
                 last_notification_error=self._last_error)
 
+    @property
+    def stop_report(self) -> StopReport | None:
+        """Return the latest combined runtime and notification stop snapshot."""
+
+        runtime_report = self.runtime_host.stop_report
+        now = time.monotonic()
+        with self._lock:
+            started_at = self._stop_started_at
+            if started_at is None:
+                return None
+            thread_alive = self._thread is not None and self._thread.is_alive()
+            if (
+                self._notification_phase["status"] == "in_progress"
+                and not thread_alive
+            ):
+                self._notification_phase["status"] = "completed"
+                self._notification_phase["finished_at"] = now
+            notification = self._notification_phase_snapshot_locked(now)
+            status = self._stop_status
+            timeout = self._stop_timeout
+            finished_at = self._stop_finished_at
+        if runtime_report is None:
+            runtime_phases = tuple(
+                StopPhase(name, "not_started", None, None, None)
+                for name in (
+                    "worker_drain", "executor_shutdown", "final_pump", "runtime_close"
+                )
+            )
+            active_workers = self.runtime_host.health().active_workers
+            runtime_waitable = False
+        else:
+            runtime_phases = runtime_report.phases
+            active_workers = runtime_report.active_worker_count
+            runtime_waitable = runtime_report.can_continue_waiting
+        # A timeout describes the last stop call, even if a thread finished
+        # between the deadline check and this snapshot. Only a successful retry
+        # settles that call-level status. Runtime failures remain visible.
+        if status == "completed" and runtime_report is not None and runtime_report.status == "failed":
+            status = "failed"
+        phases = runtime_phases + (notification,)
+        return StopReport(
+            scope="orchestrator_host",
+            status=status,
+            started_at=started_at,
+            finished_at=finished_at,
+            elapsed_seconds=max(
+                0.0, (finished_at if finished_at is not None else now) - started_at
+            ),
+            timeout_seconds=timeout,
+            phases=phases,
+            unfinished_phases=tuple(
+                phase.name
+                for phase in phases
+                if phase.status not in {"completed", "skipped"}
+            ),
+            active_worker_count=active_workers,
+            notification_thread_alive=thread_alive,
+            pending_delivery_count=None,
+            pending_delivery_persisted=None,
+            can_continue_waiting=runtime_waitable or thread_alive,
+            errors=() if runtime_report is None else runtime_report.errors,
+        )
+
+    def _notification_phase_snapshot_locked(self, now: float) -> StopPhase:
+        values = self._notification_phase
+        started_at = values["started_at"]
+        finished_at = values["finished_at"]
+        elapsed = None
+        if started_at is not None:
+            elapsed = max(
+                0.0, (finished_at if finished_at is not None else now) - started_at
+            )
+        return StopPhase(
+            name="notification_join",
+            status=values["status"],
+            started_at=started_at,
+            finished_at=finished_at,
+            elapsed_seconds=elapsed,
+            error_type=values["error_type"],
+            error_message=values["error_message"],
+        )
+
+    def _begin_stop(self, timeout: float) -> None:
+        with self._lock:
+            if self._stop_started_at is None:
+                self._stop_started_at = time.monotonic()
+            self._stop_timeout = timeout
+            if self._stop_status not in {"completed", "failed"}:
+                self._stop_status = "in_progress"
+                self._stop_finished_at = None
+
+    def _start_notification_join(self, thread) -> None:
+        with self._lock:
+            phase = self._notification_phase
+            if thread is None:
+                if phase["status"] == "not_started":
+                    phase["status"] = "skipped"
+                    phase["finished_at"] = time.monotonic()
+            elif phase["status"] == "not_started":
+                phase["status"] = "in_progress"
+                phase["started_at"] = time.monotonic()
+
+    def _finish_notification_join(self) -> None:
+        with self._lock:
+            phase = self._notification_phase
+            if phase["status"] == "in_progress":
+                phase["status"] = "completed"
+                phase["finished_at"] = time.monotonic()
+
+    def _finish_stop(self, status: str) -> None:
+        with self._lock:
+            self._stop_status = status
+            self._stop_finished_at = (
+                time.monotonic() if status in {"completed", "failed"} else None
+            )
+
     def stop(self, timeout: float = 5.0) -> bool:
         if type(timeout) not in {int, float} or timeout < 0 or not float(timeout) < float("inf"):
             raise ValueError("timeout must be a finite non-negative number")
@@ -171,6 +311,7 @@ class OrchestratorHost:
             if self._thread is threading.current_thread():
                 raise RuntimeError("notification callback cannot join its own host")
         deadline = time.monotonic() + timeout
+        self._begin_stop(float(timeout))
         self._stop_event.set()
         self._wake_event.set()
         error = None
@@ -181,12 +322,22 @@ class OrchestratorHost:
             stopped = False
         with self._lock:
             thread = self._thread
+        self._start_notification_join(thread)
         if thread is not None:
             thread.join(max(0.0, deadline - time.monotonic()))
+            if not thread.is_alive():
+                self._finish_notification_join()
         if error is not None:
+            self._finish_stop("failed")
             raise error
         if not stopped or (thread is not None and thread.is_alive()):
-            raise TimeoutError("OrchestratorHost did not stop before the timeout")
+            self._finish_stop("timed_out")
+            report = self.stop_report
+            assert report is not None
+            raise OrchestratorHostTimeoutError(
+                "OrchestratorHost did not stop before the timeout", report
+            )
+        self._finish_stop("completed")
         return True
 
     def __enter__(self):
@@ -196,4 +347,7 @@ class OrchestratorHost:
         self.stop()
 
 
-__all__ = ["OrchestratorHost", "OrchestratorHostHealth"]
+__all__ = [
+    "OrchestratorHost", "OrchestratorHostHealth", "OrchestratorHostTimeoutError",
+    "StopPhase", "StopReport",
+]

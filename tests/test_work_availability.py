@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from dispatcher_sdk.orchestrator import Orchestrator
+from dispatcher_sdk.orchestrator import Orchestrator, RunDisposed
 from dispatcher_sdk.execution_kernel import Kernel, ExecutionCommandV2, RetryPolicy
 from dispatcher_sdk.orchestrator.availability import inspect_work_availability
 
@@ -133,6 +133,17 @@ class WorkAvailabilityTests(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             self.report()
         self.assertFalse(Path(self.sdk.db_path).exists())
+
+    def test_disposed_run_is_reported_before_unknown_run(self):
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO sdk_disposed_runs(run_id,tombstone,authentication) VALUES(?,?,?)",
+                ("run", "{}", "test-authentication"),
+            )
+            connection.execute("DELETE FROM sdk_runs WHERE run_id='run'")
+
+        with self.assertRaises(RunDisposed):
+            self.report()
 
     def test_recovery_and_unknown_effect_are_read_only(self):
         self.add()

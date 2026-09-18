@@ -14,12 +14,23 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 | `ExecutionCommandV2`, `ExecutionResultV2`, `ExecutionSnapshot`, `ExecutionLease`, `ExecutionError`, `RetryPolicy`, `EffectRecord`, `Event`, `ResultOutboxStatusV2` | Validated execution, effect, event and delivery records |
 | `Handler`, `HandlerContext`, `HandlerEffects`, `registry_revision`, `handler_revision` | Implement and identify handlers and tracked effects |
 | `RuntimeHost`, `RuntimeHostHealth`, `RuntimeHostError` | Run workers and transport with a background host and inspect its health |
+| `StopPhase`, `StopReport`, `host.stop_report` | Live, serializable shutdown stages and uncertainty; exported from execution and orchestration packages |
+| `OrchestratorHostTimeoutError` | Compatible `TimeoutError` subclass carrying a shutdown report |
 | `ScriptSpec`, `script_handler`, `script_handlers` | Freeze inline scripts and register the process-only script handler |
 | `Orchestrator` | Explicit Run/task operations, atomic `submit_task`, paged reads, historical revisions, linked continuation, receipts and delivery |
 | `Orchestrator.reopen_run`, `inspect_reopen`, `get_recovery`, `advance_recovery`, `abort_recovery`, `renew_recovery`, `resume_recoveries`, `Orchestrator.upgrade_schema` | Same-Run terminal recovery with generation fencing, durable decision/activation progress, idempotent replay and explicit schema upgrade |
 | `NotificationInbox`, `InboxLease`, `InboxRecord`, `InboxState` | Durable application acceptance and fenced transactional processing |
+| `RequestResultInbox`, `RequestResultIdentity`, `RequestResultObservation` | Stable request/result correlation with independent transport and explicit caller receipts |
+| `inspect_execution_origin`, `ExecutionOriginReport`, `ExecutionHandlerBinding` | Bounded read-only result/execution lookup of the original task, attempt and frozen binding in one store |
 | `SandboxSpec`, `SandboxBackend`, `SandboxHandler`, `SandboxJournal`, `sandbox_handlers` | Frozen remote execution inputs, backend contract and persistent lifecycle recovery |
-| `inspect_storage`, `backup_database`, `export_database` (storage module) | Read-only deployment preflight, SQLite backup and SQL export |
+| `inspect_storage`, `backup_database`, `export_database`, `inspect_storage_usage` (storage module) | Read-only deployment preflight, SQLite backup, SQL export and bounded capacity analysis |
+| `maintenance_lease`, `inspect_maintenance` (storage module) | Exclusive maintenance and coordination status |
+| `upgrade_storage`, `compact_database` (storage_migration module) | Explicit non-overwriting copy conversion and compaction |
+| `RetentionPolicy`, `plan_retention`, `apply_retention` (retention module) | Bounded plans and validated single-store history/event pruning with internal content GC |
+| `StoreGroupDescriptor`, `snapshot_store_group`, `verify_snapshot`, `restore_snapshot` (storage_snapshots module) | Authenticated declared-component snapshots and read-only restore |
+| `ProvenanceRegistry`, `plan_disposal`, `dispose_run` (provenance module) | Authenticated registry and conservative permanent disposal |
+| `HistoryExpired`, `EventCursorExpired`, `RunDisposed` (orchestrator package) | Distinguish intentional retention/disposal from unknown identities |
+| `ContentReadBudget`, `ContentSizeLimitError` (content module) | Shared encoded-byte allowance for composed decoding; size limits remain compatible with `ContentIntegrityError` |
 | `OrchestratorHost`, `OrchestratorHostHealth` | Drive execution, synchronization and notification callbacks in background threads |
 | `canonical_json` | Compare strict JSON content without conflating boolean, integer and float values |
 | `Operations` | Construct typed, detached operation dictionaries for `apply_operations` |
@@ -36,6 +47,8 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 
 See [diagnostics and projections](SDK_DIAGNOSTICS_AND_PROJECTIONS.md) for complete
 signatures, failure semantics, evidence limits and runnable examples.
+See [shutdown, inspection and origin APIs](SDK_RELIABILITY.md) and
+[request result receipts](REQUEST_RESULT_RECEIPTS.md) for the reliability additions.
 
 Kernel exception types, `SCHEMA_VERSION`, `EXECUTION_STATES`, `TERMINAL_STATES`,
 `TRANSITION_MATRIX`, `can_transition` and `reduce_state` are also exported.
@@ -68,7 +81,8 @@ are separate identities:
 - Execution command/result contracts use `SCHEMA_VERSION = 2`. Unknown fields,
   invalid JSON values and conflicting identities are rejected.
 - Kernel SQLite storage remains schema 2 with its `kernel_schema_meta` marker.
-  Version 0.6 changes Orchestrator persistence to schema 2, using `sdk_*` tables.
+  The current development tree uses Orchestrator schema 3 and `sdk_*` tables;
+  earlier 0.6 builds used schema 2, which requires an explicit copy upgrade.
   Older unversioned Orchestrator databases are incompatible and are not migrated
   automatically. Table layouts are implementation details, not a public SQL API.
 - Commands bind `handler_id`, `handler_contract_version` and `registry_revision`.
@@ -162,3 +176,6 @@ can commit application SQL with its consumed marker; it does not make external
 network or file operations exactly once. See [task submission](TASK_SUBMISSION.md)
 for atomic submission replay and [Run storage validation](RUN_STORAGE_VALIDATION.md)
 for history growth and full-snapshot costs.
+
+Storage lifecycle APIs are development capabilities with explicit scope limits; see
+[storage retention and maintenance](STORAGE_RETENTION.md) before using destructive operations.

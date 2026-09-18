@@ -12,13 +12,14 @@ import hashlib
 from importlib import metadata
 from pathlib import Path
 import sqlite3
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 from . import _version
+from ._inspection import InspectionBudget, InspectionBudgetExceeded
 from .durability import Durability, validate_durability
 from .execution_kernel._registry import Handler, handler_revision, normalize_handlers, registry_revision
 from .execution_kernel.contracts import SCHEMA_VERSION
-from .storage import _read_only, inspect_storage
+from .storage import StorageInspectionCheck, _inspect_storage, _read_only
 
 VerdictStatus = Literal["supported", "unsupported", "unknown", "not_checked", "not_applicable"]
 
@@ -66,7 +67,7 @@ class StorageIdentity:
     status: Literal["missing", "recognized", "unsupported", "damaged", "unknown"]
     exists: bool | None
     schemas: dict[str, int | str]
-    integrity: Literal["ok", "failed", "unknown"]
+    integrity: Literal["ok", "failed", "unknown", "not_checked"]
     bindings: Literal["checked", "not_checked", "unknown"]
     facts: dict[str, Any]
     durability: DurabilityObservation
@@ -94,6 +95,11 @@ class RuntimeIdentityReport:
     execute: CapabilityVerdict
     resume: CapabilityVerdict
     snapshot_scope: str = "independent_storage_snapshots; catalog_summary_is_a_separate_snapshot"
+    requested_check: StorageInspectionCheck = "full"
+    actual_scope: tuple[str, ...] = ("module",)
+    complete: bool = True
+    stopped_reason: str | None = None
+    elapsed_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable report (no callable or connection objects)."""
@@ -104,7 +110,15 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _source_identity() -> ModuleIdentity:
+def _unknown_module_identity() -> ModuleIdentity:
+    root = Path(__file__).resolve().parent
+    return ModuleIdentity(None, str(root / "__init__.py"), None, "unknown", None,
+                          "unknown", "unknown", "unknown")
+
+
+def _source_identity(budget: InspectionBudget | None = None) -> ModuleIdentity:
+    if budget is not None:
+        budget.check()
     root = Path(__file__).resolve().parent
     try:
         distribution = metadata.distribution("dispatcher-sdk")
@@ -112,6 +126,8 @@ def _source_identity() -> ModuleIdentity:
     except metadata.PackageNotFoundError:
         distribution = None
         installed_version = None
+    if budget is not None:
+        budget.check()
     declared = getattr(_version, "SOURCE_VERSION", None)
     if not isinstance(declared, str) or not declared:
         declared = None
@@ -132,6 +148,8 @@ def _source_identity() -> ModuleIdentity:
         record_mismatch = False
         actual_names = set()
         for path in sources:
+            if budget is not None:
+                budget.check()
             relative = path.relative_to(root).as_posix()
             record_name = "dispatcher_sdk/" + relative
             actual_names.add(record_name)
@@ -145,6 +163,8 @@ def _source_identity() -> ModuleIdentity:
                 complete_record = False
             elif base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode().rstrip("=") != expected.value:
                 record_mismatch = True
+            if budget is not None:
+                budget.check()
         if records and actual_names != set(records):
             record_mismatch = True
         source_hash = digest.hexdigest()
@@ -160,7 +180,9 @@ def _verdict(status: VerdictStatus, reason: str) -> CapabilityVerdict:
     return CapabilityVerdict(status, (reason,))
 
 
-def _storage(name: str, path: str | Path, handlers, durability: Durability | None) -> StorageIdentity:
+def _storage(name: str, path: str | Path, handlers, durability: Durability | None,
+             check: StorageInspectionCheck, budget: InspectionBudget,
+             bindings_requested: bool) -> StorageIdentity:
     started = _now()
     resolved = str(Path(path).resolve())
     facts: dict[str, Any] = {}
@@ -169,13 +191,14 @@ def _storage(name: str, path: str | Path, handlers, durability: Durability | Non
     summary_time = None
     summary = _verdict("not_checked", "catalog_not_checked")
     schemas: dict[str, int | str] = {}
-    integrity = "unknown"
-    bindings = "not_checked" if handlers is None else "unknown"
+    integrity = "not_checked" if check != "full" else "unknown"
+    bindings = "unknown" if bindings_requested else "not_checked"
     exists: bool | None = None
     reasons: tuple[str, ...] = ()
     try:
         exists = Path(path).exists()
-        facts = inspect_storage(path, handlers=handlers)
+        facts = _inspect_storage(path, handlers=handlers, check=check, budget=budget,
+                                 snapshot_name=name)
         exists = facts["exists"]
         schemas = {key.removesuffix("_schema"): value for key, value in facts.items() if key.endswith("_schema")}
         if not exists:
@@ -183,40 +206,69 @@ def _storage(name: str, path: str | Path, handlers, durability: Durability | Non
             read = execute = resume = _verdict("unsupported", "storage_missing")
             summary = _verdict("unsupported", "storage_missing")
         else:
-            integrity = "failed" if any(item["component"] == "sqlite" for item in facts["issues"]) else "ok"
+            integrity_status = facts.get("checks", {}).get("integrity", "unknown")
+            integrity = ("failed" if integrity_status == "failed" else "ok" if integrity_status == "ok"
+                         else "not_checked" if integrity_status == "not_checked" else "unknown")
             unsupported = any(value == "unsupported" for value in schemas.values())
             recognized = any(isinstance(value, int) for value in schemas.values())
-            status = "damaged" if integrity == "failed" else "unsupported" if unsupported or not recognized else "recognized"
+            schema_status = facts.get("checks", {}).get("schema", "unknown")
+            status = ("damaged" if integrity == "failed" else "unknown"
+                      if schema_status == "unknown" else "unsupported"
+                      if unsupported or not recognized else "recognized")
             if status != "recognized":
-                read = execute = resume = _verdict("unsupported", "storage_" + status)
+                verdict = "unknown" if status == "unknown" else "unsupported"
+                read = execute = resume = _verdict(verdict, "storage_" + status)
             else:
                 read = _verdict("supported", "recognized_schema")
                 execution_store = any(isinstance(schemas.get(component), int)
                     for component in ("kernel", "orchestrator"))
-                bindings = "checked" if handlers is not None and execution_store else "not_checked"
+                binding_status = facts.get("checks", {}).get("bindings", "not_checked")
+                bindings = ("checked" if binding_status == "checked" and execution_store else
+                            "unknown" if binding_status == "unknown" and execution_store else "not_checked")
                 if not execution_store:
                     # A journal/inbox schema says nothing about the owning
                     # execution store, handler eligibility or recovery authority.
                     execute = _verdict("not_applicable", "auxiliary_storage_only")
                     resume = _verdict("unknown", "owning_execution_store_not_checked")
-                elif facts["issues"]:
+                elif any(item["component"] != "sqlite" for item in facts["issues"]):
                     execute = resume = _verdict("unsupported", "storage_or_binding_incompatible")
                 else:
                     execute = _verdict("supported", "recognized_schema")
-                    resume = _verdict("unknown", "bindings_not_checked") if handlers is None else _verdict("supported", "schema_and_bindings_checked")
+                    resume = (_verdict("supported", "schema_and_bindings_checked")
+                              if bindings == "checked" else
+                              _verdict("unknown", "binding_check_incomplete")
+                              if bindings == "unknown" else
+                              _verdict("unknown", "bindings_not_checked"))
             # Only generic SQLite catalog metadata is supported for arbitrary old schemas.
             # No legacy application rows are interpreted or promoted to execution authority.
-            if integrity == "ok":
+            if integrity != "failed" and facts.get("complete", True):
                 try:
-                    with _read_only(path) as connection:
+                    budget.check()
+                    with _read_only(path, timeout=budget.sqlite_timeout_seconds) as connection:
+                        budget.install(connection)
                         connection.execute("BEGIN")
                         rows = connection.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name LIMIT 101").fetchall()
                         tables = tuple(row[0] for row in rows[:100])
                         truncated = len(rows) > 100
                     summary_time = _now()
                     summary = _verdict("supported", "sqlite_catalog_only")
-                except (OSError, sqlite3.DatabaseError):
-                    summary = _verdict("unknown", "catalog_snapshot_unavailable")
+                except InspectionBudgetExceeded:
+                    facts["complete"] = False
+                    facts["stopped_reason"] = budget.stopped_reason or "timeout"
+                    facts["elapsed_seconds"] = budget.elapsed_seconds
+                    if not facts["issues"]:
+                        facts["compatible"] = None
+                    summary = _verdict("unknown", "catalog_snapshot_incomplete")
+                except (OSError, sqlite3.DatabaseError) as error:
+                    if isinstance(error, sqlite3.DatabaseError) and budget.interrupted(error):
+                        facts["complete"] = False
+                        facts["stopped_reason"] = budget.stopped_reason or "timeout"
+                        facts["elapsed_seconds"] = budget.elapsed_seconds
+                        if not facts["issues"]:
+                            facts["compatible"] = None
+                        summary = _verdict("unknown", "catalog_snapshot_incomplete")
+                    else:
+                        summary = _verdict("unknown", "catalog_snapshot_unavailable")
     except FileNotFoundError:
         status, exists = "missing", False
         read = execute = resume = summary = _verdict("unsupported", "storage_missing")
@@ -256,7 +308,10 @@ def _aggregate(storages: tuple[StorageIdentity, ...], capability: str) -> Capabi
 
 def runtime_identity(path: str | Path | None = None, *, handlers: Mapping[Any, Handler] | None = None,
                      durability: Durability | None = None,
-                     component_paths: Mapping[str, str | Path] | None = None) -> RuntimeIdentityReport:
+                     component_paths: Mapping[str, str | Path] | None = None,
+                     check: StorageInspectionCheck = "full",
+                     timeout_seconds: float | None = None,
+                     progress: Callable[[dict[str, Any]], None] | None = None) -> RuntimeIdentityReport:
     """Describe imported source, registry and storage without initializing writers.
 
     ``path`` names the main store; ``component_paths`` adds independently observed
@@ -271,12 +326,11 @@ def runtime_identity(path: str | Path | None = None, *, handlers: Mapping[Any, H
     not authentication or verification of already loaded bytecode.
     """
     started = _now()
+    if check not in ("schema", "bindings", "full"):
+        raise ValueError("check must be 'schema', 'bindings', or 'full'")
+    budget = InspectionBudget(timeout_seconds, progress)
     if durability is not None:
         validate_durability(durability)
-    normalized = None if handlers is None else normalize_handlers(handlers)
-    revision = None if normalized is None else registry_revision(normalized)
-    bindings = () if normalized is None else tuple(HandlerBindingIdentity(key[0], key[1],
-        handler_revision(normalized, *key)) for key in sorted(normalized))
     paths = dict(component_paths or {})
     if path is not None:
         if "main" in paths:
@@ -284,8 +338,46 @@ def runtime_identity(path: str | Path | None = None, *, handlers: Mapping[Any, H
         paths = {"main": path, **paths}
     if any(not isinstance(name, str) or not name for name in paths):
         raise ValueError("component path names must be non-empty strings")
-    storages = tuple(_storage(name, item, normalized, durability) for name, item in paths.items())
-    module = _source_identity()
+    budget.emit("module", "started")
+    module_complete = True
+    try:
+        module = _source_identity(budget)
+    except InspectionBudgetExceeded:
+        module = _unknown_module_identity()
+        module_complete = False
+        budget.emit("module", "stopped", reason=budget.stopped_reason or "timeout")
+    else:
+        budget.emit("module", "completed")
+    normalized = None
+    revision = None
+    bindings: tuple[HandlerBindingIdentity, ...] = ()
+    registry_complete = False
+    if module_complete:
+        try:
+            budget.emit("registry", "started")
+            budget.check()
+            normalized = None if handlers is None else normalize_handlers(handlers)
+            budget.check()
+            revision = None if normalized is None else registry_revision(normalized)
+            budget.check()
+            binding_items = []
+            if normalized is not None:
+                for key in sorted(normalized):
+                    budget.check()
+                    binding_items.append(HandlerBindingIdentity(
+                        key[0], key[1], handler_revision(normalized, *key)))
+                    budget.check()
+            bindings = tuple(binding_items)
+            registry_complete = True
+            budget.emit("registry", "completed")
+        except InspectionBudgetExceeded:
+            normalized = None
+            revision = None
+            bindings = ()
+            budget.emit("registry", "stopped", reason=budget.stopped_reason or "timeout")
+    storages = tuple(_storage(name, item, normalized, durability, check, budget,
+                              handlers is not None)
+                     for name, item in paths.items())
     execute, resume = _aggregate(storages, "execute"), _aggregate(storages, "resume")
     identity_errors = tuple(reason for condition, reason in (
         (module.version_agreement == "mismatch", "distribution_source_version_mismatch"),
@@ -295,10 +387,21 @@ def runtime_identity(path: str | Path | None = None, *, handlers: Mapping[Any, H
         # positive deployment verdict when installed and imported artifacts differ.
         execute = CapabilityVerdict("unsupported", tuple(dict.fromkeys(identity_errors + execute.reasons)))
         resume = CapabilityVerdict("unsupported", tuple(dict.fromkeys(identity_errors + resume.reasons)))
+    actual_scope = (("module", "registry") if registry_complete else
+                    ("module",) if module_complete else ()) + tuple(
+        f"{storage.name}:{scope}" for storage in storages
+        for scope in storage.facts.get("actual_scope", ()))
+    complete = (module_complete and registry_complete
+                and all(storage.facts.get("complete", True) for storage in storages))
+    stopped_reason = next((storage.facts.get("stopped_reason") for storage in storages
+                           if storage.facts.get("stopped_reason")),
+                          budget.stopped_reason if not complete else None)
     return RuntimeIdentityReport(started, _now(), module,
         {"execution_command": SCHEMA_VERSION, "execution_result": SCHEMA_VERSION,
          "handler_registry": 2, "handler_binding": 1, "runtime_identity": 1},
-        revision, bindings, storages, _aggregate(storages, "read"), execute, resume)
+        revision, bindings, storages, _aggregate(storages, "read"), execute, resume,
+        requested_check=check, actual_scope=actual_scope, complete=complete,
+        stopped_reason=stopped_reason, elapsed_seconds=budget.elapsed_seconds)
 
 
 __all__ = ["runtime_identity", "RuntimeIdentityReport", "ModuleIdentity", "StorageIdentity",

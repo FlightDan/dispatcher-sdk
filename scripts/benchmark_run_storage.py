@@ -41,8 +41,8 @@ class _ObservedKernel(SQLiteKernel):
 class _ObservedOrchestrator(Orchestrator):
     statements = None
 
-    def _connect(self):
-        connection = super()._connect()
+    def _connect(self, *, configure=True):
+        connection = super()._connect(configure=configure)
         if self.statements is not None:
             connection.set_trace_callback(self.statements.append)
         return connection

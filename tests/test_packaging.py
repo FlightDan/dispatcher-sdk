@@ -55,7 +55,7 @@ class PackagingTests(unittest.TestCase):
                     modules = [alias.name for alias in node.names]
                 elif isinstance(node, ast.ImportFrom):
                     modules = [node.module or ""]
-                    if node.level > 1 and not (node.level == 2 and node.module == "durability"):
+                    if node.level > 1 and not (node.level == 2 and node.module in {"durability", "storage_connection"}):
                         self.fail(f"Kernel reaches outside its package: {source}:{node.lineno}")
                 else:
                     continue

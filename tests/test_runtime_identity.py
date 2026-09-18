@@ -31,6 +31,24 @@ class RuntimeIdentityTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.path = Path(self.temporary.name) / "runtime.db"
 
+    def test_final_registry_fingerprint_cannot_finish_after_its_budget_as_complete(self):
+        for function in ("registry_revision", "handler_revision"):
+            with self.subTest(function=function):
+                clock = [0.0]
+
+                def slow_fingerprint(*_args):
+                    clock[0] = 2.0
+                    return "test-revision"
+
+                with patch("dispatcher_sdk._inspection.time.monotonic", side_effect=lambda: clock[0]), \
+                        patch("dispatcher_sdk.identity." + function, side_effect=slow_fingerprint):
+                    report = runtime_identity(handlers={"echo": echo}, timeout_seconds=1)
+                self.assertFalse(report.complete)
+                self.assertEqual(report.stopped_reason, "timeout")
+                self.assertIsNone(report.registry_revision)
+                self.assertEqual(report.handler_bindings, ())
+                self.assertNotIn("registry", report.actual_scope)
+
     def test_missing_is_not_readable_and_not_created(self):
         result = runtime_identity(self.path, handlers={})
         self.assertEqual(result.storages[0].status, "missing")
@@ -39,6 +57,22 @@ class RuntimeIdentityTests(unittest.TestCase):
         self.assertFalse(self.path.exists())
         self.assertEqual(runtime_identity().read.status, "not_checked")
         json.dumps(result.to_dict())
+
+    def test_module_only_identity_does_not_inspect_storage(self):
+        with patch("dispatcher_sdk.identity._inspect_storage") as inspect:
+            result = runtime_identity()
+        inspect.assert_not_called()
+        self.assertEqual(result.actual_scope, ("module", "registry"))
+        self.assertFalse(result.storages)
+
+    def test_module_identity_timeout_is_incomplete_and_unknown(self):
+        result = runtime_identity(timeout_seconds=0)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.stopped_reason, "timeout")
+        self.assertEqual(result.module.version_agreement, "unknown")
+        self.assertIsNone(result.module.source_sha256)
+        self.assertEqual(result.execute.status, "not_checked")
+        self.assertEqual(result.resume.status, "not_checked")
 
     def test_current_storage_bindings_and_read_only_contents(self):
         with Runtime(self.path, {"echo": echo}, isolation_mode="thread") as runtime:
@@ -105,7 +139,7 @@ class RuntimeIdentityTests(unittest.TestCase):
         self.assertEqual(result.storages[0].status, "damaged")
         self.assertEqual(result.read.status, "unsupported")
         self.assertEqual(before, self.path.read_bytes())
-        with patch("dispatcher_sdk.identity.inspect_storage", side_effect=PermissionError("denied")):
+        with patch("dispatcher_sdk.identity._inspect_storage", side_effect=PermissionError("denied")):
             result = runtime_identity(self.path)
         self.assertEqual(result.read.status, "unknown")
         self.assertEqual(result.storages[0].integrity, "unknown")
@@ -124,7 +158,7 @@ class RuntimeIdentityTests(unittest.TestCase):
                 # Manually created exceptions also lack codes on newer Python.
                 error = sqlite3.DatabaseError(message)
                 self.assertFalse(hasattr(error, "sqlite_errorcode"))
-                with patch("dispatcher_sdk.identity.inspect_storage", side_effect=error):
+                with patch("dispatcher_sdk.identity._inspect_storage", side_effect=error):
                     storage = runtime_identity(self.path).storages[0]
                 self.assertEqual(storage.status, "damaged" if damaged else "unknown")
                 self.assertEqual(storage.integrity, "failed" if damaged else "unknown")
@@ -142,7 +176,7 @@ class RuntimeIdentityTests(unittest.TestCase):
             with self.subTest(code=code):
                 error = sqlite3.DatabaseError(message)
                 error.sqlite_errorcode = code
-                with patch("dispatcher_sdk.identity.inspect_storage", side_effect=error):
+                with patch("dispatcher_sdk.identity._inspect_storage", side_effect=error):
                     storage = runtime_identity(self.path).storages[0]
                 self.assertEqual(storage.status, "damaged" if damaged else "unknown")
 
@@ -264,6 +298,36 @@ class RuntimeIdentityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Orchestrator.open_sqlite(self.path, {}, isolation_mode="thread")
         self.assertEqual(before, self.path.read_bytes())
+
+    def test_schema_identity_reports_omitted_integrity_and_bindings(self):
+        with Runtime(self.path, {}, isolation_mode="thread"):
+            pass
+        report = runtime_identity(self.path, handlers={}, check="schema")
+        storage = report.storages[0]
+        self.assertEqual(storage.status, "recognized")
+        self.assertEqual(storage.integrity, "not_checked")
+        self.assertEqual(storage.bindings, "not_checked")
+        self.assertEqual(storage.read.status, "supported")
+        self.assertEqual(storage.execute.status, "supported")
+        self.assertEqual(storage.resume.status, "unknown")
+        self.assertIsNone(storage.facts["compatible"])
+
+    def test_one_timeout_budget_spans_component_snapshots(self):
+        with Runtime(self.path, {}, isolation_mode="thread"):
+            pass
+        second = self.path.parent / "second.db"
+        with Runtime(second, {}, isolation_mode="thread"):
+            pass
+        events = []
+        report = runtime_identity(self.path, handlers={}, component_paths={"second": second},
+                                  timeout_seconds=0, progress=events.append)
+        self.assertFalse(report.complete)
+        self.assertEqual(report.stopped_reason, "timeout")
+        self.assertEqual([item.status for item in report.storages], ["unknown", "unknown"])
+        self.assertEqual([item.integrity for item in report.storages], ["unknown", "unknown"])
+        self.assertIn("main:existence", report.actual_scope)
+        self.assertIn("second:existence", report.actual_scope)
+        self.assertTrue(all("percent" not in event for event in events))
 
 
 if __name__ == "__main__":

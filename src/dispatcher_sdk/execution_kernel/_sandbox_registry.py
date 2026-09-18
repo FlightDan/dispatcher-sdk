@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sqlite3
+from ..storage_connection import connect as storage_connect
 from uuid import uuid4
 
 from ..durability import configure_sqlite_connection
@@ -24,7 +25,7 @@ def validate_registry(connection):
 def register_journals(db_path, paths, *, durability, initialize_only=False):
     if str(db_path) == ":memory:":
         return None
-    connection = sqlite3.connect(db_path, timeout=30)
+    connection = storage_connect(db_path, timeout=30)
     try:
         configure_sqlite_connection(connection, db_path, durability=durability)
         connection.execute("BEGIN IMMEDIATE")

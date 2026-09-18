@@ -35,20 +35,25 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                     self.assertIn(module.split(".")[0], sys.stdlib_module_names,
                                   msg=f"external Kernel import in {source}: {module}")
 
-    def _run(self, command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    def _run(self, command: list[str], *, cwd: Path,
+             timeout: float = 300) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
         environment["PYTHONNOUSERSITE"] = "1"
         environment["PIP_NO_CACHE_DIR"] = "1"
-        completed = subprocess.run(
-            command,
-            cwd=cwd,
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=300,
-        )
+        try:
+            completed = subprocess.run(
+                command, cwd=cwd, env=environment, capture_output=True,
+                text=True, check=False, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            def tail(value):
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="replace")
+                return (value or "")[-8000:]
+
+            self.fail(f"command timed out after {timeout}s: {command!r}\n"
+                      f"stdout tail:\n{tail(error.stdout)}\nstderr tail:\n{tail(error.stderr)}")
         self.assertEqual(
             completed.returncode,
             0,
@@ -149,7 +154,9 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                             ignore=shutil.ignore_patterns("__pycache__", "test_packaging.py",
                                                           "test_execution_kernel_isolated_consumer.py"))
             self._run([str(interpreter), "-m", "unittest", "discover", "-s", "tests", "-v"],
-                      cwd=installed_suite)
+                      # This runs the complete suite again, including SQLite
+                      # FULL durability fixtures; it needs its own suite budget.
+                      cwd=installed_suite, timeout=600)
 
             consumer = root / "consumer.py"
             consumer.write_text(

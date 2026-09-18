@@ -21,6 +21,24 @@ class CommandConflict(OrchestrationError):
     """A command identity was reused for different content."""
 
 
+class EventCursorExpired(OrchestrationError):
+    """An explicitly configured retention policy expired this event cursor."""
+
+    def __init__(self, run_id: str, cursor: int, expired_through: int):
+        self.run_id = run_id
+        self.cursor = cursor
+        self.expired_through = expired_through
+        super().__init__(f"event cursor {cursor} for {run_id} expired; resume after {expired_through}")
+
+
+class HistoryExpired(OrchestrationError):
+    """An explicitly configured retention policy removed this revision."""
+
+
+class RunDisposed(OrchestrationError):
+    """The Run identity has been permanently retired and cannot be reused."""
+
+
 TERMINAL = frozenset({"succeeded", "failed", "timed_out", "cancelled", "dead"})
 RUN_TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 

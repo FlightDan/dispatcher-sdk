@@ -9,7 +9,7 @@ delivery leases single-writer while allowing Kernel executions to overlap.
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import threading
 import time
 from typing import Any, Callable, Protocol
@@ -48,6 +48,55 @@ class RuntimeHostHealth:
     retry_count: int
     last_error: RuntimeHostError | None
     recent_errors: tuple[RuntimeHostError, ...]
+
+
+@dataclass(frozen=True)
+class StopPhase:
+    """One observable phase of a host shutdown."""
+
+    name: str
+    status: str
+    started_at: float | None
+    finished_at: float | None
+    elapsed_seconds: float | None
+    error_type: str | None = None
+    error_message: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StopReport:
+    """A point-in-time, JSON-serializable snapshot of host shutdown.
+
+    ``pending_delivery_count`` and ``pending_delivery_persisted`` are scoped to
+    application notification delivery.  ``None`` means the host did not
+    observe the value; shutdown reporting never performs a potentially
+    blocking durable-store scan to fill either field.
+
+    ``can_continue_waiting`` describes whether an unfinished host thread was
+    still observable when the snapshot was made.  It does not promise that
+    waiting will finish or cancel the operation that is holding shutdown up.
+    """
+
+    scope: str
+    status: str
+    started_at: float
+    finished_at: float | None
+    elapsed_seconds: float
+    timeout_seconds: float | None
+    phases: tuple[StopPhase, ...]
+    unfinished_phases: tuple[str, ...]
+    active_worker_count: int
+    notification_thread_alive: bool | None
+    pending_delivery_count: int | None
+    pending_delivery_persisted: bool | None
+    can_continue_waiting: bool
+    errors: tuple[RuntimeHostError, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 class RuntimeHost:
@@ -119,6 +168,25 @@ class RuntimeHost:
         self._shutdown_lock = threading.Lock()
         self._shutdown_attempted = False
         self._shutdown_error: BaseException | None = None
+        self._stop_started_at: float | None = None
+        self._stop_finished_at: float | None = None
+        self._stop_timeout: float | None = None
+        self._stop_status = "not_started"
+        self._stop_phases: dict[str, dict[str, Any]] = {
+            name: {
+                "status": "not_started",
+                "started_at": None,
+                "finished_at": None,
+                "error_type": None,
+                "error_message": None,
+            }
+            for name in (
+                "worker_drain",
+                "executor_shutdown",
+                "final_pump",
+                "runtime_close",
+            )
+        }
 
         # A composition created before this host may have handed the Bridge
         # an adapter which still points only at SQLiteKernel.  Binding here is
@@ -219,18 +287,135 @@ class RuntimeHost:
         coordinator.join(timeout)
         return not coordinator.is_alive()
 
+    @property
+    def stop_report(self) -> StopReport | None:
+        """Return the latest shutdown snapshot, or ``None`` before shutdown."""
+
+        with self._lock:
+            return self._stop_report_locked()
+
+    def _stop_report_locked(self) -> StopReport | None:
+        started_at = self._stop_started_at
+        if started_at is None:
+            return None
+        now = time.monotonic()
+        phases = tuple(
+            self._phase_snapshot_locked(name, values, now)
+            for name, values in self._stop_phases.items()
+        )
+        coordinator_alive = bool(
+            self._coordinator is not None and self._coordinator.is_alive()
+        )
+        finished_at = self._stop_finished_at
+        return StopReport(
+            scope="runtime_host",
+            status=self._stop_status,
+            started_at=started_at,
+            finished_at=finished_at,
+            elapsed_seconds=max(
+                0.0, (finished_at if finished_at is not None else now) - started_at
+            ),
+            timeout_seconds=self._stop_timeout,
+            phases=phases,
+            unfinished_phases=tuple(
+                phase.name
+                for phase in phases
+                if phase.status not in {"completed", "skipped"}
+            ),
+            active_worker_count=len(self._futures),
+            notification_thread_alive=None,
+            pending_delivery_count=None,
+            pending_delivery_persisted=None,
+            can_continue_waiting=coordinator_alive,
+            errors=tuple(self._recent_errors),
+        )
+
+    @staticmethod
+    def _phase_snapshot_locked(
+        name: str, values: dict[str, Any], now: float
+    ) -> StopPhase:
+        started_at = values["started_at"]
+        finished_at = values["finished_at"]
+        elapsed = None
+        if started_at is not None:
+            elapsed = max(
+                0.0, (finished_at if finished_at is not None else now) - started_at
+            )
+        return StopPhase(
+            name=name,
+            status=values["status"],
+            started_at=started_at,
+            finished_at=finished_at,
+            elapsed_seconds=elapsed,
+            error_type=values["error_type"],
+            error_message=values["error_message"],
+        )
+
+    def _begin_stop(self, timeout: float | None) -> None:
+        with self._lock:
+            first_stop = self._stop_started_at is None
+            if first_stop:
+                self._stop_started_at = time.monotonic()
+            if self._stop_status in {"completed", "failed"}:
+                return
+            # The coordinator also enters this method from ``finally``.  Do
+            # not let that unbounded internal cleanup erase the caller's
+            # finite deadline from the report.
+            if first_stop or timeout is not None:
+                self._stop_timeout = timeout
+            self._stop_status = "in_progress"
+            self._stop_finished_at = None
+
+    def _start_stop_phase(self, name: str) -> None:
+        with self._lock:
+            values = self._stop_phases[name]
+            if values["status"] == "not_started":
+                values["status"] = "in_progress"
+                values["started_at"] = time.monotonic()
+
+    def _finish_stop_phase(
+        self, name: str, *, error: BaseException | None = None, skipped: bool = False
+    ) -> None:
+        with self._lock:
+            values = self._stop_phases[name]
+            now = time.monotonic()
+            if values["started_at"] is None and not skipped:
+                values["started_at"] = now
+            values["finished_at"] = now
+            if error is not None:
+                values["status"] = "failed"
+                values["error_type"] = type(error).__name__
+                values["error_message"] = str(error)
+            else:
+                values["status"] = "skipped" if skipped else "completed"
+
+    def _finish_stop(self, status: str) -> None:
+        with self._lock:
+            if self._stop_status == "failed" and status != "failed":
+                return
+            if status == "timed_out" and self._stop_status in {"completed", "failed"}:
+                return
+            self._stop_status = status
+            self._stop_finished_at = (
+                time.monotonic() if status in {"completed", "failed"} else None
+            )
+
     def stop(self, timeout: float | None = None) -> bool:
         """Stop scheduling, drain workers, and close the supplied runtime."""
 
         if timeout is not None and (
-            type(timeout) not in {int, float} or timeout < 0
+            type(timeout) not in {int, float} or timeout < 0 or not float(timeout) < float("inf")
         ):
-            raise ValueError("timeout must be a non-negative number or None")
+            raise ValueError("timeout must be a finite non-negative number or None")
+        stop_called_at = time.monotonic()
+        deadline = None if timeout is None else stop_called_at + timeout
+        self._begin_stop(None if timeout is None else float(timeout))
         with self._lock:
             if self._state == "new":
                 self._state = "stopping"
                 coordinator = None
             elif self._state == "stopped":
+                self._finish_stop("completed")
                 return True
             elif self._state == "failed" and self._coordinator is None:
                 coordinator = None
@@ -242,26 +427,38 @@ class RuntimeHost:
             self._wake_event.set()
 
         if coordinator is None:
+            self._finish_stop_phase("worker_drain", skipped=True)
             self._shutdown_resources()
-            self._raise_shutdown_error()
+            try:
+                self._raise_shutdown_error()
+            except BaseException:
+                self._finish_stop("failed")
+                raise
+            self._finish_stop("completed")
             return True
 
         if timeout is None:
             coordinator.join()
         else:
-            graceful_timeout = timeout / 2.0
-            coordinator.join(graceful_timeout)
+            graceful_deadline = stop_called_at + timeout / 2.0
+            coordinator.join(max(0.0, graceful_deadline - time.monotonic()))
             if coordinator.is_alive():
                 # Revoke active handler authority without closing the Kernel.
                 # The coordinator remains the sole owner of final Bridge
                 # flushing and runtime.close, so callers can safely preserve
                 # the Orchestrator store when the bounded join returns false.
                 self._request_runtime_stop_once()
-                coordinator.join(timeout - graceful_timeout)
+                coordinator.join(max(0.0, deadline - time.monotonic()))
         if coordinator.is_alive():
+            self._finish_stop("timed_out")
             return False
         self._shutdown_resources(flush=True)
-        self._raise_shutdown_error()
+        try:
+            self._raise_shutdown_error()
+        except BaseException:
+            self._finish_stop("failed")
+            raise
+        self._finish_stop("completed")
         return True
 
     def _raise_shutdown_error(self) -> None:
@@ -278,9 +475,15 @@ class RuntimeHost:
                 return
             executor = self._executor
             if executor is not None:
+                with self._lock:
+                    drain_complete = self._stop_phases["worker_drain"]["status"] == "completed"
+                if not drain_complete:
+                    self._start_stop_phase("worker_drain")
+                self._start_stop_phase("executor_shutdown")
                 try:
                     executor.shutdown(wait=True, cancel_futures=True)
                 except BaseException as exc:
+                    self._finish_stop_phase("executor_shutdown", error=exc)
                     self._record_error("executor_shutdown", exc)
                     with self._lock:
                         self._shutdown_error = exc
@@ -292,8 +495,18 @@ class RuntimeHost:
                         return
                 else:
                     self._collect_workers()
+                    if not drain_complete:
+                        self._finish_stop_phase("worker_drain")
+                    self._finish_stop_phase("executor_shutdown")
+            else:
+                with self._lock:
+                    drain_status = self._stop_phases["worker_drain"]["status"]
+                if drain_status == "not_started":
+                    self._finish_stop_phase("worker_drain", skipped=True)
+                self._finish_stop_phase("executor_shutdown", skipped=True)
             self._shutdown_attempted = True
             if flush:
+                self._start_stop_phase("final_pump")
                 errors_before = self.health().error_count
                 try:
                     self._pump()
@@ -301,17 +514,26 @@ class RuntimeHost:
                 except BaseException as exc:
                     self._record_error("final_pump", exc)
                 if self.health().error_count != errors_before:
+                    error = RuntimeError("final Bridge flush failed")
+                    self._finish_stop_phase("final_pump", error=error)
                     with self._lock:
-                        self._shutdown_error = RuntimeError("final Bridge flush failed")
+                        self._shutdown_error = error
                         self._state = "failed"
+                else:
+                    self._finish_stop_phase("final_pump")
+            else:
+                self._finish_stop_phase("final_pump", skipped=True)
+            self._start_stop_phase("runtime_close")
             try:
                 self.runtime.close()
             except BaseException as exc:
+                self._finish_stop_phase("runtime_close", error=exc)
                 self._record_error("runtime_close", exc)
                 with self._lock:
                     self._shutdown_error = exc
                     self._state = "failed"
             else:
+                self._finish_stop_phase("runtime_close")
                 with self._lock:
                     self._executor = None
                     if self._state != "failed":
@@ -490,11 +712,13 @@ class RuntimeHost:
         self._wake_event.clear()
 
     def _drain_workers(self) -> None:
+        self._start_stop_phase("worker_drain")
         while True:
             self._collect_workers()
             with self._lock:
                 active = len(self._futures)
             if active == 0:
+                self._finish_stop_phase("worker_drain")
                 return
             self._wait(allow_stopping=True)
 
@@ -557,8 +781,15 @@ class RuntimeHost:
             # particular, ``shutdown(wait=False)`` here creates a use-after-
             # close race for a still-running ``run_once``.
             self._stop_event.set()
+            self._begin_stop(None)
             self._request_runtime_stop_once()
             self._shutdown_resources(flush=startup_ready)
+            with self._lock:
+                failed = self._shutdown_error is not None or self._state == "failed"
+            self._finish_stop("failed" if failed else "completed")
 
 
-__all__ = ["RuntimeHost", "RuntimeHostBridge", "RuntimeHostError", "RuntimeHostHealth"]
+__all__ = [
+    "RuntimeHost", "RuntimeHostBridge", "RuntimeHostError", "RuntimeHostHealth",
+    "StopPhase", "StopReport",
+]

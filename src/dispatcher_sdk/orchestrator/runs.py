@@ -22,6 +22,7 @@ class RunHistoryMixin:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
+            self._assert_not_disposed(connection, run_id)
             row = connection.execute(
                 "SELECT value FROM sdk_run_items WHERE run_id=? AND section='task' AND item_key=?",
                 (run_id, task_id)).fetchone()
@@ -57,6 +58,7 @@ class RunHistoryMixin:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
+            self._assert_not_disposed(connection, run_id)
             row = connection.execute("SELECT run_id,revision,state FROM sdk_runs WHERE run_id=?",
                                      (run_id,)).fetchone()
             if row is None:
@@ -195,6 +197,7 @@ class RunHistoryMixin:
                 raise RevisionConflict("run generation changed")
             if previous["state"] not in RUN_TERMINAL:
                 raise OrchestrationError("finish the current Run before continuing it")
+            self._assert_not_disposed(connection, next_run_id)
             if connection.execute("SELECT 1 FROM sdk_runs WHERE run_id=?", (next_run_id,)).fetchone():
                 raise CommandConflict("next Run identity already exists")
             if connection.execute("SELECT 1 FROM sdk_run_links WHERE previous_run_id=?", (run_id,)).fetchone():

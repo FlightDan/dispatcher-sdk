@@ -2,14 +2,32 @@
 
 ## 0.6.0 (developer preview, unreleased)
 
+- Structured shutdown reports preserve stop/error contracts and expose worker,
+  final-pump, resource-close and notification phases without post-timeout scans.
+- Explicit schema/binding/full inspection levels, cooperative scan budgets and
+  progress; file-only capacity reads avoid implicit page attribution.
+- Bounded read-only execution/result origin lookup across same-store segments.
+- Request/result correlation and independent explicit caller receipts compose
+  the existing inbox schema. Delivery does not imply reception or review approval.
+  See [reliability APIs](docs/SDK_RELIABILITY.md).
+
+- Orchestrator schema 3 stores large application-state children by content digest,
+  sharing history/event payloads without changing logical reads or command digests.
+  Existing schema 2 requires explicit copy upgrade; Kernel remains schema 2.
+- Bounded read-only storage usage and retention planning; maintenance leases guard
+  validated, idempotent history/event pruning and unreachable internal-object GC.
+- Non-overwriting copy upgrade/compaction, authenticated component snapshot and
+  read-only restore, and conservative registry-backed terminal-Run disposal.
+  See [storage maintenance scope and limits](docs/STORAGE_RETENTION.md); full
+  quotas, resumable large migrations and restore activation remain unimplemented.
+
 - Runtime identity and independent storage read/execute/resume preflight verdicts;
   unsupported Kernel/Orchestrator schemas are checked before configuring WAL.
 - Synchronous `ProjectionConsumer` persists complete pages before ACK, safely
   replays idempotent effects, and drains to a fixed high-water boundary.
 - Read-only work-availability and cancellation reports expose scheduling causes,
   pending delivery, execution generations, uncertainty and cleanup evidence.
-- Opt-in cancellation journal schema 1 is a separate file; core schemas remain
-  unchanged. Runtime process/thread registrations are fenced by invocation
+- Opt-in cancellation journal schema 1 is a separate file; it does not itself change core schemas. Runtime process/thread registrations are fenced by invocation
   generation so older invocations cannot supply newer cleanup evidence.
 - Typed operation constructors and Run/event views, with a packaged `py.typed` marker.
 - Optional notification callback for `OrchestratorHost`: omitted callbacks leave

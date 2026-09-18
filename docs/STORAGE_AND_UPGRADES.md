@@ -1,7 +1,10 @@
 # Storage, upgrades, and deployment preflight
 
-Version 0.6 changes the Orchestrator's persisted layout to schema 2 without
-automatically migrating older, unversioned orchestration databases.
+The current development tree uses Orchestrator schema 3, with content-addressed
+application state, history and decision-event payloads. Earlier 0.6 development
+builds used schema 2. Ordinary opening never converts either legacy schema 2 or
+older unversioned orchestration databases. See
+[retention and maintenance APIs](STORAGE_RETENTION.md) for explicit copy upgrades.
 Opening an unsupported or damaged orchestration store raises an error instead
 of recreating missing tables. The Kernel's protocol and SQLite schema remain
 at version 2; the Orchestrator change does not introduce a Kernel schema 3.
@@ -11,10 +14,16 @@ The notification inbox has its own schema version 1, recorded in
 including the version marker and clock row. Opening a partial, unversioned, or
 incompatible inbox fails without filling in missing tables.
 
-## Adding same-Run recovery to a schema 2 store
+Preflight now accepts explicit `check="schema"`, `"bindings"` and `"full"`
+levels with cooperative time budgets and progress observations. The existing
+default remains `"full"`; read-only does not mean cheap. Capacity inspection's
+`detail="files"` reads only file sizes, while `"physical"` can scan `dbstat`.
+See [inspection cost and evidence](SDK_RELIABILITY.md#explicit-inspection-cost).
+
+## Legacy helper: adding same-Run recovery to a schema 2 store
 
 An Orchestrator database created by an earlier schema 2 build needs an explicit
-upgrade before this version can open it:
+legacy schema preparation step before the explicit copy upgrade can accept it:
 
 ```python
 from dispatcher_sdk.orchestrator import Orchestrator
@@ -29,8 +38,9 @@ changes, and Run history remains unchanged.
 
 `upgrade_schema()` accepts only a durable database with an Orchestrator schema 2
 marker. It does not convert an unversioned store, repair damaged tables, or
-upgrade the notification inbox. Back up the database and stop its writers before
-running a deployment upgrade.
+upgrade the notification inbox. This helper deliberately leaves the source at
+schema 2; it does not enable the schema 3 reader. Back up the database and stop
+its writers before running it, then use `upgrade_storage` to publish a new file.
 
 ## Moving from an older orchestration store
 
@@ -248,3 +258,12 @@ The repository CI is configured for Linux and Windows with Python 3.10 through
 3.13; that configuration does not prove every matrix entry has passed. See
 [Windows runtime](WINDOWS_RUNTIME.md) for the recorded platform, commands and
 limits.
+
+## Planned retention and lifecycle improvements
+
+The [storage retention improvement plan](STORAGE_RETENTION_IMPROVEMENT_PLAN.md)
+describes proposed content deduplication, explicit format upgrades, reachability
+planning, retention, compaction, coordinated snapshots, archival and Run disposal.
+It includes phased delivery and acceptance criteria. The
+[implemented API guide](STORAGE_RETENTION.md) distinguishes the available
+development APIs from the remaining roadmap; the complete plan is not yet implemented.

@@ -14,6 +14,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+from ..storage_connection import connect as storage_connect
 import time
 from typing import Any, Callable, Iterator, Literal, TypedDict, cast
 import uuid
@@ -205,7 +206,7 @@ class NotificationInbox:
             connection.close()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        connection = storage_connect(self.db_path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         try:
             configure_sqlite_connection(connection, self.db_path, durability=self.durability)

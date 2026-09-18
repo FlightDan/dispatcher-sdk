@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+from ..storage_connection import connect as storage_connect
 import threading
 import time
 from typing import Any, Iterator, Optional
@@ -80,7 +81,7 @@ class SQLiteBase:
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(
+        self._connection = storage_connect(
             self.db_path,
             timeout=SQLITE_OPEN_TIMEOUT_SECONDS,
             isolation_level=None,

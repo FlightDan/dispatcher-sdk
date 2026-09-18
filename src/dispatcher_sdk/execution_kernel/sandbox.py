@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+from ..storage_connection import connect as storage_connect
 import time
 from typing import Any
 from uuid import uuid4
@@ -81,7 +82,7 @@ class SandboxJournal:
 
     @contextmanager
     def _connect(self):
-        connection = sqlite3.connect(self.path, timeout=30)
+        connection = storage_connect(self.path, timeout=30)
         try:
             configure_sqlite_connection(connection, self.path, durability=self.durability)
             yield connection
