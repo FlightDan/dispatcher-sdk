@@ -4,6 +4,7 @@
 
 | Concept | Responsibility |
 | --- | --- |
+| Dispatcher / Task | The 0.7 managed API for submitting a local task, waiting for its result and reopening its durable handle after restart. |
 | Handler | Application function that receives payload and execution context. |
 | Kernel / Runtime | Kernel stores execution authority; Runtime executes registered handlers. |
 | Execution command | Identifies one execution, handler binding, payload, timeout and retry policy. |
@@ -13,9 +14,16 @@
 | Recovery / generation | Recovery resumes a terminal Run; generation separates old work from work created after the reopen. |
 | Notification / inbox | Delivers outcomes to the application; a durable inbox deduplicates receipt. |
 
-A minimal workflow creates a Run, records a task and dispatch intent, delivers the
-command, executes it, then synchronizes results. The application validates the
-result and explicitly chooses the next operation or finishes the Run.
+For an ordinary local task, `Dispatcher.submit()` creates the Run and task,
+starts the background Host and returns a durable `Task` handle. The application
+can wait for the result or consume saved result notifications. See
+[managed tasks](Managed-Tasks.md) for the short path.
+
+The lower-level workflow creates a Run, records a task and dispatch intent,
+delivers the command, executes it, then synchronizes results. Use it when the
+application needs dependencies, waits, explicit recovery or control over Run
+decisions. The application validates the result and explicitly chooses the next
+operation or finishes the Run.
 
 `submit_task()` persists intent; it does not execute the handler. Manual loops use
 `flush()`, `runtime.run_once()` and `sync()`. `OrchestratorHost` drives the background

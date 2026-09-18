@@ -51,7 +51,7 @@ its writers before running it, then use `upgrade_storage` to publish a new file.
    explicit recovery decision before retiring its workers.
 3. Take a database backup and, when useful, a SQL export. Preserve the original
    database and deployment for historical inspection or unfinished recovery.
-4. Start the 0.6 application with a new database. Transfer only the application
+4. Start the 0.7 application with a new database. Transfer only the application
    input or state that the application explicitly chooses to carry forward.
 
 A backup or SQL dump preserves the source layout; restoring it does not convert

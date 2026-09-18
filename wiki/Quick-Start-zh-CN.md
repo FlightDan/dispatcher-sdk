@@ -2,7 +2,7 @@
 
 [English](Quick-Start.md) | [简体中文](Quick-Start-zh-CN.md) | [首页](Home-zh-CN.md)
 
-使用包含 0.6 预览版代码的仓库，并确保 Python 版本为 3.10+。
+使用 0.7 开发版代码，并确保 Python 版本为 3.10+。
 在仓库根目录运行：
 
 ```sh
@@ -14,18 +14,18 @@ python -m venv .venv
 
 ```sh
 python -m pip install .
-python examples/kernel_task.py
+python examples/managed_task.py
 ```
 
 预期输出：
 
 ```text
-{'total': 60}
+42
 ```
 
-[该示例](../examples/kernel_task.py) 会提交任务，关闭 Runtime，再打开同一个
-SQLite 数据库并执行队列中的任务。示例使用的临时存储会在退出时删除；实际应用
-需要把数据保存在固定路径，才能在重启后恢复。
+[该示例](../examples/managed_task.py) 使用 `Dispatcher` 管理 Runtime、后台 Host、
+部署检查和通知收件箱。它用稳定的请求 ID 提交一个任务，并等待持久化结果。
+示例为了方便运行使用临时目录；实际应用应改用固定路径。
 
 ## 执行脚本并接收结果
 
@@ -49,6 +49,6 @@ report ready
 
 ## 接入自己的任务
 
-从完整的[原子提交示例](../docs/TASK_SUBMISSION.md)开始。该示例会创建 Run、
-提交可信函数，并演示响应丢失后的原样重放。请从该示例复制代码，以保持参数与
-当前版本一致。下一步阅读[接入指南](Integration-Guide-zh-CN.md)。
+先看[托管任务](Managed-Tasks-zh-CN.md)。需要任务依赖、等待条件或显式 Run 决策时，
+再使用底层的[原子提交指南](../docs/TASK_SUBMISSION.md)。接着可阅读
+[接入指南](Integration-Guide-zh-CN.md)。

@@ -10,11 +10,14 @@ handles execution and delivery.
 ## Start here
 
 1. [Quick start](Quick-Start.md): install the checkout and run a complete example.
-2. [Core concepts](Core-Concepts.md): understand Runtime, Run, task and host ownership.
-3. [Integration guide](Integration-Guide.md): choose a path for functions, scripts or workflows.
-4. [Troubleshooting](Troubleshooting.md): diagnose pending work, duplicates and recovery.
-5. [Integration engineering principles](Engineering-Principles.md): prepare durable deployments and evidence that can be reviewed.
-6. [Diagnostics and projections](Diagnostics-and-Projections.md): inspect deployment identity, persist events, and check work availability or cancellation.
+2. [Managed tasks](Managed-Tasks.md): use the 0.7 `Dispatcher` API without assembling the Runtime, Orchestrator and Host yourself.
+3. [Core concepts](Core-Concepts.md): understand Runtime, Run, task and host ownership.
+4. [Integration guide](Integration-Guide.md): choose a path for functions, scripts or workflows.
+5. [Sandbox execution](Sandbox-Execution.md): run remote Linux scripts and understand cleanup and recovery limits.
+6. [Storage and local recovery](Storage-and-Recovery.md): inspect SQLite, measure contention and activate a local restored copy.
+7. [Troubleshooting](Troubleshooting.md): diagnose pending work, duplicates and recovery.
+8. [Integration engineering principles](Engineering-Principles.md): prepare durable deployments and evidence that can be reviewed.
+9. [Diagnostics and projections](Diagnostics-and-Projections.md): inspect deployment identity, persist events, and check work availability or cancellation.
 
 Coding agents should start with [DocsforAgents](../DocsforAgents/README.md).
 Detailed API contracts are maintained in [docs/SDK.md](../docs/SDK.md) and the
@@ -25,7 +28,7 @@ discovery, see the [integration engineering principles](Engineering-Principles.m
 
 ## Version and scope
 
-These pages describe the 0.6 developer-preview checkout, which requires Python 3.10+.
+These pages describe the 0.7 development checkout (`0.7.0.dev0`), which requires Python 3.10+.
 Read documentation from the same revision as your code. Older releases may lack
 these entry points. Before opening an existing database, read
 [storage and upgrades](../docs/STORAGE_AND_UPGRADES.md).

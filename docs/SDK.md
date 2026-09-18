@@ -47,7 +47,7 @@ Python 3.10+ is required. The core has zero third-party runtime dependencies.
 Install the optional adapter with `python3 -m pip install ".[opensandbox]"`; this
 adds the pinned OpenSandbox SDK and requires a separately deployed service.
 
-## Version 0.6 integration guides
+## Version 0.7 integration guides
 
 - [Diagnostics and projections](SDK_DIAGNOSTICS_AND_PROJECTIONS.md): deployment identity, durable event consumption, work availability and cancellation reports.
 - [Cancellation evidence](CANCELLATION_EVIDENCE.md): optional journal configuration, cleanup evidence, backup and compatibility.
@@ -61,9 +61,10 @@ adds the pinned OpenSandbox SDK and requires a separately deployed service.
 - [Sandbox runtime](SANDBOX_RUNTIME.md) and [adapter contract](SANDBOX_ADAPTERS.md): persisted remote lifecycle, collection and uncertain disposal recovery.
 - [Windows runtime](WINDOWS_RUNTIME.md): native Job Object execution verified on Windows 11 x64 (build 10.0.26100.9168), Python 3.12.10; includes process/script lifecycle, storage, packaging and installed examples.
 
-Version 0.6 does not automatically migrate old Orchestrator databases. Keep the
-old deployment available to drain its work, preserve a backup and start a new
-store.
+Version 0.7 does not automatically migrate old Orchestrator databases. Preserve
+a backup and follow [storage and upgrades](STORAGE_AND_UPGRADES.md) for either an
+explicit copy upgrade or a clean-store handoff. Do not open a legacy store as a
+current writer.
 Execution command/result contracts and Kernel storage remain version 2.
 
 ## Command-driven example
@@ -216,9 +217,11 @@ intents. `committed` is a durable point between the Run transaction and local
 activation; a later `advance_recovery()` safely completes it. With separate
 Orchestrator and Kernel databases, this is a recoverable SDK boundary rather
 than one transaction across both databases. Use
-`Orchestrator.upgrade_schema(path)` once on an existing declared Orchestrator
-schema 2 database before opening it with this version; the upgrade preserves
-Run history and is idempotent.
+`Orchestrator.upgrade_schema(path)` once to prepare an existing declared
+Orchestrator schema 2 database, then use the explicit `upgrade_storage` copy
+operation to produce a schema 3 destination. The preparation preserves Run
+history and is idempotent; it does not make the schema 2 source directly readable
+by the schema 3 Orchestrator.
 
 ## Decisions, receipts and recovery
 

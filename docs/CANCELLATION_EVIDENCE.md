@@ -8,7 +8,7 @@ generation.
 ## Storage design
 
 The optional Runtime cancellation journal uses a separate SQLite file that the
-caller explicitly configures. Kernel schema 2, Orchestrator schema 2 and existing sandbox
+caller explicitly configures. Kernel schema 2, Orchestrator schema 3 and existing sandbox
 schema 1 remain unchanged. Enabling it creates a separate journal without migrating an existing active
 database. Existing SDK APIs keep their default behavior.
 

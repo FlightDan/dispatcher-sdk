@@ -9,11 +9,14 @@ Python 应用中运行任务，并使用持久化状态、执行时限和显式�
 ## 从这里开始
 
 1. [快速开始](Quick-Start-zh-CN.md)：安装当前代码并运行完整示例。
-2. [核心概念](Core-Concepts-zh-CN.md)：理解 Runtime、Run、任务和宿主各自负责什么。
-3. [接入指南](Integration-Guide-zh-CN.md)：选择函数、脚本或工作流接入路径。
-4. [常见问题](Troubleshooting-zh-CN.md)：排查待执行任务、重复通知和恢复状态。
-5. [接入工程原则](Engineering-Principles-zh-CN.md)：准备可恢复的部署和可审查的证据。
-6. [诊断与事件投影](Diagnostics-and-Projections-zh-CN.md)：检查部署身份和持久化事件，排查工作是否可用以及取消状态。
+2. [托管任务](Managed-Tasks-zh-CN.md)：用 0.7 的 `Dispatcher` 接口提交任务，不必自己组装 Runtime、Orchestrator 和 Host。
+3. [核心概念](Core-Concepts-zh-CN.md)：理解 Runtime、Run、任务和宿主各自负责什么。
+4. [接入指南](Integration-Guide-zh-CN.md)：选择函数、脚本或工作流接入路径。
+5. [沙箱执行](Sandbox-Execution-zh-CN.md)：运行远程 Linux 脚本，了解清理和恢复边界。
+6. [存储与本地恢复](Storage-and-Recovery-zh-CN.md)：查看 SQLite 积压、测量并发，并激活本地恢复副本。
+7. [常见问题](Troubleshooting-zh-CN.md)：排查待执行任务、重复通知和恢复状态。
+8. [接入工程原则](Engineering-Principles-zh-CN.md)：准备可恢复的部署和可审查的证据。
+9. [诊断与事件投影](Diagnostics-and-Projections-zh-CN.md)：检查部署身份和持久化事件，排查工作是否可用以及取消状态。
 
 使用编程 Agent 接入 SDK 时，可让它先阅读英文 [DocsforAgents](../DocsforAgents/README.md)。
 详细 API 契约统一维护在 [docs/SDK.md](../docs/SDK.md) 和
@@ -23,7 +26,7 @@ Python 应用中运行任务，并使用持久化状态、执行时限和显式�
 
 ## 版本与范围
 
-这些页面对应 0.6 开发者预览代码，运行环境要求 Python 3.10+。
+这些页面对应 0.7 开发版代码（`0.7.0.dev0`），运行环境要求 Python 3.10+。
 文档要和代码版本匹配；旧版本可能没有这里介绍的接口。
 如果要打开现有数据库，请先阅读[存储与升级](../docs/STORAGE_AND_UPGRADES.md)。
 

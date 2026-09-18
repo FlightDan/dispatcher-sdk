@@ -2,7 +2,7 @@
 
 [English](Quick-Start.md) | [简体中文](Quick-Start-zh-CN.md) | [Home](Home.md)
 
-Use Python 3.10+ and a checkout containing the 0.6 preview. From its root:
+Use Python 3.10+ and the 0.7 development checkout. From its root:
 
 ```sh
 python -m venv .venv
@@ -13,18 +13,19 @@ Activate with `source .venv/bin/activate` on POSIX, or
 
 ```sh
 python -m pip install .
-python examples/kernel_task.py
+python examples/managed_task.py
 ```
 
 Expected output:
 
 ```text
-{'total': 60}
+42
 ```
 
-The [example](../examples/kernel_task.py) submits work, closes the Runtime,
-reopens the same SQLite database and executes the queued task. Its temporary
-storage is deleted on exit. Use persistent paths for real application recovery.
+The [example](../examples/managed_task.py) uses `Dispatcher` to own the Runtime,
+background Host, deployment check and notification inbox. It submits one task
+with a stable request ID and waits for the persisted result. The temporary
+directory keeps the example self-contained; use a fixed path in an application.
 
 ## Run a script and receive its result
 
@@ -50,7 +51,6 @@ requirements and recorded validation scope, see
 
 ## Add your own task
 
-Start with the complete [atomic submission example](../docs/TASK_SUBMISSION.md).
-It creates a Run, submits a trusted function and demonstrates exact replay after
-a lost response. Copy the code from that example to keep its parameters consistent
-with your checkout, then read the [integration guide](Integration-Guide.md).
+Start with [managed tasks](Managed-Tasks.md). Use the lower-level
+[atomic submission guide](../docs/TASK_SUBMISSION.md) when you need dependencies,
+waits or explicit Run decisions. Then read the [integration guide](Integration-Guide.md).
