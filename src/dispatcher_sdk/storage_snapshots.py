@@ -363,7 +363,10 @@ def _backup_sqlite(source: Path, destination: Path) -> None:
         raise SnapshotValidationError(f"cannot snapshot SQLite component {source}: {error}") from error
     finally:
         source_connection.close()
-    descriptor = os.open(destination, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    # Windows rejects fsync on a read-only handle (WinError 9).  The
+    # destination is our newly-created snapshot artifact, so a writable handle
+    # is safe and preserves the durability barrier on every platform.
+    descriptor = os.open(destination, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
     try:
         os.fsync(descriptor)
     finally:

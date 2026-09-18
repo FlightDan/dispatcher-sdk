@@ -93,7 +93,10 @@ class ScriptExecutionTests(unittest.TestCase):
         self.assertEqual(self.runtime.kernel.get_effect(snapshot.result.effect_ids[0]).state, "committed")
 
     def test_timeout_kills_script_and_parks_ambiguous_effect_without_terminal_result(self):
-        self.submit("import time\nprint('started')\ntime.sleep(2)\nopen('escaped.txt', 'w').write('escaped')\n", timeout=0.3)
+        # Leave enough time for the isolated process to prepare and persist its
+        # effect before the business deadline, without allowing the script to
+        # reach the side effect after the supervisor kills it.
+        self.submit("import time\nprint('started')\ntime.sleep(3)\nopen('escaped.txt', 'w').write('escaped')\n", timeout=2.0)
         snapshot = self.runtime.run_once()
         self.assertEqual(snapshot.state, "recovery_required")
         self.assertIsNone(snapshot.result)
@@ -102,7 +105,7 @@ class ScriptExecutionTests(unittest.TestCase):
         logs = list(Path(effect.request["output_root"]).glob("*/stdout.log"))
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0].read_text(), "started\n")
-        time.sleep(2)
+        time.sleep(3)
         self.assertFalse((self.root / "escaped.txt").exists())
         self.assertIsNone(self.runtime.run_once())
         self.assertEqual(self.runtime.kernel.result_outbox(), [])
