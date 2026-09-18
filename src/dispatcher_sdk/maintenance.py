@@ -274,7 +274,14 @@ def _open_lock_file(path: Path) -> int:
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags, 0o600)
+        # POSIX permits unlinking a file while its lock descriptor is open.
+        # Windows needs delete sharing for the same inode-replacement check to
+        # work, so its descriptor is opened through CreateFileW below.
+        descriptor = (
+            _open_windows_lock_file(path)
+            if os.name == "nt"
+            else os.open(path, flags, 0o600)
+        )
     except OSError as error:
         if error.errno in (errno.ELOOP, errno.EMLINK):
             raise MaintenanceMetadataError(
@@ -405,6 +412,43 @@ elif os.name == "nt":  # pragma: no cover - exercised by Windows CI
         ]
 
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _create_file = _kernel32.CreateFileW
+    _create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    _create_file.restype = wintypes.HANDLE
+    _close_handle = _kernel32.CloseHandle
+    _close_handle.argtypes = [wintypes.HANDLE]
+    _close_handle.restype = wintypes.BOOL
+    _GENERIC_READ = 0x80000000
+    _GENERIC_WRITE = 0x40000000
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _FILE_SHARE_DELETE = 0x00000004
+    _OPEN_EXISTING = 3
+    _FILE_ATTRIBUTE_NORMAL = 0x00000080
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    def _open_windows_lock_file(path: Path) -> int:
+        handle = _create_file(
+            str(path),
+            _GENERIC_READ | _GENERIC_WRITE,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            None,
+            _OPEN_EXISTING,
+            _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if handle == _INVALID_HANDLE_VALUE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_RDWR | _O_BINARY)
+        except BaseException:
+            _close_handle(handle)
+            raise
+
     _lock_file_ex = _kernel32.LockFileEx
     _lock_file_ex.argtypes = [
         wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
