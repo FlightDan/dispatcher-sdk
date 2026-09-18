@@ -255,9 +255,17 @@ class ExecutionOriginTests(unittest.TestCase):
         sql = inspect_execution_origin(
             self.path, execution_id="large", max_query_steps=1
         )
-        timed_out = inspect_execution_origin(
-            self.path, execution_id="large", timeout=1e-12
-        )
+        class Clock:
+            calls = 0
+
+            def __call__(self):
+                self.calls += 1
+                return 0.0 if self.calls == 1 else 1.0
+
+        with patch("dispatcher_sdk.orchestrator.origins.time.monotonic", new=Clock()):
+            timed_out = inspect_execution_origin(
+                self.path, execution_id="large", timeout=0.5
+            )
 
         self.assertEqual(payload.status, "incomplete")
         self.assertEqual(payload.reason_codes, ("payload_budget_exceeded",))

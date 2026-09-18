@@ -194,13 +194,15 @@ class DispatcherTests(unittest.TestCase):
                 app.submit("double", 9, request_id="old")
 
     def test_expired_transaction_lease_preserves_original_failure(self):
-        with self.open(callback_lease_seconds=0.2) as app:
+        # Keep the lease long enough for Windows full-durability SQLite I/O,
+        # while still making the callback deliberately outlive it.
+        with self.open(callback_lease_seconds=1.0) as app:
             app.submit("double", 1, request_id="expired").wait()
             wait_for(lambda: bool(app.inbox.list_messages(state="pending")))
             app.host.stop()
 
             def mutation(connection, notification):
-                time.sleep(0.3)
+                time.sleep(1.2)
                 raise ValueError("original mutation failure")
 
             with self.assertRaisesRegex(ValueError, "original mutation failure"):
