@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -61,7 +62,7 @@ class DispatcherTests(unittest.TestCase):
                                   [first, second]))
         self.assertEqual(tasks[0].snapshot["command"]["execution_id"],
                          tasks[1].snapshot["command"]["execution_id"])
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM sdk_executions").fetchone()[0], 1)
 
     def test_preflight_refuses_changed_pending_handler_before_start(self):
@@ -71,7 +72,7 @@ class DispatcherTests(unittest.TestCase):
         with self.assertRaises(DeploymentMismatchError) as caught:
             Dispatcher(self.path, {"double": changed}, isolation_mode="thread")
         self.assertFalse(caught.exception.report["compatible"])
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM kernel_executions").fetchone()[0], 0)
 
     def test_callback_failure_retries_receipt_without_reexecuting_task(self):
@@ -96,7 +97,7 @@ class DispatcherTests(unittest.TestCase):
         with self.open(callback_retry_delay=0.01) as app:
             app.submit("double", 3, request_id="sql").wait()
             wait_for(lambda: bool(app.inbox.list_messages(state="pending")))
-            with sqlite3.connect(self.path) as connection:
+            with closing(sqlite3.connect(self.path)) as connection, connection:
                 connection.execute("CREATE TABLE business(value INTEGER)")
 
             def failing(connection, notification):
@@ -105,14 +106,14 @@ class DispatcherTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 app.consume_results(failing)
-            with sqlite3.connect(self.path) as connection:
+            with closing(sqlite3.connect(self.path)) as connection, connection:
                 self.assertEqual(connection.execute("SELECT count(*) FROM business").fetchone()[0], 0)
             time.sleep(0.02)
             count = app.consume_results(lambda c, n: c.execute(
                 "INSERT INTO business VALUES(?)", (n["result"]["value"],)))
             self.assertEqual(count, 1)
             self.assertEqual(app.consume_results(lambda c, n: self.fail("already consumed")), 0)
-            with sqlite3.connect(self.path) as connection:
+            with closing(sqlite3.connect(self.path)) as connection, connection:
                 self.assertEqual(connection.execute("SELECT value FROM business").fetchone()[0], 6)
 
     def test_unconsumed_results_survive_restart(self):

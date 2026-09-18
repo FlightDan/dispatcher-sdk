@@ -1,3 +1,4 @@
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import sqlite3
@@ -108,7 +109,7 @@ class ReopenRunTests(unittest.TestCase):
             if name == "after_recovery_prepare" else None
         with self.assertRaisesRegex(RuntimeError, "after_recovery_prepare"):
             self.sdk.reopen_run("run", command_id="reopen", **self.reopen_args(failed["revision"]))
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             recovery_id = connection.execute("SELECT recovery_id FROM sdk_recoveries").fetchone()[0]
         self.assertEqual(self.sdk.get_run("run")["state"], "failed")
         self.sdk._failpoint = lambda name: None

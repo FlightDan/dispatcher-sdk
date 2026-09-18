@@ -41,6 +41,7 @@ _MAX_METADATA_ROWS = 256
 _MAX_GROUP_BYTES = 1 << 50
 _SPACE_OVERHEAD = 1024 * 1024
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 class SnapshotError(RuntimeError):
@@ -262,7 +263,10 @@ def _safe_destination(raw_path: str | os.PathLike[str], label: str) -> Path:
 
 
 def _open_read_no_follow(path: Path) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY | _O_BINARY
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -283,7 +287,7 @@ def _open_read_no_follow(path: Path) -> int:
 def _copy_and_hash(source: Path, destination: Path) -> tuple[int, str]:
     source_descriptor = _open_read_no_follow(source)
     before = os.fstat(source_descriptor)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         destination_descriptor = os.open(destination, flags, 0o600)
@@ -366,7 +370,7 @@ def _backup_sqlite(source: Path, destination: Path) -> None:
     # Windows rejects fsync on a read-only handle (WinError 9).  The
     # destination is our newly-created snapshot artifact, so a writable handle
     # is safe and preserves the durability barrier on every platform.
-    descriptor = os.open(destination, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+    descriptor = os.open(destination, os.O_RDWR | _O_BINARY | getattr(os, "O_CLOEXEC", 0))
     try:
         os.fsync(descriptor)
     finally:
@@ -527,7 +531,7 @@ def _publish_manifest(root: Path, manifest: dict[str, Any]) -> Path:
     temporary = root / f".{_MANIFEST_NAME}.{uuid.uuid4().hex}.pending"
     descriptor: int | None = None
     try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(temporary, flags, 0o600)
         view = memoryview(payload)
@@ -655,7 +659,8 @@ def snapshot_store_group(
             marker = target / _READ_ONLY_MARKER
             marker_descriptor = os.open(
                 marker,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
+                | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
             )

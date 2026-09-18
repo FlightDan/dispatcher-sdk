@@ -47,6 +47,7 @@ _RECEIPT = ".sdk-activation.json"
 _PENDING = ".sdk-activation-pending.json"
 _READ_ONLY_MARKER = ".sdk-snapshot-readonly"
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 class ActivationError(RuntimeError):
@@ -154,7 +155,7 @@ def _write_new(path: Path, payload: bytes) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.pending")
     descriptor: int | None = None
     try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(temporary, flags, 0o600)
         view = memoryview(payload)

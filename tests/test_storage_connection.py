@@ -1,4 +1,5 @@
 """Connection lifetime and permanent identity safety regressions."""
+from contextlib import closing
 import sqlite3
 import tempfile
 import threading
@@ -57,7 +58,7 @@ class StorageConnectionTests(unittest.TestCase):
                 sdk.create_run("previous", command_id="create")
                 sdk.apply_operations("previous", command_id="finish", expected_revision=0,
                                      operations=[Operations.finish("succeeded")])
-                with sqlite3.connect(path) as connection:
+                with closing(sqlite3.connect(path)) as connection, connection:
                     connection.execute("INSERT INTO sdk_disposed_runs VALUES(?,?,?)",
                                        ("disposed", "{}", "test"))
                 with self.assertRaises(RunDisposed):

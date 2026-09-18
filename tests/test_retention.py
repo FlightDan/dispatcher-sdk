@@ -1,3 +1,4 @@
+from contextlib import closing
 import copy
 import json
 from pathlib import Path
@@ -55,14 +56,14 @@ class RetentionTests(unittest.TestCase):
                 )
 
     def _unpin(self, *commands):
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.executemany(
                 "DELETE FROM sdk_commands WHERE run_id='run' AND command_id=?",
                 [(command,) for command in commands],
             )
 
     def _counts(self):
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             return {
                 "history": connection.execute(
                     "SELECT COUNT(*) FROM sdk_run_history WHERE run_id='run'"
@@ -77,7 +78,7 @@ class RetentionTests(unittest.TestCase):
             }
 
     def _replace_trigger_with_noop(self, trigger, table, action):
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute(f'DROP TRIGGER "{trigger}"')
             connection.execute(
                 f'CREATE TRIGGER "{trigger}" AFTER {action} ON "{table}" BEGIN SELECT 1; END'
@@ -106,7 +107,7 @@ class RetentionTests(unittest.TestCase):
         with Orchestrator.open_sqlite(self.path, {}) as orchestrator:
             before = orchestrator.get_run("run")
             receipt = orchestrator.get_command_receipt("run", "commit-3")
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             high_before = connection.execute(
                 "SELECT high_water FROM sdk_event_watermarks WHERE run_id='run'"
             ).fetchone()[0]
@@ -126,7 +127,7 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual(orchestrator.get_command_receipt("run", "commit-3"), receipt)
             with self.assertRaises(HistoryExpired):
                 orchestrator.get_run_at("run", 1)
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             high_after, expired = connection.execute(
                 "SELECT high_water,expired_through FROM sdk_event_watermarks WHERE run_id='run'"
             ).fetchone()
@@ -185,7 +186,7 @@ class RetentionTests(unittest.TestCase):
         with maintenance_lease(self.path, "test", "retention") as lease:
             apply_retention(self.path, plan, lease=lease)
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             remaining_event_keys = {
                 row[0] for row in connection.execute(
                     "SELECT record_key FROM sdk_retention_times WHERE category='event'"

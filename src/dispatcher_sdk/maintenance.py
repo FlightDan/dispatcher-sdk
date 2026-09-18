@@ -34,6 +34,7 @@ _RETIRED_SUFFIX = ".sdk-retired.json"
 _SNAPSHOT_READ_ONLY_MARKER = ".sdk-snapshot-readonly"
 _MAX_METADATA_BYTES = 64 * 1024
 _RETRY_INTERVAL_SECONDS = 0.01
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 class MaintenanceError(RuntimeError):
@@ -473,7 +474,10 @@ def _read_bytes_no_follow(path: Path) -> bytes | None:
     expected = _safe_existing_regular(path, label="maintenance metadata path")
     if expected is None:
         return None
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY | _O_BINARY
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -581,7 +585,7 @@ def _publish_metadata(path: Path, document: dict[str, object]) -> None:
     _safe_existing_regular(path, label="maintenance metadata path")
     payload = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor: int | None = None
     try:

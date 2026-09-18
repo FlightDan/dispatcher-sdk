@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import json
 from pathlib import Path
 import sqlite3
@@ -45,7 +45,7 @@ class ExecutionOriginTests(unittest.TestCase):
         self.add_cancelled_attempts_and_continuation()
         for partial in (False, True):
             with self.subTest(partial=partial):
-                with sqlite3.connect(self.path) as connection:
+                with closing(sqlite3.connect(self.path)) as connection, connection:
                     connection.execute("DROP TABLE sdk_content_objects")
                     connection.execute(
                         "CREATE TABLE sdk_content_objects(digest TEXT,encoded TEXT NOT NULL,logical_bytes INTEGER NOT NULL)")
@@ -58,7 +58,7 @@ class ExecutionOriginTests(unittest.TestCase):
 
     def test_referenced_encoded_bytes_share_one_payload_budget(self):
         self.add_cancelled_attempts_and_continuation()
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             row = connection.execute(
                 "SELECT value FROM sdk_run_items WHERE run_id='run' AND section='attempt' AND item_key=?",
                 ('["task",0]',)).fetchone()
@@ -85,7 +85,7 @@ class ExecutionOriginTests(unittest.TestCase):
         nested = []
         for _ in range(105):
             nested = [nested]
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             row = connection.execute(
                 "SELECT value FROM sdk_run_items WHERE run_id='run' AND section='attempt' AND item_key=?",
                 ('["task",0]',)).fetchone()
@@ -99,7 +99,7 @@ class ExecutionOriginTests(unittest.TestCase):
 
     def test_missing_task_identity_and_blob_link_do_not_produce_complete_evidence(self):
         self.add_cancelled_attempts_and_continuation()
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             original = connection.execute(
                 "SELECT value FROM sdk_run_items WHERE run_id='run' AND section='task' AND item_key='task'"
             ).fetchone()[0]
@@ -107,7 +107,7 @@ class ExecutionOriginTests(unittest.TestCase):
         report = inspect_execution_origin(self.path, execution_id="old")
         self.assertEqual(report.status, "incomplete")
         self.assertIn("task_identity_mismatch", report.reason_codes)
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("UPDATE sdk_run_items SET value=? WHERE run_id='run' AND section='task'", (original,))
             connection.execute("UPDATE sdk_run_links SET next_run_id=x'ff' WHERE previous_run_id='run'")
         report = inspect_execution_origin(self.path, execution_id="old")
@@ -145,7 +145,7 @@ class ExecutionOriginTests(unittest.TestCase):
         )
 
     def insert_result(self, result_id: str, execution_id: str) -> None:
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute(
                 "INSERT INTO sdk_results("
                 "result_id,execution_id,result_json,kernel_revision,state,lease_id,lease_owner,"
@@ -237,7 +237,7 @@ class ExecutionOriginTests(unittest.TestCase):
                 }
             ],
         )
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             row = connection.execute(
                 "SELECT value FROM sdk_run_items WHERE run_id='run' AND section='attempt'"
             ).fetchone()
@@ -307,14 +307,14 @@ class ExecutionOriginTests(unittest.TestCase):
             "run", command_id="add", expected_revision=0,
             operations=[{"kind": "add_task", "task_id": "task", "command": self.command("target")}],
         )
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute(
                 "INSERT INTO sdk_disposed_runs VALUES('run','{}','test-authentication')"
             )
         disposed = inspect_execution_origin(self.path, execution_id="target")
         self.assertEqual(disposed.reason_codes, ("origin_run_disposed",))
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("DELETE FROM sdk_disposed_runs WHERE run_id='run'")
             connection.execute(
                 "DELETE FROM sdk_run_items WHERE run_id='run' AND section='attempt'"
@@ -325,7 +325,7 @@ class ExecutionOriginTests(unittest.TestCase):
         unknown = inspect_execution_origin(self.path, execution_id="target")
         self.assertEqual(unknown.reason_codes, ("attempt_evidence_unknown",))
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("INSERT INTO sdk_expired_revisions VALUES('run',0)")
         pruned = inspect_execution_origin(self.path, execution_id="target")
         self.assertEqual(pruned.reason_codes, ("attempt_evidence_pruned",))

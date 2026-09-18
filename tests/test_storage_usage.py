@@ -1,3 +1,4 @@
+from contextlib import closing
 import hashlib
 from pathlib import Path
 import sqlite3
@@ -26,7 +27,7 @@ class StorageUsageTests(unittest.TestCase):
 
     def test_physical_read_leaves_database_and_directory_unchanged(self):
         path = self.root / "store.sqlite3"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE sdk_events(sequence INTEGER PRIMARY KEY, payload TEXT)")
             connection.execute("CREATE INDEX sdk_events_payload ON sdk_events(payload)")
             connection.execute("INSERT INTO sdk_events(payload) VALUES(?)", ('{"value":1}',))
@@ -52,7 +53,7 @@ class StorageUsageTests(unittest.TestCase):
 
     def test_inspection_executes_no_write_or_maintenance_statements(self):
         path = self.root / "readonly.sqlite3"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE sdk_events(sequence INTEGER PRIMARY KEY, payload TEXT)")
             connection.execute("INSERT INTO sdk_events(payload) VALUES('value')")
         statements = []
@@ -75,7 +76,7 @@ class StorageUsageTests(unittest.TestCase):
         path = self.root / "logical.sqlite3"
         current = "not-json-current"
         history = "not-json-history"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute(
                 "CREATE TABLE sdk_run_items(run_id TEXT,section TEXT,item_key TEXT,value TEXT)"
             )
@@ -96,7 +97,7 @@ class StorageUsageTests(unittest.TestCase):
 
     def test_logical_scan_stops_at_global_row_budget(self):
         path = self.root / "bounded.sqlite3"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE sdk_events(sequence INTEGER PRIMARY KEY, payload TEXT)")
             connection.executemany("INSERT INTO sdk_events(payload) VALUES(?)",
                                    [(f'{{"value":{number}}}',) for number in range(5)])
@@ -109,7 +110,7 @@ class StorageUsageTests(unittest.TestCase):
 
     def test_content_object_storage_is_counted_once(self):
         path = self.root / "objects.sqlite3"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute(
                 "CREATE TABLE sdk_content_objects(digest TEXT PRIMARY KEY,stored_length INTEGER,content BLOB)"
             )
@@ -124,7 +125,7 @@ class StorageUsageTests(unittest.TestCase):
 
     def test_current_sdk_content_object_schema_reports_encoded_storage(self):
         path = self.root / "encoded-objects.sqlite3"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute(
                 "CREATE TABLE sdk_content_objects(digest TEXT PRIMARY KEY,encoded TEXT,logical_bytes INTEGER)"
             )
@@ -176,7 +177,7 @@ class StorageUsageTests(unittest.TestCase):
 
     def test_timeout_during_physical_inspection_is_incomplete(self):
         path = self.root / "budget.sqlite3"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE sdk_events(sequence INTEGER PRIMARY KEY,payload TEXT)")
         events = []
         report = inspect_storage_usage(path, timeout_seconds=0, progress=events.append)
@@ -187,7 +188,7 @@ class StorageUsageTests(unittest.TestCase):
 
     def test_sqlite_progress_handler_interrupts_large_dbstat_scan(self):
         path = self.root / "large-physical.sqlite3"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE sdk_large(value BLOB)")
             connection.executemany("INSERT INTO sdk_large VALUES(zeroblob(512))",
                                    [() for _ in range(20_000)])
@@ -214,7 +215,7 @@ class StorageUsageTests(unittest.TestCase):
 
     def test_logical_scan_limit_marks_top_level_incomplete(self):
         path = self.root / "top-level-limit.sqlite3"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE sdk_events(sequence INTEGER PRIMARY KEY,payload TEXT)")
             connection.executemany("INSERT INTO sdk_events(payload) VALUES(?)", [("x",), ("y",)])
         report = inspect_storage_usage(path, detail="logical", scan_limit=1)

@@ -108,7 +108,7 @@ class StoragePreflightTests(unittest.TestCase):
     def test_schema_tier_rejects_invalid_kernel_clock_without_history_scan(self):
         with Runtime(self.path, {}, isolation_mode="thread"):
             pass
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("PRAGMA ignore_check_constraints=ON")
             connection.execute("UPDATE kernel_clock SET watermark=-1")
         report = inspect_storage(self.path, check="schema")
@@ -119,7 +119,7 @@ class StoragePreflightTests(unittest.TestCase):
     def test_all_tiers_reject_invalid_orchestrator_singletons(self):
         with Runtime(self.path, {}, isolation_mode="thread") as runtime:
             Orchestrator(self.path, runtime.kernel)
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("UPDATE sdk_storage_identity SET store_id='' WHERE singleton=1")
             connection.execute("UPDATE sdk_storage_clock SET mutation=-1 WHERE singleton=1")
         for check in ("schema", "bindings", "full"):
@@ -160,7 +160,7 @@ class StoragePreflightTests(unittest.TestCase):
             runtime.kernel.submit(command)
         # A large history makes an accidental MAX/COUNT/history walk observable
         # as a real cost; the schema tier must stay catalog-only regardless.
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             start = connection.execute("SELECT event_sequence FROM kernel_clock").fetchone()[0]
             rows = [(start + number, f"bulk-{number}", f"bulk-execution-{number}", 1,
                      "fixture", None, "queued", "{}", 1.0)
@@ -251,7 +251,7 @@ class StoragePreflightTests(unittest.TestCase):
     def test_sqlite_progress_handler_interrupts_large_integrity_scan(self):
         with Runtime(self.path, {}, isolation_mode="thread"):
             pass
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("CREATE TABLE app_large(value BLOB)")
             connection.executemany("INSERT INTO app_large VALUES(zeroblob(512))",
                                    [() for _ in range(20_000)])
