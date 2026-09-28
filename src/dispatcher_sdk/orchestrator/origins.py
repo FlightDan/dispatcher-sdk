@@ -14,6 +14,7 @@ from typing import Any, Literal
 from ..content import ContentIntegrityError, ContentReadBudget, ContentSizeLimitError, decode_value
 from ..execution_kernel import ExecutionCommandV2
 from ..storage import _read_only
+from .store import ORCHESTRATOR_SCHEMA_VERSION
 
 
 DEFAULT_MAX_PAYLOAD_BYTES = 1024 * 1024
@@ -157,7 +158,7 @@ def _validate_schema(connection: sqlite3.Connection) -> dict[tuple[str, tuple[st
     marker = connection.execute(
         "SELECT component,version FROM sdk_schema_meta"
     ).fetchall()
-    if len(marker) != 1 or tuple(marker[0]) != ("orchestrator", 3):
+    if len(marker) != 1 or tuple(marker[0]) != ("orchestrator", ORCHESTRATOR_SCHEMA_VERSION):
         raise ValueError("unsupported orchestrator schema")
     for table, required in _REQUIRED_COLUMNS.items():
         columns = {
@@ -350,7 +351,7 @@ def inspect_execution_origin(
             connection.execute("BEGIN")
             try:
                 indexes = _validate_schema(connection)
-                schema_version = 3
+                schema_version = ORCHESTRATOR_SCHEMA_VERSION
             except ValueError:
                 return _empty_report(
                     source, lookup_kind, lookup_id, status="incomplete",
@@ -368,7 +369,7 @@ def inspect_execution_origin(
             ):
                 return _empty_report(
                     source, lookup_kind, lookup_id, status="incomplete",
-                    reason_codes=("source_identity_missing",), schema_version=3,
+                    reason_codes=("source_identity_missing",), schema_version=ORCHESTRATOR_SCHEMA_VERSION,
                     execution_id=execution_id, result_id=result_id,
                 )
             store_id, store_incarnation = identity[0], identity[1]
@@ -385,7 +386,7 @@ def inspect_execution_origin(
                     return _empty_report(
                         source, lookup_kind, lookup_id, status="not_found",
                         reason_codes=("result_not_found_in_supplied_store",),
-                        schema_version=3, store_id=store_id,
+                        schema_version=ORCHESTRATOR_SCHEMA_VERSION, store_id=store_id,
                         store_incarnation=store_incarnation, result_id=lookup_id,
                     )
                 result_id = str(result_row[0])
@@ -415,7 +416,7 @@ def inspect_execution_origin(
                 )
                 return _empty_report(
                     source, lookup_kind, lookup_id, status=status,
-                    reason_codes=(reason,), schema_version=3, store_id=store_id,
+                    reason_codes=(reason,), schema_version=ORCHESTRATOR_SCHEMA_VERSION, store_id=store_id,
                     store_incarnation=store_incarnation,
                     execution_id=execution_id, result_id=result_id,
                 )
@@ -429,7 +430,7 @@ def inspect_execution_origin(
             ):
                 return _empty_report(
                     source, lookup_kind, lookup_id, status="incomplete",
-                    reason_codes=("execution_registration_invalid",), schema_version=3,
+                    reason_codes=("execution_registration_invalid",), schema_version=ORCHESTRATOR_SCHEMA_VERSION,
                     store_id=store_id, store_incarnation=store_incarnation,
                     execution_id=execution_id, result_id=result_id,
                 )
@@ -441,7 +442,7 @@ def inspect_execution_origin(
             ).fetchone() is not None:
                 partial = _empty_report(
                     source, lookup_kind, lookup_id, status="incomplete",
-                    reason_codes=("origin_run_disposed",), schema_version=3,
+                    reason_codes=("origin_run_disposed",), schema_version=ORCHESTRATOR_SCHEMA_VERSION,
                     store_id=store_id, store_incarnation=store_incarnation,
                     execution_id=execution_id, result_id=result_id,
                 )
@@ -455,7 +456,7 @@ def inspect_execution_origin(
             ).fetchone() is None:
                 partial = _empty_report(
                     source, lookup_kind, lookup_id, status="incomplete",
-                    reason_codes=("origin_run_unknown",), schema_version=3,
+                    reason_codes=("origin_run_unknown",), schema_version=ORCHESTRATOR_SCHEMA_VERSION,
                     store_id=store_id, store_incarnation=store_incarnation,
                     execution_id=execution_id, result_id=result_id,
                 )
@@ -490,7 +491,7 @@ def inspect_execution_origin(
             if missing:
                 partial = _empty_report(
                     source, lookup_kind, lookup_id, status="incomplete",
-                    reason_codes=tuple(missing), schema_version=3, store_id=store_id,
+                    reason_codes=tuple(missing), schema_version=ORCHESTRATOR_SCHEMA_VERSION, store_id=store_id,
                     store_incarnation=store_incarnation,
                     execution_id=execution_id, result_id=result_id,
                 )
@@ -586,7 +587,7 @@ def inspect_execution_origin(
                 source_scope="supplied_store",
                 store_id=store_id,
                 store_incarnation=store_incarnation,
-                schema_version=3,
+                schema_version=ORCHESTRATOR_SCHEMA_VERSION,
                 lookup_kind=lookup_kind,
                 lookup_id=lookup_id,
                 execution_id=execution_id,

@@ -4,6 +4,12 @@ Status: implemented and verified on `release/0.7.0` (`0.7.0.dev0`). The user app
 breaking changes and explicit local recovery activation. This document records
 the implementation contract, migration impact and validation evidence.
 
+The proposed next increment is recorded in the
+[0.7.0.dev1 improvement plan](DEV_0_7_0_DEV1_IMPROVEMENT_PLAN.md).
+It covers managed Runs, execution authorization, pause/revision/resume, lifecycle
+settlement, continuous budgets and bounded diagnostics. It is a proposal, not an
+implemented capability or validation report.
+
 ## Goals and scope
 
 The normal embedded application should understand handlers, stable request IDs,

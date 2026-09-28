@@ -1,4 +1,4 @@
-"""Exact v2 SQLite schema validation and post-bootstrap authorization."""
+"""Exact v3 SQLite schema validation and post-bootstrap authorization."""
 
 from __future__ import annotations
 
@@ -10,10 +10,15 @@ from typing import Optional
 from .errors import StorageIsolationError
 
 
+KERNEL_STORAGE_SCHEMA_VERSION = 3
+
+
 KERNEL_TABLES = frozenset(
     {
         "kernel_schema_meta",
         "kernel_clock",
+        "kernel_run_controls",
+        "kernel_managed_executions",
         "kernel_executions",
         "kernel_events",
         "kernel_result_outbox",
@@ -26,6 +31,7 @@ KERNEL_INDEXES = frozenset(
     {
         "kernel_executions_idempotency",
         "kernel_executions_claim",
+        "kernel_managed_executions_run",
         "kernel_events_identity",
         "kernel_events_execution_revision",
         "kernel_result_outbox_execution",
@@ -40,10 +46,10 @@ BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS kernel_schema_meta (
     component TEXT NOT NULL PRIMARY KEY CHECK (component = 'execution_kernel'),
     schema_version NOT NULL
-        CHECK (typeof(schema_version) = 'integer' AND schema_version = 2)
+        CHECK (typeof(schema_version) = 'integer' AND schema_version = 3)
 );
 INSERT OR IGNORE INTO kernel_schema_meta (component, schema_version)
-    VALUES ('execution_kernel', 2);
+    VALUES ('execution_kernel', 3);
 CREATE TABLE IF NOT EXISTS kernel_clock (
     singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
     watermark REAL NOT NULL CHECK (
@@ -56,6 +62,41 @@ CREATE TABLE IF NOT EXISTS kernel_clock (
 );
 INSERT OR IGNORE INTO kernel_clock (singleton, watermark, event_sequence)
     VALUES (1, 0, 0);
+CREATE TABLE IF NOT EXISTS kernel_run_controls (
+    run_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(run_id)) > 0),
+    control_epoch INTEGER NOT NULL CHECK (
+        typeof(control_epoch) = 'integer' AND control_epoch >= 0
+    ),
+    generation INTEGER NOT NULL CHECK (
+        typeof(generation) = 'integer' AND generation >= 0
+    ),
+    state TEXT NOT NULL CHECK (state IN ('active', 'pausing', 'paused')),
+    max_claims INTEGER NOT NULL CHECK (
+        typeof(max_claims) = 'integer' AND max_claims >= 0
+    ),
+    claims_used INTEGER NOT NULL CHECK (
+        typeof(claims_used) = 'integer' AND claims_used >= 0 AND claims_used <= max_claims
+    ),
+    deadline_at REAL NOT NULL CHECK (
+        typeof(deadline_at) IN ('integer', 'real')
+        AND deadline_at >= 0 AND deadline_at <= 1.7976931348623157e308
+    )
+);
+CREATE TABLE IF NOT EXISTS kernel_managed_executions (
+    execution_id TEXT NOT NULL PRIMARY KEY CHECK (
+        length(trim(execution_id)) > 0 AND substr(execution_id, 1, 12) = 'sdk-managed:'
+    ),
+    run_id TEXT NOT NULL CHECK (length(trim(run_id)) > 0),
+    generation INTEGER NOT NULL CHECK (
+        typeof(generation) = 'integer' AND generation >= 0
+    ),
+    drain_allowed INTEGER NOT NULL CHECK (
+        typeof(drain_allowed) = 'integer' AND drain_allowed IN (0, 1)
+    ),
+    FOREIGN KEY (run_id) REFERENCES kernel_run_controls(run_id)
+);
+CREATE INDEX IF NOT EXISTS kernel_managed_executions_run
+    ON kernel_managed_executions(run_id, generation, drain_allowed, execution_id);
 CREATE TABLE IF NOT EXISTS kernel_executions (
     execution_id TEXT NOT NULL PRIMARY KEY,
     idempotency_key TEXT NOT NULL,
@@ -252,6 +293,46 @@ COMMIT;
 """
 
 
+def _schema_v2_from_v3() -> str:
+    """Build the exact supported v2 layout from the unchanged v2 objects.
+
+    Kernel v3 only adds two tables and their index, and changes the schema
+    marker constraint/value. Keeping the old DDL derivation here makes the
+    explicit copy-upgrade validator compare against the former exact layout
+    without duplicating the much larger execution/effect schema text.
+    """
+
+    removed_prefixes = (
+        "CREATE TABLE IF NOT EXISTS kernel_run_controls",
+        "CREATE TABLE IF NOT EXISTS kernel_managed_executions",
+        "CREATE INDEX IF NOT EXISTS kernel_managed_executions_run",
+    )
+    statements: list[str] = []
+    for raw in SCHEMA_SQL.split(";"):
+        statement = raw.strip()
+        if not statement:
+            continue
+        if statement.startswith(removed_prefixes):
+            continue
+        if statement.startswith("CREATE TABLE IF NOT EXISTS kernel_schema_meta"):
+            statement = statement.replace("schema_version = 3", "schema_version = 2", 1)
+        elif statement.startswith("INSERT OR IGNORE INTO kernel_schema_meta"):
+            statement = statement.replace(
+                "VALUES ('execution_kernel', 3)",
+                "VALUES ('execution_kernel', 2)",
+                1,
+            )
+        statements.append(statement)
+    if not any("schema_version = 2" in statement for statement in statements):
+        raise RuntimeError("internal Kernel v2 schema derivation failed")
+    return ";\n".join(statements) + ";"
+
+
+# Used only by explicit copy migration. Opening a v2 Kernel store in a v3
+# writer remains a hard error; this reference never runs during normal open.
+KERNEL_SCHEMA_V2 = _schema_v2_from_v3()
+
+
 EXPECTED_COLUMNS = {
     "kernel_schema_meta": (
         ("component", "TEXT", 1, 1), ("schema_version", "", 1, 0),
@@ -259,6 +340,16 @@ EXPECTED_COLUMNS = {
     "kernel_clock": (
         ("singleton", "INTEGER", 1, 1), ("watermark", "REAL", 1, 0),
         ("event_sequence", "INTEGER", 1, 0),
+    ),
+    "kernel_run_controls": (
+        ("run_id", "TEXT", 1, 1), ("control_epoch", "INTEGER", 1, 0),
+        ("generation", "INTEGER", 1, 0), ("state", "TEXT", 1, 0),
+        ("max_claims", "INTEGER", 1, 0), ("claims_used", "INTEGER", 1, 0),
+        ("deadline_at", "REAL", 1, 0),
+    ),
+    "kernel_managed_executions": (
+        ("execution_id", "TEXT", 1, 1), ("run_id", "TEXT", 1, 0),
+        ("generation", "INTEGER", 1, 0), ("drain_allowed", "INTEGER", 1, 0),
     ),
     "kernel_executions": (
         ("execution_id", "TEXT", 1, 1), ("idempotency_key", "TEXT", 1, 0),
@@ -314,13 +405,31 @@ EXPECTED_COLUMNS = {
 SQL_REQUIREMENTS = {
     "kernel_schema_meta": (
         "check(component='execution_kernel')",
-        "typeof(schema_version)='integer'andschema_version=2",
+        "typeof(schema_version)='integer'andschema_version=3",
     ),
     "kernel_clock": (
         "check(singleton=1)",
         "typeof(watermark)in('integer','real')",
         "watermark>=0",
         "typeof(event_sequence)='integer'andevent_sequence>=0",
+    ),
+    "kernel_run_controls": (
+        "length(trim(run_id))>0",
+        "typeof(control_epoch)='integer'andcontrol_epoch>=0",
+        "typeof(generation)='integer'andgeneration>=0",
+        "statein('active','pausing','paused')",
+        "typeof(max_claims)='integer'andmax_claims>=0",
+        "typeof(claims_used)='integer'andclaims_used>=0andclaims_used<=max_claims",
+        "typeof(deadline_at)in('integer','real')",
+        "deadline_at>=0",
+        "deadline_at<=1.7976931348623157e308",
+    ),
+    "kernel_managed_executions": (
+        "length(trim(execution_id))>0",
+        "substr(execution_id,1,12)='sdk-managed:'",
+        "length(trim(run_id))>0",
+        "typeof(generation)='integer'andgeneration>=0",
+        "typeof(drain_allowed)='integer'anddrain_allowedin(0,1)",
     ),
     "kernel_executions": (
         "check(statein(",
@@ -379,6 +488,7 @@ SQL_REQUIREMENTS = {
 EXPECTED_INDEX_SQL = {
     "kernel_executions_idempotency": "createuniqueindexkernel_executions_idempotencyonkernel_executions(idempotency_key)",
     "kernel_executions_claim": "createindexkernel_executions_claimonkernel_executions(state,registry_revision,next_attempt_at,created_at)",
+    "kernel_managed_executions_run": "createindexkernel_managed_executions_runonkernel_managed_executions(run_id,generation,drain_allowed,execution_id)",
     "kernel_events_identity": "createuniqueindexkernel_events_identityonkernel_events(event_id)",
     "kernel_events_execution_revision": "createuniqueindexkernel_events_execution_revisiononkernel_events(execution_id,revision)",
     "kernel_result_outbox_execution": "createuniqueindexkernel_result_outbox_executiononkernel_result_outbox(execution_id)",
@@ -393,6 +503,135 @@ def _normalize_sql(value: str) -> str:
     parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\])", value)
     return "".join(part if index % 2 else re.sub(r"\s+", "", part.lower()).replace("ifnotexists", "")
                    for index, part in enumerate(parts))
+
+
+def _schema_statement_for(name: str, schema_sql: str = SCHEMA_SQL) -> str:
+    for raw in schema_sql.split(";"):
+        statement = raw.strip()
+        normalized = _normalize_sql(statement)
+        if (
+            f"createtable{name.lower()}(" in normalized
+            or f"createindex{name.lower()}on" in normalized
+            or f"createuniqueindex{name.lower()}on" in normalized
+        ):
+            return statement
+    raise RuntimeError(f"internal Kernel schema statement is missing: {name}")
+
+
+def validate_kernel_schema_v2(connection: sqlite3.Connection) -> None:
+    """Require the exact Kernel v2 schema before an explicit copy upgrade."""
+
+    v2_tables = KERNEL_TABLES - {
+        "kernel_run_controls",
+        "kernel_managed_executions",
+    }
+    actual_tables = {
+        name
+        for name in existing_table_names(connection)
+        if name.startswith("kernel_")
+    }
+    if actual_tables != set(v2_tables):
+        raise StorageIsolationError(
+            "incompatible Kernel v2 table set; "
+            f"missing={sorted(v2_tables - actual_tables)!r}, "
+            f"unexpected={sorted(actual_tables - v2_tables)!r}"
+        )
+
+    reference = sqlite3.connect(":memory:")
+    try:
+        reference.executescript(KERNEL_SCHEMA_V2)
+        expected_objects = {
+            row[0]: (row[1], _normalize_sql(row[2] or ""))
+            for row in reference.execute(
+                "SELECT name,type,sql FROM sqlite_master WHERE name LIKE 'kernel_%'"
+            ).fetchall()
+        }
+        actual_objects = {
+            row[0]: (row[1], _normalize_sql(row[2] or ""))
+            for row in connection.execute(
+                "SELECT name,type,sql FROM sqlite_master WHERE name LIKE 'kernel_%'"
+            ).fetchall()
+        }
+        if actual_objects != expected_objects:
+            raise StorageIsolationError("Kernel v2 schema differs from the supported exact layout")
+        for table in v2_tables:
+            if _table_columns(connection, table) != _table_columns(reference, table):
+                raise StorageIsolationError(f"incompatible Kernel v2 column schema: {table}")
+    finally:
+        reference.close()
+
+    marker = connection.execute(
+        "SELECT component,schema_version,typeof(schema_version) FROM kernel_schema_meta"
+    ).fetchall()
+    if (
+        len(marker) != 1
+        or marker[0][0] != "execution_kernel"
+        or type(marker[0][1]) is not int
+        or marker[0][1] != 2
+        or marker[0][2] != "integer"
+    ):
+        raise StorageIsolationError("kernel_schema_meta must contain exactly execution_kernel schema v2")
+    clock = connection.execute(
+        "SELECT singleton,watermark,event_sequence,typeof(watermark),typeof(event_sequence) "
+        "FROM kernel_clock"
+    ).fetchall()
+    if (
+        len(clock) != 1
+        or clock[0][0] != 1
+        or type(clock[0][2]) is not int
+        or clock[0][2] < 0
+        or clock[0][3] not in {"integer", "real"}
+        or clock[0][4] != "integer"
+        or not math.isfinite(float(clock[0][1]))
+        or clock[0][1] < 0
+    ):
+        raise StorageIsolationError("Kernel v2 clock row is invalid")
+    events = connection.execute(
+        "SELECT COALESCE(MAX(sequence),0) FROM kernel_events"
+    ).fetchone()
+    if events is None or events[0] != clock[0][2]:
+        raise StorageIsolationError("Kernel v2 global event sequence is inconsistent")
+
+
+def upgrade_kernel_schema_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Upgrade an exact Kernel v2 schema in a private copy, preserving rows.
+
+    This is deliberately explicit and never called by SQLiteKernel open. The
+    caller must pass an idle writable connection to a copied database. New
+    managed control tables start empty; existing execution data is unchanged.
+    """
+
+    if not isinstance(connection, sqlite3.Connection):
+        raise TypeError("connection must be a sqlite3.Connection")
+    if connection.in_transaction:
+        raise RuntimeError("Kernel schema upgrade requires an idle connection")
+    previous_row_factory = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            # Revalidate after taking the write lock so the checked layout is
+            # the one being upgraded, even when called outside a maintenance copy.
+            validate_kernel_schema_v2(connection)
+            connection.execute("DROP TABLE kernel_schema_meta")
+            connection.execute(_schema_statement_for("kernel_schema_meta"))
+            connection.execute(
+                "INSERT INTO kernel_schema_meta(component,schema_version) VALUES(?,?)",
+                ("execution_kernel", KERNEL_STORAGE_SCHEMA_VERSION),
+            )
+            for name in (
+                "kernel_run_controls",
+                "kernel_managed_executions",
+                "kernel_managed_executions_run",
+            ):
+                connection.execute(_schema_statement_for(name))
+            validate_schema(connection, KERNEL_TABLES)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        connection.row_factory = previous_row_factory
 
 
 def _expected_object_sql() -> dict[str, str]:
@@ -432,6 +671,8 @@ def _table_columns(connection: sqlite3.Connection, table: str) -> tuple[tuple, .
     statements = {
         "kernel_schema_meta": "PRAGMA table_info(kernel_schema_meta)",
         "kernel_clock": "PRAGMA table_info(kernel_clock)",
+        "kernel_run_controls": "PRAGMA table_info(kernel_run_controls)",
+        "kernel_managed_executions": "PRAGMA table_info(kernel_managed_executions)",
         "kernel_executions": "PRAGMA table_info(kernel_executions)",
         "kernel_events": "PRAGMA table_info(kernel_events)",
         "kernel_result_outbox": "PRAGMA table_info(kernel_result_outbox)",
@@ -462,7 +703,7 @@ def validate_schema(
         raise StorageIsolationError("incompatible execution-kernel schema object set")
     for table, expected in EXPECTED_COLUMNS.items():
         if _table_columns(connection, table) != expected:
-            raise StorageIsolationError(f"incompatible v2 column schema: {table}")
+            raise StorageIsolationError(f"incompatible v3 column schema: {table}")
     sql_by_name = {row["name"]: _normalize_sql(row["sql"] or "") for row in objects}
     expected_sql = _expected_object_sql()
     for name, expected in expected_sql.items():
@@ -482,11 +723,11 @@ def validate_schema(
         len(meta) != 1
         or meta[0]["component"] != "execution_kernel"
         or type(meta[0]["schema_version"]) is not int
-        or meta[0]["schema_version"] != 2
+        or meta[0]["schema_version"] != KERNEL_STORAGE_SCHEMA_VERSION
         or meta[0][2] != "integer"
     ):
         raise StorageIsolationError(
-            "kernel_schema_meta must contain exactly execution_kernel schema v2"
+            f"kernel_schema_meta must contain exactly execution_kernel schema v{KERNEL_STORAGE_SCHEMA_VERSION}"
         )
     clock = connection.execute(
         """SELECT singleton, watermark, event_sequence,
@@ -517,6 +758,8 @@ def validate_schema(
 def install_authorizer(connection: sqlite3.Connection):
     read_tables = KERNEL_TABLES | {"sqlite_master", "sqlite_schema"}
     insert_tables = {
+        "kernel_run_controls",
+        "kernel_managed_executions",
         "kernel_executions",
         "kernel_events",
         "kernel_result_outbox",
@@ -525,6 +768,10 @@ def install_authorizer(connection: sqlite3.Connection):
     }
     update_columns = {
         "kernel_clock": {"watermark", "event_sequence"},
+        "kernel_run_controls": {
+            "control_epoch", "generation", "state", "claims_used",
+        },
+        "kernel_managed_executions": {"drain_allowed"},
         "kernel_executions": {
             "state", "attempt", "redelivery_count", "next_attempt_at", "lease_id",
             "lease_owner", "fence", "lease_expires_at", "started_at", "result_json",

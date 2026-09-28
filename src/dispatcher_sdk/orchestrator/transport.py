@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 from ..execution_kernel import (CASConflictError, EffectRecoveryRequiredError,
@@ -11,6 +12,20 @@ from .contracts import OrchestrationError, TERMINAL, canonical, integer
 
 
 class TransportMixin:
+    @staticmethod
+    def _managed_delivery_intent(intent):
+        """Expose delivery identity without the command payload or cancel reason."""
+        command = intent.get("command")
+        return {
+            "kind": intent.get("kind"),
+            "execution_id": intent.get("execution_id"),
+            "generation": intent.get("generation", 0),
+            "command_digest": (
+                hashlib.sha256(canonical(command).encode()).hexdigest()
+                if isinstance(command, dict) else None
+            ),
+        }
+
     def delivery_messages(self, execution_ids=None, *, limit=100, pending_only=False):
         """Inspect command delivery failures without reading private storage."""
         integer(limit, "limit")
@@ -21,9 +36,29 @@ class TransportMixin:
             selected = set(execution_ids)
             if any(type(value) is not str or not value.strip() for value in selected):
                 raise OrchestrationError("invalid execution identifier")
+            if not selected:
+                return ()
+            if len(selected) > 900:
+                raise OrchestrationError("delivery query exceeds 900 execution identifiers")
+        predicates = []
+        parameters = []
+        if selected is not None:
+            predicates.append(
+                "json_extract(o.payload,'$.execution_id') IN ("
+                + ",".join("?" for _ in selected) + ")"
+            )
+            parameters.extend(sorted(selected))
+        if pending_only:
+            predicates.append("o.delivered=0")
+        where = " WHERE " + " AND ".join(predicates) if predicates else ""
         connection = self._connect()
         try:
-            rows = connection.execute("SELECT * FROM sdk_outbox ORDER BY sequence").fetchall()
+            rows = connection.execute(
+                "SELECT o.*,m.run_id IS NOT NULL AS managed FROM sdk_outbox o "
+                "LEFT JOIN sdk_managed_runs m ON m.run_id=o.run_id"
+                + where + " ORDER BY o.sequence LIMIT ?",
+                (*parameters, limit),
+            ).fetchall()
         finally:
             connection.close()
         records = []
@@ -36,7 +71,9 @@ class TransportMixin:
             records.append({"message_id": row["sequence"], "run_id": row["run_id"],
                             "command_id": row["command_id"], "execution_id": intent["execution_id"],
                             "generation": int(intent.get("generation", 0)),
-                            "kind": intent["kind"], "intent": intent,
+                            "kind": intent["kind"],
+                            "intent": (self._managed_delivery_intent(intent)
+                                       if row["managed"] else intent),
                             "state": "delivered" if row["delivered"] else
                                 "failed" if row["last_error"] is not None else "pending",
                             "attempts": row["attempts"], "last_attempt_at": row["last_attempt_at"],
@@ -46,8 +83,13 @@ class TransportMixin:
         return tuple(records)
 
     def _delivery_failed(self, row, error):
-        detail = {"type": type(error).__name__, "message": str(error)}
         with self._transaction() as connection:
+            managed = connection.execute(
+                "SELECT 1 FROM sdk_managed_runs WHERE run_id=?", (row["run_id"],)
+            ).fetchone() is not None
+            detail = {"type": type(error).__name__,
+                      "message": ("managed delivery failed"
+                                  if managed else str(error))}
             # A concurrent successful flusher wins over an older failure.
             changed = connection.execute(
                 "UPDATE sdk_outbox SET attempts=attempts+1,last_error=?,last_attempt_at=? "
@@ -58,7 +100,10 @@ class TransportMixin:
                 state["revision"] += 1
                 self._save(connection, state, changes=set())
                 self._event(connection, state, "delivery.failed", {
-                    "message_id": row["sequence"], "intent": json.loads(row["payload"]), "error": detail})
+                    "message_id": row["sequence"],
+                    "intent": (self._managed_delivery_intent(json.loads(row["payload"]))
+                               if managed else json.loads(row["payload"])),
+                    "error": detail})
 
     def _delivery_command(self, intent):
         command = ExecutionCommandV2.from_dict(intent["command"])
@@ -100,6 +145,18 @@ class TransportMixin:
             pending = connection.execute(
                 "SELECT sequence,run_id,payload FROM sdk_outbox WHERE delivered=0 "
                 "ORDER BY attempts,sequence").fetchall()
+            managed_controls = {
+                row["run_id"]: (
+                    row["control_state"],
+                    frozenset(json.loads(row["drain_execution_ids"])),
+                )
+                for row in connection.execute(
+                    "SELECT m.run_id,m.control_state,t.drain_execution_ids "
+                    "FROM sdk_managed_runs m JOIN sdk_managed_control_transitions t "
+                    "ON t.run_id=m.run_id AND t.control_epoch=m.control_epoch "
+                    "WHERE m.run_id IN (SELECT run_id FROM sdk_outbox WHERE delivered=0)"
+                )
+            }
         finally:
             connection.close()
         messages = [(row, json.loads(row["payload"])) for row in pending
@@ -111,22 +168,51 @@ class TransportMixin:
         # a broken cancel must not block unrelated dispatches.
         selected = [(row, intent) for row, intent in messages
                     if intent["kind"] != "dispatch"
-                    or intent["execution_id"] not in cancellations][:limit]
+                    or intent["execution_id"] not in cancellations]
+        # Only the frozen drain set can receive new Kernel registrations while
+        # a managed Run is pausing. Kernel claim repeats this check atomically.
+        selected = [(row, intent) for row, intent in selected
+                    if intent["kind"] != "dispatch"
+                    or row["run_id"] not in managed_controls
+                    or managed_controls[row["run_id"]][0] == "active"
+                    or (managed_controls[row["run_id"]][0] == "pausing"
+                        and intent["execution_id"] in managed_controls[row["run_id"]][1])][:limit]
+        managed_runs = set(managed_controls)
         count = 0
         for row, intent in selected:
             execution_id = intent["execution_id"]
             try:
                 command = self._delivery_command(intent)
                 if intent["kind"] == "dispatch":
-                    try:
-                        snapshot = self.kernel.get(execution_id)
-                    except ExecutionNotFoundError:
-                        snapshot = (self.runtime or self.kernel).submit(command)
+                    if row["run_id"] in managed_runs:
+                        try:
+                            self.kernel.get(execution_id)
+                        except ExecutionNotFoundError:
+                            snapshot = (self.runtime or self.kernel).submit_managed(
+                                command, run_id=row["run_id"],
+                                generation=int(intent.get("generation", 0)),
+                            )
+                        else:
+                            # Replay must also verify the Kernel registration;
+                            # matching command bytes alone do not prove control.
+                            snapshot = self.kernel.submit_managed(
+                                command, run_id=row["run_id"],
+                                generation=int(intent.get("generation", 0)),
+                            )
+                    else:
+                        try:
+                            snapshot = self.kernel.get(execution_id)
+                        except ExecutionNotFoundError:
+                            snapshot = (self.runtime or self.kernel).submit(command)
                     # An already accepted command, especially a cancelled one,
                     # must not be submitted through runtime validation again.
                     self._check_delivery_snapshot(snapshot, command)
                 elif intent["kind"] == "cancel":
-                    self._cancel_execution(execution_id, intent["reason"], command)
+                    self._cancel_execution(
+                        execution_id, intent["reason"], command,
+                        managed_run_id=row["run_id"] if row["run_id"] in managed_runs else None,
+                        generation=int(intent.get("generation", 0)),
+                    )
                 else:
                     raise OrchestrationError("unknown persisted delivery intent")
             except Exception as error:
@@ -147,7 +233,7 @@ class TransportMixin:
             count += completed
         return count
 
-    def _cancel_execution(self, execution_id, reason, command):
+    def _cancel_execution(self, execution_id, reason, command, *, managed_run_id=None, generation=0):
         for _ in range(8):
             try:
                 snapshot = self.kernel.get(execution_id)
@@ -156,7 +242,12 @@ class TransportMixin:
                 # submit/cancel pair would let another worker run the command.
                 # If a racing dispatch won first, this returns its existing
                 # snapshot and the runtime cancellation below handles cleanup.
-                snapshot = self.kernel.cancel_before_accept(command, reason=reason)
+                if managed_run_id is None:
+                    snapshot = self.kernel.cancel_before_accept(command, reason=reason)
+                else:
+                    snapshot = self.kernel.cancel_managed_before_accept(
+                        command, run_id=managed_run_id, generation=generation, reason=reason,
+                    )
             self._check_delivery_snapshot(snapshot, command)
             # Re-enter runtime cancellation for cancelled executions to finish process cleanup.
             if snapshot.state in TERMINAL and snapshot.state != "cancelled":

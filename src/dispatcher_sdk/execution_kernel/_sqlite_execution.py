@@ -4,16 +4,24 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Optional
+import os
+from pathlib import Path
+import sqlite3
 import uuid
 
-from ._sqlite_base import SQLiteBase, encode_json
+from ._sqlite_base import MAX_SQLITE_INTEGER, SQLiteBase, encode_json
 from ._sqlite_completion import ExecutionCompletionMixin
 from ._sqlite_effects import EffectStoreMixin
 from ._sqlite_outbox import ResultOutboxMixin
 from ._sqlite_recovery import EffectRecoveryMixin
 from .contracts import ExecutionCommandV2, ExecutionLease, ExecutionSnapshot
 from .claiming import claim_predicate
-from .errors import IdempotencyConflictError
+from .errors import (
+    CASConflictError,
+    ExecutionNotFoundError,
+    IdempotencyConflictError,
+    StorageIsolationError,
+)
 from .transitions import reduce_state
 
 
@@ -38,11 +46,33 @@ def _claim_revisions(
     return tuple(dict.fromkeys(values))
 
 
+MANAGED_EXECUTION_PREFIX = "sdk-managed:"
+
+
 def _next_claim_row(connection, timestamp: float, revisions: Optional[tuple[str, ...]]):
-    predicate, parameters = claim_predicate(timestamp, revisions)
+    predicate, parameters = claim_predicate(timestamp, revisions, alias="k")
     return connection.execute(
-        "SELECT * FROM kernel_executions WHERE " + predicate + " ORDER BY created_at, execution_id LIMIT 1",
-        parameters,
+        """SELECT k.* FROM kernel_executions AS k WHERE """ + predicate + """
+           AND (
+               k.execution_id NOT GLOB 'sdk-managed:*'
+               OR EXISTS (
+                   SELECT 1 FROM kernel_managed_executions AS m
+                   JOIN kernel_run_controls AS c ON c.run_id = m.run_id
+                   WHERE m.execution_id = k.execution_id
+                     AND (
+                         (
+                             c.claims_used < c.max_claims
+                             AND c.deadline_at > ?
+                             AND (
+                                 (c.state = 'active' AND m.generation = c.generation)
+                                 OR (c.state = 'pausing' AND m.drain_allowed = 1)
+                             )
+                         )
+                     )
+               )
+           )
+           ORDER BY k.created_at, k.execution_id LIMIT 1""",
+        (*parameters, timestamp),
     ).fetchone()
 
 
@@ -53,14 +83,390 @@ class SQLiteKernel(
     ResultOutboxMixin,
     SQLiteBase,
 ):
-    """Durable v2 kernel constrained to exact ``kernel_*`` schema objects."""
+    """Durable v3 kernel constrained to exact ``kernel_*`` schema objects."""
+
+    @staticmethod
+    def _managed_run_id(value: str) -> str:
+        if type(value) is not str or not value.strip():
+            raise ValueError("run_id must be a non-empty string")
+        return value
+
+    @staticmethod
+    def _managed_generation(value: int, name: str = "generation") -> int:
+        if type(value) is not int or value < 0 or value > MAX_SQLITE_INTEGER:
+            raise ValueError(
+                f"{name} must be a non-negative SQLite integer"
+            )
+        return value
+
+    @staticmethod
+    def _normalize_drain_ids(values) -> tuple[str, ...]:
+        if isinstance(values, (str, bytes, bytearray)) or not isinstance(
+            values, (Sequence, set, frozenset)
+        ):
+            raise ValueError("drain_execution_ids must be a sequence or set of identifiers")
+        identifiers = tuple(values)
+        if any(type(value) is not str or not value.strip() for value in identifiers):
+            raise ValueError("drain_execution_ids must contain non-empty strings")
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("drain_execution_ids must not contain duplicates")
+        if any(not value.startswith(MANAGED_EXECUTION_PREFIX) for value in identifiers):
+            raise ValueError("drain_execution_ids must use the reserved managed execution prefix")
+        return tuple(sorted(identifiers))
+
+    @staticmethod
+    def _run_control_value(row, drain_ids=()) -> dict:
+        return {
+            "run_id": row[0],
+            "control_epoch": row[1],
+            "generation": row[2],
+            "state": row[3],
+            "max_claims": row[4],
+            "claims_used": row[5],
+            "deadline_at": row[6],
+            "drain_execution_ids": tuple(drain_ids),
+        }
+
+    def _require_shared_transaction(self, connection) -> None:
+        if not isinstance(connection, sqlite3.Connection):
+            raise TypeError("connection must be a sqlite3.Connection")
+        if not connection.in_transaction:
+            raise RuntimeError("caller must hold an open SQLite transaction")
+        if self.db_path == ":memory:":
+            raise ValueError("managed Run controls require a durable Kernel database")
+        if connection is self._connection:
+            same_store = True
+        else:
+            main = next(
+                (row[2] for row in connection.execute("PRAGMA database_list") if row[1] == "main"),
+                None,
+            )
+            try:
+                same_store = main is not None and os.path.samefile(main, self.db_path)
+            except OSError:
+                same_store = False
+        if not same_store:
+            raise StorageIsolationError(
+                "control transaction must use the Kernel's main SQLite database"
+            )
+        marker = connection.execute(
+            "SELECT component,schema_version FROM kernel_schema_meta"
+        ).fetchone()
+        from ._sqlite_schema import KERNEL_STORAGE_SCHEMA_VERSION
+
+        if tuple(marker or ()) != ("execution_kernel", KERNEL_STORAGE_SCHEMA_VERSION):
+            raise StorageIsolationError("control transaction requires Kernel schema v3")
+
+    def _run_control_snapshot(self, connection, run_id: str):
+        row = connection.execute(
+            "SELECT run_id,control_epoch,generation,state,max_claims,claims_used,deadline_at "
+            "FROM kernel_run_controls WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        drain_ids = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT execution_id FROM kernel_managed_executions "
+                "WHERE run_id=? AND drain_allowed=1 ORDER BY execution_id",
+                (run_id,),
+            )
+        )
+        return self._run_control_value(row, drain_ids)
+
+    def _authorize_managed_operation(
+        self,
+        connection,
+        execution_id: str,
+        *,
+        timestamp: float,
+        operation: str,
+        settlement: bool = False,
+    ) -> None:
+        """Recheck Run control before managed work or effect settlement."""
+
+        if not execution_id.startswith(MANAGED_EXECUTION_PREFIX):
+            return
+        row = connection.execute(
+            """SELECT m.generation,m.drain_allowed,c.generation,c.state,c.deadline_at
+               FROM kernel_managed_executions AS m
+               LEFT JOIN kernel_run_controls AS c ON c.run_id=m.run_id
+               WHERE m.execution_id=?""",
+            (execution_id,),
+        ).fetchone()
+        if row is None or row[2] is None:
+            raise StorageIsolationError(
+                f"managed execution lacks its Run control during {operation}"
+            )
+        # An external effect may finish after pause/deadline changed. Recording
+        # that already-authorized outcome grants no new external authority.
+        if settlement:
+            return
+        if row[4] <= timestamp:
+            raise CASConflictError("managed Run deadline has elapsed")
+        if row[3] == "active" and row[0] == row[2]:
+            return
+        if (
+            row[3] == "pausing"
+            and row[1] == 1
+            and operation not in {"effect preparation", "external effect claim"}
+        ):
+            return
+        raise CASConflictError(
+            f"managed Run control does not allow {operation} for this execution"
+        )
+
+    def _charge_managed_claim(self, connection, execution_id: str, *, timestamp: float) -> None:
+        if not execution_id.startswith(MANAGED_EXECUTION_PREFIX):
+            return
+        cursor = connection.execute(
+            """UPDATE kernel_run_controls SET claims_used=claims_used+1
+               WHERE run_id=(SELECT run_id FROM kernel_managed_executions
+                             WHERE execution_id=?)
+                 AND claims_used < max_claims AND deadline_at > ?
+                 AND EXISTS (
+                     SELECT 1 FROM kernel_managed_executions AS m
+                     WHERE m.execution_id=? AND m.run_id=kernel_run_controls.run_id
+                       AND (
+                           (kernel_run_controls.state='active'
+                                AND m.generation=kernel_run_controls.generation)
+                           OR (kernel_run_controls.state='pausing' AND m.drain_allowed=1)
+                       )
+                 )""",
+            (execution_id, timestamp, execution_id),
+        )
+        self._cas(cursor, "managed Run claim budget")
+
+    def get_run_control(self, run_id: str) -> dict | None:
+        """Read one durable control snapshot without advancing the Kernel clock."""
+
+        run_id = self._managed_run_id(run_id)
+        with self._lock:
+            self._connection.execute("BEGIN")
+            try:
+                return self._run_control_snapshot(self._connection, run_id)
+            finally:
+                self._connection.rollback()
+
+    def register_run_control(
+        self, run_id: str, *, max_claims: int, deadline_at: float
+    ) -> dict:
+        """Idempotently register a managed Run, initially closed to claims."""
+
+        with self._transaction() as (connection, _timestamp):
+            return self.register_run_control_in_transaction(
+                connection,
+                run_id,
+                max_claims=max_claims,
+                deadline_at=deadline_at,
+            )
+
+    def register_run_control_in_transaction(
+        self, connection, run_id: str, *, max_claims: int, deadline_at: float
+    ) -> dict:
+        """Register in a caller-owned transaction for a shared Orchestrator store."""
+
+        run_id = self._managed_run_id(run_id)
+        if type(max_claims) is not int or not 0 <= max_claims <= MAX_SQLITE_INTEGER:
+            raise ValueError("max_claims must be a non-negative SQLite integer")
+        deadline_at = self._number(deadline_at, "deadline_at", minimum=0.0)
+        self._require_shared_transaction(connection)
+        current = self._run_control_snapshot(connection, run_id)
+        if current is not None:
+            if current["max_claims"] != max_claims or current["deadline_at"] != deadline_at:
+                raise IdempotencyConflictError(
+                    "managed Run was registered with different budget limits"
+                )
+            return current
+        connection.execute(
+            "INSERT INTO kernel_run_controls "
+            "(run_id,control_epoch,generation,state,max_claims,claims_used,deadline_at) "
+            "VALUES(?,0,0,'paused',?,0,?)",
+            (run_id, max_claims, deadline_at),
+        )
+        return self._run_control_snapshot(connection, run_id)
+
+    def set_run_control(
+        self,
+        run_id: str,
+        *,
+        expected_epoch: int,
+        state: str,
+        generation: int,
+        drain_execution_ids=(),
+    ) -> dict:
+        """CAS a durable control epoch and replace its scoped drain set."""
+
+        run_id = self._managed_run_id(run_id)
+        with self._transaction() as (connection, _timestamp):
+            return self.set_run_control_in_transaction(
+                connection,
+                run_id,
+                expected_epoch=expected_epoch,
+                state=state,
+                generation=generation,
+                drain_execution_ids=drain_execution_ids,
+            )
+
+    def set_run_control_in_transaction(
+        self,
+        connection,
+        run_id: str,
+        *,
+        expected_epoch: int,
+        state: str,
+        generation: int,
+        drain_execution_ids=(),
+    ) -> dict:
+        """Apply the control CAS inside a caller-owned shared-file transaction.
+
+        The caller must have acquired ``BEGIN IMMEDIATE`` and owns commit or
+        rollback. Separate database files cannot share this transaction.
+        """
+
+        run_id = self._managed_run_id(run_id)
+        if type(expected_epoch) is not int or expected_epoch < 0:
+            raise ValueError("expected_epoch must be a non-negative integer")
+        if expected_epoch >= MAX_SQLITE_INTEGER:
+            raise ValueError("expected_epoch cannot be advanced")
+        if type(state) is not str or state not in {"active", "pausing", "paused"}:
+            raise ValueError("state must be active, pausing, or paused")
+        generation = self._managed_generation(generation)
+        drain_ids = self._normalize_drain_ids(drain_execution_ids)
+        if state != "pausing" and drain_ids:
+            raise ValueError("drain_execution_ids are only valid while pausing")
+        self._require_shared_transaction(connection)
+
+        current = self._run_control_snapshot(connection, run_id)
+        if current is None:
+            raise ExecutionNotFoundError(f"managed Run control {run_id!r} is not registered")
+        target_epoch = expected_epoch + 1
+        if current["control_epoch"] == target_epoch:
+            if (
+                current["state"] == state
+                and current["generation"] == generation
+                and current["drain_execution_ids"] == drain_ids
+            ):
+                return current
+            raise CASConflictError("managed Run control epoch already has different content")
+        if current["control_epoch"] != expected_epoch:
+            raise CASConflictError("managed Run control epoch changed")
+        if generation < current["generation"]:
+            raise ValueError("managed Run generation cannot move backwards")
+
+        if drain_ids:
+            placeholders = ",".join("?" for _ in drain_ids)
+            rows = connection.execute(
+                "SELECT execution_id FROM kernel_managed_executions "
+                f"WHERE run_id=? AND generation=? AND execution_id IN ({placeholders})",
+                (run_id, generation, *drain_ids),
+            ).fetchall()
+            if {row[0] for row in rows} != set(drain_ids):
+                raise ValueError(
+                    "each drain execution must already be registered to this Run and generation"
+                )
+
+        cursor = connection.execute(
+            "UPDATE kernel_run_controls SET control_epoch=?,generation=?,state=? "
+            "WHERE run_id=? AND control_epoch=?",
+            (target_epoch, generation, state, run_id, expected_epoch),
+        )
+        self._cas(cursor, "managed Run control")
+        connection.execute(
+            "UPDATE kernel_managed_executions SET drain_allowed=0 WHERE run_id=?",
+            (run_id,),
+        )
+        for execution_id in drain_ids:
+            cursor = connection.execute(
+                "UPDATE kernel_managed_executions SET drain_allowed=1 "
+                "WHERE run_id=? AND generation=? AND execution_id=?",
+                (run_id, generation, execution_id),
+            )
+            self._cas(cursor, "managed Run drain registration")
+        return self._run_control_snapshot(connection, run_id)
 
     def submit(self, command: ExecutionCommandV2) -> ExecutionSnapshot:
         if type(command) is not ExecutionCommandV2:
             raise TypeError("submit requires ExecutionCommandV2")
+        if command.execution_id.startswith(MANAGED_EXECUTION_PREFIX):
+            raise StorageIsolationError(
+                "reserved managed execution IDs require submit_managed"
+            )
         encoded = encode_json(command.to_dict())
         with self._transaction() as (connection, timestamp):
             row, _ = self._submit_in_transaction(command, encoded, connection, timestamp)
+            return self._snapshot(row)
+
+    def submit_managed(
+        self, command: ExecutionCommandV2, *, run_id: str, generation: int
+    ) -> ExecutionSnapshot:
+        """Atomically register and queue one opted-in managed execution."""
+
+        if type(command) is not ExecutionCommandV2:
+            raise TypeError("submit_managed requires ExecutionCommandV2")
+        if not command.execution_id.startswith(MANAGED_EXECUTION_PREFIX):
+            raise ValueError(
+                f"managed execution_id must start with {MANAGED_EXECUTION_PREFIX!r}"
+            )
+        run_id = self._managed_run_id(run_id)
+        generation = self._managed_generation(generation)
+        if command.correlation_id != run_id:
+            raise ValueError("managed execution correlation_id must match run_id")
+        encoded = encode_json(command.to_dict())
+        with self._transaction() as (connection, timestamp):
+            control = connection.execute(
+                "SELECT generation,state FROM kernel_run_controls WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if control is None:
+                raise StorageIsolationError("managed Run control is missing")
+            mapping = connection.execute(
+                "SELECT run_id,generation FROM kernel_managed_executions "
+                "WHERE execution_id=?",
+                (command.execution_id,),
+            ).fetchone()
+            existing = connection.execute(
+                "SELECT * FROM kernel_executions WHERE execution_id=? OR idempotency_key=? "
+                "ORDER BY CASE WHEN execution_id=? THEN 0 ELSE 1 END LIMIT 1",
+                (command.execution_id, command.idempotency_key, command.execution_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["command_json"] != encoded:
+                    raise IdempotencyConflictError(
+                        "execution_id/idempotency_key already identifies another command"
+                    )
+                if (
+                    mapping is None
+                    or mapping["run_id"] != run_id
+                    or mapping["generation"] != generation
+                ):
+                    raise IdempotencyConflictError(
+                        "existing execution has no matching managed Run registration"
+                    )
+                return self._snapshot(existing)
+            if mapping is not None:
+                raise StorageIsolationError(
+                    "managed execution registration exists without its Kernel execution"
+                )
+            if control["generation"] != generation:
+                raise CASConflictError("managed execution generation is stale")
+            if control["state"] != "active":
+                raise CASConflictError(
+                    "new managed executions may only be accepted by an active Run"
+                )
+            connection.execute(
+                "INSERT INTO kernel_managed_executions "
+                "(execution_id,run_id,generation,drain_allowed) VALUES(?,?,?,0)",
+                (command.execution_id, run_id, generation),
+            )
+            row, created = self._submit_in_transaction(
+                command, encoded, connection, timestamp
+            )
+            if not created:
+                raise IdempotencyConflictError(
+                    "execution was accepted without its managed registration"
+                )
             return self._snapshot(row)
 
     def cancel_before_accept(
@@ -77,6 +483,10 @@ class SQLiteKernel(
         """
         if type(command) is not ExecutionCommandV2:
             raise TypeError("cancel_before_accept requires ExecutionCommandV2")
+        if command.execution_id.startswith(MANAGED_EXECUTION_PREFIX):
+            raise StorageIsolationError(
+                "reserved managed execution IDs require cancel_managed_before_accept"
+            )
         if type(reason) is not str or not reason.strip():
             raise ValueError("reason must be a non-empty string")
         encoded = encode_json(command.to_dict())
@@ -88,6 +498,85 @@ class SQLiteKernel(
                 row, command, timestamp=timestamp, reason=reason, effect_ids=[])
             return self._terminal(
                 connection, row, result, event_type="cancelled", timestamp=timestamp)
+
+    def cancel_managed_before_accept(
+        self,
+        command: ExecutionCommandV2,
+        *,
+        run_id: str,
+        generation: int,
+        reason: str = "execution cancelled",
+    ) -> ExecutionSnapshot:
+        """Atomically bind then cancel a not-yet-accepted managed execution."""
+
+        if type(command) is not ExecutionCommandV2:
+            raise TypeError("cancel_managed_before_accept requires ExecutionCommandV2")
+        if not command.execution_id.startswith(MANAGED_EXECUTION_PREFIX):
+            raise ValueError(
+                f"managed execution_id must start with {MANAGED_EXECUTION_PREFIX!r}"
+            )
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        run_id = self._managed_run_id(run_id)
+        generation = self._managed_generation(generation)
+        if command.correlation_id != run_id:
+            raise ValueError("managed execution correlation_id must match run_id")
+        encoded = encode_json(command.to_dict())
+        with self._transaction() as (connection, timestamp):
+            control = connection.execute(
+                "SELECT generation FROM kernel_run_controls WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if control is None:
+                raise StorageIsolationError("managed Run control is missing")
+            mapping = connection.execute(
+                "SELECT run_id,generation FROM kernel_managed_executions "
+                "WHERE execution_id=?",
+                (command.execution_id,),
+            ).fetchone()
+            existing = connection.execute(
+                "SELECT * FROM kernel_executions WHERE execution_id=? OR idempotency_key=? "
+                "ORDER BY CASE WHEN execution_id=? THEN 0 ELSE 1 END LIMIT 1",
+                (command.execution_id, command.idempotency_key, command.execution_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["command_json"] != encoded:
+                    raise IdempotencyConflictError(
+                        "execution_id/idempotency_key already identifies another command"
+                    )
+                if (
+                    mapping is None
+                    or mapping["run_id"] != run_id
+                    or mapping["generation"] != generation
+                ):
+                    raise IdempotencyConflictError(
+                        "existing execution has no matching managed Run registration"
+                    )
+                return self._snapshot(existing)
+            if mapping is not None:
+                raise StorageIsolationError(
+                    "managed execution registration exists without its Kernel execution"
+                )
+            if control["generation"] != generation:
+                raise CASConflictError("managed execution generation is stale")
+            connection.execute(
+                "INSERT INTO kernel_managed_executions "
+                "(execution_id,run_id,generation,drain_allowed) VALUES(?,?,?,0)",
+                (command.execution_id, run_id, generation),
+            )
+            row, created = self._submit_in_transaction(
+                command, encoded, connection, timestamp
+            )
+            if not created:
+                raise IdempotencyConflictError(
+                    "execution was accepted without its managed registration"
+                )
+            result = self._cancelled_result(
+                row, command, timestamp=timestamp, reason=reason, effect_ids=[]
+            )
+            return self._terminal(
+                connection, row, result, event_type="cancelled", timestamp=timestamp
+            )
 
     def _submit_in_transaction(self, command, encoded, connection, timestamp):
         existing = connection.execute(
@@ -258,6 +747,9 @@ class SQLiteKernel(
             fence = row["fence"] + 1
             revision = row["revision"] + 1
             expires_at = self._checked_add(timestamp, duration, "lease_seconds")
+            self._charge_managed_claim(
+                connection, row["execution_id"], timestamp=timestamp
+            )
             cursor = connection.execute(
                 """UPDATE kernel_executions
                    SET state = 'leased', attempt = ?, lease_id = ?, lease_owner = ?,
@@ -355,6 +847,9 @@ class SQLiteKernel(
             leased_revision = row["revision"] + 1
             running_revision = leased_revision + 1
             expires_at = self._checked_add(timestamp, duration, "lease_seconds")
+            self._charge_managed_claim(
+                connection, row["execution_id"], timestamp=timestamp
+            )
             cursor = connection.execute(
                 """UPDATE kernel_executions
                    SET state = 'running', attempt = ?, lease_id = ?, lease_owner = ?,
@@ -420,6 +915,12 @@ class SQLiteKernel(
             row = self._assert_lease(
                 connection, lease, timestamp=timestamp, states={"leased"}
             )
+            self._authorize_managed_operation(
+                connection,
+                lease.execution_id,
+                timestamp=timestamp,
+                operation="start",
+            )
             reduce_state(
                 row["state"],
                 "start",
@@ -470,6 +971,12 @@ class SQLiteKernel(
                 lease,
                 timestamp=timestamp,
                 states={"leased", "running"},
+            )
+            self._authorize_managed_operation(
+                connection,
+                lease.execution_id,
+                timestamp=timestamp,
+                operation="lease renewal",
             )
             expires_at = self._checked_add(timestamp, duration, "lease_seconds")
             revision = row["revision"] + 1

@@ -19,6 +19,15 @@ from typing import Any, Callable
 import uuid
 
 from .content import decode_value, encode_value
+from .execution_kernel._sqlite_schema import (
+    KERNEL_STORAGE_SCHEMA_VERSION,
+    KERNEL_TABLES,
+    existing_table_names,
+    upgrade_kernel_schema_v2_to_v3,
+    validate_kernel_schema_v2,
+    validate_schema as validate_kernel_schema,
+)
+from .execution_kernel.errors import StorageIsolationError
 from .maintenance import Lease
 from .storage import _new_artifact
 from .orchestrator.contracts import canonical
@@ -29,6 +38,8 @@ from .orchestrator.store import (
     LEGACY_SCHEMA,
     ORCHESTRATOR_SCHEMA_VERSION,
     SCHEMA,
+    SCHEMA_V3,
+    SCHEMA_V4_INSTALL,
     StoreMixin,
     execute_schema,
     initialize_storage_tracking,
@@ -129,6 +140,29 @@ def _validate_legacy(connection: sqlite3.Connection) -> None:
         )
 
 
+def _validate_v3(connection: sqlite3.Connection) -> None:
+    if _declared_version(connection) != 3:
+        raise StorageMigrationError("upgrade requires an exact schema v3 source")
+    with closing(sqlite3.connect(":memory:")) as reference:
+        execute_schema(reference, SCHEMA_V3)
+        results = ResultsMixin()
+        results.max_result_deliveries = 5
+        results._init_results(reference)
+        NotificationsMixin._init_notifications(reference)
+        initialize_storage_tracking(reference)
+        if StoreMixin._schema_objects(connection) != StoreMixin._schema_objects(reference):
+            raise StorageMigrationError("schema v3 source differs from the supported layout")
+    identity = connection.execute(
+        "SELECT store_id,incarnation FROM sdk_storage_identity WHERE singleton=1"
+    ).fetchone()
+    clock = connection.execute(
+        "SELECT mutation FROM sdk_storage_clock WHERE singleton=1"
+    ).fetchone()
+    if (identity is None or any(type(value) is not str or not value for value in identity)
+            or clock is None or type(clock[0]) is not int or clock[0] < 0):
+        raise StorageMigrationError("schema v3 storage identity or clock is invalid")
+
+
 def _validate_current(connection: sqlite3.Connection) -> None:
     if _declared_version(connection) != ORCHESTRATOR_SCHEMA_VERSION:
         raise StorageMigrationError(
@@ -138,6 +172,32 @@ def _validate_current(connection: sqlite3.Connection) -> None:
         Orchestrator.__new__(Orchestrator)._validate_existing_store(connection)
     except (ValueError, RuntimeError, sqlite3.DatabaseError) as exc:
         raise StorageMigrationError("current Orchestrator schema validation failed") from exc
+    if _kernel_source_version(connection) == 2:
+        raise StorageMigrationError("copied Kernel still has schema v2")
+
+
+def _kernel_source_version(connection: sqlite3.Connection) -> int | None:
+    names = {name for name in existing_table_names(connection) if name.startswith("kernel_")}
+    if not names:
+        return None
+    try:
+        marker = connection.execute(
+            "SELECT component,schema_version FROM kernel_schema_meta"
+        ).fetchall()
+        if len(marker) != 1 or marker[0][0] != "execution_kernel":
+            raise StorageMigrationError("invalid Kernel schema marker")
+        version = marker[0][1]
+        if type(version) is not int:
+            raise StorageMigrationError("invalid Kernel schema version")
+        if version == 2:
+            validate_kernel_schema_v2(connection)
+        elif version == KERNEL_STORAGE_SCHEMA_VERSION:
+            validate_kernel_schema(connection, names)
+        else:
+            raise StorageMigrationError("unsupported Kernel schema version")
+        return version
+    except (sqlite3.DatabaseError, StorageIsolationError) as error:
+        raise StorageMigrationError("Kernel schema differs from its declared version") from error
 
 
 def _backup(source: Path, target_path: Path) -> None:
@@ -153,7 +213,7 @@ def _install_v3(connection: sqlite3.Connection) -> None:
     connection.execute("BEGIN IMMEDIATE")
     try:
         connection.execute("DROP TABLE sdk_schema_meta")
-        execute_schema(connection, SCHEMA)
+        execute_schema(connection, SCHEMA_V3)
         results = ResultsMixin()
         results.max_result_deliveries = 5
         results._init_results(connection)
@@ -164,7 +224,7 @@ def _install_v3(connection: sqlite3.Connection) -> None:
         initialize_storage_tracking(connection)
         connection.execute(
             "INSERT INTO sdk_schema_meta VALUES('orchestrator',?)",
-            (ORCHESTRATOR_SCHEMA_VERSION,),
+            (3,),
         )
         connection.execute(
             "INSERT INTO sdk_storage_identity VALUES(1,?,?,?)",
@@ -178,6 +238,21 @@ def _install_v3(connection: sqlite3.Connection) -> None:
             "SELECT r.run_id,COALESCE(MAX(e.sequence),0),0 FROM sdk_runs r "
             "LEFT JOIN sdk_events e ON e.run_id=r.run_id GROUP BY r.run_id"
         )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _install_v4(connection: sqlite3.Connection) -> None:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _validate_v3(connection)
+        connection.execute("DROP TABLE sdk_schema_meta")
+        execute_schema(connection, SCHEMA_V4_INSTALL)
+        initialize_storage_tracking(connection)
+        connection.execute("INSERT INTO sdk_schema_meta VALUES('orchestrator',?)",
+                           (ORCHESTRATOR_SCHEMA_VERSION,))
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -279,6 +354,7 @@ def _report(
     required_bytes: int,
     source_version: int,
     converted_values: int = 0,
+    kernel_source_version: int | None = None,
 ) -> dict[str, Any]:
     return {
         "operation": operation,
@@ -291,6 +367,10 @@ def _report(
         "target_version": ORCHESTRATOR_SCHEMA_VERSION,
         "from_schema": source_version,
         "to_schema": ORCHESTRATOR_SCHEMA_VERSION,
+        "kernel_source_version": kernel_source_version,
+        "kernel_target_version": (
+            KERNEL_STORAGE_SCHEMA_VERSION if kernel_source_version is not None else None
+        ),
         "converted_values": converted_values,
         "source_unchanged": True,
         "automatic_activation": False,
@@ -310,7 +390,7 @@ def upgrade_storage(
     lease: Lease,
     failpoint: _Failpoint | None = None,
 ) -> dict[str, Any]:
-    """Copy an exact Orchestrator schema-v2 store into a fresh schema-v3 file."""
+    """Copy an exact Orchestrator schema-v2/v3 store into a fresh current file."""
 
     if not isinstance(lease, Lease):
         raise TypeError("lease must be a maintenance Lease")
@@ -320,7 +400,14 @@ def upgrade_storage(
     required_bytes = _space_precheck(source_path, destination_path)
     with closing(_open_read_only(source_path)) as connection:
         connection.execute("BEGIN")
-        _validate_legacy(connection)
+        source_version = _declared_version(connection)
+        if source_version == 2:
+            _validate_legacy(connection)
+        elif source_version == 3:
+            _validate_v3(connection)
+        else:
+            raise StorageMigrationError("upgrade requires an exact schema v2 or v3 source")
+        kernel_source_version = _kernel_source_version(connection)
     _hit(failpoint, "after_source_validation")
     lease.check(source_path)
 
@@ -331,11 +418,16 @@ def upgrade_storage(
         lease.check(source_path)
         with closing(sqlite3.connect(temporary, timeout=30)) as target:
             target.row_factory = sqlite3.Row
-            _install_v3(target)
+            if source_version == 2:
+                _install_v3(target)
+            _install_v4(target)
+            if kernel_source_version == 2:
+                upgrade_kernel_schema_v2_to_v3(target)
             _hit(failpoint, "after_schema")
-            converted = _convert_legacy_values(
-                target, source_path, lease, failpoint
-            )
+            if source_version == 2:
+                converted = _convert_legacy_values(
+                    target, source_path, lease, failpoint
+                )
             _hit(failpoint, "before_validation")
             _quick_validate(target)
             target.execute("PRAGMA journal_mode=DELETE")
@@ -350,8 +442,9 @@ def upgrade_storage(
         destination_path,
         before_bytes,
         required_bytes,
-        2,
+        source_version,
         converted,
+        kernel_source_version,
     )
 
 
@@ -369,6 +462,7 @@ def compact_database(
     with closing(_open_read_only(source_path)) as connection:
         connection.execute("BEGIN")
         _validate_current(connection)
+        kernel_source_version = _kernel_source_version(connection)
     lease.check(source_path)
 
     with _new_artifact(destination_path) as temporary:
@@ -407,6 +501,7 @@ def compact_database(
         before_bytes,
         required_bytes,
         ORCHESTRATOR_SCHEMA_VERSION,
+        kernel_source_version=kernel_source_version,
     )
 
 

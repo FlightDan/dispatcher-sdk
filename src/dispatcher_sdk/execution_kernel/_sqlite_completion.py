@@ -20,6 +20,7 @@ from .errors import (
     InvalidStateTransitionError,
     ResultConflictError,
     StaleFenceError,
+    StorageIsolationError,
 )
 from .transitions import TERMINAL_STATES, reduce_state
 
@@ -255,13 +256,28 @@ class ExecutionCompletionMixin:
             row = self._assert_lease(
                 connection, lease, timestamp=timestamp, states={"running"}
             )
+            self._authorize_managed_operation(
+                connection,
+                lease.execution_id,
+                timestamp=timestamp,
+                operation="execution completion",
+                settlement=True,
+            )
             command = self._validate_result(connection, row, lease, result, timestamp)
             parked = self._park_unfinished_effects(
                 connection, row, timestamp, trigger=f"complete:{result.status}"
             )
             if parked is not None:
                 return parked
-            if self._retryable(result, command):
+            managed_deadline_elapsed = False
+            if lease.execution_id.startswith("sdk-managed:"):
+                deadline = connection.execute(
+                    "SELECT c.deadline_at FROM kernel_managed_executions m "
+                    "JOIN kernel_run_controls c ON c.run_id=m.run_id "
+                    "WHERE m.execution_id=?", (lease.execution_id,),
+                ).fetchone()
+                managed_deadline_elapsed = deadline is not None and deadline[0] <= timestamp
+            if self._retryable(result, command) and not managed_deadline_elapsed:
                 if row["attempt"] >= command.retry_policy.max_attempts:
                     dead = self._dead_result(
                         row,
@@ -369,6 +385,13 @@ class ExecutionCompletionMixin:
             row = self._assert_lease(
                 connection, lease, timestamp=timestamp, states={"leased", "running"}
             )
+            self._authorize_managed_operation(
+                connection,
+                lease.execution_id,
+                timestamp=timestamp,
+                operation="dead-letter transition",
+                settlement=True,
+            )
             parked = self._park_unfinished_effects(
                 connection, row, timestamp, trigger="dead_letter"
             )
@@ -437,6 +460,18 @@ class ExecutionCompletionMixin:
                     fence=row["fence"],
                     reason="a non-cancelled terminal execution is immutable",
                 )
+            if execution_id.startswith("sdk-managed:"):
+                control = connection.execute(
+                    "SELECT c.state FROM kernel_managed_executions m "
+                    "JOIN kernel_run_controls c ON c.run_id=m.run_id "
+                    "WHERE m.execution_id=?", (execution_id,),
+                ).fetchone()
+                if control is None:
+                    raise StorageIsolationError("managed cancellation lacks Run control")
+                if control[0] not in {"pausing", "paused"}:
+                    raise CASConflictError(
+                        "managed cancellation requires a persisted pause barrier"
+                    )
             if row["state"] == "recovery_required":
                 recovery_effect_id = row["recovery_effect_id"]
                 if lease is None:

@@ -387,6 +387,12 @@ class EffectStoreMixin:
                 "SELECT * FROM kernel_effects WHERE effect_id = ?", (effect_id,)
             ).fetchone()
             if row is None:
+                self._authorize_managed_operation(
+                    connection,
+                    lease.execution_id,
+                    timestamp=timestamp,
+                    operation="effect preparation",
+                )
                 cursor = connection.execute(
                     """INSERT INTO kernel_effects
                        (effect_id, execution_id, name, request_json, state, response_json,
@@ -430,6 +436,12 @@ class EffectStoreMixin:
                 if existing.state == "committed":
                     result = existing
                 elif existing.state == "not_applied":
+                    self._authorize_managed_operation(
+                        connection,
+                        lease.execution_id,
+                        timestamp=timestamp,
+                        operation="effect preparation",
+                    )
                     # A new perform cycle has its own preparation/uncertainty
                     # timestamps and claim. Prior recovery remains immutable in
                     # effect_events, rather than leaking into this attempt.
@@ -530,6 +542,12 @@ class EffectStoreMixin:
                 raise EffectIndeterminateError("indeterminate effect requires recovery")
             if record.state != "prepared":
                 raise EffectConflictError("only a prepared effect can be claimed")
+            self._authorize_managed_operation(
+                connection,
+                lease.execution_id,
+                timestamp=timestamp,
+                operation="external effect claim",
+            )
             claim_id = uuid.uuid4().hex
             cursor = connection.execute(
                 """UPDATE kernel_effects SET state = 'performing', claim_id = ?, revision = ?
@@ -581,6 +599,13 @@ class EffectStoreMixin:
                 raise EffectIndeterminateError("ordinary commit cannot resolve uncertainty")
             if record.state != "performing":
                 raise EffectConflictError("effect is not under performing authority")
+            self._authorize_managed_operation(
+                connection,
+                lease.execution_id,
+                timestamp=timestamp,
+                operation="effect commit",
+                settlement=True,
+            )
             validated = EffectRecord(
                 record.effect_id, record.execution_id, record.name, record.request,
                 "committed", record.lease_id, claim_id, record.attempt, record.fence,
@@ -639,6 +664,13 @@ class EffectStoreMixin:
                 raise EffectConflictError("committed effect cannot become indeterminate")
             if record.state != "performing":
                 raise EffectConflictError("effect is not under performing authority")
+            self._authorize_managed_operation(
+                connection,
+                lease.execution_id,
+                timestamp=timestamp,
+                operation="effect uncertainty recording",
+                settlement=True,
+            )
             validated = EffectRecord(
                 record.effect_id, record.execution_id, record.name, record.request,
                 "indeterminate", record.lease_id, claim_id, record.attempt, record.fence,

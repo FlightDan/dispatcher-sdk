@@ -18,6 +18,7 @@ from typing import Any
 from .content import (CONTENT_PREFIX, ContentIntegrityError, decode_value,
                       MAX_DEPTH, MAX_LOGICAL_BYTES, _Decoder, _object_digest)
 from .maintenance import Lease
+from .orchestrator.store import ORCHESTRATOR_SCHEMA_VERSION
 
 
 class RetentionError(RuntimeError):
@@ -131,9 +132,11 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
             "SELECT component,version FROM sdk_schema_meta"
         ).fetchall()
     except sqlite3.DatabaseError as error:
-        raise RetentionError("database is not an orchestrator schema v3 store") from error
-    if len(marker) != 1 or tuple(marker[0]) != ("orchestrator", 3):
-        raise RetentionError("retention requires orchestrator schema version 3")
+        raise RetentionError("database is not a supported orchestrator store") from error
+    if len(marker) != 1 or tuple(marker[0]) != ("orchestrator", ORCHESTRATOR_SCHEMA_VERSION):
+        raise RetentionError(
+            f"retention requires orchestrator schema version {ORCHESTRATOR_SCHEMA_VERSION}"
+        )
     tables = {str(row[0]) for row in connection.execute(
         "SELECT name FROM sqlite_schema WHERE type='table'"
     )}
@@ -294,7 +297,7 @@ def _blocked_plan(
         "format_version": 1,
         "path": str(path),
         "run_id": run_id,
-        "schema_version": 3,
+        "schema_version": ORCHESTRATOR_SCHEMA_VERSION,
         "policy": policy.to_dict(),
         "policy_digest": _digest(policy.to_dict()),
         "scan": {"limit": scan_limit, "rows_scanned": rows_scanned, "complete": False},
@@ -558,7 +561,7 @@ def _build_plan(
         "format_version": 1,
         "path": str(path),
         "run_id": run_id,
-        "schema_version": 3,
+        "schema_version": ORCHESTRATOR_SCHEMA_VERSION,
         "policy": policy.to_dict(),
         "policy_digest": _digest(policy.to_dict()),
         "scan": {"limit": scan_limit, "rows_scanned": scanner.used, "complete": True,
@@ -659,7 +662,8 @@ def _validate_plan_document(plan: Any, path: Path) -> tuple[str, RetentionPolicy
         raise RetentionError("plan was modified after its digest was computed")
     if plan.get("path") != str(path) or type(plan.get("run_id")) is not str:
         raise RetentionError("plan belongs to another database path or has an invalid run")
-    if plan.get("format_version") != 1 or plan.get("schema_version") != 3:
+    if (plan.get("format_version") != 1
+            or plan.get("schema_version") != ORCHESTRATOR_SCHEMA_VERSION):
         raise RetentionError("unsupported retention plan format or schema")
     policy = _policy_from_plan(plan.get("policy"))
     if plan.get("policy_digest") != _digest(policy.to_dict()):

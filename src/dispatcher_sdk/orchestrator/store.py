@@ -12,7 +12,7 @@ from ..content import CONTENT_SCHEMA, decode_value, encode_value
 from .contracts import CommandConflict, OrchestrationError, HistoryExpired, EventCursorExpired, RunDisposed, TERMINAL, canonical
 
 
-ORCHESTRATOR_SCHEMA_VERSION = 3
+ORCHESTRATOR_SCHEMA_VERSION = 4
 def _schema_marker(version: int) -> str:
     return f"""
 CREATE TABLE IF NOT EXISTS sdk_schema_meta (
@@ -86,7 +86,7 @@ CREATE INDEX IF NOT EXISTS sdk_recovery_waiters_expiry ON sdk_recovery_waiters(r
 
 # Keep the previous exact DDL available to the explicit copy-upgrade tool.
 LEGACY_SCHEMA = _schema_marker(2) + _COMMON_SCHEMA
-SCHEMA = _schema_marker(ORCHESTRATOR_SCHEMA_VERSION) + _COMMON_SCHEMA + CONTENT_SCHEMA + """
+_V3_BODY = _COMMON_SCHEMA + CONTENT_SCHEMA + """
 CREATE TABLE IF NOT EXISTS sdk_storage_identity (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL,
  incarnation TEXT NOT NULL, created_at REAL NOT NULL);
@@ -105,6 +105,62 @@ CREATE TABLE IF NOT EXISTS sdk_disposed_runs (
 CREATE TABLE IF NOT EXISTS sdk_maintenance_receipts (
  operation_id TEXT PRIMARY KEY, plan_digest TEXT NOT NULL, result TEXT NOT NULL);
 """
+SCHEMA_V3 = _schema_marker(3) + _V3_BODY
+SCHEMA_V4_ADDITIONS = """
+CREATE TABLE IF NOT EXISTS sdk_managed_runs (
+ run_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, spec_digest TEXT NOT NULL,
+ control_state TEXT NOT NULL CHECK(control_state IN ('active','pausing','paused')),
+ control_epoch INTEGER NOT NULL CHECK(control_epoch>=0),
+ generation INTEGER NOT NULL CHECK(generation>=0),
+ max_claims INTEGER NOT NULL CHECK(max_claims>=0),
+ deadline_at REAL NOT NULL CHECK(deadline_at>0),
+ created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS sdk_managed_runs_state ON sdk_managed_runs(control_state,run_id);
+CREATE TABLE IF NOT EXISTS sdk_managed_commands (
+ run_id TEXT NOT NULL, request_id TEXT NOT NULL, digest TEXT NOT NULL,
+ response TEXT NOT NULL, PRIMARY KEY(run_id,request_id));
+CREATE TABLE IF NOT EXISTS sdk_managed_control_transitions (
+ run_id TEXT NOT NULL, control_epoch INTEGER NOT NULL CHECK(control_epoch>=0),
+ control_state TEXT NOT NULL CHECK(control_state IN ('active','pausing','paused')),
+ generation INTEGER NOT NULL CHECK(generation>=0),
+ drain_execution_ids TEXT NOT NULL,
+ pause_mode TEXT CHECK(pause_mode IN ('drain','interrupt') OR pause_mode IS NULL),
+ created_at REAL NOT NULL,
+ PRIMARY KEY(run_id,control_epoch));
+CREATE TABLE IF NOT EXISTS sdk_managed_revisions (
+ revision_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, request_id TEXT NOT NULL,
+ request_digest TEXT NOT NULL, source_generation INTEGER NOT NULL,
+ target_generation INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('preparing','prepared','committed','activated','aborted','failed')),
+ plan TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+ UNIQUE(run_id,request_id));
+CREATE INDEX IF NOT EXISTS sdk_managed_revisions_run ON sdk_managed_revisions(run_id,status);
+CREATE TABLE IF NOT EXISTS sdk_managed_waits (
+ run_id TEXT NOT NULL, parent_execution_id TEXT NOT NULL,
+ child_execution_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('open','closed')),
+ created_at REAL NOT NULL, updated_at REAL NOT NULL,
+ PRIMARY KEY(run_id,parent_execution_id,child_execution_id));
+CREATE INDEX IF NOT EXISTS sdk_managed_waits_child ON sdk_managed_waits(run_id,child_execution_id,state);
+CREATE TABLE IF NOT EXISTS sdk_managed_budget_entries (
+ run_id TEXT NOT NULL, entry_id TEXT NOT NULL, kind TEXT NOT NULL,
+ amount INTEGER NOT NULL CHECK(amount>=0), evidence TEXT NOT NULL,
+ created_at REAL NOT NULL, PRIMARY KEY(run_id,entry_id));
+CREATE TABLE IF NOT EXISTS sdk_managed_settlements (
+ run_id TEXT NOT NULL, execution_id TEXT NOT NULL, generation INTEGER NOT NULL,
+ phase TEXT NOT NULL CHECK(phase IN ('candidate','cleanup_required','sealed','delivered')),
+ candidate TEXT, error TEXT, cleanup_evidence TEXT, created_at REAL NOT NULL,
+ updated_at REAL NOT NULL, PRIMARY KEY(run_id,execution_id,generation));
+CREATE TABLE IF NOT EXISTS sdk_managed_cleanup_obligations (
+ run_id TEXT NOT NULL, control_epoch INTEGER NOT NULL CHECK(control_epoch>=0),
+ execution_id TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation>=0),
+ state TEXT NOT NULL CHECK(state IN ('pending','confirmed')),
+ evidence TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+ PRIMARY KEY(run_id,control_epoch,execution_id));
+CREATE INDEX IF NOT EXISTS sdk_managed_cleanup_pending
+ ON sdk_managed_cleanup_obligations(run_id,state,control_epoch,execution_id);
+"""
+SCHEMA_V4_INSTALL = _schema_marker(ORCHESTRATOR_SCHEMA_VERSION) + SCHEMA_V4_ADDITIONS
+SCHEMA = _schema_marker(ORCHESTRATOR_SCHEMA_VERSION) + _V3_BODY + SCHEMA_V4_ADDITIONS
 
 
 def execute_schema(connection, script):

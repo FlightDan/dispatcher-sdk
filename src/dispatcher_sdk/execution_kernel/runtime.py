@@ -236,6 +236,24 @@ class InProcessRuntime:
             )
         return self.kernel.submit(command)
 
+    def submit_managed(
+        self, command: ExecutionCommandV2, *, run_id: str, generation: int
+    ):
+        """Submit a Run-associated execution after validating its handler binding."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("runtime is closed")
+        self._assert_registry_current()
+        if not self._binding_matches(command):
+            raise RegistryRevisionMismatchError(
+                f"command requires registry revision {command.registry_revision}; "
+                f"runtime provides {self.registry_revision}"
+            )
+        return self.kernel.submit_managed(
+            command, run_id=run_id, generation=generation
+        )
+
     def command(self, handler_id: str, *, execution_id: str,
                 idempotency_key: str, correlation_id: str, timeout_seconds: float,
                 payload: Any, handler_contract_version: int = 1,

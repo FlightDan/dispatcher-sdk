@@ -792,7 +792,7 @@ class SharedSQLiteIsolationTests(unittest.TestCase):
                     ).fetchall()
                 finally:
                     check.close()
-                self.assertEqual(meta, [("execution_kernel", 2, "integer")])
+                self.assertEqual(meta, [("execution_kernel", 3, "integer")])
             finally:
                 kernel.close()
 
@@ -824,7 +824,7 @@ class SharedSQLiteIsolationTests(unittest.TestCase):
             finally:
                 kernel.close()
 
-    def test_kernel_schema_meta_is_required_and_strictly_v2(self) -> None:
+    def test_kernel_schema_meta_is_required_and_strictly_v3(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             partial = Path(temp) / "partial.sqlite3"
             connection = sqlite3.connect(partial)
@@ -834,7 +834,7 @@ class SharedSQLiteIsolationTests(unittest.TestCase):
             with self.assertRaises(StorageIsolationError):
                 SQLiteKernel(partial)
 
-        for invalid in (3, 2.0, "2"):
+        for invalid in (4, 3.0, "3"):
             with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temp:
                 path = Path(temp) / "wrong-meta.sqlite3"
                 kernel = SQLiteKernel(path)

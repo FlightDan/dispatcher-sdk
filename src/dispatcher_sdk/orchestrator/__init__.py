@@ -18,6 +18,7 @@ from .cancellation import (
 from .inbox import NotificationInbox, InboxLease, InboxRecord, InboxState
 from .request_results import RequestResultInbox, RequestResultIdentity, RequestResultObservation
 from .origins import ExecutionHandlerBinding, ExecutionOriginReport, inspect_execution_origin
+from .run_diagnostics import RunDiagnosticReport, inspect_run_diagnostics
 from .types import (
     AddTaskOperation, AttemptSnapshot, AttemptState, CancelOperation,
     DispatchOperation, FinishOperation, NewAttemptOperation, Observation,
@@ -36,6 +37,7 @@ __all__ = [
     "NotificationInbox", "InboxLease", "InboxRecord", "InboxState",
     "RequestResultInbox", "RequestResultIdentity", "RequestResultObservation",
     "ExecutionHandlerBinding", "ExecutionOriginReport", "inspect_execution_origin",
+    "RunDiagnosticReport", "inspect_run_diagnostics",
     "OrchestratorHostTimeoutError", "StopPhase", "StopReport",
     "Orchestrator", "OrchestratorHost", "OrchestratorHostHealth", "OrchestrationError",
     "RevisionConflict", "CommandConflict", "canonical_json", "Operations", "RecoveryDetails", "RecoveryRecord",

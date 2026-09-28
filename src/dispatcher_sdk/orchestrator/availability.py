@@ -8,6 +8,7 @@ import sqlite3
 from typing import TYPE_CHECKING, Any, Sequence
 
 from ..execution_kernel._sqlite_execution import _claim_revisions
+from ..execution_kernel._sqlite_schema import KERNEL_STORAGE_SCHEMA_VERSION
 from ..execution_kernel.claiming import claim_predicate
 from .contracts import OrchestrationError, TERMINAL, canonical, identifier
 
@@ -139,7 +140,7 @@ def inspect_work_availability(
         from .store import ORCHESTRATOR_SCHEMA_VERSION, StoreMixin
         if tuple(connection.execute("SELECT component,version FROM sdk_schema_meta").fetchone() or ()) != ("orchestrator", ORCHESTRATOR_SCHEMA_VERSION):
             raise OrchestrationError("unsupported orchestration schema")
-        if tuple(connection.execute("SELECT component,schema_version FROM authority.kernel_schema_meta").fetchone() or ()) != ("execution_kernel", 2):
+        if tuple(connection.execute("SELECT component,schema_version FROM authority.kernel_schema_meta").fetchone() or ()) != ("execution_kernel", KERNEL_STORAGE_SCHEMA_VERSION):
             raise OrchestrationError("unsupported Kernel schema")
         StoreMixin._assert_not_disposed(connection, run_id)
         run = connection.execute("SELECT revision,state FROM sdk_runs WHERE run_id=?", (run_id,)).fetchone()

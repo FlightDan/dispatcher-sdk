@@ -21,6 +21,7 @@ from .notifications import NotificationsMixin
 from .recovery import RecoveryMixin
 from .runs import RunHistoryMixin
 from .convenience import ConvenienceMixin
+from .managed import ManagedRunMixin
 from .types import Observation, Operation, RunEvent, RunSnapshot
 from .availability import WorkAvailabilityReport, inspect_work_availability
 from .cancellation import CancellationRecoveryReport, inspect_cancellation
@@ -37,7 +38,7 @@ def _event_payload(connection, raw: str):
     return payload
 
 
-class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin, RecoveryMixin, RunHistoryMixin, ConvenienceMixin):
+class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin, RecoveryMixin, RunHistoryMixin, ConvenienceMixin, ManagedRunMixin):
     """Use explicit commands to manage tasks backed by a public Kernel instance.
 
     Each call opens its own SQLite connection. Application callbacks and Kernel
@@ -267,6 +268,12 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             if replay is not None:
                 return replay
             state = self._load(connection, run_id)
+            if connection.execute(
+                "SELECT 1 FROM sdk_managed_runs WHERE run_id=?", (run_id,)
+            ).fetchone() is not None:
+                raise OrchestrationError(
+                    "managed Run operations require the controlled managed interface"
+                )
             active_recovery = self._active_recovery(connection, run_id)
             if active_recovery is not None:
                 raise OrchestrationError(

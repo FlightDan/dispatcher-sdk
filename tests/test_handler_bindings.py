@@ -193,7 +193,8 @@ class MultiRevisionClaimTests(unittest.TestCase):
         self.assertEqual(lease.execution_id, "z-literal")
         self.assertEqual(self.kernel.get("a-foreign").state, "queued")
         selections = [statement for statement in statements
-                      if statement.startswith("SELECT * FROM kernel_executions WHERE state = 'queued'")]
+                      if "FROM kernel_executions AS k WHERE" in statement
+                      and "ORDER BY k.created_at" in statement]
         self.assertEqual(len(selections), 1)
 
     def test_single_revision_and_unfiltered_claims_keep_existing_meanings(self):

@@ -7,6 +7,10 @@ import tempfile
 import unittest
 
 from dispatcher_sdk.content import CONTENT_PREFIX, decode_value
+from dispatcher_sdk.execution_kernel import (
+    ExecutionCommandV2, RetryPolicy, SQLiteKernel, StorageIsolationError,
+)
+from dispatcher_sdk.execution_kernel._sqlite_schema import KERNEL_SCHEMA_V2
 from dispatcher_sdk.maintenance import (
     InvalidLeaseError,
     MaintenanceBusyError,
@@ -17,7 +21,9 @@ from dispatcher_sdk.orchestrator import Orchestrator
 from dispatcher_sdk.orchestrator.contracts import canonical
 from dispatcher_sdk.orchestrator.notifications import NotificationsMixin
 from dispatcher_sdk.orchestrator.results import ResultsMixin
-from dispatcher_sdk.orchestrator.store import LEGACY_SCHEMA, execute_schema
+from dispatcher_sdk.orchestrator.store import (
+    LEGACY_SCHEMA, SCHEMA_V3, execute_schema, initialize_storage_tracking,
+)
 from dispatcher_sdk.storage_migration import compact_database, upgrade_storage
 
 
@@ -100,7 +106,7 @@ class StorageMigrationTests(unittest.TestCase):
             report = upgrade_storage(self.source, self.destination, lease=lease)
 
         self.assertEqual(self._digest(self.source), before_hash)
-        self.assertEqual((report["source_version"], report["target_version"]), (2, 3))
+        self.assertEqual((report["source_version"], report["target_version"]), (2, 4))
         self.assertTrue(report["source_unchanged"])
         self.assertFalse(report["automatic_cutover"])
         self.assertFalse(report["resumable"])
@@ -136,6 +142,79 @@ class StorageMigrationTests(unittest.TestCase):
                 ).fetchone()[0],
                 3,
             )
+
+    def test_schema_v3_copy_upgrade_preserves_run_and_requires_explicit_cutover(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            execute_schema(connection, SCHEMA_V3)
+            results = ResultsMixin()
+            results.max_result_deliveries = 5
+            results._init_results(connection)
+            NotificationsMixin._init_notifications(connection)
+            connection.execute("INSERT INTO sdk_storage_clock VALUES(1,0)")
+            initialize_storage_tracking(connection)
+            connection.execute("INSERT INTO sdk_schema_meta VALUES('orchestrator',3)")
+            connection.execute("INSERT INTO sdk_storage_identity VALUES(1,'old-store','old-incarnation',1)")
+            connection.execute("INSERT INTO sdk_runs VALUES('run',2,'running')")
+            connection.execute("INSERT INTO sdk_run_items VALUES('run','root','generation','0')")
+            connection.commit()
+        before_hash = self._digest(self.source)
+
+        with maintenance_lease(self.source, "test", "upgrade", lease_seconds=30) as lease:
+            report = upgrade_storage(self.source, self.destination, lease=lease)
+
+        self.assertEqual((report["source_version"], report["target_version"]), (3, 4))
+        self.assertEqual(self._digest(self.source), before_hash)
+        with self.assertRaisesRegex(ValueError, "unsupported orchestration schema"):
+            Orchestrator(self.source, object())
+        sdk = Orchestrator(self.destination, object())
+        self.assertEqual(sdk.get_run_summary("run")["revision"], 2)
+        with closing(sqlite3.connect(self.destination)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM sdk_managed_runs").fetchone()[0], 0)
+
+    def test_combined_v3_orchestrator_v2_kernel_copy_preserves_execution(self):
+        command = ExecutionCommandV2(
+            execution_id="legacy-execution", idempotency_key="legacy-key",
+            registry_revision="handler-v1:legacy", correlation_id="run",
+            causation_id=None, handler_id="legacy", handler_contract_version=1,
+            retry_policy=RetryPolicy(), timeout_seconds=1, payload={"value": "preserved"},
+        )
+        with closing(sqlite3.connect(self.source)) as connection:
+            execute_schema(connection, SCHEMA_V3)
+            results = ResultsMixin()
+            results.max_result_deliveries = 5
+            results._init_results(connection)
+            NotificationsMixin._init_notifications(connection)
+            connection.execute("INSERT INTO sdk_storage_clock VALUES(1,0)")
+            initialize_storage_tracking(connection)
+            connection.execute("INSERT INTO sdk_schema_meta VALUES('orchestrator',3)")
+            connection.execute("INSERT INTO sdk_storage_identity VALUES(1,'old-store','old-incarnation',1)")
+            connection.execute("INSERT INTO sdk_runs VALUES('run',0,'running')")
+            connection.commit()
+            connection.executescript(KERNEL_SCHEMA_V2)
+            connection.execute(
+                "INSERT INTO kernel_executions "
+                "(execution_id,idempotency_key,registry_revision,command_json,state,"
+                "attempt,redelivery_count,next_attempt_at,lease_id,lease_owner,fence,"
+                "lease_expires_at,started_at,result_json,recovery_effect_id,"
+                "recovery_target_state,recovery_reason,revision,created_at,updated_at) "
+                "VALUES(?,?,?,?, 'queued',0,0,1,NULL,NULL,0,NULL,NULL,NULL,NULL,NULL,NULL,1,1,1)",
+                (command.execution_id, command.idempotency_key,
+                 command.registry_revision, canonical(command.to_dict())),
+            )
+            connection.commit()
+        before_hash = self._digest(self.source)
+
+        with maintenance_lease(self.source, "test", "upgrade", lease_seconds=30) as lease:
+            report = upgrade_storage(self.source, self.destination, lease=lease)
+
+        self.assertEqual((report["source_version"], report["target_version"]), (3, 4))
+        self.assertEqual(self._digest(self.source), before_hash)
+        with self.assertRaises(StorageIsolationError):
+            SQLiteKernel(self.source)
+        with SQLiteKernel(self.destination) as kernel:
+            self.assertEqual(kernel.get("legacy-execution").command.to_dict(), command.to_dict())
+            self.assertEqual(kernel.get("legacy-execution").state, "queued")
+        self.assertEqual(Orchestrator(self.destination, object()).get_run_summary("run")["revision"], 0)
 
     def test_failure_and_destination_collision_never_publish_partial_output(self):
         self._create_legacy()

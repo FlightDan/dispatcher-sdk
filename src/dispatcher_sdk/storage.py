@@ -13,7 +13,9 @@ from typing import Any, Callable, Literal, Mapping
 
 from ._inspection import InspectionBudget, InspectionBudgetExceeded, ProgressCallbackError
 from .execution_kernel._registry import Handler, handler_revision, normalize_handlers, registry_revision
-from .execution_kernel._sqlite_schema import existing_table_names, validate_schema
+from .execution_kernel._sqlite_schema import (
+    KERNEL_STORAGE_SCHEMA_VERSION, existing_table_names, validate_schema,
+)
 from .execution_kernel.contracts import ExecutionCommandV2
 from .execution_kernel.transitions import TERMINAL_STATES
 from .storage_usage import inspect_storage_usage
@@ -57,7 +59,7 @@ def _validate_kernel_schema_light(connection: sqlite3.Connection, kernel_tables:
         raise ValueError("incompatible execution-kernel schema object set")
     for table, expected in schema.EXPECTED_COLUMNS.items():
         if schema._table_columns(connection, table) != expected:
-            raise ValueError(f"incompatible v2 column schema: {table}")
+            raise ValueError(f"incompatible v{KERNEL_STORAGE_SCHEMA_VERSION} column schema: {table}")
     sql_by_name = {row["name"]: schema._normalize_sql(row["sql"] or "") for row in objects}
     for name, expected in schema._expected_object_sql().items():
         if sql_by_name.get(name) != expected:
@@ -72,8 +74,10 @@ def _validate_kernel_schema_light(connection: sqlite3.Connection, kernel_tables:
         "SELECT component,schema_version,typeof(schema_version) FROM kernel_schema_meta"
     ).fetchall()
     if (len(meta) != 1 or meta[0][0] != "execution_kernel" or type(meta[0][1]) is not int
-            or meta[0][1] != 2 or meta[0][2] != "integer"):
-        raise ValueError("kernel_schema_meta must contain exactly execution_kernel schema v2")
+            or meta[0][1] != KERNEL_STORAGE_SCHEMA_VERSION or meta[0][2] != "integer"):
+        raise ValueError(
+            f"kernel_schema_meta must contain exactly execution_kernel schema v{KERNEL_STORAGE_SCHEMA_VERSION}"
+        )
     clock = connection.execute(
         "SELECT singleton,watermark,event_sequence,typeof(watermark),typeof(event_sequence) FROM kernel_clock"
     ).fetchall()
@@ -167,7 +171,7 @@ def _inspect_storage(path: str | Path, *, handlers: Mapping[Any, Handler] | None
                     report["issues"].append({"component": "kernel", "message": str(error)})
                 else:
                     kernel_valid = True
-                    report["kernel_schema"] = 2
+                    report["kernel_schema"] = KERNEL_STORAGE_SCHEMA_VERSION
                     if check == "full":
                         report["execution_counts"] = {row[0]: row[1] for row in connection.execute(
                             "SELECT state,COUNT(*) FROM kernel_executions GROUP BY state")}

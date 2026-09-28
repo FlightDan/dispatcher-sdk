@@ -51,7 +51,7 @@ class StoragePreflightTests(unittest.TestCase):
                                  operations=[Operations.add_task("task", command)])
             good = inspect_storage(self.path, handlers={"echo": echo, "unrelated": other})
             self.assertTrue(good["compatible"], good)
-            self.assertEqual((good["kernel_schema"], good["orchestrator_schema"]), (2, 3))
+            self.assertEqual((good["kernel_schema"], good["orchestrator_schema"]), (3, 4))
             mismatch = inspect_storage(self.path, handlers={"echo": other})
             self.assertFalse(mismatch["compatible"])
             self.assertEqual(mismatch["binding_mismatch_count"], 1)
