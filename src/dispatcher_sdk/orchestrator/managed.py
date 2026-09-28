@@ -10,9 +10,12 @@ import heapq
 import json
 import math
 from pathlib import Path
+import sqlite3
 from typing import Any, Sequence
 
 from ..execution_kernel import ExecutionCommandV2
+from ..execution_kernel.cancellation import CancellationJournal, inspect_cancellation_journal
+from .cancellation import _sandbox_facts
 from .contracts import (CommandConflict, OrchestrationError, RevisionConflict, TERMINAL,
                         canonical, clone, digest, identifier, integer)
 from .reducer import reduce_operation
@@ -557,6 +560,82 @@ class ManagedRunMixin:
             self._event(connection, {"run_id": run_id, "revision": revision,
                                      "generation": row["generation"]}, "managed.paused", response)
             return response
+
+    def _confirm_managed_cleanup_from_runtime(
+        self, run_id: str, execution_id: str, *, control_epoch: int,
+    ) -> dict[str, Any]:
+        """Seal a cleanup obligation only from a bound Runtime cancellation receipt.
+
+        The cancellation journal is a separate immutable evidence store. A
+        missing receipt, thread-only revocation, unresolved sandbox operation,
+        or unknown Effect leaves the obligation pending.
+        """
+        identifier(run_id, "run_id")
+        identifier(execution_id, "execution_id")
+        integer(control_epoch, "control_epoch")
+        journal = getattr(self.runtime, "cancellation_journal", None)
+        with self._transaction() as connection:
+            obligation = connection.execute(
+                "SELECT state,evidence FROM sdk_managed_cleanup_obligations "
+                "WHERE run_id=? AND control_epoch=? AND execution_id=?",
+                (run_id, control_epoch, execution_id),
+            ).fetchone()
+            if obligation is None:
+                raise OrchestrationError("unknown managed cleanup obligation")
+            if obligation["state"] == "confirmed":
+                return json.loads(obligation["evidence"])
+            if not isinstance(journal, CancellationJournal):
+                raise OrchestrationError("trusted Runtime cancellation journal is unavailable")
+            row = connection.execute(
+                "SELECT k.* FROM kernel_executions k JOIN kernel_managed_executions m "
+                "ON m.execution_id=k.execution_id WHERE k.execution_id=? AND m.run_id=?",
+                (execution_id, run_id),
+            ).fetchone()
+            if row is None or row["state"] not in TERMINAL:
+                raise OrchestrationError("execution authority has not settled")
+            if connection.execute(
+                "SELECT 1 FROM kernel_effects WHERE execution_id=? "
+                "AND state IN ('performing','indeterminate') LIMIT 1",
+                (execution_id,),
+            ).fetchone():
+                raise OrchestrationError("unresolved effect blocks cleanup confirmation")
+            snapshot = self.kernel._snapshot(row)
+            try:
+                page = inspect_cancellation_journal(
+                    journal.path, source_id=journal.source_id,
+                    kernel_path=self.kernel.db_path, snapshot=snapshot, limit=1000,
+                )
+                sandbox_records, sandbox_issues = _sandbox_facts(connection, snapshot)
+            except (OSError, ValueError, sqlite3.Error) as error:
+                raise OrchestrationError("runtime cleanup evidence is unavailable") from error
+            if page.truncated or sandbox_issues or any(
+                not record["cleanup_confirmed"] for record in sandbox_records
+            ):
+                raise OrchestrationError("runtime cleanup evidence is incomplete")
+            receipt = next((item for item in page.receipts
+                            if "failure" not in item.phases
+                            and item.phases.get("authority_revoked", {}).get("state") == "confirmed"
+                            and item.phases.get("process_cleanup", {}).get("state") == "confirmed"
+                            and (not sandbox_records or item.phases.get("remote_cleanup", {}).get("state")
+                                 == "confirmed")), None)
+            if receipt is None:
+                raise OrchestrationError("no process-stop receipt confirms managed cleanup")
+            proof = {
+                "source": "runtime.cancellation_journal",
+                "source_id": journal.source_id,
+                "receipt_id": receipt.receipt_id,
+                "command_digest": receipt.command_digest,
+                "attempt": receipt.attempt,
+                "fence": receipt.fence,
+                "sandbox_operations": len(sandbox_records),
+            }
+            encoded = canonical(proof)
+            connection.execute(
+                "UPDATE sdk_managed_cleanup_obligations SET state='confirmed',evidence=?,updated_at=? "
+                "WHERE run_id=? AND control_epoch=? AND execution_id=? AND state='pending'",
+                (encoded, float(self.clock()), run_id, control_epoch, execution_id),
+            )
+            return proof
 
     def list_managed_control_transitions(
         self, run_id: str, *, after_epoch: int = -1, limit: int = 100,

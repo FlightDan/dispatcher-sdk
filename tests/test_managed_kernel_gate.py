@@ -304,6 +304,10 @@ class ManagedKernelGateTests(unittest.TestCase):
         self.assertEqual(self.kernel.get(lease.execution_id).state, "cancelled")
         with self.assertRaisesRegex(OrchestrationError, "cleanup evidence"):
             self.sdk._settle_managed_pause("one", expected_control_epoch=2)
+        with self.assertRaisesRegex(OrchestrationError, "trusted Runtime cancellation journal"):
+            self.sdk._confirm_managed_cleanup_from_runtime(
+                "one", lease.execution_id, control_epoch=2,
+            )
         self.assertEqual(self.sdk.get_managed_control("one")["control_state"], "pausing")
 
     def test_managed_delivery_failure_diagnostics_redact_command_payload(self):
