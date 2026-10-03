@@ -228,12 +228,29 @@ class ExecutionCompletionMixin:
             )
         return False
 
-    def complete(self, lease: ExecutionLease, result: ExecutionResultV2) -> ExecutionSnapshot:
+    def complete(self, lease: ExecutionLease, result: ExecutionResultV2, *,
+                 timeout_seconds: float | None = None) -> ExecutionSnapshot:
+        return self._complete_result(lease, result, timeout_seconds=timeout_seconds)
+
+    def _restore_completion(self, lease: ExecutionLease, result: ExecutionResultV2, *,
+                            timeout_seconds: float = .1) -> ExecutionSnapshot:
+        """Settle a retained result without granting expired business authority.
+
+        The exact lease, attempt, fence and revision must still own the row;
+        completion must have happened before its original lease expiry. A
+        cancel, reap or subsequent claim therefore wins over this receipt.
+        """
+        return self._complete_result(lease, result, timeout_seconds=timeout_seconds,
+                                     settlement=True)
+
+    def _complete_result(self, lease: ExecutionLease, result: ExecutionResultV2, *,
+                         timeout_seconds: float | None = None,
+                         settlement: bool = False) -> ExecutionSnapshot:
         if type(lease) is not ExecutionLease:
             raise TypeError("complete requires ExecutionLease")
         if type(result) is not ExecutionResultV2:
             raise TypeError("complete requires ExecutionResultV2")
-        with self._transaction() as (connection, timestamp):
+        with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             row = self._get_row(connection, lease.execution_id)
             if row["state"] in TERMINAL_STATES:
                 current = self._result(row["result_json"])
@@ -254,7 +271,8 @@ class ExecutionCompletionMixin:
                     reason="terminal state is immutable",
                 )
             row = self._assert_lease(
-                connection, lease, timestamp=timestamp, states={"running"}
+                connection, lease, timestamp=timestamp, states={"running"},
+                settlement=settlement,
             )
             self._authorize_managed_operation(
                 connection,
@@ -350,13 +368,19 @@ class ExecutionCompletionMixin:
             )
 
     def require_effect_recovery(
-        self, lease: ExecutionLease, effect_id: str
+        self, lease: ExecutionLease, effect_id: str, *, timeout_seconds: float | None = None
     ) -> ExecutionSnapshot:
+        return self._require_effect_recovery(lease, effect_id, timeout_seconds=timeout_seconds)
+
+    def _require_effect_recovery(self, lease: ExecutionLease, effect_id: str, *,
+                                 timeout_seconds: float | None = None,
+                                 settlement: bool = False) -> ExecutionSnapshot:
         if type(effect_id) is not str or not effect_id.strip():
             raise ValueError("effect_id must be a non-empty string")
-        with self._transaction() as (connection, timestamp):
+        with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             row = self._assert_lease(
-                connection, lease, timestamp=timestamp, states={"running"}
+                connection, lease, timestamp=timestamp, states={"running"},
+                settlement=settlement,
             )
             effect = connection.execute(
                 """SELECT execution_id, state FROM kernel_effects
@@ -418,6 +442,8 @@ class ExecutionCompletionMixin:
         *,
         reason: str = "execution cancelled",
         expected_revision: Optional[int] = None,
+        expected_supervision: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> ExecutionSnapshot:
         """Cancel an execution through either worker or external authority.
 
@@ -446,8 +472,10 @@ class ExecutionCompletionMixin:
             raise ValueError("lease and expected_revision are mutually exclusive")
         recovery_effect_id: Optional[str] = None
         answer: Optional[ExecutionSnapshot] = None
-        with self._transaction() as (connection, timestamp):
+        with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             row = self._get_row(connection, execution_id)
+            if expected_supervision is not None:
+                self._assert_stall_disposition(connection, row, expected_supervision)
             if row["state"] in TERMINAL_STATES:
                 if row["state"] == "cancelled":
                     return self._snapshot(row)

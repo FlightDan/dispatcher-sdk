@@ -47,6 +47,29 @@ class ScriptSpecTests(unittest.TestCase):
             Kernel.open_sqlite(Path(temp) / "kernel.db", script_handlers(), isolation_mode="thread")
 
 
+@unittest.skipUnless(os.name == "nt" or (os.name == "posix" and "fork" in multiprocessing.get_all_start_methods()),
+                     "requires a real supported process backend")
+class PortableScriptStreamTests(unittest.TestCase):
+    def test_no_newline_raw_stdout_survives_native_process_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with Kernel.open_sqlite(root / "kernel.db", script_handlers(), isolation_mode="process") as runtime:
+                source = "import sys,time\nsys.stdout.buffer.write(b'raw-without-newline\\xff')\nsys.stdout.flush()\ntime.sleep(3)\nopen('escaped', 'w').write('escaped')\n"
+                runtime.submit(ScriptSpec(source, (sys.executable, "-u"), root, root / "logs").command(
+                    execution_id="raw-timeout", idempotency_key="raw-timeout", registry_revision=runtime.registry_revision,
+                    correlation_id="raw-timeout", timeout_seconds=2))
+                result = runtime.run_once()
+                self.assertEqual("recovery_required", result.state)
+                effect = runtime.kernel.get_effect(result.recovery_effect_id)
+                logs = list(Path(effect.request["output_root"]).glob("*/stdout.log"))
+                self.assertEqual(1, len(logs))
+                self.assertEqual(b"raw-without-newline\xff", logs[0].read_bytes())
+                observation = runtime.observe("raw-timeout")
+                self.assertEqual(20, observation["metrics"]["stdout_bytes"]["count"])
+                time.sleep(1.2)
+                self.assertFalse((root / "escaped").exists())
+
+
 @unittest.skipUnless(os.name == "posix" and "fork" in multiprocessing.get_all_start_methods(),
                      "requires POSIX fork process supervision")
 class ScriptExecutionTests(unittest.TestCase):

@@ -6,6 +6,7 @@ from ctypes import wintypes
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import shutil
 import subprocess
 import sys
@@ -198,6 +199,62 @@ class UnsupportedWindowsBackendTests(unittest.TestCase):
     def test_native_windows_is_required(self):
         with self.assertRaisesRegex(RuntimeError, "native Windows"):
             _WinAPI()
+
+
+class WindowsDescendantContainmentTests(unittest.TestCase):
+    def test_job_member_handles_are_verified_and_original_worker_is_preserved(self):
+        opened, killed, closed = [], [], []
+        members = [[7, 8, 9], [7, 10], [7], [7]]
+
+        class API:
+            def process_ids(self, job):
+                return tuple(members.pop(0) if len(members) > 1 else members[0])
+
+            def check(self, result, operation):
+                if not result:
+                    raise OSError(operation)
+
+        class DLL:
+            def OpenProcess(self, rights, inherit, pid):
+                opened.append(pid)
+                return pid + 100
+
+            def IsProcessInJob(self, handle, job, assigned):
+                # PID 9 was reused outside this Job before handle acquisition.
+                assigned._obj.value = handle != 109
+                return True
+
+            def WaitForSingleObject(self, handle, milliseconds):
+                return 258
+
+            def TerminateProcess(self, handle, code):
+                killed.append(handle)
+                return True
+
+            def CloseHandle(self, handle):
+                closed.append(handle)
+                return True
+
+        api = API()
+        api.dll = DLL()
+        handle = windows_runtime.WindowsProcessHandle(api, 99,
+            SimpleNamespace(dwProcessId=7, hProcess=107, hThread=None))
+        self.assertTrue(handle.stop_descendants(time.monotonic() + 1))
+        self.assertEqual([8, 9, 10], opened)
+        self.assertEqual([108, 110], killed)
+        self.assertEqual([108, 109, 110], closed)
+
+    def test_job_enumeration_is_bounded_before_large_allocation(self):
+        api = _WinAPI.__new__(_WinAPI)
+
+        def query(job, information_class, listing, size, returned):
+            listing._obj.assigned = windows_runtime._MAX_JOB_PROCESSES + 1
+            return False
+
+        api.dll = SimpleNamespace(QueryInformationJobObject=query)
+        with patch.object(ctypes, "get_last_error", return_value=234, create=True):
+            with self.assertRaisesRegex(RuntimeError, "bounded enumeration"):
+                api.process_ids(99)
 
 
 class WindowsPublicationRaceTests(unittest.TestCase):

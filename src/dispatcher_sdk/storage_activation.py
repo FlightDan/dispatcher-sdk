@@ -212,6 +212,26 @@ def _member(snapshot: VerifiedSnapshot, name: str) -> Mapping[str, Any]:
     raise ActivationPreconditionError(f"snapshot component metadata is missing: {name}")
 
 
+def _require_empty_sandbox_registry(component: Path) -> None:
+    """An identity-only registry owns no external sandbox cleanup obligations."""
+    from .execution_kernel._sandbox_registry import validate_registry
+
+    connection = sqlite3.connect(component.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("BEGIN")
+        validate_registry(connection)
+        if connection.execute("SELECT 1 FROM runtime_sandbox_journals LIMIT 1").fetchone():
+            raise ActivationPreconditionError(
+                "sandbox journals are external resources and cannot be activated safely"
+            )
+    except (ValueError, sqlite3.Error) as error:
+        raise ActivationPreconditionError("sandbox registry validation failed") from error
+    finally:
+        connection.close()
+
+
 def _preflight(snapshot: VerifiedSnapshot, handlers: Mapping[Any, Handler]) -> None:
     if not snapshot.source_components:
         raise ActivationPreconditionError(
@@ -232,10 +252,12 @@ def _preflight(snapshot: VerifiedSnapshot, handlers: Mapping[Any, Handler]) -> N
         )
         if not recognized:
             raise ActivationPreconditionError(f"component is not a supported SDK store: {name}")
-        if report.get("sandbox_schema") != "absent" or report.get("sandbox_registry_schema") != "absent":
+        if report.get("sandbox_schema") != "absent":
             raise ActivationPreconditionError(
                 "sandbox journals are external resources and cannot be activated safely"
             )
+        if report.get("sandbox_registry_schema") != "absent":
+            _require_empty_sandbox_registry(component)
         if report["issues"] or report["checks"]["integrity"] != "ok":
             raise ActivationPreconditionError(
                 f"component failed integrity, schema, or deployment preflight: {name}"

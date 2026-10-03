@@ -1,4 +1,4 @@
-"""Explicit copy upgrades and copy compaction for Orchestrator stores.
+"""Explicit SDK store copy upgrades and Orchestrator copy compaction.
 
 These operations never modify or activate the source database.  They require a
 live exclusive maintenance lease and publish only a fully validated new file.
@@ -24,7 +24,9 @@ from .execution_kernel._sqlite_schema import (
     KERNEL_TABLES,
     existing_table_names,
     upgrade_kernel_schema_v2_to_v3,
+    upgrade_kernel_schema_v3_to_v4,
     validate_kernel_schema_v2,
+    validate_kernel_schema_v3,
     validate_schema as validate_kernel_schema,
 )
 from .execution_kernel.errors import StorageIsolationError
@@ -172,8 +174,8 @@ def _validate_current(connection: sqlite3.Connection) -> None:
         Orchestrator.__new__(Orchestrator)._validate_existing_store(connection)
     except (ValueError, RuntimeError, sqlite3.DatabaseError) as exc:
         raise StorageMigrationError("current Orchestrator schema validation failed") from exc
-    if _kernel_source_version(connection) == 2:
-        raise StorageMigrationError("copied Kernel still has schema v2")
+    if _kernel_source_version(connection) not in {None, KERNEL_STORAGE_SCHEMA_VERSION}:
+        raise StorageMigrationError("copied Kernel still has a historical schema")
 
 
 def _kernel_source_version(connection: sqlite3.Connection) -> int | None:
@@ -191,6 +193,8 @@ def _kernel_source_version(connection: sqlite3.Connection) -> int | None:
             raise StorageMigrationError("invalid Kernel schema version")
         if version == 2:
             validate_kernel_schema_v2(connection)
+        elif version == 3:
+            validate_kernel_schema_v3(connection)
         elif version == KERNEL_STORAGE_SCHEMA_VERSION:
             validate_kernel_schema(connection, names)
         else:
@@ -337,13 +341,17 @@ def _convert_legacy_values(
     return total
 
 
-def _quick_validate(connection: sqlite3.Connection) -> None:
+def _quick_validate(connection: sqlite3.Connection, *, kernel_only: bool = False) -> None:
     rows = connection.execute("PRAGMA quick_check").fetchall()
     if [tuple(row) for row in rows] != [("ok",)]:
         raise StorageMigrationError(
             "target SQLite integrity check failed: " + "; ".join(str(row[0]) for row in rows)
         )
-    _validate_current(connection)
+    if kernel_only:
+        if _kernel_source_version(connection) != KERNEL_STORAGE_SCHEMA_VERSION:
+            raise StorageMigrationError("copied Kernel still has a historical schema")
+    else:
+        _validate_current(connection)
 
 
 def _report(
@@ -355,18 +363,22 @@ def _report(
     source_version: int,
     converted_values: int = 0,
     kernel_source_version: int | None = None,
+    component: str = "orchestrator",
 ) -> dict[str, Any]:
+    target_version = (KERNEL_STORAGE_SCHEMA_VERSION if component == "execution_kernel"
+                      else ORCHESTRATOR_SCHEMA_VERSION)
     return {
         "operation": operation,
+        "component": component,
         "source": str(source),
         "destination": str(destination),
         "before_bytes": before_bytes,
         "after_bytes": destination.stat().st_size,
         "space_precheck_bytes": required_bytes,
         "source_version": source_version,
-        "target_version": ORCHESTRATOR_SCHEMA_VERSION,
+        "target_version": target_version,
         "from_schema": source_version,
-        "to_schema": ORCHESTRATOR_SCHEMA_VERSION,
+        "to_schema": target_version,
         "kernel_source_version": kernel_source_version,
         "kernel_target_version": (
             KERNEL_STORAGE_SCHEMA_VERSION if kernel_source_version is not None else None
@@ -375,10 +387,14 @@ def _report(
         "source_unchanged": True,
         "automatic_activation": False,
         "automatic_cutover": False,
+        "external_stores_included": False,
+        "observation_journal_included": False,
         "resumable": False,
         "limitation": (
             "This copy operation is not a resumable 134 GB migration; validate capacity "
-            "and rehearse large production stores separately."
+            "and rehearse large production stores separately. Only the source SQLite "
+            "file is copied; external observation and cleanup journals are not copied "
+            "or rebound to the destination."
         ),
     }
 
@@ -390,7 +406,11 @@ def upgrade_storage(
     lease: Lease,
     failpoint: _Failpoint | None = None,
 ) -> dict[str, Any]:
-    """Copy an exact Orchestrator schema-v2/v3 store into a fresh current file."""
+    """Copy a supported Orchestrator or standalone Kernel into a current file.
+
+    Auxiliary observation and cleanup journals require separate preservation;
+    this operation neither copies them nor changes their source-path bindings.
+    """
 
     if not isinstance(lease, Lease):
         raise TypeError("lease must be a maintenance Lease")
@@ -400,14 +420,23 @@ def upgrade_storage(
     required_bytes = _space_precheck(source_path, destination_path)
     with closing(_open_read_only(source_path)) as connection:
         connection.execute("BEGIN")
-        source_version = _declared_version(connection)
-        if source_version == 2:
-            _validate_legacy(connection)
-        elif source_version == 3:
-            _validate_v3(connection)
-        else:
-            raise StorageMigrationError("upgrade requires an exact schema v2 or v3 source")
+        names = existing_table_names(connection)
+        kernel_only = not any(name.startswith("sdk_") for name in names)
         kernel_source_version = _kernel_source_version(connection)
+        if kernel_only:
+            if kernel_source_version is None:
+                raise StorageMigrationError("database has no supported SDK storage schema")
+            source_version = kernel_source_version
+        else:
+            source_version = _declared_version(connection)
+        if not kernel_only and source_version == 2:
+            _validate_legacy(connection)
+        elif not kernel_only and source_version == 3:
+            _validate_v3(connection)
+        elif not kernel_only and source_version == ORCHESTRATOR_SCHEMA_VERSION:
+            Orchestrator.__new__(Orchestrator)._validate_existing_store(connection)
+        elif not kernel_only:
+            raise StorageMigrationError("upgrade requires a supported exact Orchestrator source")
     _hit(failpoint, "after_source_validation")
     lease.check(source_path)
 
@@ -418,18 +447,21 @@ def upgrade_storage(
         lease.check(source_path)
         with closing(sqlite3.connect(temporary, timeout=30)) as target:
             target.row_factory = sqlite3.Row
-            if source_version == 2:
+            if not kernel_only and source_version == 2:
                 _install_v3(target)
-            _install_v4(target)
+            if not kernel_only and source_version != ORCHESTRATOR_SCHEMA_VERSION:
+                _install_v4(target)
             if kernel_source_version == 2:
                 upgrade_kernel_schema_v2_to_v3(target)
+            if kernel_source_version in {2, 3}:
+                upgrade_kernel_schema_v3_to_v4(target)
             _hit(failpoint, "after_schema")
-            if source_version == 2:
+            if not kernel_only and source_version == 2:
                 converted = _convert_legacy_values(
                     target, source_path, lease, failpoint
                 )
             _hit(failpoint, "before_validation")
-            _quick_validate(target)
+            _quick_validate(target, kernel_only=kernel_only)
             target.execute("PRAGMA journal_mode=DELETE")
             target.commit()
         lease.check(source_path)
@@ -445,6 +477,7 @@ def upgrade_storage(
         source_version,
         converted,
         kernel_source_version,
+        "execution_kernel" if kernel_only else "orchestrator",
     )
 
 

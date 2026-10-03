@@ -9,6 +9,7 @@ for every writer, before transactions or a restrictive authorizer are installed.
 from __future__ import annotations
 
 from pathlib import Path
+import math
 import sqlite3
 import time
 from typing import Literal, cast
@@ -26,10 +27,11 @@ def validate_durability(value: object) -> Durability:
     return cast(Durability, value)
 
 
-def _enable_wal(connection: sqlite3.Connection, db_path: str) -> None:
+def _enable_wal(connection: sqlite3.Connection, db_path: str, *,
+                timeout_seconds: float = SQLITE_OPEN_TIMEOUT_SECONDS) -> None:
     # SQLite's journal-mode negotiation may return SQLITE_BUSY without invoking
     # its busy handler when two processes first open the same database.
-    deadline = time.monotonic() + SQLITE_OPEN_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
     while True:
         try:
             row = connection.execute("PRAGMA journal_mode = WAL").fetchone()
@@ -52,6 +54,7 @@ def configure_sqlite_connection(
     db_path: str | Path,
     *,
     durability: Durability = "full",
+    timeout_seconds: float = SQLITE_OPEN_TIMEOUT_SECONDS,
 ) -> None:
     """Configure and verify a connection, raising if SQLite refuses the profile.
 
@@ -60,14 +63,17 @@ def configure_sqlite_connection(
     This configures the main database only; attached databases are not covered.
     """
     profile = validate_durability(durability)
+    if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be finite and positive")
     if connection.in_transaction:
         raise ValueError("SQLite durability must be configured outside a transaction")
-    connection.execute("PRAGMA busy_timeout = 30000")
-    _enable_wal(connection, str(db_path))
+    timeout_ms = max(1, int(timeout_seconds * 1000))
+    connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")
+    _enable_wal(connection, str(db_path), timeout_seconds=timeout_seconds)
     synchronous = 2 if profile == "full" else 1
     connection.execute(f"PRAGMA synchronous = {synchronous}")
     expected = {
-        "busy_timeout": 30000,
+        "busy_timeout": timeout_ms,
         "journal_mode": "memory" if str(db_path) == ":memory:" else "wal",
         "synchronous": synchronous,
     }

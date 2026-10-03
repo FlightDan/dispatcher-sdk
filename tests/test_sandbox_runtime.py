@@ -62,6 +62,23 @@ class FileBackend:
         return True
 
 
+@dataclass(frozen=True)
+class CountingFileBackend(FileBackend):
+    """A persistent fake provider counts actual native-worker business calls."""
+
+    def _call(self, phase):
+        with Path(self.root, "business-calls.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"phase": phase, "pid": os.getpid(), "at": time.time()}) + "\n")
+
+    def start(self, sandbox_id, spec, *, timeout):
+        self._call("start")
+        return super().start(sandbox_id, spec, timeout=timeout)
+
+    def collect(self, sandbox_id, command_id, spec, *, timeout):
+        self._call("collect")
+        return super().collect(sandbox_id, command_id, spec, timeout=timeout)
+
+
 @unittest.skipUnless(os.name in {"posix", "nt"}, "requires native process isolation")
 class SandboxRuntimeTests(unittest.TestCase):
     def setUp(self):
@@ -155,6 +172,36 @@ class SandboxRuntimeTests(unittest.TestCase):
             self.assertTrue(runtime.recover_sandboxes()[0]["cleanup_confirmed"])
             self.assertEqual(runtime.kernel.get("x").state, "recovery_required")
             self.assertEqual(handler.journal().get("x")["result"], record["result"])
+
+    def test_native_cleanup_failure_restart_preserves_result_without_business_replay(self):
+        (self.root / "reject_cleanup").touch()
+        handler = SandboxHandler(CountingFileBackend(str(self.root)), str(self.root / "sandbox.db"),
+            poll_interval=.01, operation_timeout=.2)
+        runtime = Runtime(str(self.root / "kernel.db"), {handler.handler_id: handler})
+        command = runtime.command(handler.handler_id, execution_id="restart-cleanup", idempotency_key="restart-cleanup",
+            correlation_id="run", timeout_seconds=10, payload=self.spec.to_payload())
+        runtime.submit(command)
+        self.assertEqual(runtime.run_once().state, "recovery_required")
+        original = handler.journal().get(command.execution_id)
+        calls = (self.root / "business-calls.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(line) for line in calls.splitlines()]
+        self.assertEqual([event["phase"] for event in events], ["start", "collect"])
+        self.assertTrue(all(event["pid"] != os.getpid() for event in events))
+        self.assertEqual(original["result"]["output"]["artifact"], "retained")
+        with self.assertRaises(SandboxOutcomeUnknown):
+            runtime.close()
+        (self.root / "reject_cleanup").unlink()
+        reopened_handler = SandboxHandler(CountingFileBackend(str(self.root)), str(self.root / "sandbox.db"),
+            poll_interval=.01, operation_timeout=.2)
+        with Runtime(str(self.root / "kernel.db"), {reopened_handler.handler_id: reopened_handler}) as reopened:
+            reports = reopened.recover_sandboxes(all_pages=True)
+            latest = reopened_handler.journal().get(command.execution_id)
+            self.assertTrue(latest["cleanup_confirmed"], reports)
+            self.assertEqual(latest["result"], original["result"])
+            self.assertEqual(latest["operation_key"], original["operation_key"])
+            self.assertIsNone(reopened.run_once())
+            self.assertEqual(reopened.kernel.get(command.execution_id).state, "recovery_required")
+            self.assertEqual((self.root / "business-calls.jsonl").read_text(encoding="utf-8"), calls)
 
     def test_explicit_not_applied_creates_new_generation_only_after_old_cleanup(self):
         runtime, handler = self.runtime("lost_start")

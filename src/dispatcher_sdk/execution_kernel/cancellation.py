@@ -235,10 +235,16 @@ class CancellationJournal:
             connection.commit()
 
     @contextmanager
-    def _connect(self):
-        connection = storage_connect(self.path, timeout=30)
+    def _connect(self, timeout_seconds: float = 30):
+        connection = storage_connect(self.path, timeout=timeout_seconds)
         try:
-            configure_sqlite_connection(connection, self.path, durability=self.durability)
+            if timeout_seconds >= 30:
+                configure_sqlite_connection(connection, self.path, durability=self.durability)
+            else:
+                connection.execute(f"PRAGMA busy_timeout={max(1, int(timeout_seconds * 1000))}")
+                if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                    raise RuntimeError("cancellation journal WAL mode is unavailable")
+                connection.execute(f"PRAGMA synchronous={2 if self.durability == 'full' else 1}")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA trusted_schema=OFF")
             yield connection
@@ -246,12 +252,12 @@ class CancellationJournal:
             connection.close()
 
     def _begin(self, snapshot: ExecutionSnapshot, *, expected_revision: int,
-               reason: str, isolation_mode: str) -> str:
+               reason: str, isolation_mode: str, timeout_seconds: float = 30) -> str:
         if type(expected_revision) is not int or expected_revision < 0:
             raise ValueError("expected_revision must be an integer >= 0")
         _identifier(reason, "reason")
         receipt_id = uuid.uuid4().hex
-        with self._connect() as connection:
+        with self._connect(timeout_seconds) as connection:
             connection.execute("BEGIN IMMEDIATE")
             validate_cancellation_schema(connection, source_id=self.source_id, kernel_path=self.kernel_path)
             connection.execute(
@@ -262,10 +268,10 @@ class CancellationJournal:
             connection.commit()
         return receipt_id
 
-    def _record(self, receipt_id: str, stage: str, evidence: dict[str, Any]) -> None:
+    def _record(self, receipt_id: str, stage: str, evidence: dict[str, Any], *, timeout_seconds: float = 30) -> None:
         _validate_evidence(stage, evidence)
         encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        with self._connect() as connection:
+        with self._connect(timeout_seconds) as connection:
             connection.execute("BEGIN IMMEDIATE")
             validate_cancellation_schema(connection, source_id=self.source_id, kernel_path=self.kernel_path)
             request = connection.execute("SELECT attempt,fence,isolation_mode FROM cancellation_requests WHERE receipt_id=?",

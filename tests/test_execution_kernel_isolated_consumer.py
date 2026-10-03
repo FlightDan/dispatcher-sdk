@@ -105,7 +105,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
             )
             wheels = tuple(wheelhouse.glob("*.whl"))
             self.assertEqual(len(wheels), 1)
-            self.assertTrue(wheels[0].name.startswith("dispatcher_sdk-0.7.0.dev0-"))
+            self.assertTrue(wheels[0].name.startswith("dispatcher_sdk-0.7.0.dev2-"))
             with zipfile.ZipFile(wheels[0]) as archive:
                 self.assertIn("dispatcher_sdk/py.typed", archive.namelist())
                 packaged_python = {
@@ -115,7 +115,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                                      if name.endswith(".dist-info/METADATA"))
                 metadata = email.message_from_bytes(archive.read(metadata_name))
                 self.assertEqual(metadata["Name"], "dispatcher-sdk")
-                self.assertEqual(metadata["Version"], "0.7.0.dev0")
+                self.assertEqual(metadata["Version"], "0.7.0.dev2")
                 requirements = metadata.get_all("Requires-Dist", [])
                 self.assertEqual(len(requirements), 1)
                 self.assertRegex(requirements[0], r'^opensandbox\s*==\s*0\.1\.16\s*;\s*extra == [\"\']opensandbox[\"\']$')
@@ -161,7 +161,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
             self._run([str(interpreter), "-m", "unittest", "discover", "-s", "tests", "-v"],
                       # This runs the complete suite again, including SQLite
                       # FULL durability fixtures; it needs its own suite budget.
-                      cwd=installed_suite, timeout=600)
+                      cwd=installed_suite, timeout=900)
 
             consumer = root / "consumer.py"
             consumer.write_text(
@@ -176,7 +176,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                     import importlib.util
                     import dispatcher_sdk
                     from importlib.metadata import version
-                    assert version("dispatcher-sdk") == "0.7.0.dev0"
+                    assert version("dispatcher-sdk") == "0.7.0.dev2"
                     assert importlib.util.find_spec("agent_dispatcher") is None
                     assert importlib.util.find_spec("agent_dispatcher_sdk") is None
                     assert not any(name.startswith("dispatcher_sdk.")

@@ -17,6 +17,27 @@ from .store import execute_schema
 
 
 class NotificationsMixin:
+    def enqueue_stall_notification(self, payload):
+        """Accept one stable SDK stall episode into the existing delivery outbox."""
+        if type(payload) is not dict or payload.get("kind") != "stalled":
+            raise ValueError("expected a stalled notification")
+        notification_id = _identity(payload.get("notification_id"), "notification_id")
+        maximum = _integer(payload.get("max_deliveries", 5), "max_deliveries")
+        encoded = canonical(payload)
+        target = payload.get("target")
+        if type(target) is not dict or not target.get("run_id") or not target.get("task_id"):
+            raise ValueError("stall target must identify a Run task")
+        with self._transaction() as connection:
+            self._assert_not_disposed(connection, target["run_id"])
+            previous = connection.execute("SELECT payload FROM sdk_notifications WHERE notification_id=?",
+                (notification_id,)).fetchone()
+            if previous is not None and previous[0] != encoded:
+                raise CommandConflict("stall notification identity has different content")
+            connection.execute("INSERT OR IGNORE INTO sdk_notifications(notification_id,payload,max_attempts,next_attempt_at) "
+                "VALUES(?,?,?,?)", (notification_id, encoded, maximum, self.clock()))
+            return self._notification_record(connection.execute(
+                "SELECT * FROM sdk_notifications WHERE notification_id=?", (notification_id,)).fetchone())
+
     @staticmethod
     def _init_notifications(connection):
         execute_schema(connection, """

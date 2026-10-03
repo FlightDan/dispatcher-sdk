@@ -1,4 +1,4 @@
-"""Exact v3 SQLite schema validation and post-bootstrap authorization."""
+"""Exact SQLite schema validation and post-bootstrap authorization."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Optional
 from .errors import StorageIsolationError
 
 
-KERNEL_STORAGE_SCHEMA_VERSION = 3
+KERNEL_STORAGE_SCHEMA_VERSION = 4
 
 
 KERNEL_TABLES = frozenset(
@@ -24,6 +24,9 @@ KERNEL_TABLES = frozenset(
         "kernel_result_outbox",
         "kernel_effects",
         "kernel_effect_events",
+        "kernel_execution_limits",
+        "kernel_supervision",
+        "kernel_progress_keys",
     }
 )
 
@@ -292,6 +295,49 @@ CREATE UNIQUE INDEX IF NOT EXISTS kernel_effect_events_identity
 COMMIT;
 """
 
+# The former layout stays available only to explicit copy upgrades. New writers
+# reject that marker rather than installing control tables on an ordinary open.
+KERNEL_SCHEMA_V3 = SCHEMA_SQL
+SUPERVISION_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS kernel_execution_limits (
+    execution_id TEXT NOT NULL PRIMARY KEY,
+    envelope_json TEXT NOT NULL,
+    parent_execution_id TEXT,
+    parent_attempt INTEGER,
+    parent_fence INTEGER,
+    depth INTEGER NOT NULL DEFAULT 0 CHECK (depth >= 0),
+    entry_state TEXT NOT NULL DEFAULT 'unentered' CHECK (entry_state IN ('unentered','pending','confirmed')),
+    entry_attempt INTEGER,
+    entry_fence INTEGER,
+    CHECK ((entry_state='unentered' AND entry_attempt IS NULL AND entry_fence IS NULL)
+        OR (entry_state IN ('pending','confirmed') AND entry_attempt >= 1 AND entry_fence >= 1)),
+    FOREIGN KEY (execution_id) REFERENCES kernel_executions(execution_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_supervision (
+    execution_id TEXT NOT NULL PRIMARY KEY,
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    fence INTEGER NOT NULL CHECK (fence >= 0),
+    progress_revision INTEGER NOT NULL DEFAULT 0 CHECK (progress_revision >= 0),
+    progress_at REAL,
+    episode_id TEXT,
+    policy_version TEXT,
+    episode_progress_revision INTEGER,
+    FOREIGN KEY (execution_id) REFERENCES kernel_executions(execution_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_progress_keys (
+    execution_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt >= 1),
+    event_id TEXT NOT NULL CHECK (length(event_id) > 0),
+    progress_revision INTEGER NOT NULL CHECK (progress_revision >= 1),
+    PRIMARY KEY (execution_id, attempt, event_id),
+    FOREIGN KEY (execution_id) REFERENCES kernel_executions(execution_id)
+);
+"""
+SCHEMA_SQL = (KERNEL_SCHEMA_V3
+              .replace("schema_version = 3", "schema_version = 4", 1)
+              .replace("VALUES ('execution_kernel', 3)", "VALUES ('execution_kernel', 4)", 1)
+              .replace("COMMIT;", SUPERVISION_SCHEMA_SQL + "COMMIT;", 1))
+
 
 def _schema_v2_from_v3() -> str:
     """Build the exact supported v2 layout from the unchanged v2 objects.
@@ -308,7 +354,7 @@ def _schema_v2_from_v3() -> str:
         "CREATE INDEX IF NOT EXISTS kernel_managed_executions_run",
     )
     statements: list[str] = []
-    for raw in SCHEMA_SQL.split(";"):
+    for raw in KERNEL_SCHEMA_V3.split(";"):
         statement = raw.strip()
         if not statement:
             continue
@@ -334,6 +380,23 @@ KERNEL_SCHEMA_V2 = _schema_v2_from_v3()
 
 
 EXPECTED_COLUMNS = {
+    "kernel_execution_limits": (
+        ("execution_id", "TEXT", 1, 1), ("envelope_json", "TEXT", 1, 0),
+        ("parent_execution_id", "TEXT", 0, 0), ("parent_attempt", "INTEGER", 0, 0),
+        ("parent_fence", "INTEGER", 0, 0), ("depth", "INTEGER", 1, 0),
+        ("entry_state", "TEXT", 1, 0), ("entry_attempt", "INTEGER", 0, 0),
+        ("entry_fence", "INTEGER", 0, 0),
+    ),
+    "kernel_supervision": (
+        ("execution_id", "TEXT", 1, 1), ("attempt", "INTEGER", 1, 0),
+        ("fence", "INTEGER", 1, 0), ("progress_revision", "INTEGER", 1, 0),
+        ("progress_at", "REAL", 0, 0), ("episode_id", "TEXT", 0, 0),
+        ("policy_version", "TEXT", 0, 0), ("episode_progress_revision", "INTEGER", 0, 0),
+    ),
+    "kernel_progress_keys": (
+        ("execution_id", "TEXT", 1, 1), ("attempt", "INTEGER", 1, 2),
+        ("event_id", "TEXT", 1, 3), ("progress_revision", "INTEGER", 1, 0),
+    ),
     "kernel_schema_meta": (
         ("component", "TEXT", 1, 1), ("schema_version", "", 1, 0),
     ),
@@ -405,7 +468,7 @@ EXPECTED_COLUMNS = {
 SQL_REQUIREMENTS = {
     "kernel_schema_meta": (
         "check(component='execution_kernel')",
-        "typeof(schema_version)='integer'andschema_version=3",
+        "typeof(schema_version)='integer'andschema_version=4",
     ),
     "kernel_clock": (
         "check(singleton=1)",
@@ -524,6 +587,9 @@ def validate_kernel_schema_v2(connection: sqlite3.Connection) -> None:
     v2_tables = KERNEL_TABLES - {
         "kernel_run_controls",
         "kernel_managed_executions",
+        "kernel_execution_limits",
+        "kernel_supervision",
+        "kernel_progress_keys",
     }
     actual_tables = {
         name
@@ -614,16 +680,76 @@ def upgrade_kernel_schema_v2_to_v3(connection: sqlite3.Connection) -> None:
             # the one being upgraded, even when called outside a maintenance copy.
             validate_kernel_schema_v2(connection)
             connection.execute("DROP TABLE kernel_schema_meta")
-            connection.execute(_schema_statement_for("kernel_schema_meta"))
+            connection.execute(_schema_statement_for("kernel_schema_meta", KERNEL_SCHEMA_V3))
             connection.execute(
                 "INSERT INTO kernel_schema_meta(component,schema_version) VALUES(?,?)",
-                ("execution_kernel", KERNEL_STORAGE_SCHEMA_VERSION),
+                ("execution_kernel", 3),
             )
             for name in (
                 "kernel_run_controls",
                 "kernel_managed_executions",
                 "kernel_managed_executions_run",
             ):
+                connection.execute(_schema_statement_for(name, KERNEL_SCHEMA_V3))
+            validate_kernel_schema_v3(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        connection.row_factory = previous_row_factory
+
+
+def validate_kernel_schema_v3(connection: sqlite3.Connection) -> None:
+    """Validate the former exact layout without authorizing a writer."""
+    reference = sqlite3.connect(":memory:")
+    try:
+        reference.executescript(KERNEL_SCHEMA_V3)
+        query = "SELECT name,type,sql FROM sqlite_master WHERE name LIKE 'kernel_%'"
+        expected = {row[0]: (row[1], _normalize_sql(row[2] or ""))
+                    for row in reference.execute(query)}
+        actual = {row[0]: (row[1], _normalize_sql(row[2] or ""))
+                  for row in connection.execute(query)}
+        if actual != expected:
+            raise StorageIsolationError("Kernel v3 schema differs from its exact layout")
+        marker = connection.execute(
+            "SELECT component,schema_version,typeof(schema_version) FROM kernel_schema_meta"
+        ).fetchall()
+        if len(marker) != 1 or tuple(marker[0]) != ("execution_kernel", 3, "integer"):
+            raise StorageIsolationError("invalid Kernel v3 schema marker")
+        clock = connection.execute(
+            "SELECT singleton,watermark,event_sequence FROM kernel_clock"
+        ).fetchall()
+        if (len(clock) != 1 or clock[0][0] != 1
+                or type(clock[0][2]) is not int or clock[0][2] < 0
+                or not math.isfinite(float(clock[0][1])) or clock[0][1] < 0):
+            raise StorageIsolationError("invalid Kernel v3 clock")
+        maximum = connection.execute(
+            "SELECT COALESCE(MAX(sequence),0) FROM kernel_events"
+        ).fetchone()[0]
+        if maximum != clock[0][2]:
+            raise StorageIsolationError("inconsistent Kernel v3 event sequence")
+    finally:
+        reference.close()
+
+
+def upgrade_kernel_schema_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Explicitly upgrade a private copy; historical execution rows stay intact."""
+    if connection.in_transaction:
+        raise RuntimeError("Kernel schema upgrade requires an idle connection")
+    previous_row_factory = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            validate_kernel_schema_v3(connection)
+            connection.execute("DROP TABLE kernel_schema_meta")
+            connection.execute(_schema_statement_for("kernel_schema_meta"))
+            connection.execute(
+                "INSERT INTO kernel_schema_meta(component,schema_version) VALUES(?,?)",
+                ("execution_kernel", KERNEL_STORAGE_SCHEMA_VERSION),
+            )
+            for name in ("kernel_execution_limits", "kernel_supervision", "kernel_progress_keys"):
                 connection.execute(_schema_statement_for(name))
             validate_schema(connection, KERNEL_TABLES)
             connection.commit()
@@ -678,6 +804,9 @@ def _table_columns(connection: sqlite3.Connection, table: str) -> tuple[tuple, .
         "kernel_result_outbox": "PRAGMA table_info(kernel_result_outbox)",
         "kernel_effects": "PRAGMA table_info(kernel_effects)",
         "kernel_effect_events": "PRAGMA table_info(kernel_effect_events)",
+        "kernel_execution_limits": "PRAGMA table_info(kernel_execution_limits)",
+        "kernel_supervision": "PRAGMA table_info(kernel_supervision)",
+        "kernel_progress_keys": "PRAGMA table_info(kernel_progress_keys)",
     }
     rows = connection.execute(statements[table]).fetchall()
     return tuple((row[1], row[2].upper(), row[3], row[5]) for row in rows)
@@ -703,7 +832,7 @@ def validate_schema(
         raise StorageIsolationError("incompatible execution-kernel schema object set")
     for table, expected in EXPECTED_COLUMNS.items():
         if _table_columns(connection, table) != expected:
-            raise StorageIsolationError(f"incompatible v3 column schema: {table}")
+            raise StorageIsolationError(f"incompatible column schema: {table}")
     sql_by_name = {row["name"]: _normalize_sql(row["sql"] or "") for row in objects}
     expected_sql = _expected_object_sql()
     for name, expected in expected_sql.items():
@@ -765,8 +894,17 @@ def install_authorizer(connection: sqlite3.Connection):
         "kernel_result_outbox",
         "kernel_effects",
         "kernel_effect_events",
+        "kernel_execution_limits",
+        "kernel_supervision",
+        "kernel_progress_keys",
     }
     update_columns = {
+        "kernel_execution_limits": {"envelope_json", "parent_execution_id", "parent_attempt", "parent_fence", "depth",
+            "entry_state", "entry_attempt", "entry_fence"},
+        "kernel_supervision": {
+            "attempt", "fence", "progress_revision", "progress_at", "episode_id",
+            "policy_version", "episode_progress_revision",
+        },
         "kernel_clock": {"watermark", "event_sequence"},
         "kernel_run_controls": {
             "control_epoch", "generation", "state", "claims_used",

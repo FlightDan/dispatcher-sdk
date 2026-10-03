@@ -15,10 +15,10 @@ class PackagingTests(unittest.TestCase):
     def test_project_metadata_names_dependency_free_sdk(self):
         metadata = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertRegex(metadata, r'(?m)^name = "dispatcher-sdk"$')
-        self.assertRegex(metadata, r'(?m)^version = "0\.7\.0\.dev0"$')
+        self.assertRegex(metadata, r'(?m)^version = "0\.7\.0\.dev2"$')
         self.assertRegex(metadata, r'(?m)^dependencies = \[\]$')
         source_version = (SOURCE / "_version.py").read_text(encoding="utf-8")
-        self.assertRegex(source_version, r'(?m)^SOURCE_VERSION = "0\.7\.0\.dev0"$')
+        self.assertRegex(source_version, r'(?m)^SOURCE_VERSION = "0\.7\.0\.dev2"$')
 
     def test_core_is_dependency_free_and_provider_imports_are_lazy(self):
         sources = list(SOURCE.rglob("*.py"))
@@ -55,7 +55,9 @@ class PackagingTests(unittest.TestCase):
                     modules = [alias.name for alias in node.names]
                 elif isinstance(node, ast.ImportFrom):
                     modules = [node.module or ""]
-                    if node.level > 1 and not (node.level == 2 and node.module in {"durability", "storage_connection"}):
+                    allowed_core = {"durability", "storage_connection", "_inspection", "observability"}
+                    module = node.module or ""
+                    if node.level > 1 and not (node.level == 2 and module.split(".")[0] in allowed_core):
                         self.fail(f"Kernel reaches outside its package: {source}:{node.lineno}")
                 else:
                     continue

@@ -68,8 +68,11 @@ class SQLiteBase:
         default_lease_seconds: float = 30.0,
         outbox_max_attempts: int = 8,
         durability: Durability = "full",
+        control_timeout_seconds: float | None = None,
     ) -> None:
         self.durability = validate_durability(durability)
+        self._default_control_timeout = (None if control_timeout_seconds is None else
+            self._positive_duration(control_timeout_seconds, "control_timeout_seconds"))
         self.db_path = str(db_path)
         self._now = now or time.time
         self.default_lease_seconds = self._positive_duration(
@@ -83,7 +86,7 @@ class SQLiteBase:
         self._lock = threading.RLock()
         self._connection = storage_connect(
             self.db_path,
-            timeout=SQLITE_OPEN_TIMEOUT_SECONDS,
+            timeout=SQLITE_OPEN_TIMEOUT_SECONDS if self._default_control_timeout is None else self._default_control_timeout,
             isolation_level=None,
             check_same_thread=False,
         )
@@ -98,9 +101,11 @@ class SQLiteBase:
                 validate_schema(self._connection, kernel_names)
             # WAL is a persistent setting. Reject unsupported existing schema
             # before configuring it, not merely before the first data write.
-            configure_sqlite_connection(
-                self._connection, self.db_path, durability=self.durability
-            )
+            if self._default_control_timeout is None:
+                configure_sqlite_connection(self._connection, self.db_path, durability=self.durability)
+            else:
+                configure_sqlite_connection(self._connection, self.db_path, durability=self.durability,
+                    timeout_seconds=self._default_control_timeout)
             if not kernel_names:
                 initialize_schema(self._connection)
                 validate_schema(self._connection, KERNEL_TABLES)
@@ -160,7 +165,7 @@ class SQLiteBase:
         """Return logical now without mutating the durable watermark."""
 
         wall = self._wall_time()
-        with self._lock:
+        with self._control_lock(None):
             row = self._connection.execute(
                 "SELECT watermark FROM kernel_clock WHERE singleton = 1"
             ).fetchone()
@@ -184,8 +189,51 @@ class SQLiteBase:
         return timestamp
 
     @contextmanager
-    def _transaction(self) -> Iterator[tuple[sqlite3.Connection, float]]:
-        with self._lock:
+    def _control_lock(self, timeout_seconds: float | None):
+        """Bound control admission without changing persistent SQLite settings."""
+        if self._default_control_timeout is not None:
+            timeout_seconds = (self._default_control_timeout if timeout_seconds is None
+                else min(timeout_seconds, self._default_control_timeout))
+        duration = None if timeout_seconds is None else self._positive_duration(timeout_seconds, "timeout_seconds")
+        deadline = None if duration is None else time.monotonic() + duration
+        acquired = self._lock.acquire() if duration is None else self._lock.acquire(timeout=duration)
+        if not acquired:
+            raise TimeoutError("Kernel control lock admission timed out")
+        # Read this only after owning the RLock: another thread's operation
+        # must not donate its deadline. A nested call inherits its caller's
+        # earliest bound even when its configured default is longer.
+        previous_deadline = getattr(self, "_control_deadline", None)
+        if previous_deadline is not None:
+            deadline = previous_deadline if deadline is None else min(deadline, previous_deadline)
+        self._control_deadline = deadline
+        old_timeout = None
+        try:
+            if deadline is None:
+                yield
+                return
+            if deadline <= time.monotonic():
+                raise TimeoutError("Kernel control admission budget elapsed")
+            self._connection.set_authorizer(None)
+            try:
+                old_timeout = self._connection.execute("PRAGMA busy_timeout").fetchone()[0]
+                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                self._connection.execute(f"PRAGMA busy_timeout={remaining_ms}")
+            finally:
+                self._connection.set_authorizer(self._authorizer)
+            yield
+        finally:
+            if old_timeout is not None:
+                self._connection.set_authorizer(None)
+                try:
+                    self._connection.execute(f"PRAGMA busy_timeout={old_timeout}")
+                finally:
+                    self._connection.set_authorizer(self._authorizer)
+            self._control_deadline = previous_deadline
+            self._lock.release()
+
+    @contextmanager
+    def _transaction(self, *, timeout_seconds: float | None = None) -> Iterator[tuple[sqlite3.Connection, float]]:
+        with self._control_lock(timeout_seconds):
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 timestamp = self._advance_clock(self._connection)
@@ -264,7 +312,7 @@ class SQLiteBase:
         return row
 
     def get(self, execution_id: str) -> ExecutionSnapshot:
-        with self._lock:
+        with self._control_lock(None):
             return self._snapshot(self._get_row(self._connection, execution_id))
 
     snapshot = get
@@ -288,6 +336,7 @@ class SQLiteBase:
         *,
         timestamp: float,
         states: Optional[set[str]] = None,
+        settlement: bool = False,
     ) -> sqlite3.Row:
         if type(lease) is not ExecutionLease:
             raise TypeError("operation requires ExecutionLease")
@@ -316,7 +365,7 @@ class SQLiteBase:
             or row["lease_expires_at"] != lease.expires_at
         ):
             raise StaleFenceError("lease attempt, fence, or revision is stale", context=context)
-        if row["lease_expires_at"] is None or row["lease_expires_at"] <= timestamp:
+        if row["lease_expires_at"] is None or (not settlement and row["lease_expires_at"] <= timestamp):
             raise StaleFenceError("lease has expired", context=context)
         return row
 

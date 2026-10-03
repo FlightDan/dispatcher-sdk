@@ -23,6 +23,9 @@ def echo(payload, context):
 
 
 def mutate_file(payload, context):
+    with open(payload["invocations"], "a", encoding="utf-8") as invocation:
+        invocation.write(str(context.lease.attempt) + "\n")
+
     def perform():
         with open(payload["marker"], "a", encoding="utf-8") as marker:
             marker.write("mutation\n")
@@ -64,6 +67,7 @@ class SDKRecoveryTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.path = Path(temporary.name) / "recovery.sqlite3"
         self.marker = Path(temporary.name) / "mutation.txt"
+        self.invocations = Path(temporary.name) / "invocations.txt"
         self.clock = Clock()
         self.open_stack()
 
@@ -175,6 +179,7 @@ class SDKRecoveryTests(unittest.TestCase):
     def effect_crash(self, window, attempts):
         self.register(handler="mutate", attempts=attempts, backoff=0, payload={
             "marker": str(self.marker), "effect_id": "file-effect",
+            "invocations": str(self.invocations),
             "operation_id": "original-operation", "crash_window": window,
         })
         self.runtime.close()
@@ -186,6 +191,9 @@ class SDKRecoveryTests(unittest.TestCase):
         self.assertIsNone(running.result)
         self.assertEqual(self.marker.read_text(encoding="utf-8"), "mutation\n")
         self.assertEqual(self.runtime.kernel.result_outbox(), [])
+        limits = self.runtime.kernel.get_execution_limits("execution")
+        self.assertEqual(limits["entry_state"], "confirmed")
+        self.assertIsNotNone(limits["envelope"]["started_at"])
         return running
 
     def assert_effect_replay(self, running):
@@ -201,6 +209,27 @@ class SDKRecoveryTests(unittest.TestCase):
                          {"receipt": "original-operation", "content": "mutation\n"})
         self.assertEqual(terminal.result.effect_ids, ["file-effect"])
         self.assertEqual(self.marker.read_text(encoding="utf-8"), "mutation\n")
+        self.assertEqual(len(self.runtime.kernel.result_outbox()), 1)
+        self.assert_business_unchanged()
+
+    def assert_effect_recovery_budget_exhausted(self, running):
+        before = self.runtime.kernel.get_effect("file-effect")
+        cutoff = self.runtime.kernel.get_execution_limits("execution")["envelope"]["constraints"]
+        self.assertLess(cutoff[0]["deadline_at"], self.clock.value)
+        self.runtime.close()
+        self.child_worker(0)
+        self.open_stack()
+        self.sdk.sync()
+        terminal = self.sdk.inspect_execution("execution")
+        self.assertEqual(terminal.state, "timed_out", terminal.result.error)
+        self.assertEqual(terminal.result.error.code, "handler_timeout")
+        self.assertEqual(terminal.attempt, 2)
+        self.assertGreater(terminal.fence, running.fence)
+        self.assertEqual(self.runtime.kernel.get_execution_limits("execution")["envelope"]["constraints"], cutoff)
+        self.assertEqual(self.runtime.kernel.get_effect("file-effect"), before)
+        self.assertEqual(before.response, {"receipt": "original-operation", "content": "mutation\n"})
+        self.assertEqual(self.invocations.read_text(), "1\n")
+        self.assertEqual(self.marker.read_text(), "mutation\n")
         self.assertEqual(len(self.runtime.kernel.result_outbox()), 1)
         self.assert_business_unchanged()
 
@@ -227,9 +256,9 @@ class SDKRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(resolved.state, "committed")
         self.assertEqual(self.sdk.inspect_execution("execution").state, "queued")
-        self.assert_effect_replay(running)
+        self.assert_effect_recovery_budget_exhausted(running)
 
-    def test_committed_effect_survives_crash_before_result_and_reuses_response(self):
+    def test_committed_effect_survives_crash_and_expired_recovery_denies_business(self):
         running = self.effect_crash("after_commit", 2)
         self.assertEqual(self.runtime.kernel.get_effect("file-effect").state, "committed")
         self.clock.value = running.lease.expires_at
@@ -237,7 +266,21 @@ class SDKRecoveryTests(unittest.TestCase):
         self.sdk.sync()
         self.assertEqual(self.sdk.inspect_execution("execution").state, "queued")
         self.assertEqual(self.runtime.pending_recoveries(), [])
+        self.assert_effect_recovery_budget_exhausted(running)
+
+    def test_explicit_applied_recovery_within_original_budget_reuses_response(self):
+        running = self.effect_crash("before_commit", 1)
+        # The host witnessed child death and reconciles immediately while the
+        # original deadline remains live, using the supported recovery signal.
+        cutoff = self.runtime.kernel.get_execution_limits("execution")["envelope"]["constraints"]
+        self.runtime.kernel.require_effect_recovery(running.lease, "file-effect")
+        effect = self.runtime.kernel.get_effect("file-effect")
+        self.sdk.resolve_effect("file-effect", decision="applied",
+            response={"receipt": "original-operation", "content": self.marker.read_text()},
+            expected_revision=effect.revision, recovery_id="immediate-reconciliation")
         self.assert_effect_replay(running)
+        self.assertEqual(self.invocations.read_text(), "1\n2\n")
+        self.assertEqual(self.runtime.kernel.get_execution_limits("execution")["envelope"]["constraints"], cutoff)
 
 
 if __name__ == "__main__":

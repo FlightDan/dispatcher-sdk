@@ -1,7 +1,7 @@
 """Recover a real worker crash after a file write but before its receipt commits.
 
-A controllable clock advances the expired lease without making the demo sleep.
-Use the normal Kernel clock in an application. The child is joined before repair.
+The child is joined before explicit repair, within the original execution budget.
+An expired budget would preserve the repaired effect but forbid business replay.
 """
 import multiprocessing
 import os
@@ -67,8 +67,8 @@ def main():
             process.close()
         with Kernel.open_sqlite(database, {"append": append_receipt}, now=clock,
                                isolation_mode="thread") as runtime:
-            clock.value = runtime.kernel.get("invoice-1").lease.expires_at
-            runtime.reap()
+            crashed = runtime.kernel.get("invoice-1")
+            runtime.kernel.require_effect_recovery(crashed.lease, "invoice-write")
             assert runtime.kernel.get("invoice-1").state == "recovery_required"
             print("Worker exited; execution is recovery_required")
             # This demo owns an exclusive temporary directory and the child has exited.

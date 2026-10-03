@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import json
 from typing import Optional
 import os
 from pathlib import Path
@@ -14,6 +15,8 @@ from ._sqlite_completion import ExecutionCompletionMixin
 from ._sqlite_effects import EffectStoreMixin
 from ._sqlite_outbox import ResultOutboxMixin
 from ._sqlite_recovery import EffectRecoveryMixin
+from .supervision import SupervisionMixin
+from .budget import BudgetClockUnknownError, BudgetEnvelope, sample_clock
 from .contracts import ExecutionCommandV2, ExecutionLease, ExecutionSnapshot
 from .claiming import claim_predicate
 from .errors import (
@@ -21,6 +24,7 @@ from .errors import (
     ExecutionNotFoundError,
     IdempotencyConflictError,
     StorageIsolationError,
+    StaleFenceError,
 )
 from .transitions import reduce_state
 
@@ -49,8 +53,15 @@ def _claim_revisions(
 MANAGED_EXECUTION_PREFIX = "sdk-managed:"
 
 
-def _next_claim_row(connection, timestamp: float, revisions: Optional[tuple[str, ...]]):
+def _next_claim_row(connection, timestamp: float, revisions: Optional[tuple[str, ...]],
+                    execution_id: str | None = None):
     predicate, parameters = claim_predicate(timestamp, revisions, alias="k")
+    if execution_id is not None:
+        predicate += " AND k.execution_id = ?"
+        parameters = (*parameters, execution_id)
+    else:
+        predicate += " AND NOT EXISTS (SELECT 1 FROM kernel_execution_limits l " \
+                     "WHERE l.execution_id=k.execution_id AND l.parent_execution_id IS NOT NULL)"
     return connection.execute(
         """SELECT k.* FROM kernel_executions AS k WHERE """ + predicate + """
            AND (
@@ -77,6 +88,7 @@ def _next_claim_row(connection, timestamp: float, revisions: Optional[tuple[str,
 
 
 class SQLiteKernel(
+    SupervisionMixin,
     ExecutionCompletionMixin,
     EffectRecoveryMixin,
     EffectStoreMixin,
@@ -84,6 +96,39 @@ class SQLiteKernel(
     SQLiteBase,
 ):
     """Durable v3 kernel constrained to exact ``kernel_*`` schema objects."""
+
+    def _assert_child_claim(self, connection, execution_id: str, timestamp: float) -> None:
+        limits = connection.execute(
+            "SELECT * FROM kernel_execution_limits WHERE execution_id=?", (execution_id,)
+        ).fetchone()
+        if limits is None or limits["parent_execution_id"] is None:
+            return
+        parent = self._get_row(connection, limits["parent_execution_id"])
+        if (parent["state"] != "running"
+                or (parent["attempt"], parent["fence"]) != (limits["parent_attempt"], limits["parent_fence"])
+                or parent["lease_expires_at"] is None or parent["lease_expires_at"] <= timestamp):
+            raise StaleFenceError("child claim belongs to a revoked parent lease")
+        self._authorize_managed_operation(
+            connection, parent["execution_id"], timestamp=timestamp, operation="child claim"
+        )
+        parent_limits = connection.execute(
+            "SELECT * FROM kernel_execution_limits WHERE execution_id=?", (parent["execution_id"],)
+        ).fetchone()
+        if (parent_limits is None or parent_limits["entry_state"] != "confirmed"
+                or (parent_limits["entry_attempt"], parent_limits["entry_fence"]) != (
+                    parent["attempt"], parent["fence"])):
+            raise CASConflictError("child claim requires confirmed parent handler entry")
+        sample = sample_clock(wall_time=self._wall_time())
+        for stored in (parent_limits, limits):
+            envelope = BudgetEnvelope.from_dict(json.loads(stored["envelope_json"]))
+            if not any(item.origin_id == "execution:" + parent["execution_id"]
+                       and item.source == "execution" for item in envelope.constraints):
+                raise CASConflictError("child claim has no confirmed parent execution cutoff")
+            view = envelope.view(sample=sample)
+            if view.clock_status != "trusted":
+                raise BudgetClockUnknownError(view.unknown_reason)
+            if not view.remaining_work_seconds:
+                raise CASConflictError("child claim inherited work deadline has elapsed")
 
     @staticmethod
     def _managed_run_id(value: str) -> str:
@@ -155,7 +200,7 @@ class SQLiteKernel(
         from ._sqlite_schema import KERNEL_STORAGE_SCHEMA_VERSION
 
         if tuple(marker or ()) != ("execution_kernel", KERNEL_STORAGE_SCHEMA_VERSION):
-            raise StorageIsolationError("control transaction requires Kernel schema v3")
+            raise StorageIsolationError("control transaction requires the current Kernel schema")
 
     def _run_control_snapshot(self, connection, run_id: str):
         row = connection.execute(
@@ -796,6 +841,7 @@ class SQLiteKernel(
         start_safety_seconds: float = 5.0,
         registry_revision: Optional[str] = None,
         registry_revisions: Optional[Sequence[str]] = None,
+        execution_id: str | None = None,
     ) -> Optional[ExecutionLease]:
         """Atomically lease and start one queued execution.
 
@@ -806,6 +852,8 @@ class SQLiteKernel(
 
         if type(owner) is not str or not owner.strip():
             raise ValueError("owner must be a non-empty string")
+        if execution_id is not None and (type(execution_id) is not str or not execution_id.strip()):
+            raise ValueError("execution_id must be non-empty")
         revisions = _claim_revisions(registry_revision, registry_revisions)
         floor = (
             self.default_lease_seconds
@@ -817,9 +865,11 @@ class SQLiteKernel(
         )
         with self._transaction() as (connection, timestamp):
             self._reap_in_transaction(connection, timestamp)
-            row = _next_claim_row(connection, timestamp, revisions)
+            row = _next_claim_row(connection, timestamp, revisions, execution_id)
             if row is None:
                 return None
+            if execution_id is not None:
+                self._assert_child_claim(connection, row["execution_id"], timestamp)
             command = self._command(row["command_json"])
             duration = max(
                 floor,

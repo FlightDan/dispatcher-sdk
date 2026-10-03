@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -34,6 +35,8 @@ from dispatcher_sdk.storage_snapshots import (
     verify_snapshot,
 )
 from dispatcher_sdk import storage_snapshots as snapshots
+from dispatcher_sdk.storage_snapshots import VerifiedSnapshot
+from dispatcher_sdk.execution_kernel._sandbox_registry import register_journals
 
 
 def echo(payload, context):
@@ -62,6 +65,52 @@ def command(identity: str, *, attempts: int = 3) -> ExecutionCommandV2:
         timeout_seconds=5,
         payload={"value": identity},
     )
+
+
+class IdentityRegistryActivationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source = self.root / "kernel.sqlite3"
+        with SQLiteKernel(self.source):
+            pass
+        register_journals(self.source, [], durability="full", initialize_only=True)
+        self.snapshot = VerifiedSnapshot(
+            self.root, self.root / "manifest.json", "group", {"kernel": self.source},
+            {"kernel": self.source}, {}, {},
+        )
+        # Isolate activation's sandbox boundary from deployment fingerprinting
+        # and authenticated snapshot creation. The registry itself is real SQL.
+        self.inspection = {
+            "complete": True, "kernel_schema": 4, "orchestrator_schema": "absent",
+            "inbox_schema": "absent", "sandbox_schema": "absent",
+            "sandbox_registry_schema": 1, "issues": [],
+            "checks": {"integrity": "ok", "bindings": "checked"},
+        }
+
+    def test_empty_identity_registry_passes_preflight_without_writes(self):
+        with sqlite3.connect(self.source) as connection:
+            before = connection.execute("SELECT * FROM runtime_sandbox_meta").fetchall()
+        with mock.patch.object(activation, "inspect_storage", return_value=self.inspection):
+            activation._preflight(self.snapshot, {})
+        with sqlite3.connect(self.source) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM runtime_sandbox_meta").fetchall(), before)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runtime_sandbox_journals").fetchone()[0], 0)
+
+    def test_nonempty_registry_preserves_external_cleanup_rejection(self):
+        with sqlite3.connect(self.source) as connection:
+            connection.execute("INSERT INTO runtime_sandbox_journals VALUES('missing-cleanup.sqlite3')")
+        with mock.patch.object(activation, "inspect_storage", return_value=self.inspection):
+            with self.assertRaisesRegex(ActivationPreconditionError, "external resources"):
+                activation._preflight(self.snapshot, {})
+
+    def test_damaged_identity_registry_is_rejected(self):
+        with sqlite3.connect(self.source) as connection:
+            connection.execute("DELETE FROM runtime_sandbox_meta")
+        with mock.patch.object(activation, "inspect_storage", return_value=self.inspection):
+            with self.assertRaisesRegex(ActivationPreconditionError, "registry validation failed"):
+                activation._preflight(self.snapshot, {})
 
 
 class StorageActivationTests(unittest.TestCase):

@@ -49,6 +49,7 @@ adds the pinned OpenSandbox SDK and requires a separately deployed service.
 
 ## Version 0.7 integration guides
 
+- [Execution observability improvement goal](EXECUTION_OBSERVABILITY_GOAL.md): scoped implementation tasks and acceptance criteria for activity, budgets, waits, cleanup and stall notifications; planning complete does not imply implementation acceptance.
 - [0.7.0.dev1 improvement plan](DEV_0_7_0_DEV1_IMPROVEMENT_PLAN.md): proposed managed Run lifecycle and authorization changes, compatibility strategy, implementation tasks and acceptance criteria; not yet implemented.
 - [Diagnostics and projections](SDK_DIAGNOSTICS_AND_PROJECTIONS.md): deployment identity, durable event consumption, work availability and cancellation reports.
 - [Cancellation evidence](CANCELLATION_EVIDENCE.md): optional journal configuration, cleanup evidence, backup and compatibility.

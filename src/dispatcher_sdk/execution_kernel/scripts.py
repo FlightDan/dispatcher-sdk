@@ -16,6 +16,7 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import threading
 from typing import Any
 
 from .context import HandlerContext
@@ -153,23 +154,45 @@ def script_handler(payload: Any, context: HandlerContext) -> dict[str, Any]:
             source.write(spec.source.encode("utf-8"))
             source.flush()
             os.fsync(source.fileno())
-        with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
+        with stdout_path.open("xb", buffering=0) as stdout, stderr_path.open("xb", buffering=0) as stderr:
             # No second timer or process supervisor: the Kernel owns both the
             # command deadline and containment of this process's descendants.
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 [*spec.interpreter, str(source_path)],
                 cwd=spec.cwd,
                 stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
+            context.activity.enable_stream("stdout")
+            context.activity.enable_stream("stderr")
+            context.activity.observe_process(process, role="agent", process_id="script")
+            drain_errors: list[BaseException] = []
+
+            def drain(pipe, destination, stream):
+                try:
+                    with pipe:
+                        while chunk := os.read(pipe.fileno(), 65536):
+                            destination.write(chunk)
+                            context.activity.report_bytes(stream, chunk)
+                except BaseException as exc:
+                    drain_errors.append(exc)
+
+            drains = [threading.Thread(target=drain, args=(process.stdout, stdout, "stdout"), daemon=True),
+                      threading.Thread(target=drain, args=(process.stderr, stderr, "stderr"), daemon=True)]
+            for collector in drains:
+                collector.start()
+            exit_code = process.wait()
+            for collector in drains:
+                collector.join()
+            if drain_errors:
+                raise drain_errors[0]
             stdout.flush()
             stderr.flush()
             os.fsync(stdout.fileno())
             os.fsync(stderr.fileno())
         return {
-            "exit_code": completed.returncode,
+            "exit_code": exit_code,
             "source_path": str(source_path),
             "source_sha256": source_hash,
             "stdout": _output_summary(stdout_path, spec.tail_bytes),

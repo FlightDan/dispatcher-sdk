@@ -1110,9 +1110,8 @@ class RuntimeTests(unittest.TestCase):
 
             driver = threading.Thread(target=drive)
             driver.start()
-            for _ in range(100):
-                if started.exists():
-                    break
+            entry_deadline = time.monotonic() + command.timeout_seconds
+            while not started.exists() and not outcomes and not errors and time.monotonic() < entry_deadline:
                 time.sleep(0.005)
             self.assertTrue(started.exists())
             stack.close()
@@ -1214,12 +1213,12 @@ class RuntimeTests(unittest.TestCase):
                 stack.submit(command)
                 finalizing = threading.Event()
                 release = threading.Event()
-                real_outcome_result = stack._outcome_result
+                real_complete = stack.kernel.complete
 
                 def pause_finalization(*args, **kwargs):
                     finalizing.set()
                     self.assertTrue(release.wait(1.0))
-                    return real_outcome_result(*args, **kwargs)
+                    return real_complete(*args, **kwargs)
 
                 run_outcomes = []
                 run_errors = []
@@ -1244,7 +1243,7 @@ class RuntimeTests(unittest.TestCase):
                     except BaseException as exc:
                         cancel_errors.append(exc)
 
-                with patch.object(stack, "_outcome_result", new=pause_finalization):
+                with patch.object(stack.kernel, "complete", new=pause_finalization):
                     driver = threading.Thread(target=drive)
                     driver.start()
                     self.assertTrue(finalizing.wait(1.0))
@@ -1336,11 +1335,16 @@ class RuntimeTests(unittest.TestCase):
 
     def test_thread_fallback_revokes_late_effect_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
+            clock = Clock(time.time())
+            entered = threading.Event()
+            release = threading.Event()
             attempted = threading.Event()
             performed = threading.Event()
+            denied = []
 
             def late_effect(payload, context):
-                time.sleep(0.05)
+                entered.set()
+                release.wait(5)
                 try:
                     context.effects.execute_once(
                         "late-effect",
@@ -1348,6 +1352,9 @@ class RuntimeTests(unittest.TestCase):
                         {},
                         lambda: performed.set(),
                     )
+                except BaseException as exc:
+                    denied.append(exc)
+                    raise
                 finally:
                     attempted.set()
                 return None
@@ -1358,34 +1365,60 @@ class RuntimeTests(unittest.TestCase):
                 Path(temp) / "kernel.sqlite3",
                 {("late-effect", 1): late_effect},
                 isolation_mode="thread",
+                now=clock,
             )
+            outcomes = []
+            errors = []
+
+            def drive():
+                try:
+                    outcomes.append(stack.run_once())
+                except BaseException as exc:
+                    errors.append(exc)
+
+            driver = threading.Thread(target=drive)
             try:
                 stack.submit(
                     make_command(
                         "thread-timeout",
                         stack.registry_revision,
                         handler_id="late-effect",
-                        timeout=0.005,
+                        timeout=5,
                     )
                 )
-                result = stack.run_once()
-                self.assertEqual(result.state, "timed_out")
+                driver.start()
+                self.assertTrue(entered.wait(2))
+                # Entry is downstream of the durable ACK. Expire that already
+                # running execution while its actual Python call remains blocked.
+                clock.advance(6)
+                driver.join(2)
+                self.assertFalse(driver.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0].state, "timed_out")
+                release.set()
                 self.assertTrue(attempted.wait(1))
                 self.assertFalse(performed.is_set())
+                self.assertEqual(len(denied), 1)
+                self.assertEqual(type(denied[0]).__name__, "StaleFenceError")
                 with self.assertRaises(KeyError):
                     stack.kernel.get_effect("late-effect")
             finally:
+                release.set()
+                if driver.ident is not None:
+                    driver.join(2)
                 stack.close()
 
     def test_thread_timeout_slots_are_bounded_and_close_is_reentrant(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
+            clock = Clock(time.time())
             entered = threading.Event()
             release = threading.Event()
             finished = threading.Event()
 
             def blocked(_payload, _context):
                 entered.set()
-                release.wait(2)
+                release.wait(5)
                 finished.set()
                 return {"done": True}
 
@@ -1395,14 +1428,25 @@ class RuntimeTests(unittest.TestCase):
                 {("blocked", 1): blocked},
                 isolation_mode="thread",
                 max_thread_workers=1,
+                now=clock,
             )
+            outcomes = []
+            errors = []
+
+            def drive():
+                try:
+                    outcomes.append(stack.run_once())
+                except BaseException as exc:
+                    errors.append(exc)
+
+            driver = threading.Thread(target=drive)
             try:
                 stack.submit(
                     make_command(
                         "blocked-1",
                         stack.registry_revision,
                         handler_id="blocked",
-                        timeout=0.01,
+                        timeout=5,
                     )
                 )
                 stack.submit(
@@ -1410,12 +1454,18 @@ class RuntimeTests(unittest.TestCase):
                         "blocked-2",
                         stack.registry_revision,
                         handler_id="blocked",
-                        timeout=0.01,
+                        timeout=5,
                     )
                 )
-                first = stack.run_once()
-                self.assertEqual(first.state, "timed_out")
-                self.assertTrue(entered.wait(1))
+                driver.start()
+                self.assertTrue(entered.wait(2))
+                clock.advance(6)
+                driver.join(2)
+                self.assertFalse(driver.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0].state, "timed_out")
+                self.assertFalse(finished.is_set())
 
                 # The timed-out Python call still owns the only slot.  The
                 # second item must remain queued and its handler must not run.
@@ -1427,18 +1477,21 @@ class RuntimeTests(unittest.TestCase):
                 self.assertIsNone(stack.run_once())
             finally:
                 release.set()
+                if driver.ident is not None:
+                    driver.join(2)
                 self.assertTrue(finished.wait(1))
                 stack.close()
 
     def test_thread_timeout_releases_slot_after_underlying_call_exits(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
+            clock = Clock(time.time())
             entered = threading.Event()
             release = threading.Event()
             finished = threading.Event()
 
             def blocked(_payload, _context):
                 entered.set()
-                release.wait(2)
+                release.wait(5)
                 finished.set()
                 return {"done": True}
 
@@ -1448,34 +1501,62 @@ class RuntimeTests(unittest.TestCase):
                 {("blocked", 1): blocked},
                 isolation_mode="thread",
                 max_thread_workers=1,
+                now=clock,
             )
+            outcomes = []
+            errors = []
+
+            def drive():
+                try:
+                    outcomes.append(stack.run_once())
+                except BaseException as exc:
+                    errors.append(exc)
+
+            driver = threading.Thread(target=drive)
             try:
                 first = make_command(
                     "release-1",
                     stack.registry_revision,
                     handler_id="blocked",
-                    timeout=0.01,
+                    timeout=5,
                 )
                 second = make_command(
                     "release-2",
                     stack.registry_revision,
                     handler_id="blocked",
-                    timeout=0.5,
+                    timeout=5,
                 )
                 stack.submit(first)
                 stack.submit(second)
-                self.assertEqual(stack.run_once().state, "timed_out")
-                self.assertTrue(entered.wait(1))
+                driver.start()
+                self.assertTrue(entered.wait(2))
+                clock.advance(6)
+                driver.join(2)
+                self.assertFalse(driver.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0].state, "timed_out")
+                self.assertFalse(finished.is_set())
                 self.assertIsNone(stack.run_once())
                 self.assertEqual(stack.kernel.get(second.execution_id).state, "queued")
 
                 release.set()
                 self.assertTrue(finished.wait(1))
-                recovered = stack.run_once()
+                # The handler's final statement precedes context cleanup and
+                # the executor completion callback. Drive the queued work until
+                # that callback releases capacity, within a bounded real wait.
+                wait_deadline = time.monotonic() + 2
+                recovered = None
+                while recovered is None and time.monotonic() < wait_deadline:
+                    recovered = stack.run_once()
+                    if recovered is None:
+                        time.sleep(.01)
                 self.assertIsNotNone(recovered)
                 self.assertEqual(recovered.state, "succeeded")
             finally:
                 release.set()
+                if driver.ident is not None:
+                    driver.join(2)
                 stack.close()
 
 

@@ -3,6 +3,8 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .observability import ObservationOptions, StallPolicy
+    from .execution_kernel.budget import BudgetEnvelope, ExecutionBudget, DeadlineConstraint
     from .application import (Dispatcher, Task, DeploymentMismatchError, RecoveryRequiredError,
                               SubmissionConflictError)
     from .identity import (
@@ -11,6 +13,7 @@ if TYPE_CHECKING:
     )
 
 __all__ = ["Dispatcher", "Task", "DeploymentMismatchError", "RecoveryRequiredError", "SubmissionConflictError",
+           "ObservationOptions", "StallPolicy", "BudgetEnvelope", "ExecutionBudget", "DeadlineConstraint",
            "runtime_identity", "RuntimeIdentityReport", "ModuleIdentity", "StorageIdentity",
            "CapabilityVerdict", "HandlerBindingIdentity", "DurabilityObservation", "VerdictStatus"]
 
@@ -24,7 +27,8 @@ def __getattr__(name: str):
 
     module = ".application" if name in {
         "Dispatcher", "Task", "DeploymentMismatchError", "RecoveryRequiredError", "SubmissionConflictError"
-    } else ".identity"
+    } else ".observability" if name in {"ObservationOptions", "StallPolicy"} else (
+        ".execution_kernel.budget" if name in {"BudgetEnvelope", "ExecutionBudget", "DeadlineConstraint"} else ".identity")
     value = getattr(import_module(module, __name__), name)
     globals()[name] = value
     return value

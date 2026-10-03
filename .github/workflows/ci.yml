@@ -34,7 +34,9 @@ jobs:
             python-version: '3.10'
             python_arch: x64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 45
+    env:
+      SDK_ACCEPTANCE_EVIDENCE_DIR: ${{ runner.temp }}/sdk-execution-acceptance
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -57,7 +59,7 @@ jobs:
       - name: Install candidate and build tools
         run: python -m pip install . build wheel "setuptools>=68" mypy
       - name: Check typed SDK consumer compatibility
-        run: python -m mypy --python-version 3.10 --follow-imports=silent --warn-unused-ignores tests/typing/orchestrator_consumer.py tests/typing/capability_consumer.py tests/typing/reliability_consumer.py tests/typing/application_consumer.py
+        run: python -m mypy --python-version 3.10 --follow-imports=silent --warn-unused-ignores tests/typing/orchestrator_consumer.py tests/typing/capability_consumer.py tests/typing/reliability_consumer.py tests/typing/application_consumer.py tests/typing/observability_consumer.py
       - name: Run SDK tests, source rebuild and isolated wheel consumers
         run: python -m unittest discover -s tests -v
       - name: Check documentation and README examples
@@ -74,8 +76,16 @@ jobs:
           python examples/durable_audit.py
           python examples/request_result_receipts.py
           python examples/reliability_diagnostics.py
+          python examples/execution_observability.py
       - name: Run script notification example
         run: python examples/sdk_script_wakeup.py
+      - name: Save native acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: execution-acceptance-${{ matrix.os }}-py${{ matrix.python-version }}-${{ matrix.python_arch }}
+          path: ${{ env.SDK_ACCEPTANCE_EVIDENCE_DIR }}
+          if-no-files-found: warn
   secrets:
     runs-on: ubuntu-latest
     timeout-minutes: 5

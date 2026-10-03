@@ -25,7 +25,12 @@ import traceback
 from typing import Any, Callable, Optional
 
 from ..durability import Durability, validate_durability
-from ._process_runtime import invoke_handler, _serialize_handler_outcome
+from ._process_runtime import (
+    invoke_handler, _serialize_handler_outcome, _bounded_deadline,
+    _budget_outcome, _confirmed_entry_packet, _close_context, _capture_completion_time,
+    _bootstrap_diagnostic, _observe_phase,
+)
+from .budget import BudgetClockUnknownError, BudgetEnvelope
 from ._registry import Handler
 from .context import HandlerContext, HandlerEffects
 from .contracts import ExecutionCommandV2, ExecutionLease
@@ -40,6 +45,7 @@ _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 _CREATE_NO_WINDOW = 0x08000000
 _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 258
+_MAX_JOB_PROCESSES = 4096
 
 
 class _BasicLimits(ctypes.Structure):
@@ -117,6 +123,7 @@ class _WinAPI:
             "WaitForSingleObject": ([H, D], D),
             "GetExitCodeProcess": ([H, ctypes.POINTER(D)], B),
             "IsProcessInJob": ([H, H, ctypes.POINTER(B)], B),
+            "OpenProcess": ([D, B, D], H),
         }
         for name, (arguments, result) in signatures.items():
             function = getattr(self.dll, name)
@@ -132,6 +139,24 @@ class _WinAPI:
         self.check(self.dll.QueryInformationJobObject(
             job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None), "QueryInformationJobObject")
         return int(accounting.ActiveProcesses)
+
+    def process_ids(self, job: Any) -> tuple[int, ...]:
+        capacity = 64
+        for _ in range(7):
+            class ProcessList(ctypes.Structure):
+                _fields_ = [("assigned", wintypes.DWORD), ("count", wintypes.DWORD),
+                            ("ids", ctypes.c_size_t * capacity)]
+
+            listing = ProcessList()
+            result = self.dll.QueryInformationJobObject(job, 3, ctypes.byref(listing), ctypes.sizeof(listing), None)
+            if result and listing.count <= capacity and listing.assigned <= listing.count:
+                return tuple(int(listing.ids[index]) for index in range(listing.count))
+            if not result and ctypes.get_last_error() != 234:
+                self.check(result, "QueryInformationJobObject process list")
+            capacity = max(capacity * 2, int(listing.assigned))
+            if capacity > _MAX_JOB_PROCESSES:
+                break
+        raise RuntimeError("Windows Job process list exceeds its bounded enumeration")
 
 
 def _create_suspended(api: _WinAPI, arguments: list[str]) -> tuple[Any, _ProcessInformation]:
@@ -252,6 +277,41 @@ class WindowsProcessHandle:
                 self._revocation_reason = reason
             return self.terminate()
 
+    def stop_descendants(self, until: float) -> bool:
+        """Stop Job members while preserving the original worker's flush."""
+        with self._lock:
+            if self._closed or self._contained:
+                return self._contained
+            quiet_since = None
+            while time.monotonic() < until:
+                pids = tuple(pid for pid in self._api.process_ids(self._job) if pid != self.pid)
+                if not pids:
+                    quiet_since = time.monotonic() if quiet_since is None else quiet_since
+                    if time.monotonic() - quiet_since >= _POLL_SECONDS:
+                        return True
+                else:
+                    quiet_since = None
+                for pid in pids:
+                    if time.monotonic() >= until:
+                        return False
+                    # PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE.
+                    process = self._api.dll.OpenProcess(0x00101001, False, pid)
+                    if not process:
+                        if ctypes.get_last_error() == 87:
+                            continue
+                        self._api.check(False, "OpenProcess contained descendant")
+                    try:
+                        assigned = wintypes.BOOL()
+                        self._api.check(self._api.dll.IsProcessInJob(process, self._job, ctypes.byref(assigned)),
+                                        "IsProcessInJob descendant")
+                        # The acquired handle protects identity across PID reuse.
+                        if assigned.value and self._api.dll.WaitForSingleObject(process, 0) == _WAIT_TIMEOUT:
+                            self._api.check(self._api.dll.TerminateProcess(process, 70), "TerminateProcess descendant")
+                    finally:
+                        self._api.dll.CloseHandle(process)
+                time.sleep(min(_POLL_SECONDS, max(0, until - time.monotonic())))
+            return False
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
@@ -267,8 +327,18 @@ class WindowsProcessHandle:
 
 
 class _Watchdog:
-    def __init__(self, handle: WindowsProcessHandle, deadline: float) -> None:
+    def __init__(self, handle: WindowsProcessHandle, deadline: float,
+                 envelope: BudgetEnvelope | None = None, now: Any = None) -> None:
         self.handle, self.deadline = handle, deadline
+        self.envelope, self.now = envelope, now
+        self.cleanup = False
+        self.clock_error: BudgetClockUnknownError | None = None
+        try:
+            self.inherited_work_deadline = _bounded_deadline(math.inf, envelope, now)
+            self.inherited_hard_deadline = _bounded_deadline(math.inf, envelope, now, hard=True)
+        except BudgetClockUnknownError as exc:
+            self.clock_error = exc
+            self.inherited_work_deadline = self.inherited_hard_deadline = time.monotonic()
         self.lock = threading.Lock()
         self.changed = threading.Event()
         self.stopped = False
@@ -277,27 +347,50 @@ class _Watchdog:
         self.thread = threading.Thread(target=self._run, name="kernel-windows-deadline", daemon=True)
         self.thread.start()
 
-    def business_deadline(self, seconds: float) -> float:
+    def business_deadline(self, seconds: float, *, envelope: BudgetEnvelope | None = None,
+                          deadline: float | None = None) -> float:
         with self.lock:
             if self.expired or time.monotonic() >= self.deadline:
                 self.expired = True
                 self.changed.set()
                 return self.deadline
-            self.deadline = time.monotonic() + seconds
+            if envelope is not None:
+                if self.envelope is not None:
+                    envelope = BudgetEnvelope((*self.envelope.constraints, *envelope.constraints),
+                                              envelope.checkpoint, envelope.started_at)
+                self.envelope = envelope
+            self.deadline = min(self.inherited_work_deadline, _bounded_deadline(
+                time.monotonic() + seconds if deadline is None else deadline, self.envelope, self.now))
             self.changed.set()
             return self.deadline
+
+    def cleanup_deadline(self, deadline: float) -> None:
+        with self.lock:
+            self.cleanup = True
+            self.deadline = min(self.inherited_hard_deadline,
+                                _bounded_deadline(deadline, self.envelope, self.now, hard=True))
+            self.changed.set()
 
     def _run(self) -> None:
         while True:
             with self.lock:
                 if self.stopped:
                     return
-                remaining = self.deadline - time.monotonic()
+                try:
+                    self.inherited_work_deadline = _bounded_deadline(
+                        self.inherited_work_deadline, self.envelope, self.now)
+                    self.inherited_hard_deadline = _bounded_deadline(
+                        self.inherited_hard_deadline, self.envelope, self.now, hard=True)
+                    self.deadline = _bounded_deadline(self.deadline, self.envelope, self.now, hard=self.cleanup)
+                    remaining = self.deadline - time.monotonic()
+                except BudgetClockUnknownError as exc:
+                    self.clock_error = exc
+                    remaining = 0.0
                 self.changed.clear()
                 if remaining <= 0:
                     self.expired = True
             if remaining > 0:
-                self.changed.wait(min(remaining, 60.0))
+                self.changed.wait(min(remaining, 0.05))
                 continue
             try:
                 if not self.handle.terminate():
@@ -350,6 +443,10 @@ def _worker_directory():
 def _worker_main(directory: str) -> None:
     root = Path(directory)
     kernel = None
+    context: HandlerContext | None = None
+    encoded = None
+    entry_announced = False
+    stage = "worker_deserialization"
     try:
         # Pickles are private, trusted runtime input, never accepted remotely.
         # User imports/unpickling happen only after atomic Job assignment.
@@ -365,25 +462,47 @@ def _worker_main(directory: str) -> None:
             module = types.ModuleType("__mp_main__")
             module.__dict__.update(main)
             sys.modules["__main__"] = sys.modules["__mp_main__"] = module
-        handler, command, lease, now = pickle.loads(request["invocation"])
+        handler, command, lease, now, envelope, service_spec = pickle.loads(request["invocation"])
+        stage = "worker_setup"
         kernel = SQLiteKernel(request["db_path"], now=now, durability=request["durability"])
         effects = HandlerEffects(kernel, lease, lambda: True)
-        context = HandlerContext(command, lease, effects)
-        _atomic_write(root / "ready", "ready")
+        context = HandlerContext(command, lease, effects,
+                                 budget_envelope=envelope, service_spec=service_spec)
+        _atomic_write(root / "ready", json.dumps({"worker_pid": os.getpid(), "observed_at": time.time()}))
         while not (root / "go").exists():
             time.sleep(_POLL_SECONDS)
-        outcome = invoke_handler(handler, command, context)
+        stage = "handler_entry"
+        def announce_entry(entered: HandlerContext) -> None:
+            nonlocal entry_announced, stage
+            _atomic_write(root / "entered.json", json.dumps(_confirmed_entry_packet(entered, now)))
+            entry_announced = True
+            stage = "handler_execution"
+
+        outcome = invoke_handler(handler, command, context, on_entered=announce_entry)
+        _capture_completion_time(outcome, context)
         encoded = _serialize_handler_outcome(outcome, effects)
+        stage = "worker_finalization"
+        if entry_announced:
+            _atomic_write(root / "returned.json", json.dumps({"outcome_json": encoded,
+                "completed_monotonic": time.monotonic()}, allow_nan=False))
+        receipt = _close_context(context)
+        if receipt["state"] != "confirmed":
+            final = json.loads(encoded)
+            final["telemetry_flush"] = receipt
+            encoded = json.dumps(final, allow_nan=False)
+        context = None
         kernel.close()
         kernel = None
         _atomic_write(root / "outcome.json", encoded)
     except BaseException as exc:
         traceback.print_exc()
-        _atomic_write(root / "outcome.json", json.dumps({
+        details = _bootstrap_diagnostic(exc, stage)
+        _atomic_write(root / "outcome.json", encoded if encoded is not None else json.dumps({
             "kind": "error", "code": "handler_process_start_failure",
-            "message": str(exc), "retryable": False,
-            "details": {"exception_type": type(exc).__name__}, "effect_ids": []}, allow_nan=False))
+            "message": details["message"], "retryable": False,
+            "details": details, "effect_ids": []}, allow_nan=False))
     finally:
+        _close_context(context)
         if kernel is not None:
             kernel.close()
 
@@ -432,6 +551,10 @@ def invoke_windows_handler(
     on_started: Optional[Callable[[WindowsProcessHandle], bool]] = None,
     on_finished: Optional[Callable[[WindowsProcessHandle], None]] = None,
     on_cleanup_confirmed: Optional[Callable[[], None]] = None,
+    budget_envelope: BudgetEnvelope | None = None,
+    service_spec: dict | None = None,
+    on_entered: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_phase: Optional[Callable[[str, dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Spawn one native Windows worker and publish only after Job containment."""
     profile = validate_durability(durability)
@@ -439,8 +562,14 @@ def invoke_windows_handler(
         raise ValueError("Windows process isolation requires a file-backed SQLite database")
     if type(start_timeout) not in (int, float) or not math.isfinite(start_timeout) or start_timeout <= 0:
         raise ValueError("start_timeout must be finite and positive")
+    try:
+        start_deadline = _bounded_deadline(time.monotonic() + start_timeout, budget_envelope, now)
+    except BudgetClockUnknownError as exc:
+        return _budget_outcome({"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
+                               "control_error": True, "retryable": False, "effect_ids": []}, budget_envelope)
+    if start_deadline <= time.monotonic():
+        return _budget_outcome({"kind": "timeout", "phase": "admission", "effect_ids": []}, budget_envelope)
     api = _WinAPI()
-    start_deadline = time.monotonic() + start_timeout
     with _worker_directory() as directory:
         root = Path(directory)
         main = sys.modules.get("__main__")
@@ -452,7 +581,7 @@ def invoke_windows_handler(
             main_path = None
         request = {"db_path": os.path.abspath(db_path), "durability": profile,
                    "sys_path": list(sys.path), "main_path": main_path, "main_module": main_module,
-                   "invocation": pickle.dumps((handler, command, lease, now), protocol=4)}
+                   "invocation": pickle.dumps((handler, command, lease, now, budget_envelope, service_spec), protocol=4)}
         (root / "request.pickle").write_bytes(pickle.dumps(request, protocol=4))
         # sys.path may be configured by an embedder/test runner without PYTHONPATH.
         bootstrap = "import sys; sys.path[:]=%r; " % list(sys.path) + _BOOTSTRAP
@@ -461,26 +590,83 @@ def invoke_windows_handler(
         watchdog = None
         registered = False
         deadline = None
+        hard_deadline = None
+        entry = None
+        invocation_permitted = False
+        work_expired = False
         outcome = None
         contained_at = None
+        returned = False
+        telemetry_unknown = None
         try:
-            watchdog = _Watchdog(handle, start_deadline)
+            watchdog = _Watchdog(handle, start_deadline, budget_envelope, now)
             if on_started is not None:
                 registered = bool(on_started(handle))
                 if not registered:
                     handle.revoke("runtime_closed")
             handle.resume()
             while not watchdog.expired and handle.revocation_reason is None:
-                if deadline is None and (root / "ready").exists():
-                    deadline = watchdog.business_deadline(command.timeout_seconds)
-                    if not watchdog.expired:
-                        _atomic_write(root / "go", "invoke")
+                if not invocation_permitted and (root / "ready").exists():
+                    if on_phase is not None:
+                        try:
+                            ready = json.loads((root / "ready").read_text(encoding="utf-8"))
+                            if type(ready) is not dict:
+                                ready = {"source": "worker_ready_file"}
+                        except (OSError, ValueError):
+                            ready = {"source": "worker_ready_file", "metadata_unknown": True}
+                        _observe_phase(on_phase, "worker_ready", ready)
+                    _atomic_write(root / "go", "invoke")
+                    invocation_permitted = True
+                    if budget_envelope is None:
+                        deadline = watchdog.business_deadline(command.timeout_seconds)
+                if entry is None and (root / "entered.json").exists():
+                    entry = json.loads((root / "entered.json").read_text(encoding="utf-8"))
+                    actual = BudgetEnvelope.from_dict(entry["budget_envelope"])
+                    if budget_envelope is not None:
+                        actual = BudgetEnvelope((*budget_envelope.constraints, *actual.constraints),
+                                                actual.checkpoint, actual.started_at)
+                        budget_envelope = actual
+                    deadline = watchdog.business_deadline(command.timeout_seconds, envelope=budget_envelope,
+                                                         deadline=entry["deadline_monotonic"])
+                    hard_deadline = _bounded_deadline(entry["hard_deadline_monotonic"], budget_envelope, now, hard=True)
+                    if on_entered is not None:
+                        try:
+                            on_entered(entry)
+                        except BaseException:
+                            pass
+                if not returned and (root / "returned.json").exists():
+                    completion = json.loads((root / "returned.json").read_text(encoding="utf-8"))
+                    completed = completion.get("completed_monotonic")
+                    if (deadline is None or type(completed) not in {int, float} or not math.isfinite(completed)
+                            or completed >= deadline):
+                        work_expired = True
+                        break
+                    outcome = json.loads(completion["outcome_json"])
+                    returned = True
+                    watchdog.cleanup_deadline(hard_deadline if hard_deadline is not None else deadline)
+                if returned:
+                    try:
+                        until = min(hard_deadline if hard_deadline is not None else deadline, time.monotonic() + .25)
+                        if not handle.stop_descendants(until):
+                            telemetry_unknown = "descendant containment did not become quiet within its bound"
+                            break
+                    except Exception as exc:
+                        telemetry_unknown = f"{type(exc).__name__}: {exc}"
+                        break
                 if (root / "outcome.json").exists():
                     outcome = json.loads((root / "outcome.json").read_text(encoding="utf-8"))
+                    work_expired = not returned and deadline is not None and time.monotonic() >= deadline
+                    if deadline is not None and time.monotonic() < deadline and hard_deadline is not None:
+                        watchdog.cleanup_deadline(hard_deadline)
                     break
                 if handle.exited():
                     break
                 time.sleep(_POLL_SECONDS)
+        except BudgetClockUnknownError as exc:
+            outcome = {"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
+                       "control_error": True, "retryable": False, "effect_ids": []}
+            if watchdog is not None:
+                watchdog.clock_error = exc
         finally:
             try:
                 if not handle.terminate():
@@ -499,9 +685,38 @@ def invoke_windows_handler(
                         if registered and on_finished is not None:
                             on_finished(handle)
         if handle.revocation_reason is not None:
-            return {"kind": "authority_revoked", "reason": handle.revocation_reason, "effect_ids": []}
-        if deadline is not None and (contained_at is None or contained_at >= deadline):
-            return {"kind": "timeout", "effect_ids": []}
+            return _budget_outcome({"kind": "authority_revoked", "reason": handle.revocation_reason, "effect_ids": []}, budget_envelope, entry)
+        if watchdog is not None and getattr(watchdog, "clock_error", None) is not None:
+            return _budget_outcome({"kind": "error", "code": "budget_clock_unknown",
+                                   "message": str(watchdog.clock_error), "control_error": True,
+                                   "retryable": False, "effect_ids": []}, budget_envelope, entry)
+        if (work_expired or (entry is None and deadline is not None and time.monotonic() >= deadline)
+                or (watchdog is not None and watchdog.expired)
+                or (hard_deadline is not None and (contained_at is None or contained_at >= hard_deadline))):
+            capture_unknown = None
+            if outcome is None and (budget_envelope is not None or entry is not None or (root / "returned.json").exists()):
+                for name in ("outcome.json", "returned.json"):
+                    path = root / name
+                    if not path.exists():
+                        continue
+                    try:
+                        if path.stat().st_size > 256 * 1024:
+                            capture_unknown = "completed outcome exceeds bounded timeout diagnostics"
+                            continue
+                        captured = json.loads(path.read_text(encoding="utf-8"))
+                        if name == "returned.json":
+                            captured = json.loads(captured["outcome_json"])
+                        if type(captured) is dict:
+                            outcome = captured
+                            break
+                    except (ValueError, KeyError, TypeError, OSError) as exc:
+                        capture_unknown = f"{type(exc).__name__}: {exc}"[:2048]
+            timeout = {"kind": "timeout", "effect_ids": [] if type(outcome) is not dict else outcome.get("effect_ids", [])}
+            if type(outcome) is dict:
+                timeout["details"] = {"business_outcome": outcome}
+            elif capture_unknown is not None:
+                timeout["details"] = {"business_outcome_capture": {"state": "unknown", "reason": capture_unknown}}
+            return _budget_outcome(timeout, budget_envelope, entry)
         # The worker can atomically publish between the loop's file check and
         # its exit check. After containment no writer remains, so recover that
         # final publication without weakening cancellation or deadline checks.
@@ -514,10 +729,15 @@ def invoke_windows_handler(
                 stream.seek(max(0, stderr.stat().st_size - 8192))
                 tail = stream.read(8192).decode("utf-8", errors="replace")
         if type(outcome) is dict:
+            if telemetry_unknown is not None:
+                outcome["telemetry_flush"] = {"state": "unknown", "reason": telemetry_unknown}
             if outcome.get("kind") == "error" and tail:
                 outcome["details"] = {**(outcome.get("details") or {}), "stderr_tail": tail}
-            return outcome
-        return {"kind": "error", "code": "handler_process_exit" if deadline else "handler_process_start_failure",
+            if (entry is None and outcome.get("code") == "handler_process_start_failure"
+                    and type(outcome.get("details")) is dict and outcome["details"].get("exception_type")):
+                _observe_phase(on_phase, "worker_bootstrap_failed", outcome["details"])
+            return _budget_outcome(outcome, budget_envelope, entry)
+        return _budget_outcome({"kind": "error", "code": "handler_process_exit" if deadline else "handler_process_start_failure",
                 "message": "Windows worker exited without a completed outcome",
                 "retryable": False, "details": {"exitcode": handle.exitcode, "stderr_tail": tail},
-                "effect_ids": []}
+                "effect_ids": []}, budget_envelope, entry)
