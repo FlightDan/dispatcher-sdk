@@ -301,13 +301,19 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
         close.assert_called_once_with(99)
 
     def test_flush_descendant_signal_uses_acquired_process_handle(self):
+        native_close = process_runtime.os.close
+
+        def close_descriptor(descriptor):
+            if descriptor != 99:
+                native_close(descriptor)
+
         with patch.object(process_runtime.os, "pidfd_open", return_value=99, create=True), patch.object(
                 process_runtime.signal, "pidfd_send_signal", create=True) as signal_process, patch.object(
-                process_runtime.os, "close") as close, patch.object(process_runtime, "_descendant_process_ids",
+                process_runtime.os, "close", side_effect=close_descriptor) as close, patch.object(process_runtime, "_descendant_process_ids",
                 return_value=(42, 43)):
             self.assertTrue(process_runtime._stop_flush_descendants(1, 43))
         signal_process.assert_called_once_with(99, process_runtime.signal.SIGKILL)
-        close.assert_called_once_with(99)
+        self.assertEqual(1, sum(call.args == (99,) for call in close.call_args_list))
 
     @staticmethod
     def capture_process_cleanup(receipts):

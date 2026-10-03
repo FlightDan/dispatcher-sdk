@@ -1,9 +1,11 @@
 # Execution observability acceptance evidence
 
 This index tracks [T01–T09 and A01–A18](EXECUTION_OBSERVABILITY_GOAL.md).
-The implementation is not yet fully accepted. Source-level focused checks have
-passed on Linux x86_64; installed-candidate validation, full regression, the
-native Windows matrix and the remaining live ModPort handoff are pending.
+The implementation is not yet fully accepted. Focused checks have passed on
+Linux x86_64. Installed candidate `a8403c3` passed three original public-example
+runs and a real native SSE witness, but failed the complete regression.
+Its corrective source changes still need a fresh frozen installed candidate,
+complete regression, native Windows matrix and remaining live ModPort handoff.
 No release is authorized by this work.
 
 ## Candidate and reproducible commands
@@ -50,10 +52,10 @@ links or substitutes for the candidate CI artifacts.
 | A12 Conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; separate capacity keeps local deadlines working. Candidate matrix pending. |
 | A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Latest candidate regression pending. |
 | A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; separately installed historical `v0.7.0.dev0` writer | Actual old installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Full public API and pending-obligation upgrade regression pending. |
-| A15 Installed entry | Isolated wheel consumer suite and portable public example | Fresh final wheel installation/import proof pending. Earlier wheels do not count. |
-| A16 Current ModPort | Current SDKHandler/budget/raw stream adapters; staged actual reviewer → stdio MCP → host schedule → SDK child → host response witness | Ten staged source tests passed, including original storage failure and original tool deadline. Remaining live rework files await cross-project approval; installed candidate and real provider/SSE witness pending. No Minecraft Run was launched. |
+| A15 Installed entry | Isolated wheel consumer suite and portable public example | `a8403c3` clean-wheel import and three original parent12/child5/wait15 example runs passed. Its complete installed consumer suite failed; corrective candidate validation remains required. |
+| A16 Current ModPort | Current SDKHandler/budget/raw stream adapters; staged actual reviewer → stdio MCP → host schedule → SDK child → host response witness | Ten staged tests passed with the installed `a8403c3` SDK. Genuine native SSE completed with raw SDK stream metrics. Production supervisor emitted two real model requests but returned business `agent_timeout`, so normal completion remains unverified. Remaining live rework files await cross-project approval. No Minecraft Run was launched. |
 | A17 Native Windows | `test_windows_runtime`, portable native observability/deadline/pressure suites | Linux mocks are not native acceptance. Windows x64/ARM64 jobs and raw Job evidence pending. Linux-only cgroup cases do not apply to Windows. |
-| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | Pending. Earlier full failures and an interrupted run are not passes. |
+| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `a8403c3` outer run of 844 tests had 3 failures and 16 skips; nested installed run of 839 tests had 3 errors and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
 
 ## Current raw host evidence
 
@@ -71,6 +73,14 @@ links or substitutes for the candidate CI artifacts.
 | Historical installed writer rejected new layout | `/tmp/sdk-historical-writer-evidence.json`; `/tmp/sdk-historical-current-reopen.log` |
 | Native shared-cgroup clue plus actual exit 137 passed | `/tmp/sdk-native-shared-oom-clue.log`; `/tmp/sdk-observability-native-2jg_2v20` |
 | Five public typing fixtures passed; six README examples passed | `/tmp/sdk-docs-latest.log`; current typing command output |
+| Installed `a8403c3` original public example passed three times | `/tmp/sdk-observability-installed-import-final5.json`; `/tmp/sdk-observability-installed-example-final5-run*.log` |
+| Installed ModPort stdio MCP / child raw-error handoff passed ten checks | `/tmp/modport-rework-installed-final5.log` |
+| Actual native summary SSE completed; supervisor business timed out | `/tmp/modport-a16-3e4mk7z4/completion.json`; `summary-evidence.json`, `native-summary.txt`, `supervisor-evidence.json`; `/tmp/modport-a16-launch-VLnk45-completion.json` |
+| Corrective receipt / child / clock checks passed 63 in 58.878s | `/tmp/sdk-receipt-delivery-corrections-focused.log` |
+| Corrective native / pressure / child / entry checks passed 42 in 114.595s | `/tmp/sdk-native-corrections-final.log` |
+| Real dual-store contention, receipt-only retry close, and readonly admission passed 4 in 10.073s | `/tmp/sdk-double-settlement-read-final.log`; original outcome artifacts printed in that log |
+| Cancellation under a locked diagnostic writer plus existing receipts passed 19 in 34.967s | `/tmp/sdk-cancel-order-public-regression.log`; `/tmp/sdk-cancel-telemetry-order-jizf77lp/evidence.json` |
+| Child result delivery under Kernel contention passed eight checks and one final native witness | `/tmp/sdk-child-completed-delivery-writer-final.log`; `/tmp/sdk-child-completed-delivery-writer-proof.log`; `/tmp/sdk-child-delivery-writer-cutoff-eq4mgwoe/evidence.json` |
 
 These focused results precede the final candidate freeze. Final installed and
 CI results will supersede them for acceptance while preserving failure history.
@@ -92,6 +102,28 @@ windows. `/tmp/sdk-child-contention-native-pressure-settlement.log` and
 The driver now retries the binding through its existing bounded background
 flusher; the corrective native run above passed. A new complete frozen
 candidate run remains necessary.
+
+The later frozen `a8403c3` complete run finished, rather than being interrupted:
+`/tmp/sdk-observability-full-regression-final5.log` retains all three outer
+failures and three nested installed-suite errors. Actual cancellation committed
+before a late file write, but optional diagnostic writes delayed local revocation.
+An installed pressure worker was reaped at its deadline while simultaneous
+receipt and lifecycle admission failures dropped its only original timeout
+result; `/tmp/sdk-observability-pressure-fx63k80k/evidence.json` and its sidecars
+retain that causal evidence. The installed child failure also exposed a result
+committed before its cutoff but delivered through the request journal afterward.
+The corrective witnesses above preserve the same business deadlines and original
+results. A source-focused pass does not supersede the failed frozen candidate.
+
+Both provider witnesses used fresh temporary Run identities, unchanged original
+110-second total deadlines, seven claims and no automatic retries. The first
+harness allocated an incorrect 80-second supervisor stage and failed before
+summary registry entry; `/tmp/modport-a16-o2mkelk8/completion.json` retains it.
+After correcting the harness, native SSE reported one model request, 106 events,
+96 text chunks and 38,278 stdout bytes. The production supervisor's planning
+completed in 43.040s; execution exhausted its remaining 34.711s while retaining
+the production settlement reserve. Its SDK `succeeded` state records successful
+return of a failed business result and does not establish A16 completion.
 
 ## Review and limits
 

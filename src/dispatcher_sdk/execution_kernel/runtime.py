@@ -70,12 +70,17 @@ from .sandbox_contracts import SandboxOutcomeUnknown
 from ._sandbox_registry import register_journals, journal_paths
 from .cancellation import CancellationJournal
 from .settlement import SettlementJournal, merge_diagnostic_notes
+from .pending_settlements import PendingSettlements, SettlementAdmission
 
 
 class _ProcessRegistration(threading.Event):
     """Completion alone is not a cleanup proof when invocation raises."""
 
     cleanup_confirmed = False
+
+
+class _UnpersistedSettlementsError(RuntimeError):
+    """Local cleanup finished, but original result retention is unresolved."""
 
 
 class InProcessRuntime:
@@ -177,6 +182,7 @@ class InProcessRuntime:
         self._settlement_lock = threading.Lock()
         self._settlement_inflight_lock = threading.Lock()
         self._settlement_inflight: set[tuple[str, int, int]] = set()
+        self._pending_settlements = PendingSettlements()
         if isolation_mode == "thread":
             self._thread_executor = ThreadPoolExecutor(
                 max_workers=max_thread_workers,
@@ -247,6 +253,10 @@ class InProcessRuntime:
                 first_closer = True
         if not first_closer:
             close_complete.wait()
+            if isinstance(self._close_error, _UnpersistedSettlementsError):
+                self._persist_pending_settlements(time.monotonic() + 1, limit=64)
+                if not self._pending_settlements.identities():
+                    self._close_error = None
             if self._close_error is not None:
                 raise self._close_error
             return
@@ -262,9 +272,12 @@ class InProcessRuntime:
                 while self._active_runs:
                     self._lifecycle_condition.wait()
             try:
+                self._persist_pending_settlements(time.monotonic() + 1, limit=64)
                 unresolved = self.recover_sandboxes(all_pages=True)
                 if any(not item["cleanup_confirmed"] for item in unresolved):
                     raise SandboxOutcomeUnknown("remote cleanup remains pending in the sandbox journal")
+                if self._pending_settlements.identities():
+                    raise _UnpersistedSettlementsError("runtime closed with original outcomes not yet durably persisted")
             finally:
                 self.kernel.close()
                 if self._temporary_observation is not None:
@@ -327,6 +340,28 @@ class InProcessRuntime:
                 self._settlement_error = f"{type(exc).__name__}: {exc}"
             self._stop_event.wait(.25)
 
+    def _persist_pending_settlements(self, deadline: float, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Transfer original local facts to the journal, without running work."""
+        reports: list[dict[str, Any]] = []
+        if self._settlement_journal is None:
+            return reports
+        for entry in self._pending_settlements.entries(limit):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                payload = entry.payload
+                original = payload if set(payload) == {"kind", "outcome"} else ExecutionResultV2.from_dict(payload)
+                self._settlement_journal.record(entry.lease, original, evidence=entry.evidence,
+                    timeout_seconds=min(.1, remaining))
+                self._pending_settlements.persisted(entry.key, expected=entry)
+                reports.append({**entry.identity, "state": "persisted"})
+            except Exception as exc:
+                self._settlement_error = f"{type(exc).__name__}: {exc}"
+                reports.append({**entry.identity, "state": "unpersisted", "error": self._settlement_error})
+                break
+        return reports
+
     def recover_completions(self, *, limit: int = 50,
                             timeout_seconds: float = .5) -> tuple[dict[str, Any], ...]:
         """Retry retained result CAS operations, without invoking any handler."""
@@ -338,6 +373,9 @@ class InProcessRuntime:
             return ({"state": "pending", "error": "completion recovery busy"},)
         reports = []
         try:
+            reports.extend(self._persist_pending_settlements(deadline, limit=limit))
+            if time.monotonic() >= deadline:
+                return tuple(reports)
             records = self._settlement_journal.pending(limit=limit,
                 timeout_seconds=min(.1, max(.001, deadline-time.monotonic())))
             for record in records:
@@ -662,6 +700,11 @@ class InProcessRuntime:
             report.update(complete=False, settlement_obligations_error=self._settlement_error)
         if execution_id in self._diagnostic_errors:
             report.update(complete=False, diagnostic_receipt_error=self._diagnostic_errors[execution_id])
+        local_obligations = tuple(identity for identity in self._pending_settlements.identities()
+                                  if identity["execution_id"] == execution_id)
+        if local_obligations:
+            report.update(complete=False, local_settlement_obligations=local_obligations,
+                unknown_reason="original_result_not_durably_persisted")
         if report.get("collection_gaps", 0) > 0:
             report.update(complete=False, unknown_reason="telemetry_collection_incomplete")
         return report if reader is None else reader._bound_report(report, budget=budget)
@@ -767,18 +810,22 @@ class InProcessRuntime:
         duration = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
         cancellation_identity: ObservationIdentity | None = None
         observation_available = True
+        requested_at = self.kernel._wall_time()
+        pending_evidence: list[tuple[str, dict[str, Any], float]] = []
 
-        def record(stage, evidence):
+        def record(stage, evidence, captured_at=None):
             nonlocal observation_available
             if cancellation_identity is not None:
-                self._diagnostic_note(cancellation_identity, "cancellation_"+stage, evidence)
+                self._diagnostic_note(cancellation_identity, "cancellation_"+stage,
+                    evidence if captured_at is None else {**evidence, "captured_at": captured_at})
             if observation_available and self.observation_journal is not None and cancellation_identity is not None:
                 try:
-                    self.observation_journal.phase(cancellation_identity, "cancellation_"+stage, details=evidence)
+                    self.observation_journal.phase(cancellation_identity, "cancellation_"+stage,
+                        captured_at=captured_at, details=evidence)
                 except Exception as exc:
                     observation_available = False
                     self._observation_error = f"{type(exc).__name__}: {exc}"
-            if receipt_id is not None:
+            if receipt_id is not None and stage != "requested":
                 try:
                     legacy_evidence = ({name: evidence[name] for name in ("phase", "type")}
                         if stage == "failure" else evidence)
@@ -792,7 +839,8 @@ class InProcessRuntime:
             with self.kernel._control_lock(min(duration, .1)):
                 before = self.kernel.get(execution_id)
             cancellation_identity = ObservationIdentity(execution_id, before.attempt, before.fence)
-            record("requested", {"state": "requested", "expected_revision": expected_revision, "reason": reason})
+            pending_evidence.append(("requested", {"state": "requested",
+                "expected_revision": expected_revision, "reason": reason}, requested_at))
             if self.cancellation_journal is not None:
                 try:
                     receipt_id = self.cancellation_journal._begin(
@@ -815,11 +863,15 @@ class InProcessRuntime:
                 cancelled = None
                 recovery_error = exc
             except BaseException as exc:
+                for stage, evidence, captured_at in pending_evidence:
+                    record(stage, evidence, captured_at)
+                pending_evidence.clear()
                 record("failure", {"phase": "kernel_cancel", "type": type(exc).__name__, "message": str(exc)})
                 raise
             authority = cancelled if cancelled is not None else self.kernel.get(execution_id)
-            record("authority_revoked", {"state": "confirmed", "execution_revision": authority.revision,
-                   "execution_state": authority.state, "attempt": before.attempt, "fence": before.fence})
+            pending_evidence.append(("authority_revoked", {"state": "confirmed",
+                "execution_revision": authority.revision, "execution_state": authority.state,
+                "attempt": before.attempt, "fence": before.fence}, self.kernel._wall_time()))
             generation = (execution_id, before.attempt, before.fence)
             registration = self._process_registration_events.get(generation)
             if registration is not None:
@@ -829,19 +881,23 @@ class InProcessRuntime:
                 thread_authority = self._thread_authority_by_execution.get(generation)
         phase = "process_cleanup"
         try:
-            if supervisor is not None:
-                if not supervisor.revoke("execution_cancelled"):
+            try:
+                if supervisor is not None and not supervisor.revoke("execution_cancelled"):
                     raise RuntimeError(
                         f"process supervisor for {execution_id} did not terminate"
                     )
-            if registration is not None and not registration.wait(
-                self._handler_start_timeout()
-            ):
-                raise RuntimeError(
-                    f"process registration for {execution_id} did not settle after cancellation"
-                )
-            if thread_authority is not None:
-                thread_authority.clear()
+                if registration is not None and not registration.wait(self._handler_start_timeout()):
+                    raise RuntimeError(
+                        f"process registration for {execution_id} did not settle after cancellation"
+                    )
+                if thread_authority is not None:
+                    thread_authority.clear()
+            finally:
+                # Neither independent telemetry nor its writer admission may
+                # postpone local revocation. Preserve the original phase times.
+                for stage, evidence, captured_at in pending_evidence:
+                    record(stage, evidence, captured_at)
+                pending_evidence.clear()
             if thread_authority is not None:
                 local_state, local_code = "not_applicable", "thread_authority_is_not_thread_termination"
             elif getattr(registration, "cleanup_confirmed", False):
@@ -1529,18 +1585,18 @@ class InProcessRuntime:
             return max(started_at, self.kernel._wall_time())
 
     def _settle_outcome(self, snapshot, lease: ExecutionLease,
-                        outcome: dict[str, Any]):
+                        outcome: dict[str, Any], admission: SettlementAdmission):
         key = (lease.execution_id, lease.attempt, lease.fence)
         with self._settlement_inflight_lock:
             self._settlement_inflight.add(key)
         try:
-            return self._settle_outcome_active(snapshot, lease, outcome)
+            return self._settle_outcome_active(snapshot, lease, outcome, admission)
         finally:
             with self._settlement_inflight_lock:
                 self._settlement_inflight.discard(key)
 
     def _settle_outcome_active(self, snapshot, lease: ExecutionLease,
-                               outcome: dict[str, Any]):
+                               outcome: dict[str, Any], admission: SettlementAdmission):
         """Retain the original result before a bounded Kernel completion CAS."""
         command = snapshot.command
         if outcome.get("kind") == "authority_revoked":
@@ -1565,14 +1621,23 @@ class InProcessRuntime:
             "completion_time_unknown" if outcome.get("completion_time_known") is False else None)
         deferred = deferred_kind is not None
         result = None if deferred else self._outcome_result(command, lease, snapshot.started_at, outcome)
+        if deferred:
+            payload = {"kind": deferred_kind, "outcome": outcome}
+            journal_payload: dict[str, Any] | ExecutionResultV2 = payload
+        else:
+            assert result is not None
+            payload = result.to_dict()
+            journal_payload = result
+        evidence = {"telemetry_flush": outcome.get("telemetry_flush"), "outcome_kind": outcome.get("kind")}
+        retained_key = self._pending_settlements.retain(admission, lease, payload, evidence)
         record = None
         if self._settlement_journal is not None:
             try:
                 record = self._settlement_journal.record(lease,
-                    {"kind": deferred_kind, "outcome": outcome} if deferred else result,
-                    evidence={"telemetry_flush": outcome.get("telemetry_flush"),
-                              "outcome_kind": outcome.get("kind")},
+                    journal_payload,
+                    evidence=evidence,
                     timeout_seconds=.1)
+                self._pending_settlements.persisted(retained_key)
             except Exception as exc:
                 self._settlement_error = f"{type(exc).__name__}: {exc}"
         if not self._lifecycle_lock.acquire(timeout=.1):
@@ -1626,6 +1691,9 @@ class InProcessRuntime:
                          "result_id": result.result_id}, timeout_seconds=.1)
                 except Exception as exc:
                     self._settlement_error = f"{type(exc).__name__}: {exc}"
+            elif completed.result is not None and completed.result.result_id == result.result_id:
+                # The authoritative Kernel itself durably owns the exact result.
+                self._pending_settlements.persisted(retained_key)
             self._activity_phase(lease, "result_recorded", state=completed.state,
                 result_id=result.result_id, source="kernel_complete")
             return completed
@@ -1635,18 +1703,25 @@ class InProcessRuntime:
     def run_once(self, *, execution_id: str | None = None):
         self._start_services()
         self.recover_completions(timeout_seconds=.25)
+        admission = self._pending_settlements.acquire()
+        if admission is None:
+            # Bound both active calls and outcomes waiting for persistence;
+            # leave additional work queued until a reservation is released.
+            return None
         with self._lifecycle_condition:
             if self._closed:
+                self._pending_settlements.finish(admission)
                 return None
             self._active_runs += 1
         try:
-            return self._run_once_active(execution_id=execution_id)
+            return self._run_once_active(execution_id=execution_id, admission=admission)
         finally:
+            self._pending_settlements.finish(admission)
             with self._lifecycle_condition:
                 self._active_runs -= 1
                 self._lifecycle_condition.notify_all()
 
-    def _run_once_active(self, *, execution_id: str | None = None):
+    def _run_once_active(self, *, execution_id: str | None = None, admission: SettlementAdmission):
         self._assert_registry_current()
         limits = None if execution_id is None else self.kernel.get_execution_limits(execution_id)
         targeted_child = limits is not None and limits.get("parent_execution_id") is not None
@@ -1717,7 +1792,7 @@ class InProcessRuntime:
                     "kind": outcome.get("kind"), "code": outcome.get("code"),
                     "details": outcome.get("details"), "telemetry_flush": flush,
                     "telemetry_incomplete": isinstance(flush, dict) and flush.get("state") != "confirmed"})
-                return self._settle_outcome(snapshot, running_lease, outcome)
+                return self._settle_outcome(snapshot, running_lease, outcome, admission)
             finally:
                 if process_execution_started:
                     # Native invocation has already completed containment.

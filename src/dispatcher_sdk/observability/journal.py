@@ -273,14 +273,28 @@ class ObservationJournal:
         budget = budget or InspectionBudget(positive(timeout, "timeout"), None)
         budget.check()
         connection = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True,
-                                     timeout=min(timeout, self.options.write_timeout))
+                                     timeout=min(timeout, budget.sqlite_timeout_seconds))
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA trusted_schema=OFF")
             budget.install(connection)
             connection.execute("BEGIN")
-            self._validate_binding(connection)
+            while True:
+                budget.check()
+                connection.execute(f"PRAGMA busy_timeout={max(1, int(budget.sqlite_timeout_seconds * 1000))}")
+                try:
+                    self._validate_binding(connection)
+                    break
+                except sqlite3.OperationalError as error:
+                    code = getattr(error, "sqlite_errorcode", None)
+                    contention = (code & 255 in (5, 6) if type(code) is int else str(error).lower() in {
+                        "database is locked", "database table is locked", "database schema is locked"})
+                    if not contention:
+                        raise
+                    budget.check()
+                    time.sleep(min(.01, budget.sqlite_timeout_seconds))
+            budget.check()
             yield connection, budget
         finally:
             connection.close()

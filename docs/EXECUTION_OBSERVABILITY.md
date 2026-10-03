@@ -115,6 +115,10 @@ The SDK retries short SQLite writer conflicts within the captured child-call
 window. It retains the same request, child identity and deadline; applications
 do not need a retry loop. A committed child result survives a failed response
 write, and recovery reconciles that result without invoking the handler again.
+If publication still lags when the call window ends, one bounded authoritative
+read can return a result already completed within that original window. It
+checks the parent authority and child binding; late results and unknown clocks
+do not qualify. This does not acknowledge or release the pending publication.
 Stricter observed clock checkpoints survive rollback through the request or an
 independent receipt. Incomplete checkpoint history remains unknown.
 
@@ -188,9 +192,11 @@ stale. A PID alone, an inaccessible namespace or an unregistered external child
 does not prove current liveness or exit. A process exit does not by itself prove
 that all descendants were cleaned up. Exit 137 is not sufficient evidence of OOM.
 
-After a real handler returns, the runtime retains its original result in an
-independent, full-sync settlement journal before attempting bounded Kernel
-completion. If the Kernel writer is busy, `run_once` may return the existing
+After a real handler returns, the runtime retains its immutable original result
+and attempts an independent, full-sync settlement receipt before bounded Kernel
+completion. Admission reserves one of 64 local outcome slots before claiming
+work; additional executions remain queued while all slots are occupied. If the
+Kernel writer is busy, `run_once` may return the existing
 `running` snapshot. `observe` then exposes `settlement_obligations`; a pending
 receipt proves retention, not terminal acceptance. SDK maintenance retries the
 same result during operation and after reopening. `recover_completions` can also
@@ -199,11 +205,23 @@ reaper or newer attempt that already won remains authoritative; the original
 receipt is retained as superseded. In-memory storage and unavailable receipt
 storage expose unknown retention rather than claiming durability.
 
+If both receipt persistence and Kernel completion are unavailable, the reserved
+slot keeps the exact original outcome for maintenance. `observe` exposes it as
+`local_settlement_obligations` and marks the report incomplete. These local facts
+are not durable across host death. `close` attempts a bounded receipt drain and
+raises if it cannot persist them. Retrying `close` after storage recovers writes
+the original receipts without reopening business; a fresh Runtime restores
+them through the existing fenced settlement path.
+
 `observe` also returns bounded `diagnostics` pages from this independent store.
 Cancellation stages, the actual handler outcome and the driver close receipt
 remain visible when the activity writer is locked. Lost details or an
 unconfirmed final flush make the observation incomplete even after the execution
 becomes terminal. Settlement updates retain the original diagnostic evidence.
+Cancellation retains the original requested/revoked timestamps but writes
+optional diagnostics after local revocation, so writer pressure cannot delay
+process termination. Read admission uses the caller's remaining query budget;
+exhaustion does not become an empty successful notification page.
 
 For adapters with a finite control deadline, open a public
 `SQLiteKernel(path, control_timeout_seconds=.1)`. This caps connection setup and

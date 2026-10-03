@@ -575,7 +575,78 @@ class HandlerChildren:
 
     def _await(self, row: Mapping[str, Any]) -> dict[str, Any]:
         window = _RetryWindow(BudgetEnvelope.from_dict(json.loads(row["budget_json"])), self.kernel)
-        self.store.attach(row, window)
+        try:
+            self.store.attach(row, window)
+            return self._await_window(row, window)
+        except Exception as exc:
+            wait_expired = isinstance(exc, ChildExecutionError) and exc.code == "child_wait_timeout"
+            if not wait_expired and _transient_control_error(exc):
+                # A busy read can be the last error retained by _retry when
+                # the same trusted original window expires. Do not treat
+                # contention during a live window as completed delivery.
+                wait_expired = window.remaining() <= 0
+            if not wait_expired:
+                raise
+            completed = self._completed_result(row, window)
+            if completed is None:
+                raise
+            # The durable request remains the service's publication obligation.
+            # Reading a proved result neither acknowledges that write nor
+            # releases an unresolved child reservation.
+            return self._result(completed)
+
+    def _completed_result(self, row: Mapping[str, Any], window: _RetryWindow) -> dict[str, Any] | None:
+        """Read an already committed result once after diagnostic delivery lag."""
+        sample = sample_clock(wall_time=self.kernel._wall_time())
+        views = [envelope.view(sample=sample) for envelope in (
+            BudgetEnvelope.from_dict(json.loads(row["budget_json"])), window.envelope)]
+        if any(view.clock_status != "trusted" for view in views):
+            raise BudgetClockUnknownError("child result delivery clock continuity cannot be established")
+        cutoffs = [deadline for view in views for deadline in (
+            view.effective_work_deadline_at, view.effective_hard_deadline_at) if deadline is not None]
+        if not cutoffs or (row["parent_execution_id"], row["parent_attempt"], row["parent_fence"]) != (
+                self.command.execution_id, self.parent_lease.attempt, self.parent_lease.fence):
+            return None
+        checking_parent = True
+        try:
+            lock = getattr(self.kernel, "_control_lock", None)
+            with lock(.1) if lock is not None else nullcontext():
+                self.kernel.verify(self.parent_lease)
+                checking_parent = False
+                snapshot = self.kernel.get(row["child_execution_id"])
+                if snapshot.state not in _TERMINAL or snapshot.result is None:
+                    return None
+                result = snapshot.result
+                if (result.execution_id, result.attempt, result.fence) != (
+                        row["child_execution_id"], snapshot.attempt, snapshot.fence):
+                    return None
+                if not math.isfinite(result.completed_at) or result.completed_at > min(cutoffs):
+                    return None
+                if row["action"] in {"run", "adopt"}:
+                    limits = self.kernel.get_execution_limits(row["child_execution_id"])
+                    if limits is None or (limits.get("parent_execution_id"), limits.get("parent_attempt"),
+                                          limits.get("parent_fence")) != (
+                            self.command.execution_id, self.parent_lease.attempt, self.parent_lease.fence):
+                        return None
+                # A cancellation concurrent with the child read must win.
+                # This shares the same admission deadline, not another wait.
+                checking_parent = True
+                self.kernel.verify(self.parent_lease)
+                return result.to_dict()
+        except (StaleFenceError, InvalidStateTransitionError) as exc:
+            raise ChildExecutionError("parent_authority_revoked", str(exc),
+                                      execution_id=self.command.execution_id) from exc
+        except ExecutionNotFoundError as exc:
+            if checking_parent:
+                raise ChildExecutionError("parent_authority_revoked", str(exc),
+                                          execution_id=self.command.execution_id) from exc
+            return None
+        except Exception as exc:
+            if _transient_control_error(exc):
+                return None
+            raise
+
+    def _await_window(self, row: Mapping[str, Any], window: _RetryWindow) -> dict[str, Any]:
         while True:
             self._active(window)
             current = _retry(window, lambda: self.store.request(self.command.execution_id, row["request_id"]), store=self.store)
