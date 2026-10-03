@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import os
 import tempfile
 import time
@@ -48,7 +49,28 @@ class RuntimeObservationIntegrationTests(unittest.TestCase):
                 result = runtime.run_once()
                 self.assertEqual(result.state, 'succeeded', result.result.to_dict())
                 self.assertLess(time.monotonic() - before, 5)
-                observation = runtime.observation_journal.inspect('parent')
+                # Business result delivery and durable wait publication are
+                # separate. Allow SDK maintenance to finish within this same
+                # original five-second caller bound; never rerun the handler.
+                observation = runtime.observation_journal.inspect('parent', timeout=.1)
+                first_observation = observation
+                end = before + 5
+                while not observation.get('child_waits') or any(
+                        wait['state'] == 'open' for wait in observation['child_waits']):
+                    remaining = end - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(.01, remaining))
+                    remaining = end - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    observation = runtime.observation_journal.inspect('parent', timeout=min(.1, remaining))
+                if first_observation != observation:
+                    evidence = Path(tempfile.mkdtemp(prefix='sdk-runtime-child-publication-')) / 'evidence.json'
+                    evidence.write_text(json.dumps({'mode': mode, 'failed_child': fail,
+                        'result': result.to_dict(), 'first_observation': first_observation,
+                        'final_observation': observation, 'caller_elapsed': time.monotonic() - before}, indent=2))
+                    print('runtime_child_publication_evidence=' + str(evidence), flush=True)
                 self.assertEqual(observation['identity']['execution_id'], 'parent')
                 self.assertTrue(observation['child_waits'])
                 self.assertTrue(all(wait['state'] != 'open' for wait in observation['child_waits']))

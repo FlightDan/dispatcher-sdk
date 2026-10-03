@@ -960,6 +960,26 @@ class SQLiteKernel(
                 revision=running_revision,
             )
 
+    def _verify_active_lease_readonly(self, lease: ExecutionLease) -> ExecutionSnapshot:
+        """Inspect delivery authority without advancing the durable clock.
+
+        Each call reads fresh autocommit state and inherits any enclosing
+        control deadline. Business authorization continues to use ``verify``.
+        """
+        with self._control_lock(None):
+            if self._connection.in_transaction:
+                raise StorageIsolationError("readonly lease inspection requires autocommit")
+            clock = self._connection.execute(
+                "SELECT watermark FROM kernel_clock WHERE singleton = 1"
+            ).fetchone()
+            if clock is None:
+                raise RuntimeError("kernel logical clock row is missing")
+            timestamp = max(self._wall_time(), self._number(
+                clock["watermark"], "clock watermark", minimum=0.0))
+            row = self._assert_lease(self._connection, lease, timestamp=timestamp,
+                                     states={"leased", "running"})
+            return self._snapshot(row)
+
     def verify(self, lease: ExecutionLease) -> ExecutionSnapshot:
         with self._transaction() as (connection, timestamp):
             row = self._assert_lease(

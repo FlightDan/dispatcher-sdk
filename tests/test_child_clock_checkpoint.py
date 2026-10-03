@@ -168,7 +168,9 @@ class ChildClockCheckpointTests(unittest.TestCase):
         self.wall[0] = baseline
         last = self.facts.note(identity, "child_budget_checkpoint",
             {"wait_id": row["wait_id"], "budget_envelope": checkpoint.to_dict()})
-        page = self.facts.inspect_notes(row["child_execution_id"])
+        # This establishes pagination, independently of the attachment's
+        # strict per-attempt inspection budget and original work cutoff.
+        page = self.facts.inspect_notes(row["child_execution_id"], timeout_seconds=1)
         self.assertTrue(page["complete"])
         self.assertTrue(page["has_more"])
         self.assertNotIn(last["note_id"], [note["note_id"] for note in page["notes"]])

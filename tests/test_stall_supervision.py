@@ -317,6 +317,12 @@ class StallSupervisionTests(unittest.TestCase):
         self.assertEqual(len(self.service.outbox()), 1)
 
     def test_collection_gap_breaks_window_but_history_does_not_prevent_recovery(self):
+        self.recorder.close()
+        self.recorder = ActivityRecorder(self.journal, self.identity, source_id="before-gap",
+                                        source_scope="handler", clock=self.clock,
+                                        monotonic=lambda: self.clock.elapsed)
+        self.recorder.enable_stream("stdout")
+        self.recorder.flush()
         self.watch(StallPolicy("policy", sample_interval=2, consecutive_windows=1))
         self.service.tick()
         self.recorder.phase("phase", details={"too_large": "x" * 10000})
@@ -325,7 +331,21 @@ class StallSupervisionTests(unittest.TestCase):
         self.assertEqual(self.policy_row()["consecutive"], 0)
         self.service.tick()
         self.advance()
+        self.assertEqual(self.service.outbox(), ())
+        # A successful flush cannot restore missing wait coverage. A new
+        # declared collector starts fresh continuity and preserves the gap
+        # as retired history, rather than silently clearing that history.
+        self.recorder.close()
+        self.recorder = ActivityRecorder(self.journal, self.identity, source_id="after-gap",
+                                        source_scope="handler", clock=self.clock,
+                                        monotonic=lambda: self.clock.elapsed)
+        self.recorder.enable_stream("stdout")
+        self.recorder.flush()
+        self.service.tick()
+        self.advance()
         self.assertEqual(len(self.service.outbox()), 1)
+        report = self.journal.inspect("execution")
+        self.assertTrue(any(source["source_id"] == "before-gap" for source in report["retired_sources"]))
 
     def test_restart_does_not_retroactively_count_shutdown_windows(self):
         self.watch()

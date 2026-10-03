@@ -2,9 +2,9 @@
 
 This index tracks [T01–T09 and A01–A18](EXECUTION_OBSERVABILITY_GOAL.md).
 The implementation is not yet fully accepted. Focused checks have passed on
-Linux x86_64. Installed candidate `a8403c3` passed three original public-example
-runs and a real native SSE witness, but failed the complete regression.
-Its corrective source changes still need a fresh frozen installed candidate,
+Linux x86_64. Installed candidate `269f143` completed a real two-turn production
+supervisor and native SSE summary, but failed the complete regression.
+The corrective source changes still need a fresh frozen installed candidate,
 complete regression, native Windows matrix and remaining live ModPort handoff.
 No release is authorized by this work.
 
@@ -52,10 +52,10 @@ links or substitutes for the candidate CI artifacts.
 | A12 Conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; separate capacity keeps local deadlines working. Candidate matrix pending. |
 | A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Latest candidate regression pending. |
 | A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; separately installed historical `v0.7.0.dev0` writer | Actual old installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Full public API and pending-obligation upgrade regression pending. |
-| A15 Installed entry | Isolated wheel consumer suite and portable public example | `a8403c3` clean-wheel import and three original parent12/child5/wait15 example runs passed. Its complete installed consumer suite failed; corrective candidate validation remains required. |
-| A16 Current ModPort | Current SDKHandler/budget/raw stream adapters; staged actual reviewer → stdio MCP → host schedule → SDK child → host response witness | Ten staged tests passed with the installed `a8403c3` SDK. Genuine native SSE completed with raw SDK stream metrics. Production supervisor emitted two real model requests but returned business `agent_timeout`, so normal completion remains unverified. Remaining live rework files await cross-project approval. No Minecraft Run was launched. |
+| A15 Installed entry | Isolated wheel consumer suite and portable public example | `269f143` clean-wheel import and original parent12/child5/wait15 example passed. Its complete installed consumer suite failed; corrective candidate validation remains required. |
+| A16 Current ModPort | Current SDKHandler/budget/raw stream adapters; staged actual reviewer → stdio MCP → host schedule → SDK child → host response witness | Installed `269f143` completed the production supervisor's two real model requests with a validated successful business decision and a genuine native SSE summary. The staged handoff then exposed lost resource waits; the SDK correction is independently reviewed but needs installed replay. Remaining live rework files await cross-project approval. No Minecraft Run was launched. |
 | A17 Native Windows | `test_windows_runtime`, portable native observability/deadline/pressure suites | Linux mocks are not native acceptance. Windows x64/ARM64 jobs and raw Job evidence pending. Linux-only cgroup cases do not apply to Windows. |
-| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `a8403c3` outer run of 844 tests had 3 failures and 16 skips; nested installed run of 839 tests had 3 errors and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
+| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `269f143` outer run of 857 tests had 2 failures and 16 skips; nested installed run of 852 tests had 1 failure and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
 
 ## Current raw host evidence
 
@@ -81,6 +81,15 @@ links or substitutes for the candidate CI artifacts.
 | Real dual-store contention, receipt-only retry close, and readonly admission passed 4 in 10.073s | `/tmp/sdk-double-settlement-read-final.log`; original outcome artifacts printed in that log |
 | Cancellation under a locked diagnostic writer plus existing receipts passed 19 in 34.967s | `/tmp/sdk-cancel-order-public-regression.log`; `/tmp/sdk-cancel-telemetry-order-jizf77lp/evidence.json` |
 | Child result delivery under Kernel contention passed eight checks and one final native witness | `/tmp/sdk-child-completed-delivery-writer-final.log`; `/tmp/sdk-child-completed-delivery-writer-proof.log`; `/tmp/sdk-child-delivery-writer-cutoff-eq4mgwoe/evidence.json` |
+| Frozen `269f143` complete source and installed regressions failed | `/tmp/sdk-observability-full-regression-final6.log`; `/tmp/sdk-child-delivery-writer-cutoff-h4hyjjxv/evidence.json` |
+| Installed `269f143` completed production supervisor and native SSE summary | `/tmp/modport-a16-4rqy492p/completion.json`; `/tmp/modport-a16-provider-partial-final6.json`; `/tmp/modport-a16-installed-import-preflight-final6.json` |
+| Original one-second retry-classification fixture genuinely exhausted its original window | `/tmp/sdk-final6-retry-classification-evidence.json`; `/tmp/sdk-final6-retry-classification-probe.log` |
+| Corrective wait, attachment, journal and supervision checks passed 65 in 47.338s | `/tmp/sdk-wait-attachment-integrated.log`; context attachment JSON paths printed in the log |
+| Corrective readonly proof and native child delivery checks passed 13 in 20.340s | `/tmp/sdk-child-completion-readonly-delivery.log`; `/tmp/sdk-child-delivery-writer-cutoff-ilgtye5o/evidence.json` |
+| Final child receipt, clock, readonly delivery and runtime checks passed 33 in 42.237s | `/tmp/sdk-child-corrections-final7.log`; `/tmp/sdk-child-delivery-writer-cutoff-kvfvpywd/evidence.json` |
+| Expired receipt inspection and native revoked-parent recovery passed 14 in 18.210s | `/tmp/sdk-child-receipt-revoked-native.log`; `/tmp/sdk-observability-native-u5uuwwwd/recovered-registration.json` |
+| Final native startup, restart, deadlines, cancellation, bounded pressure and runtime checks passed 15 in 78.598s | `/tmp/sdk-corrections-native-final7.log`; native artifact paths printed in the log |
+| Final five public typing fixtures passed | `/tmp/sdk-observability-types-final7-frozen.log` |
 
 These focused results precede the final candidate freeze. Final installed and
 CI results will supersede them for acceptance while preserving failure history.
@@ -124,6 +133,33 @@ After correcting the harness, native SSE reported one model request, 106 events,
 completed in 43.040s; execution exhausted its remaining 34.711s while retaining
 the production settlement reserve. Its SDK `succeeded` state records successful
 return of a failed business result and does not establish A16 completion.
+
+The later fresh 180-second temporary Run completed both formal supervisor turns
+and the native summary under its unchanged original deadline and seven claims.
+It used the installed `269f143` SDK and current production handlers. The supervisor
+reported two requests, ten model events, two text events and 1,909 stdout bytes;
+the summary reported one request, 98 events, 88 text events and 35,434 stdout bytes.
+This is genuine normal-provider evidence, but it does not cover the remaining
+live rework, cancellation or recovery requirements.
+
+The `269f143` full regression retained two failures: one source child result
+delivery proof and one nested installed retry-classification check. Receipt
+inspection had classified a bounded SQLite read timeout as unknown clock
+continuity. The correction retries only typed transient inspection failure inside
+the unchanged call window and forbids delivery if stronger clock facts remain
+unread. Independent traces also showed a write-based parent verification spending
+0.111s of a 0.1s proof allowance; the final proof checks are read-only and retain
+the same allowance, cancellation recheck and logical clock floor. The classification
+fixture now specifies five seconds for both attempts after the raw installed trace
+proved its original one-second cutoff had expired; the SDK never resets that cutoff.
+
+The staged ModPort test exposed missing memory/workspace waits with a misleading
+complete report. Wait endpoints now use bounded replay with their original
+timestamps. Retained loss makes supervision unknown; closed collector waits cannot
+exempt it. An independent real contention probe also exposed missing child
+capability after optional recorder admission failed. Workers now attach the host's
+existing sidecar without constructor I/O and validate it before the first bounded
+operation, retaining child availability without recreating missing storage.
 
 ## Review and limits
 

@@ -222,8 +222,9 @@ class HandlerContext:
             if not spec.get("journal_path"):
                 return
             options = ObservationOptions(**spec.get("options", {}))
-            self._journal = ObservationJournal(spec["journal_path"], kernel_path=self._kernel.db_path,
-                source_id=spec["source_id"], options=options)
+            self._journal = ObservationJournal._open_existing_writer(
+                spec["journal_path"], kernel_path=self._kernel.db_path,
+                source_id=spec["source_id"], options=options, clock=self._kernel._wall_time)
             identity = ObservationIdentity(self.command.execution_id, self.lease.attempt, self.lease.fence,
                 run_id=spec.get("run_id"), task_id=spec.get("task_id"), generation=spec.get("generation", 0),
                 task_attempt=spec.get("task_attempt"))

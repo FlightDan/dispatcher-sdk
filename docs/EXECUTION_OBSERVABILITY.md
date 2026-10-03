@@ -120,7 +120,10 @@ read can return a result already completed within that original window. It
 checks the parent authority and child binding; late results and unknown clocks
 do not qualify. This does not acknowledge or release the pending publication.
 Stricter observed clock checkpoints survive rollback through the request or an
-independent receipt. Incomplete checkpoint history remains unknown.
+independent receipt. Incomplete checkpoint history remains unknown. A transient
+receipt-read timeout retries inside the same original call window; unread
+checkpoint facts cannot be bypassed by the completed-result read. That proof
+uses read-only lease checks and leaves the durable logical clock unchanged.
 
 An adapter can report resource or external-service waits without changing
 deadlines:
@@ -131,6 +134,10 @@ with context.activity.wait("provider_response", target="provider"):
 ```
 
 Only report memory and other resource amounts that the adapter actually knows.
+Wait entry captures bounded IDs and timestamps without waiting for SQLite. A
+returned `captured` receipt has `persisted=False`; the SDK flusher persists and
+replays both endpoints. Lost wait facts and persistence errors retain coverage
+gaps and bounded raw diagnostics, including after unrelated successful flushes.
 
 ## Enable and recover optional stall notifications
 
@@ -150,6 +157,11 @@ fresh windows count. Sampling gaps, collector replacement and unknown metrics
 break the consecutive streak and preserve the historical windows. Wait exemptions
 pause counting without extending any deadline. Confirmed new progress ends the
 current episode; later stagnation creates a new episode.
+An active collector with retained coverage gaps remains unknown. A successful
+counter flush does not prove that missing wait facts were recovered; a new
+declared collector starts fresh continuity while preserving retired history.
+An open diagnostic wait can exempt sampling only while its owning collector is
+active and observed. Closed or replaced collectors cannot revive old exemptions.
 
 Each episode has a stable notification ID. The observation outbox, orchestration
 delivery and application inbox have separately visible phases and revisions.

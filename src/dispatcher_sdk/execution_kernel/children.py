@@ -60,7 +60,7 @@ def _transient_control_error(error: Exception) -> bool:
                 or (code is None and str(error).lower() in ("database is locked", "database table is locked")))
     return isinstance(error, TimeoutError) and str(error) in (
         "Kernel control lock admission timed out", "Kernel control admission budget elapsed",
-        "child lifecycle admission timed out")
+        "child lifecycle admission timed out", "observation schema admission budget elapsed")
 
 
 def _merge_checkpoint(envelope, checkpoint):
@@ -224,7 +224,7 @@ class _Store:
         self._floors = {}
         self._floor_lock = threading.Lock()
 
-    def _facts(self, *, writer=False):
+    def _facts(self, *, writer=False, timeout_seconds=.1):
         kernel_path = getattr(self.journal, "kernel_path", None)
         if kernel_path is None:
             return None
@@ -238,26 +238,80 @@ class _Store:
             # failed forward-checkpoint write still fails explicitly above.
             return None
         factory = SettlementJournal if writer else SettlementJournal.open_readonly
-        return factory(path, source_id=self.source_id, kernel_path=kernel_path, timeout_seconds=.1)
+        return factory(path, source_id=self.source_id, kernel_path=kernel_path,
+                       timeout_seconds=timeout_seconds)
 
     def attach(self, row, window):
         """Carry stronger observed clocks through publication and reclamation."""
+        from .settlement import SettlementBusyError
+
+        def inspect_parent(timeout):
+            lease_json = row.get("parent_lease_json")
+            if lease_json is None:
+                return
+            lease = ExecutionLease.from_dict(json.loads(lease_json))
+            try:
+                lock = getattr(window.kernel, "_control_lock", None)
+                with lock(timeout) if lock is not None else nullcontext():
+                    window.kernel._verify_active_lease_readonly(lease)
+            except (StaleFenceError, InvalidStateTransitionError, ExecutionNotFoundError) as exc:
+                raise ChildExecutionError("parent_authority_revoked", str(exc),
+                                          execution_id=lease.execution_id) from exc
+
         try:
-            facts = self._facts()
-            if facts is not None:
-                report = facts.inspect_notes(row["child_execution_id"], limit=50,
-                                             max_bytes=256*1024, timeout_seconds=.1)
-                if not report["complete"] or report.get("has_more"):
-                    raise BudgetClockUnknownError("child budget checkpoint inspection is incomplete")
+            while True:
+                try:
+                    remaining = window.remaining()
+                    if remaining <= 0:
+                        raise SettlementBusyError("child checkpoint inspection exhausted its original window")
+                    deadline = time.monotonic() + min(.1, remaining)
+                    facts = self._facts(timeout_seconds=min(.1, remaining))
+                    if facts is None:
+                        report = None
+                        break
+                    duration = min(window.remaining(), deadline - time.monotonic())
+                    if duration <= 0:
+                        raise SettlementBusyError("child checkpoint inspection admission budget elapsed")
+                    report = facts.inspect_notes(row["child_execution_id"], limit=50,
+                                                 max_bytes=256*1024, timeout_seconds=duration)
+                    truncated = report.get("truncated") or any(note.get("truncated") for note in report["notes"])
+                    if (report.get("timed_out") and not truncated and
+                            report.get("unknown_reason") == "settlement_notes_inspection_timeout"):
+                        raise SettlementBusyError(report.get("error") or "child checkpoint inspection timed out")
+                    if not report["complete"] or report.get("has_more") or truncated:
+                        raise BudgetClockUnknownError("child budget checkpoint inspection is incomplete")
+                    break
+                except SettlementBusyError:
+                    remaining = window.remaining()
+                    # A spent business window still permits one bounded
+                    # observation of known revocation. This never admits a
+                    # receipt read, result rescue, or new child work.
+                    try:
+                        inspect_parent(min(.1, remaining) if remaining > 0 else .1)
+                    except Exception as exc:
+                        if remaining <= 0 or not _transient_control_error(exc):
+                            raise
+                    remaining = window.remaining()
+                    if remaining <= 0:
+                        raise
+                    if window.stop is None:
+                        time.sleep(min(.01, remaining))
+                    else:
+                        window.stop.wait(min(.01, remaining))
+            if report is not None:
                 for note in report["notes"]:
-                    if note["phase"] == "child_budget_checkpoint" and note["evidence"].get("wait_id") == row["wait_id"]:
-                        checkpoint = BudgetEnvelope.from_dict(note["evidence"]["budget_envelope"]).checkpoint
-                        window.envelope = _merge_checkpoint(window.envelope, checkpoint)
+                    if note["phase"] == "child_budget_checkpoint":
+                        evidence = note["evidence"]
+                        if not isinstance(evidence, dict) or not isinstance(evidence.get("wait_id"), str) or not evidence["wait_id"]:
+                            raise BudgetClockUnknownError("child budget checkpoint required facts are missing")
+                        if evidence["wait_id"] == row["wait_id"]:
+                            checkpoint = BudgetEnvelope.from_dict(evidence["budget_envelope"]).checkpoint
+                            window.envelope = _merge_checkpoint(window.envelope, checkpoint)
             with self._floor_lock:
                 floor = self._floors.get(row["wait_id"])
             if floor is not None:
                 window.envelope = _merge_checkpoint(window.envelope, floor.checkpoint)
-        except BudgetClockUnknownError:
+        except (BudgetClockUnknownError, SettlementBusyError, ChildExecutionError):
             raise
         except Exception as exc:
             raise BudgetClockUnknownError(f"child budget checkpoint unavailable: {type(exc).__name__}: {exc}") from exc
@@ -575,10 +629,16 @@ class HandlerChildren:
 
     def _await(self, row: Mapping[str, Any]) -> dict[str, Any]:
         window = _RetryWindow(BudgetEnvelope.from_dict(json.loads(row["budget_json"])), self.kernel)
+        attached = False
         try:
             self.store.attach(row, window)
+            attached = True
             return self._await_window(row, window)
         except Exception as exc:
+            if not attached:
+                # An unread floor may be stronger than the original request.
+                # Result delivery cannot bypass unresolved checkpoint facts.
+                raise
             wait_expired = isinstance(exc, ChildExecutionError) and exc.code == "child_wait_timeout"
             if not wait_expired and _transient_control_error(exc):
                 # A busy read can be the last error retained by _retry when
@@ -611,7 +671,7 @@ class HandlerChildren:
         try:
             lock = getattr(self.kernel, "_control_lock", None)
             with lock(.1) if lock is not None else nullcontext():
-                self.kernel.verify(self.parent_lease)
+                self.kernel._verify_active_lease_readonly(self.parent_lease)
                 checking_parent = False
                 snapshot = self.kernel.get(row["child_execution_id"])
                 if snapshot.state not in _TERMINAL or snapshot.result is None:
@@ -631,7 +691,7 @@ class HandlerChildren:
                 # A cancellation concurrent with the child read must win.
                 # This shares the same admission deadline, not another wait.
                 checking_parent = True
-                self.kernel.verify(self.parent_lease)
+                self.kernel._verify_active_lease_readonly(self.parent_lease)
                 return result.to_dict()
         except (StaleFenceError, InvalidStateTransitionError) as exc:
             raise ChildExecutionError("parent_authority_revoked", str(exc),

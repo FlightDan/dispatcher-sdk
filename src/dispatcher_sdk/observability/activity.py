@@ -45,6 +45,7 @@ class ActivityRecorder:
         self._clock = clock or time.time
         self._monotonic = monotonic or time.monotonic
         self._lock = threading.Lock()
+        self._wait_diagnostic_lock = threading.Lock()
         self._flush_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -57,6 +58,10 @@ class ActivityRecorder:
         self._gaps = 0
         self._dropped_events = 0
         self._last_error: str | None = None
+        self._wait_error: str | None = None
+        self._wait_error_at: float | None = None
+        self._wait_error_revision = 0
+        self._wait_error_persisted_revision = 0
         self._captured_at: float | None = None
         self._persisted_at: float | None = None
         self._collected_at: float | None = None
@@ -91,22 +96,52 @@ class ActivityRecorder:
         value["last_at"] = captured_at
         self._captured_at = captured_at
 
-    def _enqueue(self, kind: str, details: dict[str, Any], captured_at: float) -> None:
+    def _wait_failure(self, error: str, captured_at: float, *, gap: bool = True) -> None:
+        bounded_error = error.encode("utf-8")[:512].decode("utf-8", errors="ignore")
+        with self._wait_diagnostic_lock:
+            if gap:
+                self._gaps += 1
+            self._wait_error = bounded_error
+            self._wait_error_at = captured_at if math.isfinite(captured_at) else 0.0
+            self._wait_error_revision += 1
+
+    def _queue_wait(self, kind: str, original: dict[str, Any], captured_at: float) -> bool:
+        if self._closed:
+            self._wait_failure("wait recorder closed", captured_at)
+            return False
+        if not self._lock.acquire(blocking=False):
+            self._wait_failure("wait capture busy", captured_at)
+            return False
+        try:
+            if self._closed:
+                self._wait_failure("wait recorder closed", captured_at)
+                return False
+            return self._enqueue(kind, original, captured_at)
+        except Exception as error:
+            self._wait_failure(f"{type(error).__name__}: {error}", captured_at)
+            return False
+        finally:
+            self._lock.release()
+
+    def _enqueue(self, kind: str, details: dict[str, Any], captured_at: float) -> bool:
         event = {"kind": kind, "captured_at": captured_at, "details": details}
         encoded = _bounded_json(event, min(4096, self.options.queue_bytes, self.options.batch_bytes)).encode("utf-8")
         size = len(encoded)
         if size > min(4096, self.options.queue_bytes, self.options.batch_bytes):
             self._dropped_events += 1
             self._gaps += 1
-            return
+            return False
         while self._events and (len(self._events) >= self.options.queue_items or
                                 self._queue_bytes + size > self.options.queue_bytes):
-            _, removed = self._events.popleft()
+            dropped, removed = self._events.popleft()
             self._queue_bytes -= removed
             self._dropped_events += 1
             self._gaps += 1
+            if dropped["kind"] in ("wait_begin", "wait_end"):
+                self._wait_failure("wait observation dropped by bounded queue", captured_at, gap=False)
         self._events.append((event, size))
         self._queue_bytes += size
+        return True
 
     def _capture(self, metric: str, *, count: int = 1, kind: str | None = None,
                  details: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -201,27 +236,44 @@ class ActivityRecorder:
 
     def wait(self, reason: str, *, target: Any = None, deadline_at: float | None = None,
              resources: Mapping[str, Any] | None = None):
-        """Record a bounded diagnostic wait around an application-owned operation."""
+        """Queue original wait facts without depending on SQLite admission."""
         from contextlib import contextmanager
+        import json
 
         @contextmanager
         def waiting():
             wait_id = uuid.uuid4().hex
-            registered = False
+            started_at = 0.0
+            original = None
             try:
-                self.journal.record_wait(self.identity, wait_id, details={"reason": reason,
-                    "target": target, "deadline_at": deadline_at, "resources": dict(resources or {})})
-                registered = True
+                started_at = float(self._clock())
+                if not math.isfinite(started_at):
+                    raise ValueError("wait capture time must be finite")
+                value = {"wait_id": wait_id, "started_at": started_at,
+                    "wait": {"reason": reason, "target": target, "deadline_at": deadline_at,
+                             "resources": dict(resources or {})}}
+                # Snapshot and byte-bound caller-owned containers before
+                # either event enters the shared bounded telemetry queue.
+                candidate = json.loads(_bounded_json(value, min(3072, self.options.queue_bytes,
+                                                                self.options.batch_bytes)))
+                _bounded_json({**candidate["wait"], "_collector_source_id": self.source_id}, 4096)
+                original = candidate
+                captured = self._queue_wait("wait_begin", original, started_at)
             except Exception as error:
-                self._last_error = f"{type(error).__name__}: {error}"
+                self._wait_failure(f"{type(error).__name__}: {error}", started_at)
+                captured = False
             try:
-                yield {"wait_id": wait_id, "state": "persisted" if registered else "unknown"}
+                yield {"wait_id": wait_id, "state": "captured" if captured else "unknown",
+                       "persisted": False}
             finally:
-                if registered:
+                if original is not None:
                     try:
-                        self.journal.end_wait(self.identity, wait_id)
+                        ended_at = float(self._clock())
+                        if not math.isfinite(ended_at):
+                            raise ValueError("wait capture time must be finite")
+                        self._queue_wait("wait_end", original, ended_at)
                     except Exception as error:
-                        self._last_error = f"{type(error).__name__}: {error}"
+                        self._wait_failure(f"{type(error).__name__}: {error}", started_at)
         return waiting()
 
     def heartbeat(self) -> dict[str, Any]:
@@ -302,6 +354,16 @@ class ActivityRecorder:
             base_size = len(_json(metrics).encode("utf-8")) + sum((len(value) + 2) // 3 * 4 for value in tails.values()) + 256
             selected = []
             consumed_bytes = 0
+            with self._wait_diagnostic_lock:
+                gaps = self._gaps
+                wait_error_revision = self._wait_error_revision
+                diagnostic = {"kind": "wait_coverage", "captured_at": self._wait_error_at,
+                    "details": {"error": self._wait_error, "collection_gaps": self._gaps}}
+            if wait_error_revision > self._wait_error_persisted_revision:
+                diagnostic_size = len(_json(diagnostic).encode("utf-8"))
+                if base_size + diagnostic_size <= self.options.batch_bytes:
+                    selected.append(diagnostic)
+                    consumed_bytes += diagnostic_size
             for event, size in self._events:
                 if len(selected) >= self.options.batch_summaries or base_size + consumed_bytes + size > self.options.batch_bytes:
                     break
@@ -314,7 +376,7 @@ class ActivityRecorder:
                 each = tail_budget // max(1, len(tails))
                 tails = {name: value[-each:] if each else b"" for name, value in tails.items()}
         return {"sequence": sequence, "metrics": metrics, "tails": tails, "captured_at": captured_at,
-                "gaps": gaps, "selected": selected}
+                "gaps": gaps, "selected": selected, "wait_error_revision": wait_error_revision}
 
     @staticmethod
     def _transient_storage_error(error: Exception) -> bool:
@@ -350,6 +412,8 @@ class ActivityRecorder:
             except Exception as error:
                 with self._lock:
                     self._last_error = f"{type(error).__name__}: {error}"
+                    if any(event["kind"] in ("wait_begin", "wait_end") for event in selected):
+                        self._wait_failure(self._last_error, captured_at)
                 return {"state": "degraded", "reason": "persistence_failed", "error": self._last_error,
                         "retryable": self._transient_storage_error(error)}
             with self._lock:
@@ -366,6 +430,8 @@ class ActivityRecorder:
                 self._queue_bytes = retained_bytes
                 self._persisted_at = float(self._clock())
                 self._collected_at = captured_at
+                if any(event["kind"] == "wait_coverage" for event in selected):
+                    self._wait_error_persisted_revision = batch["wait_error_revision"]
                 self._last_error = None
             return {"state": "persisted", "sequence": sequence, "persisted_at": self._persisted_at}
         finally:
@@ -394,8 +460,9 @@ class ActivityRecorder:
                     "no_progress_seconds": max(0.0, self._monotonic() - origin),
                     "queued_items": len(self._events), "queued_bytes": self._queue_bytes,
                     "dropped_events": self._dropped_events, "collection_gaps": self._gaps,
-                    "complete": self._gaps == 0 and self._last_error is None,
-                    "error": self._last_error, "closed": self._closed}
+                    "complete": self._gaps == 0 and self._last_error is None and self._wait_error is None,
+                    "error": self._last_error or self._wait_error, "wait_error": self._wait_error,
+                    "closed": self._closed}
 
     def start(self) -> ActivityRecorder:
         with self._lock:
@@ -458,6 +525,12 @@ class ActivityRecorder:
                 result = {**self._flush(batch_holder), "final_flush_persisted": False, "source_closed": False}
                 if result["state"] == "persisted":
                     result["final_flush_persisted"] = True
+                    with self._lock:
+                        unfinished = bool(self._events) or self._wait_error_revision > self._wait_error_persisted_revision
+                    if unfinished:
+                        result.update(state="pending", reason="remaining_observations", final_flush_persisted=False)
+                        batch_holder.clear()
+                        continue
                     self._close_result = {**result, "state": "pending", "reason": "source_close_pending"}
                     break
                 if not result.get("retryable"):

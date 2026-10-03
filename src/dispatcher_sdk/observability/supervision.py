@@ -164,12 +164,28 @@ class StallSupervisor:
     def _observed(self, row, policy, status, report):
         if status["execution_state"] != "running" or (status["attempt"], status["fence"]) != (row["attempt"], row["fence"]):
             return None, "execution_identity_changed", None
-        if not report["current"] or report.get("truncated") or any(
+        if not report["current"] or report.get("truncated") or report.get("collection_gaps", 0) > 0 or any(
                 source.get("continuity") == "unknown" for source in report["sources"]):
             return None, "collection_unknown", None
         if not report["sources"]:
             return None, "collector_not_observed", None
-        for wait in (*report.get("waits", ()), *report.get("child_waits", ())):
+        sources = {source["source_id"]: source for source in report["sources"]}
+        for wait in report.get("waits", ()):
+            if wait["state"] != "waiting":
+                continue
+            details = wait.get("details", {})
+            reason = details.get("reason") or details.get("kind")
+            if reason is None or reason not in policy.wait_exemptions:
+                continue
+            owner = details.get("_collector_source_id")
+            if "_collector_source_id" in details and type(owner) is not str:
+                return None, "collection_unknown", None
+            relevant = (sources.get(owner),) if owner is not None else tuple(sources.values())
+            if any(source is None or source.get("state") != "active" or
+                   source.get("continuity") != "observed" for source in relevant):
+                return None, "collection_unknown", None
+            return None, "wait_exempt", reason
+        for wait in report.get("child_waits", ()):
             if wait["state"] not in ("waiting", "open"):
                 continue
             details = wait.get("details", {})

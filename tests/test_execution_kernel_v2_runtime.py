@@ -478,6 +478,11 @@ class RuntimeTests(unittest.TestCase):
                         stack.registry_revision,
                         handler_id="retry",
                         attempts=2,
+                        # This tests retry classification. Both attempts share
+                        # the original work cutoff, including control and
+                        # receipt work between them; deadline exhaustion has
+                        # dedicated budget tests.
+                        timeout=5,
                     )
                 )
                 self.assertEqual(stack.run_once().state, "queued")

@@ -165,7 +165,9 @@ class ObservationJournal:
 
     def __init__(self, path: str | Path, *, kernel_path: str | Path, source_id: str,
                  options: ObservationOptions | None = None, writer: bool = True,
-                 clock=None, durability: Durability = "full") -> None:
+                 clock=None, durability: Durability = "full", _existing_only: bool = False) -> None:
+        if type(_existing_only) is not bool or (_existing_only and not writer):
+            raise ValueError("existing writer attachment requires a writable journal")
         if str(path) == ":memory:" or str(kernel_path) == ":memory:":
             raise ValueError("observation storage requires durable file paths")
         self.path = Path(path).resolve()
@@ -177,6 +179,12 @@ class ObservationJournal:
         self.writer = writer
         self.clock = clock or time.time
         self.durability = validate_durability(durability)
+        self._schema_pending = _existing_only
+        if _existing_only:
+            # Runtime supplied an already initialized sidecar. Each first
+            # operation validates it inside that operation's original bound.
+            # Constructing a child capability must not need SQLite admission.
+            return
         if writer:
             self.initialize()
         else:
@@ -189,6 +197,24 @@ class ObservationJournal:
                       clock=None) -> ObservationJournal:
         return cls(path, kernel_path=kernel_path, source_id=source_id,
                    options=options, writer=False, clock=clock)
+
+    @classmethod
+    def _open_existing_writer(cls, path: str | Path, *, kernel_path: str | Path,
+                              source_id: str, options: ObservationOptions | None = None,
+                              clock=None, durability: Durability = "full") -> ObservationJournal:
+        """Attach Runtime's initialized sidecar without recreating or opening it."""
+        return cls(path, kernel_path=kernel_path, source_id=source_id, options=options,
+                   clock=clock, durability=durability, _existing_only=True)
+
+    def _validate_existing_writer(self, connection: sqlite3.Connection, *, deadline: float) -> None:
+        if not self._schema_pending:
+            return
+        self._validate(connection)
+        if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+            raise ObservationError("existing observation journal requires WAL mode")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("observation schema admission budget elapsed")
+        self._schema_pending = False
 
     def _validate(self, connection: sqlite3.Connection) -> None:
         self._validate_binding(connection)
@@ -257,6 +283,7 @@ class ObservationJournal:
             connection.execute(f"PRAGMA synchronous={2 if self.durability == 'full' else 1}")
             connection.execute("BEGIN IMMEDIATE")
             self._validate_binding(connection)
+            self._validate_existing_writer(connection, deadline=deadline)
             now = float(self.clock())
             if not math.isfinite(now):
                 raise ObservationError("observation wall clock is not finite")
@@ -295,6 +322,8 @@ class ObservationJournal:
                     budget.check()
                     time.sleep(min(.01, budget.sqlite_timeout_seconds))
             budget.check()
+            self._validate_existing_writer(connection, deadline=time.monotonic() + budget.sqlite_timeout_seconds)
+            budget.check()
             yield connection, budget
         finally:
             connection.close()
@@ -332,6 +361,24 @@ class ObservationJournal:
                                "ON CONFLICT(execution_id,attempt,fence,phase) DO UPDATE SET "
                                "captured_at=MAX(captured_at,excluded.captured_at),persisted_at=excluded.persisted_at,details=excluded.details",
                                (*_key(identity), phase, captured_at, now, encoded))
+        elif kind in ("wait_begin", "wait_end"):
+            wait_id = identifier(details["wait_id"], "wait_id")
+            started = details["started_at"]
+            if type(started) not in (int, float) or not math.isfinite(started):
+                raise ValueError("wait capture time must be finite")
+            wait_details = _bounded_json({**details["wait"], "_collector_source_id": source_id}, 4096)
+            old = connection.execute("SELECT started_at,details FROM obs_waits WHERE execution_id=? AND attempt=? AND fence=? AND wait_id=?",
+                                     (*_key(identity), wait_id)).fetchone()
+            if old is not None and (old["started_at"] != started or old["details"] != wait_details):
+                raise ObservationError("wait identity was replayed with different original facts")
+            ended = captured_at if kind == "wait_end" else None
+            connection.execute("INSERT INTO obs_waits VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(execution_id,attempt,fence,wait_id) DO NOTHING",
+                               (*_key(identity), wait_id, "ended" if ended is not None else "waiting",
+                                started, ended, wait_details, now))
+            if ended is not None:
+                connection.execute("UPDATE obs_waits SET state='ended',ended_at=CASE WHEN ended_at IS NULL THEN ? ELSE MAX(ended_at,?) END,persisted_at=? "
+                                   "WHERE execution_id=? AND attempt=? AND fence=? AND wait_id=?",
+                                   (ended, ended, now, *_key(identity), wait_id))
 
     def phase(self, identity: ObservationIdentity, phase: str, *, captured_at: float | None = None,
               details: Mapping[str, Any] | None = None, source_id: str = "runtime") -> None:
@@ -532,7 +579,9 @@ class ObservationJournal:
     def record_wait(self, identity: ObservationIdentity, wait_id: str, *, details: Mapping[str, Any],
                     started_at: float | None = None) -> None:
         identifier(wait_id, "wait_id")
-        encoded = _bounded_json(dict(details), 4096)
+        legacy_details = dict(details)
+        legacy_details.pop("_collector_source_id", None)
+        encoded = _bounded_json(legacy_details, 4096)
         with self._transaction() as (connection, now):
             connection.execute("INSERT OR IGNORE INTO obs_waits VALUES(?,?,?,?,'waiting',?,NULL,?,?)",
                                (*_key(identity), wait_id, now if started_at is None else started_at, encoded, now))
