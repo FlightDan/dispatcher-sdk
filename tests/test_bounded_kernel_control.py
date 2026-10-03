@@ -88,7 +88,8 @@ class BoundedKernelControlTests(unittest.TestCase):
                             with self.assertRaises(sqlite3.OperationalError) as caught:
                                 children.wait_for("missing-child", request_id="wait", timeout_seconds=1)
                             self.assertNotIsInstance(caught.exception, ChildExecutionError)
-                            self.assertLess(time.monotonic()-began, .25)
+                            self.assertGreater(time.monotonic()-began, .8)
+                            self.assertLess(time.monotonic()-began, 1.25)
                             writer.rollback()
                         self.assertEqual(bounded.verify(lease).lease, lease)
 

@@ -1,0 +1,232 @@
+"""SQLite writer contention must not manufacture child business failures."""
+from contextlib import contextmanager
+import json
+from pathlib import Path
+import sqlite3
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+from dispatcher_sdk.execution_kernel.children import HandlerChildren
+from dispatcher_sdk.execution_kernel.runtime import Runtime
+from dispatcher_sdk.observability import ObservationOptions
+
+
+class WitnessList(list):
+    """External test recorder; observations do not change handler deployment state."""
+
+
+class ChildStorageContentionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.options = ObservationOptions(write_timeout=.05, query_timeout=.3, flush_interval=.1)
+
+    def runtime(self, parent, child):
+        parent.__execution_kernel_revision__ = "storage-contention-parent-v1"
+        child.__execution_kernel_revision__ = "storage-contention-child-v1"
+        runtime = Runtime(self.root / "kernel.sqlite3", {"parent": parent, "child": child},
+            isolation_mode="thread", child_capacity=1, observation_options=self.options)
+        self.addCleanup(runtime.close)
+        return runtime
+
+    def drive(self, runtime, *, timeout=6):
+        runtime.submit(runtime.command("parent", execution_id="parent", idempotency_key="parent",
+            correlation_id="storage-contention", timeout_seconds=timeout, payload={}))
+        outcomes, errors = [], []
+        def run():
+            try:
+                outcomes.append(runtime.run_once(execution_id="parent"))
+            except BaseException as exc:
+                errors.append(exc)
+        thread = threading.Thread(target=run)
+        self.addCleanup(lambda: thread.join(8))
+        thread.start()
+        return thread, outcomes, errors
+
+    @contextmanager
+    def writer(self, path):
+        connection = sqlite3.connect(path, timeout=1)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield connection
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def requests(self, runtime):
+        with runtime.observation_journal._read_connection(.3) as (connection, _):
+            return [dict(row) for row in connection.execute("SELECT * FROM sdk_child_requests")]
+
+    def poll(self, predicate, *, seconds=4):
+        cutoff = time.monotonic() + seconds
+        while time.monotonic() < cutoff:
+            result = predicate()
+            if result:
+                return result
+            time.sleep(.02)
+        self.fail("original bounded fixture window expired")
+
+    def finish(self, driver, outcomes, errors):
+        driver.join(8)
+        self.assertFalse(driver.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(outcomes))
+        return outcomes[0]
+
+    def test_observation_enqueue_busy_retries_one_original_child(self):
+        entered, release = threading.Event(), threading.Event()
+        calls, original = WitnessList(), WitnessList()
+        self.addCleanup(release.set)
+        def child(payload, context):
+            calls.append(context.lease.execution_id)
+            return {"raw_child": 42}
+        def parent(payload, context):
+            original.append(context.budget_envelope.to_dict())
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("reservation fixture was not released")
+            return context.children.run("child", {}, request_id="one", timeout_seconds=3)
+        runtime = self.runtime(parent, child)
+        driver, outcomes, errors = self.drive(runtime)
+        self.assertTrue(entered.wait(2))
+        with self.writer(runtime.observation_journal.path):
+            release.set()
+            time.sleep(.35)
+            self.assertEqual([], calls)
+            self.assertEqual([], self.requests(runtime))
+        result = self.finish(driver, outcomes, errors)
+        self.assertEqual("succeeded", result.state, result.to_dict())
+        rows = self.requests(runtime)
+        self.assertEqual(1, len(rows))
+        self.assertEqual([rows[0]["child_execution_id"]], calls)
+        self.assertEqual("completed", rows[0]["state"])
+        self.assertEqual(runtime.kernel.get(calls[0]).result.to_dict(), result.result.value)
+        limits = runtime.kernel.get_execution_limits("parent")
+        self.assertEqual(original[0]["constraints"], limits["envelope"]["constraints"])
+
+    def test_kernel_busy_during_await_preserves_already_successful_child(self):
+        waiting, resume = threading.Event(), threading.Event()
+        calls, row_seen = WitnessList(), WitnessList()
+        self.addCleanup(resume.set)
+        original_await = HandlerChildren._await
+        def gated_await(capability, row):
+            if capability.command.execution_id == "parent":
+                row_seen.append(dict(row))
+                waiting.set()
+                if not resume.wait(3):
+                    raise TimeoutError("await fixture was not released")
+            return original_await(capability, row)
+        def child(payload, context):
+            calls.append(context.lease.execution_id)
+            return {"original_result": [1, 2, 3]}
+        def parent(payload, context):
+            return context.children.run("child", {}, request_id="one", timeout_seconds=3)
+        runtime = self.runtime(parent, child)
+        with patch.object(HandlerChildren, "_await", gated_await):
+            driver, outcomes, errors = self.drive(runtime)
+            self.assertTrue(waiting.wait(2))
+            self.poll(lambda: self.requests(runtime)[0]["state"] == "completed", seconds=2)
+            raw_result = runtime.kernel.get(row_seen[0]["child_execution_id"]).result.to_dict()
+            with self.writer(runtime.kernel.db_path):
+                resume.set()
+                time.sleep(.35)
+                self.assertTrue(driver.is_alive(), "await should retry the live parent's control operation")
+            result = self.finish(driver, outcomes, errors)
+        self.assertEqual("succeeded", result.state, result.to_dict())
+        self.assertEqual(raw_result, result.result.value)
+        self.assertEqual([row_seen[0]["child_execution_id"]], calls)
+        self.assertEqual(1, len(self.requests(runtime)))
+
+    def test_failed_ownership_release_reclaims_same_result_without_reinvocation(self):
+        entered, return_child = threading.Event(), threading.Event()
+        calls = WitnessList()
+        self.addCleanup(return_child.set)
+        def child(payload, context):
+            calls.append(context.lease.execution_id)
+            entered.set()
+            if not return_child.wait(2):
+                raise TimeoutError("child fixture was not released")
+            return {"raw_fact": "original successful child"}
+        def parent(payload, context):
+            return context.children.run("child", {}, request_id="one", timeout_seconds=3)
+        runtime = self.runtime(parent, child)
+        driver, outcomes, errors = self.drive(runtime, timeout=4)
+        self.assertTrue(entered.wait(2))
+        row = self.requests(runtime)[0]
+        with self.writer(runtime.observation_journal.path):
+            return_child.set()
+            self.poll(lambda: runtime.kernel.get(row["child_execution_id"]).state == "succeeded", seconds=2.5)
+            # Keep the actual independent writer through the original caller's
+            # expiry. A failed finish/owner release cannot erase this row.
+            time.sleep(3.3)
+            retained = self.requests(runtime)[0]
+            self.assertEqual(row["child_execution_id"], retained["child_execution_id"])
+            self.assertIn(retained["state"], {"pending", "running"})
+        self.finish(driver, outcomes, errors)
+        settled = self.poll(lambda: (rows[0] if (rows := self.requests(runtime)) and rows[0]["state"] == "completed" else None))
+        raw_result = runtime.kernel.get(row["child_execution_id"]).result.to_dict()
+        self.assertEqual(raw_result, json.loads(settled["response_json"]))
+        self.assertEqual(row["wait_id"], settled["wait_id"])
+        self.assertEqual(row["budget_json"], settled["budget_json"])
+        self.assertEqual([row["child_execution_id"]], calls)
+
+    def test_reservation_retry_expires_without_late_child_admission(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = WitnessList()
+        self.addCleanup(release.set)
+        def child(payload, context):
+            calls.append(context.lease.execution_id)
+            return {}
+        def parent(payload, context):
+            entered.set()
+            if not release.wait(1):
+                raise TimeoutError("expiry fixture was not released")
+            return context.children.run("child", {}, request_id="one", timeout_seconds=.25)
+        runtime = self.runtime(parent, child)
+        driver, outcomes, errors = self.drive(runtime, timeout=.55)
+        self.assertTrue(entered.wait(.4))
+        with self.writer(runtime.observation_journal.path):
+            release.set()
+            time.sleep(.8)
+            self.assertEqual([], self.requests(runtime))
+        result = self.finish(driver, outcomes, errors)
+        self.assertNotEqual("succeeded", result.state)
+        time.sleep(.15)
+        self.assertEqual([], calls)
+        self.assertEqual([], self.requests(runtime))
+
+    def test_parent_cancellation_ends_reservation_retry_without_admission(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = WitnessList()
+        self.addCleanup(release.set)
+        def child(payload, context):
+            calls.append(context.lease.execution_id)
+            return {}
+        def parent(payload, context):
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("cancellation fixture was not released")
+            return context.children.run("child", {}, request_id="one", timeout_seconds=3)
+        runtime = self.runtime(parent, child)
+        driver, outcomes, errors = self.drive(runtime)
+        self.assertTrue(entered.wait(2))
+        with self.writer(runtime.observation_journal.path):
+            release.set()
+            time.sleep(.15)
+            snapshot = runtime.kernel.get("parent")
+            runtime.kernel.cancel("parent", expected_revision=snapshot.revision, reason="causal test cancellation")
+            time.sleep(.2)
+            self.assertEqual([], self.requests(runtime))
+        result = self.finish(driver, outcomes, errors)
+        self.assertEqual("cancelled", result.state)
+        time.sleep(.15)
+        self.assertEqual([], calls)
+        self.assertEqual([], self.requests(runtime))
+
+
+if __name__ == "__main__":
+    unittest.main()

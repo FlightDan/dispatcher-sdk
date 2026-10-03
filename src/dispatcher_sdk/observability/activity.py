@@ -27,7 +27,10 @@ class ActivityRecorder:
                  source_id: str | None = None, options: ObservationOptions | None = None,
                  source_scope: str | None = None, metric_coverage: tuple[str, ...] | None = None,
                  progress_confirm: Callable[..., Mapping[str, Any]] | None = None,
-                 clock=None, monotonic=None, start: bool = False) -> None:
+                 clock=None, monotonic=None, start: bool = False,
+                 bind_current: bool = False) -> None:
+        if type(bind_current) is not bool:
+            raise ValueError("bind_current must be a bool")
         self.journal = journal
         self.identity = identity
         self.source_id = identifier(source_id or uuid.uuid4().hex, "source_id")
@@ -36,6 +39,7 @@ class ActivityRecorder:
             "stdout_bytes", "stderr_bytes", "model_requests", "model_text", "model_first_byte_events",
             "model_events", "tool_requests", "tool_responses", "tool_events", "heartbeat", "progress", "phase_events")
         self._collector_incarnation: int | None = None
+        self._current_binding_pending = bind_current
         self.options = options or journal.options
         self._confirm = progress_confirm
         self._clock = clock or time.time
@@ -332,6 +336,9 @@ class ActivityRecorder:
             sequence, metrics, tails = batch["sequence"], batch["metrics"], batch["tails"]
             captured_at, gaps, selected = batch["captured_at"], batch["gaps"], batch["selected"]
             try:
+                if self._current_binding_pending:
+                    self.journal.bind_current(self.identity)
+                    self._current_binding_pending = False
                 if self.source_scope is not None and self._collector_incarnation is None:
                     self._collector_incarnation = self.journal.register_collector(
                         self.identity, self.source_id, source_scope=self.source_scope,

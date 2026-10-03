@@ -242,13 +242,15 @@ class ObservationJournal:
             connection.close()
 
     @contextmanager
-    def _transaction(self) -> Iterator[tuple[sqlite3.Connection, float]]:
+    def _transaction(self, *, timeout_seconds: float | None = None) -> Iterator[tuple[sqlite3.Connection, float]]:
         if not self.writer:
             raise ObservationError("read-only observation journal cannot write")
+        duration = self.options.write_timeout if timeout_seconds is None else min(
+            self.options.write_timeout, positive(timeout_seconds, "timeout_seconds"))
         connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True,
-                                     timeout=self.options.write_timeout)
+                                     timeout=duration)
         connection.row_factory = sqlite3.Row
-        deadline = time.monotonic() + self.options.write_timeout
+        deadline = time.monotonic() + duration
         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         try:
             connection.execute("PRAGMA trusted_schema=OFF")

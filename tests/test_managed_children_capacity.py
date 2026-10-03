@@ -30,8 +30,8 @@ class RequestJournal:
             connection.executescript(CHILD_SCHEMA)
 
     @contextmanager
-    def _transaction(self):
-        connection = sqlite3.connect(self.path, timeout=self.options.write_timeout)
+    def _transaction(self, *, timeout_seconds=None):
+        connection = sqlite3.connect(self.path, timeout=self.options.write_timeout if timeout_seconds is None else min(self.options.write_timeout, timeout_seconds))
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -434,7 +434,7 @@ class ManagedChildAdmissionTests(unittest.TestCase):
             row = children._enqueue(request_id="adopt", child_id="adopted", action="adopt",
                 child_command=None, envelope=children._budget("adopt", 5))
 
-            def uncertain_adopt(execution_id, *, parent_lease, budget_envelope):
+            def uncertain_adopt(execution_id, *, parent_lease, budget_envelope, timeout_seconds=None):
                 kernel.adopt_child(execution_id, parent_lease, budget_envelope)
                 raise ConnectionError("response lost after committed adoption")
 

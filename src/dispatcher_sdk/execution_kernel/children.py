@@ -11,8 +11,10 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 import json
 import math
+from pathlib import Path
 import sqlite3
 import threading
 import time
@@ -49,6 +51,80 @@ _OPEN = ("pending", "running")
 _TERMINAL = {"succeeded", "failed", "timed_out", "cancelled", "dead"}
 _MAX_GRAPH_NODES = 256
 _MAX_RECORD_BYTES = 256 * 1024
+
+
+def _transient_control_error(error: Exception) -> bool:
+    if isinstance(error, sqlite3.OperationalError):
+        code = getattr(error, "sqlite_errorcode", None)
+        return ((code is not None and code & 255 in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
+                or (code is None and str(error).lower() in ("database is locked", "database table is locked")))
+    return isinstance(error, TimeoutError) and str(error) in (
+        "Kernel control lock admission timed out", "Kernel control admission budget elapsed",
+        "child lifecycle admission timed out")
+
+
+def _merge_checkpoint(envelope, checkpoint):
+    if checkpoint.elapsed_at >= envelope.checkpoint.elapsed_at:
+        return envelope.recheckpoint(sample=checkpoint)
+    return replace(envelope, checkpoint=checkpoint).recheckpoint(sample=envelope.checkpoint)
+
+
+class _RetryWindow:
+    """One conservative work window, retained across every storage replay."""
+
+    def __init__(self, envelope: BudgetEnvelope, kernel: Any, stop=None):
+        self.envelope, self.kernel, self.stop = envelope, kernel, stop
+        self.on_advance = None
+        self.deadline = math.inf
+        self.remaining()
+
+    def remaining(self) -> float:
+        if self.stop is not None and self.stop.is_set():
+            raise ChildExecutionError("child_service_closed", "child service stopped before response settlement")
+        wall = self.kernel._wall_time() if hasattr(self.kernel, "_wall_time") else None
+        sample = sample_clock(wall_time=wall)
+        view = self.envelope.view(sample=sample)
+        previous = self.envelope.checkpoint
+        self.envelope = self.envelope.recheckpoint(sample=sample)
+        if view.clock_status != "trusted" or view.remaining_work_seconds is None:
+            raise BudgetClockUnknownError(view.unknown_reason or "child clock continuity cannot be established")
+        self.deadline = min(self.deadline, time.monotonic() + view.remaining_work_seconds)
+        projected = previous.wall_at + sample.elapsed_at - previous.elapsed_at
+        if self.on_advance is not None and self.envelope.checkpoint.wall_at > projected + .001:
+            self.on_advance(self.envelope)
+        return max(0., min(view.remaining_work_seconds, self.deadline - time.monotonic()))
+
+    def timeout(self) -> float:
+        remaining = self.remaining()
+        if remaining <= 0:
+            raise ChildExecutionError("child_wait_timeout", "child wait exhausted its inherited work window")
+        return min(.1, remaining)
+
+
+def _retry(window: _RetryWindow, operation, *, kernel=None, store=None):
+    last_error = None
+    while True:
+        remaining = window.remaining()
+        if remaining <= 0:
+            if last_error is not None:
+                raise last_error
+            raise ChildExecutionError("child_wait_timeout", "child wait exhausted its inherited work window")
+        try:
+            lock = getattr(kernel, "_control_lock", None)
+            with lock(min(.1, remaining)) if lock is not None else nullcontext():
+                with store.bound(window) if store is not None else nullcontext():
+                    return operation()
+        except Exception as exc:
+            if not _transient_control_error(exc):
+                raise
+            last_error = exc
+            remaining = window.remaining()
+            if remaining <= 0:
+                raise
+            if window.stop is None:
+                time.sleep(min(.01, remaining))
+            else:
+                window.stop.wait(min(.01, remaining))
 
 
 class ChildExecutionError(RuntimeError):
@@ -93,24 +169,43 @@ def _verify_parent(kernel: Any, lease: ExecutionLease) -> None:
 
 
 def _wait_parent_entry(kernel: Any, lease: ExecutionLease, envelope: BudgetEnvelope,
-                       stop: threading.Event | None = None) -> None:
+                       stop: threading.Event | None = None, *, window=None) -> None:
     """Wait for the durable ACK within the worker's already captured work window."""
+    window = window or _RetryWindow(envelope, kernel, stop)
     while True:
         if stop is not None and stop.is_set():
             raise ChildExecutionError("child_service_closed", "child service stopped before parent entry confirmation")
         try:
-            _verify_parent(kernel, lease)
+            # A bounded authority read remains meaningful after work expiry;
+            # it may prove cancellation before any new business admission.
+            try:
+                _verify_parent(kernel, lease)
+            except Exception as exc:
+                if not _transient_control_error(exc):
+                    raise
+            _retry(window, lambda: kernel.verify(lease), kernel=kernel)
+        except ChildExecutionError as exc:
+            if exc.code == "child_wait_timeout":
+                raise ChildExecutionError("parent_entry_confirmation_timeout",
+                    "parent entry confirmation exhausted its work deadline") from exc
+            raise
         except (StaleFenceError, InvalidStateTransitionError, ExecutionNotFoundError) as exc:
             raise ChildExecutionError("parent_authority_revoked", str(exc), execution_id=lease.execution_id) from exc
         wall = kernel._wall_time() if hasattr(kernel, "_wall_time") else None
-        view = envelope.view(sample=sample_clock(wall_time=wall))
+        view = window.envelope.view(sample=sample_clock(wall_time=wall))
         if view.clock_status != "trusted":
             raise BudgetClockUnknownError(view.unknown_reason)
         if view.remaining_work_seconds is None:
             raise ChildExecutionError("parent_budget_missing", "parent entry confirmation requires a finite work deadline")
         if view.remaining_work_seconds <= 0:
             raise ChildExecutionError("parent_entry_confirmation_timeout", "parent entry confirmation exhausted its work deadline")
-        limits = kernel.get_execution_limits(lease.execution_id)
+        try:
+            limits = _retry(window, lambda: kernel.get_execution_limits(lease.execution_id), kernel=kernel)
+        except ChildExecutionError as exc:
+            if exc.code == "child_wait_timeout":
+                raise ChildExecutionError("parent_entry_confirmation_timeout",
+                    "parent entry confirmation exhausted its work deadline") from exc
+            raise
         if (limits is not None and limits.get("entry_state") == "confirmed"
                 and (limits.get("entry_attempt"), limits.get("entry_fence")) == (lease.attempt, lease.fence)):
             return
@@ -125,14 +220,108 @@ class _Store:
     def __init__(self, journal: Any) -> None:
         self.journal = journal
         self.source_id = _identifier(journal.source_id, "source_id")
+        self._local = threading.local()
+        self._floors = {}
+        self._floor_lock = threading.Lock()
+
+    def _facts(self, *, writer=False):
+        kernel_path = getattr(self.journal, "kernel_path", None)
+        if kernel_path is None:
+            return None
+        from .settlement import SettlementJournal
+        path = str(kernel_path) + ".settlements.sqlite3"
+        if not Path(path).exists():
+            if writer:
+                raise BudgetClockUnknownError("independent child budget checkpoint storage is unavailable")
+            # Direct public capabilities may predate the optional receipt
+            # store. Their original durable request remains usable; a known
+            # failed forward-checkpoint write still fails explicitly above.
+            return None
+        factory = SettlementJournal if writer else SettlementJournal.open_readonly
+        return factory(path, source_id=self.source_id, kernel_path=kernel_path, timeout_seconds=.1)
+
+    def attach(self, row, window):
+        """Carry stronger observed clocks through publication and reclamation."""
+        try:
+            facts = self._facts()
+            if facts is not None:
+                report = facts.inspect_notes(row["child_execution_id"], limit=50,
+                                             max_bytes=256*1024, timeout_seconds=.1)
+                if not report["complete"] or report.get("has_more"):
+                    raise BudgetClockUnknownError("child budget checkpoint inspection is incomplete")
+                for note in report["notes"]:
+                    if note["phase"] == "child_budget_checkpoint" and note["evidence"].get("wait_id") == row["wait_id"]:
+                        checkpoint = BudgetEnvelope.from_dict(note["evidence"]["budget_envelope"]).checkpoint
+                        window.envelope = _merge_checkpoint(window.envelope, checkpoint)
+            with self._floor_lock:
+                floor = self._floors.get(row["wait_id"])
+            if floor is not None:
+                window.envelope = _merge_checkpoint(window.envelope, floor.checkpoint)
+        except BudgetClockUnknownError:
+            raise
+        except Exception as exc:
+            raise BudgetClockUnknownError(f"child budget checkpoint unavailable: {type(exc).__name__}: {exc}") from exc
+        window.on_advance = lambda envelope: self.remember(row, envelope)
+        self.remember(row, window.envelope)
+
+    def remember(self, row, envelope):
+        original = BudgetEnvelope.from_dict(json.loads(row["budget_json"]))
+        checkpoint = envelope.checkpoint
+        narrowed = _merge_checkpoint(original, checkpoint)
+        with self._floor_lock:
+            previous = self._floors.get(row["wait_id"])
+            if previous is not None:
+                narrowed = _merge_checkpoint(narrowed, previous.checkpoint)
+            self._floors[row["wait_id"]] = narrowed
+        projected = original.checkpoint.wall_at + checkpoint.elapsed_at - original.checkpoint.elapsed_at
+        if narrowed.checkpoint.wall_at <= projected + .001:
+            return
+        # The request's immutable deadlines remain unchanged. Only the clock
+        # floor advances. Independent notes preserve it when telemetry is busy.
+        encoded = _encode(narrowed.to_dict())
+        try:
+            with self.journal._transaction(timeout_seconds=.1) as (connection, now):
+                existing = connection.execute(
+                    "SELECT budget_json FROM sdk_child_requests WHERE source_id=? AND wait_id=?",
+                    (self.source_id, row["wait_id"])).fetchone()
+                if existing is not None:
+                    narrowed = _merge_checkpoint(BudgetEnvelope.from_dict(json.loads(existing[0])), narrowed.checkpoint)
+                    encoded = _encode(narrowed.to_dict())
+                connection.execute(
+                    "UPDATE sdk_child_requests SET budget_json=?,updated_at=? WHERE source_id=? AND wait_id=? "
+                    "AND state IN ('pending','running')", (encoded, now, self.source_id, row["wait_id"]))
+        except Exception as exc:
+            if not _transient_control_error(exc):
+                raise
+            facts = self._facts(writer=True)
+            if facts is None:
+                raise
+            facts.note({"execution_id": row["child_execution_id"], "attempt": 0, "fence": 0},
+                "child_budget_checkpoint", {"wait_id": row["wait_id"], "budget_envelope": narrowed.to_dict()},
+                timeout_seconds=.1)
+        row["budget_json"] = encoded
+
+    @contextmanager
+    def bound(self, window):
+        previous = getattr(self._local, "window", None)
+        self._local.window = window
+        try:
+            yield
+        finally:
+            self._local.window = previous
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
-        with self.journal._read_connection(self.journal.options.query_timeout) as (connection, _):
+        window = getattr(self._local, "window", None)
+        duration = self.journal.options.query_timeout if window is None else min(
+            self.journal.options.query_timeout, window.timeout())
+        with self.journal._read_connection(duration) as (connection, _):
             yield connection
 
     def transaction(self):
-        return self.journal._transaction()
+        window = getattr(self._local, "window", None)
+        return self.journal._transaction() if window is None else self.journal._transaction(
+            timeout_seconds=window.timeout())
 
     def request(self, parent_id: str, request_id: str) -> dict[str, Any] | None:
         with self.read() as connection:
@@ -161,6 +350,8 @@ class _Store:
                 connection.execute(
                     "UPDATE sdk_child_waits SET state=?,error_json=?,updated_at=? WHERE source_id=? AND wait_id=?",
                     (state, encoded_error, now, self.source_id, row["wait_id"]))
+        with self._floor_lock:
+            self._floors.pop(row["wait_id"], None)
 
 
 class HandlerChildren:
@@ -196,15 +387,17 @@ class HandlerChildren:
                 source_id=self.service_spec["source_id"], options=options)
         self.store = _Store(journal)
 
-    def _active(self) -> None:
+    def _active(self, window=None) -> None:
         try:
-            _verify_parent(self.kernel, self.parent_lease)
+            if window is None:
+                _verify_parent(self.kernel, self.parent_lease)
+            else:
+                _retry(window, lambda: self.kernel.verify(self.parent_lease), kernel=self.kernel)
         except (StaleFenceError, InvalidStateTransitionError, ExecutionNotFoundError) as exc:
             raise ChildExecutionError("parent_authority_revoked", str(exc),
                                       execution_id=self.command.execution_id) from exc
 
     def _budget(self, request_id: str, timeout_seconds: float | None) -> BudgetEnvelope:
-        self._active()
         view = self.budget_envelope.view()
         if view.clock_status != "trusted":
             raise BudgetClockUnknownError(view.unknown_reason)
@@ -221,10 +414,13 @@ class HandlerChildren:
                 f"child-call:{self.command.execution_id}:{self.parent_lease.attempt}:"
                 f"{self.parent_lease.fence}:{request_id}"),
                                        timeout_seconds=_positive(timeout_seconds, "timeout_seconds"))
-        return envelope
+        window = _RetryWindow(envelope, self.kernel)
+        self._active(window)
+        return window.envelope
 
-    def _depth(self) -> int:
-        limits = self.kernel.get_execution_limits(self.command.execution_id)
+    def _depth(self, window=None) -> int:
+        limits = (self.kernel.get_execution_limits(self.command.execution_id) if window is None else
+            _retry(window, lambda: self.kernel.get_execution_limits(self.command.execution_id), kernel=self.kernel))
         depth = 0 if limits is None else limits.get("depth", 0)
         if type(depth) is not int or depth < 0:
             raise ChildExecutionError("child_depth_unknown", "parent depth is unavailable")
@@ -252,16 +448,17 @@ class HandlerChildren:
 
     def _enqueue(self, *, request_id: str, child_id: str, action: str,
                  child_command: ExecutionCommandV2 | None, envelope: BudgetEnvelope,
-                 reason: str = "child_result") -> dict[str, Any]:
+                 reason: str = "child_result", window=None) -> dict[str, Any]:
         _identifier(request_id, "request_id")
         _identifier(child_id, "execution_id")
         _identifier(reason, "reason")
-        self._active()
-        _wait_parent_entry(self.kernel, self.parent_lease, envelope)
-        depth = self._depth()
+        window = window or _RetryWindow(envelope, self.kernel)
+        self._active(window)
+        _wait_parent_entry(self.kernel, self.parent_lease, envelope, window=window)
+        depth = self._depth(window)
         command_json = None if child_command is None else _encode(child_command.to_dict())
-        budget_json, lease_json = _encode(envelope.to_dict()), _encode(self.parent_lease.to_dict())
-        view = envelope.view()
+        budget_json, lease_json = _encode(window.envelope.to_dict()), _encode(self.parent_lease.to_dict())
+        view = window.envelope.view()
         if view.clock_status != "trusted" or not view.remaining_work_seconds:
             raise ChildExecutionError("child_budget_exhausted", "child has no trusted remaining work time")
         wait_id = str(uuid.uuid4())
@@ -315,8 +512,9 @@ class HandlerChildren:
                  self.parent_lease.fence, child_id, reason, now, view.effective_work_deadline_at, now))
         row = self.store.request(self.command.execution_id, request_id)
         assert row is not None
+        self.store.attach(row, window)
         try:
-            self._active()
+            self._active(window)
         except ChildExecutionError as exc:
             self.store.finish(row, "cancelled", error={"code": exc.code, "message": str(exc)})
             raise
@@ -338,8 +536,9 @@ class HandlerChildren:
             causation_id=self.command.execution_id, handler_id=handler_id,
             handler_contract_version=handler_contract_version, retry_policy=RetryPolicy(),
             timeout_seconds=timeout, payload=payload)
-        row = self._enqueue(request_id=request_id, child_id=child_id, action="run",
-                            child_command=child, envelope=envelope)
+        window = _RetryWindow(envelope, self.kernel)
+        row = _retry(window, lambda: self._enqueue(request_id=request_id, child_id=child_id, action="run",
+                            child_command=child, envelope=envelope, window=window), store=self.store)
         return self._await(row)
 
     def wait_for(self, execution_id: str, *, request_id: str,
@@ -347,23 +546,24 @@ class HandlerChildren:
         """Await an existing execution, adopting queued work when capacity permits."""
         _identifier(execution_id, "execution_id")
         envelope = self._budget(request_id, timeout_seconds)
+        window = _RetryWindow(envelope, self.kernel)
         try:
-            target = self.kernel.get(execution_id)
+            target = _retry(window, lambda: self.kernel.get(execution_id), kernel=self.kernel)
         except ExecutionNotFoundError as exc:
             raise ChildExecutionError("child_missing", str(exc), execution_id=execution_id) from exc
         if target.state in _TERMINAL:
             return self._result(target.result.to_dict())
-        self._depth()
+        self._depth(window)
         action = "observe"
         if target.state == "queued":
-            limits = self.kernel.get_execution_limits(execution_id)
+            limits = _retry(window, lambda: self.kernel.get_execution_limits(execution_id), kernel=self.kernel)
             parent = None if limits is None else limits.get("parent_execution_id")
             if parent is None or parent == self.command.execution_id:
                 action = "adopt"
             else:
                 reason = "child_owned_by_another_parent"
-        row = self._enqueue(request_id=request_id, child_id=execution_id, action=action,
-                            child_command=None, envelope=envelope, reason=reason)
+        row = _retry(window, lambda: self._enqueue(request_id=request_id, child_id=execution_id, action=action,
+                            child_command=None, envelope=envelope, reason=reason, window=window), store=self.store)
         return self._await(row)
 
     def _result(self, value: dict[str, Any]) -> dict[str, Any]:
@@ -374,24 +574,28 @@ class HandlerChildren:
         return value
 
     def _await(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        window = _RetryWindow(BudgetEnvelope.from_dict(json.loads(row["budget_json"])), self.kernel)
+        self.store.attach(row, window)
         while True:
-            self._active()
-            current = self.store.request(self.command.execution_id, row["request_id"])
+            self._active(window)
+            current = _retry(window, lambda: self.store.request(self.command.execution_id, row["request_id"]), store=self.store)
             if current is None:
                 raise ChildExecutionError("child_registration_missing", "durable child registration disappeared")
             if current["response_json"] is not None:
                 value = json.loads(current["response_json"])
                 if "result_ref" in value:
-                    snapshot = self.kernel.get(value["result_ref"])
+                    snapshot = _retry(window, lambda: self.kernel.get(value["result_ref"]), kernel=self.kernel)
                     if snapshot.result is None:
                         raise ChildExecutionError("child_result_missing", "recorded result reference is unavailable")
                     value = snapshot.result.to_dict()
+                with self.store._floor_lock:
+                    self.store._floors.pop(row["wait_id"], None)
                 return self._result(value)
             if current["state"] not in _OPEN:
                 error = json.loads(current["error_json"] or "{}")
                 raise ChildExecutionError(error.get("code", "child_wait_failed"), error.get("message", current["state"]),
                                           execution_id=current["child_execution_id"])
-            remaining = BudgetEnvelope.from_dict(json.loads(current["budget_json"])).view().remaining_work_seconds
+            remaining = window.remaining()
             if remaining is None:
                 raise BudgetClockUnknownError("child clock continuity cannot be established")
             if remaining <= 0:
@@ -460,9 +664,13 @@ class ChildService:
                 return
             with self.store.transaction() as (connection, now):
                 if time.monotonic() - self._last_renewal >= .5:
-                    connection.execute(
-                        "UPDATE sdk_child_requests SET owner_expires_at=? WHERE source_id=? AND service_owner=? "
-                        "AND state IN ('pending','running')", (now + 2, self.store.source_id, self.owner))
+                    for future, active_row in self._futures.values():
+                        if not future.done():
+                            connection.execute(
+                                "UPDATE sdk_child_requests SET owner_expires_at=? WHERE source_id=? AND service_owner=? "
+                                "AND parent_execution_id=? AND request_id=? AND state IN ('pending','running')",
+                                (now + 2, self.store.source_id, self.owner,
+                                 active_row["parent_execution_id"], active_row["request_id"]))
                     self._last_renewal = time.monotonic()
                 rows = connection.execute(
                     "SELECT * FROM sdk_child_requests WHERE source_id=? AND state IN ('pending','running') "
@@ -492,8 +700,9 @@ class ChildService:
             row = dict(record)
             try:
                 lease = ExecutionLease.from_dict(json.loads(row["parent_lease_json"]))
-                self.runtime.kernel.verify(lease)
-                snapshot = self.runtime.kernel.get(row["child_execution_id"])
+                _verify_parent(self.runtime.kernel, lease)
+                with self.runtime.kernel._control_lock(.1) if hasattr(self.runtime.kernel, "_control_lock") else nullcontext():
+                    snapshot = self.runtime.kernel.get(row["child_execution_id"])
                 if snapshot.state in _TERMINAL:
                     result = snapshot.result.to_dict()
                     self.store.finish(row, "completed" if result["status"] == "succeeded" else "failed", result=result)
@@ -507,17 +716,28 @@ class ChildService:
                     if not view.remaining_work_seconds:
                         raise ChildExecutionError("child_wait_timeout", "observed wait exhausted its work deadline")
             except Exception as exc:
-                self.store.finish(row, "failed", error={"code": getattr(exc, "code", None) or "child_observation_error",
-                                                       "message": str(exc)})
+                if _transient_control_error(exc):
+                    self._last_error = f"{type(exc).__name__}: {exc}"
+                    continue
+                try:
+                    self.store.finish(row, "failed", error={"code": getattr(exc, "code", None) or "child_observation_error",
+                                                           "message": str(exc)})
+                except Exception as publish_error:
+                    if not _transient_control_error(publish_error):
+                        raise
+                    self._last_error = f"{type(publish_error).__name__}: {publish_error}"
 
     def _cancel(self, child_id: str, reason: str) -> dict[str, Any] | None:
         try:
-            snapshot = self.runtime.kernel.get(child_id)
+            lock = getattr(self.runtime.kernel, "_control_lock", None)
+            with lock(.1) if lock is not None else nullcontext():
+                snapshot = self.runtime.kernel.get(child_id)
         except ExecutionNotFoundError:
             return None
         if snapshot.state not in _TERMINAL and snapshot.state != "recovery_required":
             self.runtime.cancel(child_id, expected_revision=snapshot.revision, reason=reason)
-            snapshot = self.runtime.kernel.get(child_id)
+            with lock(.1) if lock is not None else nullcontext():
+                snapshot = self.runtime.kernel.get(child_id)
         return None if snapshot.result is None else snapshot.result.to_dict()
 
     def _execute(self, row: dict[str, Any]) -> None:
@@ -526,8 +746,14 @@ class ChildService:
         try:
             lease = ExecutionLease.from_dict(json.loads(row["parent_lease_json"]))
             envelope = BudgetEnvelope.from_dict(json.loads(row["budget_json"]))
+            window = _RetryWindow(envelope, self.runtime.kernel, self._stop)
+            self.store.attach(row, window)
+            def control(operation):
+                return _retry(window, operation, kernel=self.runtime.kernel)
+            def publish(operation):
+                return _retry(window, operation, store=self.store)
             if row["action"] == "adopt":
-                limits = self.runtime.kernel.get_execution_limits(row["child_execution_id"])
+                limits = control(lambda: self.runtime.kernel.get_execution_limits(row["child_execution_id"]))
                 if limits is not None and limits.get("parent_execution_id") is not None:
                     if (limits["parent_execution_id"], limits["parent_attempt"], limits["parent_fence"]) != (
                             lease.execution_id, lease.attempt, lease.fence):
@@ -538,45 +764,50 @@ class ChildService:
                     submitted = True
             if row["depth"] > self.max_depth:
                 raise ChildExecutionError("child_depth_exceeded", "configured child depth would be exceeded")
-            _wait_parent_entry(self.runtime.kernel, lease, envelope, self._stop)
-            budget = envelope.view()
+            _wait_parent_entry(self.runtime.kernel, lease, envelope, self._stop, window=window)
+            budget = window.envelope.view()
             if budget.clock_status != "trusted":
                 raise BudgetClockUnknownError(budget.unknown_reason)
             if not budget.remaining_work_seconds:
                 raise ChildExecutionError("child_wait_timeout", "child inherited work deadline is exhausted")
             if row["action"] == "run":
-                self.runtime.submit_child(ExecutionCommandV2.from_dict(json.loads(row["command_json"])),
-                                          parent_lease=lease, budget_envelope=envelope)
+                child_command = ExecutionCommandV2.from_dict(json.loads(row["command_json"]))
+                _retry(window, lambda: self.runtime.submit_child(child_command,
+                    parent_lease=lease, budget_envelope=window.envelope, timeout_seconds=window.timeout()))
                 submitted = True
             elif row["action"] == "adopt":
-                snapshot = self.runtime.kernel.get(row["child_execution_id"])
+                snapshot = control(lambda: self.runtime.kernel.get(row["child_execution_id"]))
                 if not submitted or snapshot.state == "queued":
-                    self.runtime.adopt_child(row["child_execution_id"], parent_lease=lease, budget_envelope=envelope)
+                    _retry(window, lambda: self.runtime.adopt_child(row["child_execution_id"],
+                        parent_lease=lease, budget_envelope=window.envelope, timeout_seconds=window.timeout()))
                 submitted = True
-            with self.store.transaction() as (connection, now):
-                connection.execute(
-                    "UPDATE sdk_child_requests SET state='running',updated_at=? WHERE source_id=? "
-                    "AND parent_execution_id=? AND request_id=? AND state='pending'",
-                    (now, self.store.source_id, row["parent_execution_id"], row["request_id"]))
+            def mark_running():
+                with self.store.transaction() as (connection, now):
+                    connection.execute(
+                        "UPDATE sdk_child_requests SET state='running',updated_at=? WHERE source_id=? "
+                        "AND parent_execution_id=? AND request_id=? AND state='pending'",
+                        (now, self.store.source_id, row["parent_execution_id"], row["request_id"]))
+            publish(mark_running)
             while not self._stop.is_set():
-                self.runtime.kernel.verify(lease)
-                view = envelope.view()
+                control(lambda: self.runtime.kernel.verify(lease))
+                window.remaining()
+                view = window.envelope.view()
                 if view.clock_status != "trusted":
                     raise BudgetClockUnknownError(view.unknown_reason)
                 if not view.remaining_work_seconds:
                     raise ChildExecutionError("child_wait_timeout", "child inherited work deadline is exhausted")
-                snapshot = self.runtime.kernel.get(row["child_execution_id"])
+                snapshot = control(lambda: self.runtime.kernel.get(row["child_execution_id"]))
                 if snapshot.state in _TERMINAL:
                     result = snapshot.result.to_dict()
-                    self.store.finish(row, "completed" if result["status"] == "succeeded" else "failed", result=result)
+                    publish(lambda: self.store.finish(row, "completed" if result["status"] == "succeeded" else "failed", result=result))
                     return
                 if snapshot.state == "recovery_required":
-                    self.store.finish(row, "unknown", error={"code": "child_recovery_required",
-                        "message": snapshot.recovery_reason or "child requires explicit effect recovery"})
+                    publish(lambda: self.store.finish(row, "unknown", error={"code": "child_recovery_required",
+                        "message": snapshot.recovery_reason or "child requires explicit effect recovery"}))
                     return
                 if row["action"] != "observe" and snapshot.state == "queued":
-                    self.runtime.kernel.verify(lease)
-                    self.runtime.run_once(execution_id=row["child_execution_id"])
+                    control(lambda: self.runtime.kernel.verify(lease))
+                    _retry(window, lambda: self.runtime.run_once(execution_id=row["child_execution_id"]))
                 else:
                     self._stop.wait(min(self.poll_interval, view.remaining_work_seconds))
             raise ChildExecutionError("child_service_closed", "child service stopped before response settlement")
@@ -585,7 +816,9 @@ class ChildService:
             original_result = None
             if row["action"] == "adopt" and not submitted and lease is not None:
                 try:
-                    limits = self.runtime.kernel.get_execution_limits(row["child_execution_id"])
+                    lock = getattr(self.runtime.kernel, "_control_lock", None)
+                    with lock(.1) if lock is not None else nullcontext():
+                        limits = self.runtime.kernel.get_execution_limits(row["child_execution_id"])
                     submitted = limits is not None and (
                         limits.get("parent_execution_id"), limits.get("parent_attempt"), limits.get("parent_fence")) == (
                             lease.execution_id, lease.attempt, lease.fence)

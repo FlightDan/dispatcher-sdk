@@ -62,6 +62,10 @@ links or substitutes for the candidate CI artifacts.
 | 46 native/inspection/settlement checks passed in 56.209s | `/tmp/sdk-final-native-inspection-regression.log`; native directories printed in that log |
 | 35 settlement/readonly/native-pressure checks passed in 65.315s | `/tmp/sdk-final-readonly-settlement-pressure.log`; pressure JSON files printed in that log |
 | 29 nested control / durability / child checks passed in 10.940s | `/tmp/sdk-nested-bounded-control-final.log` |
+| 31 child contention / clock checkpoint / admission checks passed in 31.542s | `/tmp/sdk-child-contention-final-focused.log`; controlled clock and real SQLite evidence paths printed in the checkpoint log |
+| 50 deadline / cancellation / bounded control / durability checks passed in 78.967s | `/tmp/sdk-child-contention-budget-cancel-final2.log` |
+| Native registration crash and corrected saturated-worker supervision passed in 20.186s | `/tmp/sdk-current-binding-crash-pressure.log`; `/tmp/sdk-observability-pressure-mcuj611t/evidence.json` |
+| Real blocked current binding, background recovery, historical attempt protection and direct child compatibility passed | `/tmp/sdk-current-binding-recovery-focused.log`; raw JSON paths printed in that log |
 | Native cleanup failure then restart passed | `/tmp/sdk-native-cleanup-restart.log` |
 | Repeated real notification bridge crashes and retry passed | `/tmp/sdk-stall-repeated-native-crash.log` |
 | Historical installed writer rejected new layout | `/tmp/sdk-historical-writer-evidence.json`; `/tmp/sdk-historical-current-reopen.log` |
@@ -71,13 +75,32 @@ links or substitutes for the candidate CI artifacts.
 These focused results precede the final candidate freeze. Final installed and
 CI results will supersede them for acceptance while preserving failure history.
 
+The first frozen source commit, `0a1304f`, was not accepted: its installed
+public parent/child example failed with a real SQLite writer conflict.
+`/tmp/sdk-observability-installed-example-final3.log` and
+`/tmp/sdk-installed-parent-lock-causal/run-02/parent-exception.json` retain the
+original error and already successful child result. The full regression was
+interrupted after that finding; `/tmp/sdk-observability-full-regression-final3.log`
+is not a pass. Later source fixes retry only transient storage admission errors
+within the original call window, retain result publication obligations and
+preserve stricter clock checkpoints across replay.
+
+The later combined native batch also found a missing current binding under
+ordinary concurrent SDK writers, leaving one subscribed worker without stall
+windows. `/tmp/sdk-child-contention-native-pressure-settlement.log` and
+`/tmp/sdk-observability-pressure-0h6ryy0f/evidence.json` preserve that failure.
+The driver now retries the binding through its existing bounded background
+flusher; the corrective native run above passed. A new complete frozen
+candidate run remains necessary.
+
 ## Review and limits
 
 Independent reviews found and verified fixes for entry authority, original
 completion timestamps, deferred result settlement, transient SQLite errors
 misclassified as revoked authority, lost final-flush evidence, missing native
 bootstrap errors, original deadline cause, readonly receipt mutation, nested
-control deadlines and query-size fallback. Current candidate-wide verification
+control deadlines, child storage replay, conservative clock receipt recovery,
+targeted execution capacity and query-size fallback. Current candidate-wide verification
 remains required after those fixes.
 
 The independent journals retain facts; they do not authorize a new execution,

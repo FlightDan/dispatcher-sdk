@@ -299,9 +299,9 @@ class SupervisionMixin:
         return self.confirm_handler_entry(lease, envelope, timeout_seconds=timeout_seconds)
 
     def submit_child(self, command: ExecutionCommandV2, parent_lease: ExecutionLease,
-                     budget_envelope: BudgetEnvelope):
+                     budget_envelope: BudgetEnvelope, *, timeout_seconds: float | None = None):
         """Atomically bind a queued child to a live parent and inherited limits."""
-        with self._transaction() as (connection, timestamp):
+        with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             parent = self._assert_lease(connection, parent_lease, timestamp=timestamp, states={"running"})
             self._authorize_managed_operation(
                 connection, parent_lease.execution_id, timestamp=timestamp, operation="child submission"
@@ -335,8 +335,8 @@ class SupervisionMixin:
             return self._snapshot(result)
 
     def adopt_child(self, execution_id: str, parent_lease: ExecutionLease,
-                    budget_envelope: BudgetEnvelope):
-        with self._transaction() as (connection, timestamp):
+                    budget_envelope: BudgetEnvelope, *, timeout_seconds: float | None = None):
+        with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             parent = self._assert_lease(connection, parent_lease, timestamp=timestamp, states={"running"})
             self._authorize_managed_operation(
                 connection, parent_lease.execution_id, timestamp=timestamp, operation="child adoption"

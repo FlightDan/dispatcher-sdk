@@ -458,10 +458,9 @@ class InProcessRuntime:
             return
         try:
             identity = self._observation_identity(lease)
-            self.observation_journal.bind_current(identity)
             recorder = ActivityRecorder(self.observation_journal, identity, options=self.observation_options,
                 source_scope="driver", metric_coverage=("phase_events", "heartbeat"),
-                clock=self.kernel._wall_time, start=True)
+                clock=self.kernel._wall_time, start=True, bind_current=True)
             self._execution_recorders[(lease.execution_id, lease.attempt, lease.fence)] = recorder
             recorder.phase("worker_dispatch")
             recorder.heartbeat()
@@ -529,25 +528,44 @@ class InProcessRuntime:
         return self._stall_supervisor.windows(execution_id, after=after, limit=limit)
 
     def submit_child(self, command: ExecutionCommandV2, *, parent_lease: ExecutionLease,
-                     budget_envelope: BudgetEnvelope):
+                     budget_envelope: BudgetEnvelope, timeout_seconds: float | None = None):
+        if timeout_seconds is not None:
+            timeout_seconds = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
         self._assert_registry_current()
         if not self._binding_matches(command):
             raise RegistryRevisionMismatchError("child handler binding differs from runtime")
-        with self._lifecycle_lock:
+        started = time.monotonic()
+        admission = (self._lifecycle_lock if timeout_seconds is None else
+            self._bounded_lifecycle(timeout_seconds, message="child lifecycle admission timed out"))
+        with admission:
             if self._closed:
                 raise RuntimeError("runtime is closed")
-            return self.kernel.submit_child(command, parent_lease, budget_envelope)
+            remaining = None if timeout_seconds is None else timeout_seconds - (time.monotonic() - started)
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("child lifecycle admission timed out")
+            return self.kernel.submit_child(command, parent_lease, budget_envelope,
+                                            timeout_seconds=remaining)
 
     def adopt_child(self, execution_id: str, *, parent_lease: ExecutionLease,
-                    budget_envelope: BudgetEnvelope):
+                    budget_envelope: BudgetEnvelope, timeout_seconds: float | None = None):
+        if timeout_seconds is not None:
+            timeout_seconds = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
         self._assert_registry_current()
-        target = self.kernel.get(execution_id)
-        if not self._binding_matches(target.command):
-            raise RegistryRevisionMismatchError("adopted child handler binding differs from runtime")
-        with self._lifecycle_lock:
+        started = time.monotonic()
+        admission = (self._lifecycle_lock if timeout_seconds is None else
+            self._bounded_lifecycle(timeout_seconds, message="child lifecycle admission timed out"))
+        with admission:
             if self._closed:
                 raise RuntimeError("runtime is closed")
-            return self.kernel.adopt_child(execution_id, parent_lease, budget_envelope)
+            remaining = None if timeout_seconds is None else timeout_seconds - (time.monotonic() - started)
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("child lifecycle admission timed out")
+            with self.kernel._control_lock(remaining):
+                target = self.kernel.get(execution_id)
+                if not self._binding_matches(target.command):
+                    raise RegistryRevisionMismatchError("adopted child handler binding differs from runtime")
+                return self.kernel.adopt_child(execution_id, parent_lease, budget_envelope,
+                                              timeout_seconds=remaining)
 
     def observe(self, execution_id: str, *, timeout: float | None = None,
                 attempt: int | None = None, fence: int | None = None) -> dict[str, Any]:
@@ -762,7 +780,9 @@ class InProcessRuntime:
                     self._observation_error = f"{type(exc).__name__}: {exc}"
             if receipt_id is not None:
                 try:
-                    self.cancellation_journal._record(receipt_id, stage, evidence, timeout_seconds=min(duration, .1))
+                    legacy_evidence = ({name: evidence[name] for name in ("phase", "type")}
+                        if stage == "failure" else evidence)
+                    self.cancellation_journal._record(receipt_id, stage, legacy_evidence, timeout_seconds=min(duration, .1))
                 except Exception as exc:
                     evidence_errors.append(exc)
 
@@ -852,9 +872,9 @@ class InProcessRuntime:
         return cancelled
 
     @contextmanager
-    def _bounded_lifecycle(self, timeout_seconds: float):
+    def _bounded_lifecycle(self, timeout_seconds: float, *, message: str = "execution control is busy; cancellation was not submitted"):
         if not self._lifecycle_lock.acquire(timeout=timeout_seconds):
-            raise TimeoutError("execution control is busy; cancellation was not submitted")
+            raise TimeoutError(message)
         try:
             yield
         finally:
@@ -1628,19 +1648,22 @@ class InProcessRuntime:
 
     def _run_once_active(self, *, execution_id: str | None = None):
         self._assert_registry_current()
+        limits = None if execution_id is None else self.kernel.get_execution_limits(execution_id)
+        targeted_child = limits is not None and limits.get("parent_execution_id") is not None
         last_rejected = None
         while True:
             thread_slot_owned = False
             process_execution_started = False
             if self.isolation_mode == "thread":
-                if not self._acquire_thread_slot(child=execution_id is not None):
+                if not self._acquire_thread_slot(child=targeted_child):
                     # Every running/timed-out call owns one slot until its
                     # underlying thread really exits.  Do not claim and queue
                     # more work behind a stuck call.
                     return last_rejected
                 thread_slot_owned = True
             try:
-                with self._lifecycle_lock:
+                with self._lifecycle_lock if execution_id is None else self._bounded_lifecycle(
+                        .1, message="child lifecycle admission timed out"):
                     if self._closed:
                         return last_rejected
                     running_lease = self.kernel.claim_and_start(
@@ -1649,6 +1672,8 @@ class InProcessRuntime:
                         start_safety_seconds=self._handler_start_timeout() + 5.0,
                         registry_revisions=(self.registry_revision, *self.handler_revisions.values()),
                         execution_id=execution_id,
+                        timeout_seconds=None if execution_id is None else .1,
+                        child_pool=targeted_child,
                     )
                     if (
                         running_lease is not None
@@ -1677,7 +1702,7 @@ class InProcessRuntime:
                 if self.isolation_mode == "process":
                     outcome = self._invoke_process(handler, command, running_lease)
                 else:
-                    outcome = self._invoke_thread(handler, command, running_lease, child=execution_id is not None)
+                    outcome = self._invoke_thread(handler, command, running_lease, child=targeted_child)
                     # The done callback owns the slot from this point.  This
                     # remains true for a timeout: the Python thread may still
                     # be running and must continue to consume its slot.
@@ -1711,7 +1736,7 @@ class InProcessRuntime:
                                 or not receipt.get("source_closed", False)
                                 or local["dropped_events"] > 0 or local["collection_gaps"] > 0})
                 if thread_slot_owned:
-                    self._release_thread_slot(child=execution_id is not None)
+                    self._release_thread_slot(child=targeted_child)
 
 
 Runtime = InProcessRuntime

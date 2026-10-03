@@ -842,6 +842,8 @@ class SQLiteKernel(
         registry_revision: Optional[str] = None,
         registry_revisions: Optional[Sequence[str]] = None,
         execution_id: str | None = None,
+        timeout_seconds: float | None = None,
+        child_pool: bool | None = None,
     ) -> Optional[ExecutionLease]:
         """Atomically lease and start one queued execution.
 
@@ -863,11 +865,19 @@ class SQLiteKernel(
         safety = self._nonnegative_duration(
             start_safety_seconds, "start_safety_seconds"
         )
-        with self._transaction() as (connection, timestamp):
+        with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             self._reap_in_transaction(connection, timestamp)
             row = _next_claim_row(connection, timestamp, revisions, execution_id)
             if row is None:
                 return None
+            if child_pool is not None:
+                relationship = connection.execute(
+                    "SELECT parent_execution_id FROM kernel_execution_limits WHERE execution_id=?",
+                    (row["execution_id"],)).fetchone()
+                if bool(relationship is not None and relationship[0] is not None) != child_pool:
+                    # Adoption may have changed the required pool since the
+                    # runtime reserved its slot. Leave the work queued.
+                    return None
             if execution_id is not None:
                 self._assert_child_claim(connection, row["execution_id"], timestamp)
             command = self._command(row["command_json"])
