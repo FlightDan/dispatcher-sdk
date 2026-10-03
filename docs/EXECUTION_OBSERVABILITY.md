@@ -229,6 +229,8 @@ The retained obligation also carries the original observed budget checkpoint.
 Native parent timers and supervisors retain the exact samples that shortened
 their deadlines and merge those floors into the same obligation. Entry packets
 and later wall-clock rollback cannot replace a stronger timer observation.
+The worker entry packet projects both deadlines from the committed checkpoint
+and one native elapsed sample; it does not add an unconfirmed wall-clock read.
 Cleanup may consume the reserved interval after timely business return; its
 retained floor constrains future admission without changing that return's cause.
 Kernel completion commits that checkpoint with the result, before releasing a

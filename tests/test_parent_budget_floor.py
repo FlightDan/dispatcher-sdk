@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 import threading
 import time
+from dataclasses import replace
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -83,6 +85,23 @@ class SupervisorGuardClock(ParentWaitClock):
         return wall
 
 
+class RejectEntryPacketWallClock:
+    """A post-confirmation packet must never consult this fresh wall clock."""
+    def __init__(self, root):
+        self.root = str(root)
+
+    def __call__(self):
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_code.co_name == '_entry_packet':
+                (Path(self.root) / 'unexpected-entry-wall.json').write_text(json.dumps({
+                    'pid': os.getpid(), 'function': frame.f_code.co_name, 'line': frame.f_lineno}),
+                    encoding='utf-8')
+                raise AssertionError('entry packet consulted fresh wall time after durable confirmation')
+            frame = frame.f_back
+        return 100.0
+
+
 def native_wait_then_return(payload, context):
     root = Path(payload['root'])
     call = {'attempt': context.lease.attempt, 'pid': os.getpid(),
@@ -102,6 +121,75 @@ native_wait_then_return.__execution_kernel_revision__ = 'native-parent-floor-v1'
 
 @unittest.skipUnless(sys.platform == 'linux', 'requires real POSIX process containment')
 class ParentBudgetFloorTests(unittest.TestCase):
+    def test_actual_native_entry_uses_committed_clock_without_fresh_injected_wall(self):
+        root = retained_directory('sdk-native-entry-packet-clock-')
+        evidence = {'timeout_seconds': 10, 'lease_seconds': 90, 'max_attempts': 2,
+            'clock_injection': 'raise only if actual worker entry packet reads injected wall after durable ACK'}
+        try:
+            with Kernel.open_sqlite(root / 'kernel.sqlite3', {'work': native_wait_then_return},
+                    isolation_mode='process', now=RejectEntryPacketWallClock(root), lease_seconds=90) as runtime:
+                runtime.submit(runtime.command('work', execution_id='original', idempotency_key='original',
+                    correlation_id='entry-packet-clock', timeout_seconds=10,
+                    retry_policy=RetryPolicy(max_attempts=2, retry_timeouts=True),
+                    payload={'root': str(root), 'hold_seconds': .05}))
+                result = runtime.run_once(execution_id='original')
+                evidence['result'] = result.to_dict()
+                evidence['limits'] = runtime.kernel.get_execution_limits('original')
+                evidence['receipts'] = runtime._settlement_journal.inspect('original', timeout_seconds=.5)
+                path = root / 'calls.jsonl'
+                evidence['calls'] = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+                evidence['retry_events'] = [event for event in runtime.kernel.events('original')
+                                            if event['event_type'] == 'retry_scheduled']
+                evidence['fresh_entry_wall_consulted'] = (root / 'unexpected-entry-wall.json').exists()
+                self.assertEqual(result.state, 'succeeded', evidence)
+                self.assertEqual(result.result.value, {'business_attempt': 1}, evidence)
+                self.assertEqual(result.attempt, 1)
+                self.assertEqual([call['attempt'] for call in evidence['calls']], [1], evidence)
+                self.assertNotEqual(evidence['calls'][0]['pid'], os.getpid(), evidence)
+                self.assertFalse(evidence['fresh_entry_wall_consulted'], evidence)
+                self.assertEqual(evidence['retry_events'], [])
+                self.assertEqual(evidence['limits']['entry_state'], 'confirmed')
+                self.assertEqual(evidence['receipts'][0]['result'], result.result.to_dict())
+        except BaseException as error:
+            evidence['error'] = {'type': type(error).__name__, 'message': str(error)}
+            raise
+        finally:
+            path = root / 'evidence.json'
+            path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+            print('native_entry_packet_clock_evidence=' + str(path), flush=True)
+
+    def test_entry_packet_charges_native_elapsed_and_preserves_cleanup_reserve(self):
+        root = retained_directory('sdk-entry-packet-native-elapsed-')
+        checkpoint = sample_clock(wall_time=100)
+        checkpoint = replace(checkpoint, elapsed_at=checkpoint.elapsed_at - 3)
+        envelope = BudgetEnvelope((DeadlineConstraint('execution:original', 'execution', 110, 2),),
+                                  checkpoint, started_at=100)
+        evidence = {'original': envelope.to_dict(), 'native_elapsed_already_spent': 3}
+        def forbidden_wall():
+            raise AssertionError('packet consulted a fresh injected wall clock')
+        try:
+            before = time.monotonic()
+            packet = process_runtime._entry_packet(SimpleNamespace(budget_envelope=envelope), forbidden_wall)
+            after = time.monotonic()
+            evidence.update(packet=packet, before=before, after=after)
+            # Three elapsed seconds leave five business and seven hard seconds.
+            # The original ACK remains the wire authority, and the reserve is
+            # charged once rather than applied again to the inherited cutoff.
+            self.assertEqual(packet['budget_envelope'], envelope.to_dict())
+            self.assertGreater(packet['deadline_monotonic'], before + 4.9, evidence)
+            self.assertLess(packet['deadline_monotonic'], after + 5.1, evidence)
+            self.assertGreater(packet['hard_deadline_monotonic'], before + 6.9, evidence)
+            self.assertLess(packet['hard_deadline_monotonic'], after + 7.1, evidence)
+            self.assertAlmostEqual(packet['hard_deadline_monotonic'] - packet['deadline_monotonic'], 2, places=2)
+            self.assertEqual(packet['started_at'], envelope.started_at)
+        except BaseException as error:
+            evidence['error'] = {'type': type(error).__name__, 'message': str(error)}
+            raise
+        finally:
+            path = root / 'evidence.json'
+            path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+            print('entry_packet_native_elapsed_evidence=' + str(path), flush=True)
+
     def test_alarm_observation_between_normal_capture_and_assignment_keeps_stronger_floor(self):
         root = retained_directory('sdk-alarm-budget-floor-')
         checkpoint = sample_clock(wall_time=100)

@@ -270,9 +270,13 @@ def _entry_packet(context: HandlerContext, now: Any) -> dict[str, Any]:
         birth, namespace, birth_reason = _birth(os.getpid())
     except Exception:
         birth, namespace, birth_reason = None, None, "birth_identity_unavailable"
+    # This packet announces the committed ACK, not another wall-clock authority
+    # observation. Project native elapsed time from that same durable floor for
+    # both bounds; parent/supervisor timers retain their own later observations.
+    sample = sample_clock(wall_time=envelope.checkpoint.wall_at)
     return {"kind": "worker_entered", "budget_envelope": envelope.to_dict(),
-            "deadline_monotonic": envelope.deadline_monotonic(sample=_budget_sample(now)),
-            "hard_deadline_monotonic": envelope.deadline_monotonic(hard=True, sample=_budget_sample(now)),
+            "deadline_monotonic": envelope.deadline_monotonic(sample=sample),
+            "hard_deadline_monotonic": envelope.deadline_monotonic(hard=True, sample=sample),
             "started_at": envelope.started_at, "worker_pid": os.getpid(),
             "birth_identity": birth, "namespace": namespace, "birth_unknown_reason": birth_reason,
             "process_evidence": {"source": "worker_self_report", "state": "alive", "pid": os.getpid()}}

@@ -316,18 +316,43 @@ def parent_child_case(root, mode):
 
 
 def silence_cancel_case(root):
+    from dataclasses import asdict
+
     root.mkdir(parents=True, exist_ok=True)
     save(root / 'configuration.json', {'execution_timeout': 12, 'caller_timeout': 15,
-        'stall_sample': .2, 'stall_windows': 2, 'callback_capacity': 1})
+        'stall_sample': .2, 'stall_windows': 2, 'callback_capacity': 1,
+        'observation_options': asdict(OPTIONS),
+        'setup_order': ['construct', 'subscribe', 'submit', 'watch_stall', 'start']})
     received = []
-    with Dispatcher(root / 'application.sqlite3', {'silent': silent}, isolation_mode='process',
-                    observation_options=OPTIONS) as app:
+    app = Dispatcher(root / 'application.sqlite3', {'silent': silent}, isolation_mode='process',
+                     observation_options=OPTIONS)
+    try:
         def consume(notice):
             received.append(notice)
             save(root / 'notice.json', notice)
         app.subscribe_stalls(consume)
         task = app.submit('silent', {'root': str(root)}, request_id='silent-once', timeout_seconds=12)
-        task.watch_stall(StallPolicy('silent-progress', sample_interval=.2, consecutive_windows=2))
+        # Register the original policy as setup, before real execution collectors
+        # compete for the observation journal's unchanged write window.
+        registration = {'state': 'attempting', 'host_started': False,
+            'original_write_timeout': OPTIONS.write_timeout,
+            'started_at': time.time(), 'started_monotonic': time.monotonic()}
+        save(root / 'watch-registration.json', registration)
+        try:
+            receipt = task.watch_stall(StallPolicy('silent-progress', sample_interval=.2, consecutive_windows=2))
+        except Exception as error:
+            registration.update(state='failed', finished_at=time.time(), finished_monotonic=time.monotonic(),
+                error={'type': type(error).__name__, 'message': str(error),
+                    'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None),
+                    'traceback': traceback.format_exc()})
+            save(root / 'watch-registration.json', registration)
+            raise
+        registration.update(state='returned', finished_at=time.time(), finished_monotonic=time.monotonic(),
+            receipt=receipt)
+        save(root / 'watch-registration.json', registration)
+        check(receipt.get('replayed') is False, 'initial stall registration unexpectedly replayed')
+        check(not (root / 'silent-entered.json').exists(), 'silent execution started before watch setup')
+        app.start()
         await_value(lambda: read_json(root / 'silent-entered.json'), seconds=6)
         try:
             task.wait(timeout=.05)
@@ -368,6 +393,8 @@ def silence_cancel_case(root):
         worker = next(item for item in after['processes'] if item['process_id'] == 'worker')
         check(worker['state'] == 'exited' and worker['evidence'].get('cleanup') == 'confirmed',
               'worker containment not confirmed')
+    finally:
+        app.close()
 
 
 @dataclass(frozen=True)

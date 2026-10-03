@@ -6,13 +6,21 @@ maintainability only. The user has activated the revised SDK-only Goal. ModPort 
 writes are outside the revised completion criteria. Historical integration evidence
 is retained below; it does not establish the new SDK-only A16.
 
-The implementation is not yet fully accepted. Latest frozen candidate `80906d2`
-passed all five independent installed SDK scenarios and the public example. Its
-complete regression failed: 934 outer tests had four failures and 16 skips;
+The implementation is not yet fully accepted. The latest complete regression was
+on `80906d2`, which passed all five independent installed SDK scenarios and the
+public example. Its complete regression failed: 934 outer tests had four failures and 16 skips;
 the nested installed suite had one failure and 16 skips across 929 tests.
 Native Windows and the complete CI matrix remain required. No release is authorized.
 
-The corrective candidate is being validated. The failed native child-delivery
+The subsequent frozen `2ab808e` candidate passed installed success, raw failure,
+tool-budget scenarios and the original public example. Its silence scenario failed
+before policy registration committed, at the original 0.1-second observation write
+window. Registering once before starting the public host removed competing execution
+collectors without changing that window; one independent installed run then passed.
+No complete `2ab808e` regression was launched. A separate native probe found a
+remaining entry-packet wall sample that shortened a deadline without retaining its
+floor; the packet now derives both bounds from the committed ACK and native elapsed
+time. The corrective candidate is being validated. The failed native child-delivery
 cases did not establish timely child entry within their original two-second
 window. They also exposed an SDK defect: inherited parent start time caused
 completion to reject a valid pre-entry failure. That correction preserves pending
@@ -82,6 +90,11 @@ links or substitutes for the candidate CI artifacts.
 
 | Command/result | Retained evidence |
 | --- | --- |
+| Final combined entry-packet, parent/supervisor/Windows floor and native deadline checks: 33 passed in 29.144s | `/tmp/sdk-final10-focused.log`; `/tmp/sdk-final10-focused-evidence`; full frozen regression remains required |
+| Entry-packet correction: one actual native business attempt, no false timeout/retry; native elapsed/reserve projection passed | `/tmp/sdk-entry-packet-clock-regression.log`; `/tmp/sdk-native-entry-packet-clock-htlryqe_/evidence.json`; `/tmp/sdk-entry-packet-native-elapsed-ggjqappz/evidence.json`; two tests passed in 1.371s |
+| Installed `2ab808e`: three scenarios and original example passed; silence failed before watch registration committed | `/tmp/sdk-a16-installed-final9`; `/tmp/sdk-a16-installed-final9.log`; `/tmp/sdk-observability-installed-import-final9.json`; `/tmp/sdk-observability-installed-example-final9.log` |
+| Silence public setup-order correction passed once on the same installed SDK with original windows | `/tmp/sdk-silence-setup-installed-97150h_w/evidence/summary.json`; `watch-registration.json` records the original 0.1-second write window and nonreplayed pending policy before public start |
+| Native worker entry-packet wall sample lost on frozen `2ab808e`: two actual business invocations after rollback | `/tmp/sdk-worker-entry-floor-cae3vucc/evidence.json`; original 10-second execution and 90-second lease; no retry-window change |
 | Revised public contention fixture passed with original writer/caller bounds and actual SQLite BUSY, one business call and one callback | `/tmp/sdk-final9-public-contention-fixture.log`; `/tmp/sdk-final9-fixture-evidence/sdk-public-admission-contention-jut999bg/evidence.json`; independent review included notification-result transaction setup |
 | Final native budget/startup/cancellation-tree boundary checks: 34 passed in 43.424s | `/tmp/sdk-final9-boundary.log`; `/tmp/sdk-final9-boundary-evidence`; original startup failure semantics preserved |
 | Public typing and documentation after corrective changes passed | `/tmp/sdk-observability-types-final9.log` (five fixtures); `/tmp/sdk-observability-docs-final9.log` (546 links, six README examples, zero skips) |
