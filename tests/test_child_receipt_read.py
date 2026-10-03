@@ -69,21 +69,45 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
         return sample_clock(wall_time=self.kernel._wall_time())
 
     def test_persistent_receipt_contention_expires_without_completed_result_rescue(self):
+        import traceback
+
         row, window = self.short_row(.3)
+        original = BudgetEnvelope.from_dict(json.loads(row['budget_json']))
         writer = self.exclusive_writer()
         before = time.monotonic()
         try:
             with patch.object(self.children, '_completed_result') as rescue:
-                with self.assertRaises(SettlementBusyError) as caught:
-                    self.children._await(row)
+                remaining_at_call = window.remaining()
+                window_at_call = window.envelope.to_dict()
+                deadline_at_call = window.deadline
+                caught, returned, raw_traceback = None, None, None
+                try:
+                    returned = self.children._await(row)
+                except Exception as error:
+                    caught, raw_traceback = error, traceback.format_exc()
+                elapsed = time.monotonic() - before
+                remaining_at_end = window.remaining()
+                row_budget_at_end = BudgetEnvelope.from_dict(json.loads(row['budget_json']))
+                self.evidence['records'].append({'scenario': 'persistent_receipt_contention',
+                    'elapsed': elapsed, 'began': before,
+                    'remaining_at_call': remaining_at_call, 'remaining_at_end': remaining_at_end,
+                    'original_deadline_at_call': deadline_at_call,
+                    'error_type': None if caught is None else type(caught).__name__,
+                    'error': None if caught is None else str(caught), 'traceback': raw_traceback,
+                    'sqlite_errorcode': getattr(caught, 'sqlite_errorcode', None), 'returned': returned,
+                    'completed_result_rescue_calls': rescue.call_count,
+                    'writer_in_transaction': writer.in_transaction,
+                    'original_budget': original.to_dict(), 'window_at_call': window_at_call,
+                    'window_at_end': window.envelope.to_dict(), 'row_budget_at_end': row_budget_at_end.to_dict()})
+                # Setup already spent part of the original .3-second window.
+                # Exhaustion, rather than a new minimum wait, is the contract.
+                self.assertIsInstance(caught, SettlementBusyError)
                 rescue.assert_not_called()
-            elapsed = time.monotonic() - before
-            self.assertGreaterEqual(elapsed, .2)
-            self.assertLess(elapsed, .6)
-            self.evidence['records'].append({'scenario': 'persistent_receipt_contention',
-                'elapsed': elapsed, 'error_type': type(caught.exception).__name__,
-                'error': str(caught.exception), 'completed_result_rescue_calls': rescue.call_count,
-                'original_budget': json.loads(row['budget_json'])})
+                self.assertEqual(remaining_at_end, 0)
+                self.assertEqual(window.envelope.constraints, original.constraints)
+                self.assertEqual(row_budget_at_end.constraints, original.constraints)
+                self.assertTrue(writer.in_transaction)
+                self.assertLess(elapsed, .6)
         finally:
             writer.rollback()
             writer.close()

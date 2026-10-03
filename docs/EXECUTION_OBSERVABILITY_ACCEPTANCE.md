@@ -7,12 +7,26 @@ writes are outside the revised completion criteria. Historical integration evide
 is retained below; it does not establish the new SDK-only A16.
 
 The implementation is not yet fully accepted. The latest complete regression was
-on frozen `c1471ee`: 949 outer tests had three failures and 16 skips; the nested
-installed suite had two failures, one error and 16 skips across 944 tests. Its
-standalone installed SDK consumer and the nested installed consumer each passed
-all five public scenarios; the original public example also passed. Complete
+on frozen `e14faf5`: 949 outer tests had one failure and 16 skips; the nested
+installed suite had two failures and 16 skips across 944 tests. Its rebuilt
+installed consumer passed all five public scenarios; the earlier `c1471ee`
+standalone consumer and original public example also passed. Complete
 corrective regression and native Windows/CI evidence remain required. No release
-is authorized.
+is authorized. The `e14faf5` production SDK code is unchanged from `c1471ee`.
+
+The latest installed failures were a raw parent `OperationalError: database is
+locked` around the original two-second child-call cutoff, and a receipt-contention
+fixture requiring 0.2 seconds of waiting after setup had already consumed part of
+its original 0.3-second window. The latter now checks original-window exhaustion
+directly, preserving its budget and upper bound. The child business completed
+before cutoff, but its first explicit postcommit observation was later; neither
+the exact commit visibility nor the failing SQL operation is established. One
+same-budget diagnostic on freshly installed `e14faf5` passed without reproducing
+the error. The nominal activity/capacity fixture now declares the public example's
+parent-twelve/child-five-second windows before launch and retains raw exception
+stacks. This removes an unsupported performance assumption; it does not explain
+the original boundary failure. Dedicated cutoff and publication-contention
+witnesses retain their original windows.
 
 One failure in both suites came from a fixture requiring exactly two cancellation
 attempts. Retained facts show two uncommitted BUSY attempts, followed by correct
@@ -99,15 +113,20 @@ links or substitutes for the candidate CI artifacts.
 | A12 Conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; separate capacity keeps local deadlines working. Candidate matrix pending. |
 | A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Latest candidate regression pending. |
 | A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; separately installed historical `v0.7.0.dev0` writer | Actual old installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Full public API and pending-obligation upgrade regression pending. |
-| A15 Installed entry | Isolated wheel consumer suite and portable public example | `c1471ee` clean-wheel import and original parent12/child5/wait15 example passed. Its complete installed suite failed; corrective candidate validation remains required. |
-| A16 Independent SDK end-to-end | Installed public APIs, real handlers/processes, local byte/tool fixtures and persisted recovery; no ModPort or external model dependency | All five public-entry scenarios passed on installed `c1471ee` and its isolated rebuilt consumer: success/raw failure, output/silence, parent-child/tool budgets, cancellation and cleanup recovery without repeated business. Fresh corrective candidate and native matrix remain required. Historical ModPort checks are not a substitute. |
+| A15 Installed entry | Isolated wheel consumer suite and portable public example | `e14faf5` rebuilt-wheel consumer passed; its complete installed suite failed. `c1471ee` original parent12/child5/wait15 example passed with unchanged SDK code. Corrective candidate validation remains required. |
+| A16 Independent SDK end-to-end | Installed public APIs, real handlers/processes, local byte/tool fixtures and persisted recovery; no ModPort or external model dependency | All five public-entry scenarios passed on the `e14faf5` isolated rebuilt consumer: success/raw failure, output/silence, parent-child/tool budgets, cancellation and cleanup recovery without repeated business. Fresh corrective candidate and native matrix remain required. Historical ModPort checks are not a substitute. |
 | A17 Native Windows | `test_windows_runtime`, portable native observability/deadline/pressure suites | Linux mocks are not native acceptance. Windows x64/ARM64 jobs and raw Job evidence pending. Linux-only cgroup cases do not apply to Windows. |
-| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `c1471ee` outer run of 949 tests had 3 failures and 16 skips; nested installed run of 944 tests had 2 failures, 1 error and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
+| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `e14faf5` outer run of 949 tests had 1 failure and 16 skips; nested installed run of 944 tests had 2 failures and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
 
 ## Retained raw host evidence
 
 | Command/result | Retained evidence |
 | --- | --- |
+| Revised receipt exhaustion and nominal parent/child integration: 16 passed in 25.826s; independent review found no blockers | `/tmp/sdk-final12-child-receipt.log`; `/tmp/sdk-final12-child-receipt-evidence` |
+| Current documentation: 546 local links and six README examples passed, zero skipped | `/tmp/sdk-observability-docs-final12.log` |
+| Frozen `e14faf5` full regression failed: outer 949 / one failure / 16 skips; nested 944 / two failures / 16 skips; rebuilt-wheel five public scenarios passed | `/tmp/sdk-observability-full-regression-final11.log`; `/tmp/sdk-full-final11-evidence`; `/tmp/sdk-full-final11-evidence/sdk-observability-consumer-scerstph/summary.json` |
+| Installed parent failed with original raw SQLite BUSY around tool cutoff; child business timely, exact committed visibility and failing SQL unknown | `/tmp/sdk-full-final11-evidence/sdk-runtime-child-publication-8hg3pu8d/evidence.json`; original databases retained alongside it |
+| Same original parent-five/child-two-second diagnostic on fresh installed `e14faf5` passed once in 3.787s; no failure reproduction | `/tmp/sdk-final11-child-diagnostic.log`; `/tmp/sdk-final11-child-diagnostic-evidence/sdk-runtime-child-publication-dfwa7sxr/evidence.json`; staged fixture `/tmp/sdk-final11-child-diagnostic-stage` retains the original configuration |
 | Corrected cancellation admission assertions: 12 passed in 10.132s; both revised native/thread cancellation witnesses passed, followed by the reviewed native cutoff proof | `/tmp/sdk-final11-cancel-fixture.log`; `/tmp/sdk-final11-cancel-evidence`; `/tmp/sdk-final11-cancel-native.log`; `/tmp/sdk-final11-reviewed-cancel.log`; `/tmp/sdk-final11-reviewed-cancel-evidence` |
 | Exact installed child diagnostic passed once in 3.413s with original parent-five/child-two-second windows; prior failure cause remains unknown | `/tmp/sdk-final10-child-diagnostic/summary.json`; `/tmp/sdk-runtime-child-publication-e5om8c1k/evidence.json`; import points to final10 installed site-packages |
 | Frozen `c1471ee` full regression failed: outer 949 / three failures / 16 skips; nested 944 / two failures / one error / 16 skips | `/tmp/sdk-observability-full-regression-final10.log`; `/tmp/sdk-full-final10-evidence` |

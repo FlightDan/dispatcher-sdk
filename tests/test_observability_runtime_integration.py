@@ -1,13 +1,22 @@
+from pathlib import Path
 import json
+import os
 import sqlite3
 import sys
 import time
+import traceback
 import unittest
 
 import dispatcher_sdk
 from dispatcher_sdk.execution_kernel import Kernel
 from dispatcher_sdk.execution_kernel.children import ChildExecutionError
 from tests._acceptance_evidence import retained_directory
+
+
+# Nominal integration uses the public example's original windows. Deadline
+# boundary behavior has separate contention and timeout witnesses.
+PARENT_SECONDS = 12
+CHILD_CALL_SECONDS = 5
 
 
 def child_handler(payload, context):
@@ -21,11 +30,40 @@ def failing_child(payload, context):
     raise HandlerExecutionError('provider_denied', 'original provider failure', details={'provider': 'fixture'})
 
 
+def _capture_child_call_error(payload, error):
+    """Optional fixture diagnostics cannot replace the actual child exception."""
+    diagnostic_path = payload.get('_child_diagnostic_path')
+    if diagnostic_path is None:
+        return
+    try:
+        chain, seen = [], set()
+        current = error
+        while current is not None and id(current) not in seen and len(chain) < 8:
+            seen.add(id(current))
+            chain.append({'type': type(current).__name__, 'message': str(current)[:8192],
+                'sqlite_errorcode': getattr(current, 'sqlite_errorcode', None),
+                'sqlite_errorname': getattr(current, 'sqlite_errorname', None),
+                'code': getattr(current, 'code', None),
+                'traceback': ''.join(traceback.format_tb(current.__traceback__, limit=16))[:16384]})
+            current = current.__cause__ if current.__cause__ is not None else (
+                None if current.__suppress_context__ else current.__context__)
+        Path(diagnostic_path).write_text(json.dumps({'phase': 'parent_child_run',
+            'captured_at': time.time(), 'worker_pid': os.getpid(), 'exception_chain': chain,
+            'chain_truncated': current is not None}, indent=2), encoding='utf-8')
+    except Exception:
+        # Failure to write optional evidence must preserve the original error.
+        pass
+
+
 def parent_handler(payload, context):
     before = context.budget.to_dict()
     try:
-        child = context.children.run(payload.get('handler', 'child'), {'value': 9},
-            request_id='one-child', timeout_seconds=2)
+        try:
+            child = context.children.run(payload.get('handler', 'child'), {'value': 9},
+                request_id='one-child', timeout_seconds=CHILD_CALL_SECONDS)
+        except Exception as error:
+            _capture_child_call_error(payload, error)
+            raise
     except ChildExecutionError as exc:
         cause = exc.__cause__
         return {'child_error': exc.result, 'code': exc.code, 'child_error_message': str(exc),
@@ -72,29 +110,31 @@ class RuntimeObservationIntegrationTests(unittest.TestCase):
         evidence_path = root / 'evidence.json'
         evidence = {'mode': mode, 'failed_child': fail, 'interpreter': sys.executable,
             'sdk_module': dispatcher_sdk.__file__, 'kernel_path': str(path),
-            'original_parent_seconds': 5, 'original_child_call_seconds': 2}
+            'original_parent_seconds': PARENT_SECONDS, 'original_child_call_seconds': CHILD_CALL_SECONDS,
+            'raw_child_exception_path': str(root / 'parent-child-error.json')}
         before = None
         try:
             with Kernel.open_sqlite(path, {'parent': parent_handler, 'child': child_handler,
                     'failing': failing_child}, isolation_mode=mode,
                     max_thread_workers=1, child_capacity=1) as runtime:
                 runtime.submit(runtime.command('parent', execution_id='parent', idempotency_key='parent',
-                    correlation_id='root', timeout_seconds=5,
-                    payload={'handler': 'failing' if fail else 'child'}))
+                    correlation_id='root', timeout_seconds=PARENT_SECONDS,
+                    payload={'handler': 'failing' if fail else 'child',
+                        '_child_diagnostic_path': str(root / 'parent-child-error.json')}))
                 before = time.monotonic()
                 result = runtime.run_once()
                 evidence['result'] = result.to_dict()
                 evidence['returned_after_seconds'] = time.monotonic() - before
                 evidence_path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
                 self.assertEqual(result.state, 'succeeded', result.result.to_dict())
-                self.assertLess(time.monotonic() - before, 5)
+                self.assertLess(time.monotonic() - before, PARENT_SECONDS)
                 # Business result delivery and durable wait publication are
                 # separate. Allow SDK maintenance to finish within this same
-                # original five-second caller bound; never rerun the handler.
+                # original caller bound; never rerun the handler.
                 observation = runtime.observation_journal.inspect('parent', timeout=.1)
                 first_observation = observation
                 evidence['first_observation'] = first_observation
-                end = before + 5
+                end = before + PARENT_SECONDS
                 while not observation.get('child_waits') or any(
                         wait['state'] == 'open' for wait in observation['child_waits']):
                     remaining = end - time.monotonic()
