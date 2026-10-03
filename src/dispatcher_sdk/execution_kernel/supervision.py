@@ -291,14 +291,18 @@ class SupervisionMixin:
             raise CASConflictError("handler entry has no matching durable admission")
         old = BudgetEnvelope.from_dict(json.loads(existing["envelope_json"]))
         origin = "execution:" + lease.execution_id
+        old_has_entry = any(item.origin_id == origin for item in old.constraints)
+        inherited_start = (completion and not old_has_entry
+                           and existing["parent_execution_id"] is not None
+                           and envelope.started_at == old.started_at)
         no_entry = (not any(item.origin_id == origin for item in envelope.constraints)
-                    and envelope.started_at is None)
+                    and (envelope.started_at is None or inherited_start))
         # A child may be denied by its inherited deadline before SDK entry
         # preparation. Its unentered metadata has no handler-attempt authority.
         unprepared = (completion and no_entry and existing["entry_state"] == "unentered"
                       and (existing["entry_attempt"], existing["entry_fence"]) == (None, None)
-                      and old.started_at is None
-                      and not any(item.origin_id == origin for item in old.constraints))
+                      and (old.started_at is None or inherited_start)
+                      and not old_has_entry)
         # A retry denied before its entry preparation still carries the
         # original confirmed budget. Result ownership was checked against the
         # current lease; normal validation below permits only equal or tighter

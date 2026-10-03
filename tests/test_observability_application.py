@@ -3,15 +3,18 @@ from pathlib import Path
 from contextlib import contextmanager
 import json
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from unittest.mock import patch
 
 from dispatcher_sdk import Dispatcher, ObservationOptions, StallPolicy
 from dispatcher_sdk.observability import ActivityRecorder, ObservationIdentity
 from dispatcher_sdk.execution_kernel import Kernel
+from tests._acceptance_evidence import retained_directory
 
 
 def quiet_handler(payload, context):
@@ -186,53 +189,91 @@ class ObservabilityApplicationTests(unittest.TestCase):
             time.sleep(.02)
 
     def test_dead_bridge_is_visible_and_retried_through_public_dispatcher(self):
-        with tempfile.TemporaryDirectory() as temporary, Dispatcher(
-                Path(temporary)/'application.sqlite3', {'quiet': quiet_handler},
+        root = retained_directory('sdk-dead-bridge-')
+        import dispatcher_sdk
+        evidence = {'test': self.id(), 'sdk_import': dispatcher_sdk.__file__, 'interpreter': sys.executable,
+            'root': str(root), 'handler_seconds': 3, 'execution_timeout': 5,
+            'dead_notification_wait': 6, 'samples': [], 'bridge_attempts': []}
+        with Dispatcher(
+                root/'application.sqlite3', {'quiet': quiet_handler},
                 isolation_mode='thread', observation_options=ObservationOptions(flush_interval=.05, write_timeout=.2)) as dispatcher:
             received = []
             dispatcher.subscribe_stalls(received.append)
 
             def broken_bridge(payload):
+                evidence['bridge_attempts'].append({'at': time.time(), 'payload': payload})
                 raise RuntimeError('injected failure before durable inbox receipt')
+
+            def capture(label):
+                sample = {'label': label, 'at': time.time(), 'monotonic': time.monotonic()}
+                for name, read in (
+                        ('task', lambda: task.snapshot),
+                        ('observation', lambda: task.observe(timeout=.5)),
+                        ('windows', task.stall_windows),
+                        ('notifications', lambda: dispatcher.stall_notification_page(timeout=.5)),
+                        ('dispatcher_health', dispatcher.health),
+                        ('supervisor_health', dispatcher.runtime._stall_supervisor.health)):
+                    try:
+                        sample[name] = read()
+                    except Exception as error:
+                        sample[name] = {'error_type': type(error).__name__, 'error': str(error)}
+                evidence['samples'].append(sample)
 
             dispatcher.runtime.set_stall_notification_bridge(broken_bridge)
             task = dispatcher.submit('quiet', {'seconds': 3}, request_id='quiet-once', timeout_seconds=5)
-            with self.assertRaises(TimeoutError):
-                task.wait(timeout=.001)
-            task.watch_stall(StallPolicy('public-progress', sample_interval=.1,
-                consecutive_windows=2, max_deliveries=1))
-            dispatcher.start()
-            dead = self.eventually(lambda: dispatcher.stall_notifications(state='dead'), bool)[0]
-            self.assertEqual(dead['phase'], 'observation')
-            self.assertFalse(dead['received'])
-            self.assertFalse(dead['consumed'])
-            self.assertNotIn('_sdk_subscription_identity', dead['payload']['target'])
-            notification_id = dead['notification_id']
-            dispatcher.runtime.set_stall_notification_bridge(dispatcher.orchestrator.enqueue_stall_notification)
-            retry_deadline = time.monotonic()+2
-            while True:
-                try:
-                    dispatcher.retry_stall_notification(notification_id, expected_revision=dead['revision'])
-                    break
-                except sqlite3.OperationalError as error:
-                    if not any(word in str(error).lower() for word in ('locked', 'busy')):
-                        raise
-                    if time.monotonic() >= retry_deadline:
-                        raise
-                    time.sleep(.02)
-            consumed = self.eventually(lambda: dispatcher.stall_notifications(),
-                lambda rows: any(row['consumed'] for row in rows))[0]
-            self.assertEqual(consumed['notification_id'], notification_id)
-            self.assertEqual(consumed['phase'], 'inbox')
-            self.assertEqual(set(consumed['stages']), {'observation', 'orchestration', 'inbox'})
-            self.assertEqual(len(received), 1)
-            self.assertEqual(received[0]['notification_id'], notification_id)
-            windows = task.stall_windows()
-            self.assertTrue(any(window['state'] == 'stalled' for window in windows['windows']))
-            observed = task.observe()
-            self.assertEqual(observed['identity']['task_id'], 'task')
-            self.assertIn('budget', observed)
-            self.assertEqual(task.wait(timeout=5)['status'], 'succeeded')
+            try:
+                with self.assertRaises(TimeoutError):
+                    task.wait(timeout=.001)
+                evidence['watch_receipt'] = task.watch_stall(StallPolicy('public-progress', sample_interval=.1,
+                    consecutive_windows=2, max_deliveries=1))
+                dispatcher.start()
+                dead = self.eventually(lambda: dispatcher.stall_notifications(state='dead'), bool)[0]
+                evidence['dead_notification'] = dead
+                capture('dead_before_assertions')
+                self.assertEqual(dead['phase'], 'observation')
+                self.assertFalse(dead['received'])
+                self.assertFalse(dead['consumed'])
+                self.assertNotIn('_sdk_subscription_identity', dead['payload']['target'])
+                notification_id = dead['notification_id']
+                dispatcher.runtime.set_stall_notification_bridge(dispatcher.orchestrator.enqueue_stall_notification)
+                retry_deadline = time.monotonic()+2
+                while True:
+                    try:
+                        evidence['retry_receipt'] = dispatcher.retry_stall_notification(
+                            notification_id, expected_revision=dead['revision'])
+                        break
+                    except sqlite3.OperationalError as error:
+                        if not any(word in str(error).lower() for word in ('locked', 'busy')):
+                            raise
+                        if time.monotonic() >= retry_deadline:
+                            raise
+                        time.sleep(.02)
+                consumed = self.eventually(lambda: dispatcher.stall_notifications(),
+                    lambda rows: any(row['consumed'] for row in rows))[0]
+                evidence['consumed_notification'] = consumed
+                capture('consumed_before_assertions')
+                self.assertEqual(consumed['notification_id'], notification_id)
+                self.assertEqual(consumed['phase'], 'inbox')
+                self.assertEqual(set(consumed['stages']), {'observation', 'orchestration', 'inbox'})
+                self.assertEqual(len(received), 1)
+                self.assertEqual(received[0]['notification_id'], notification_id)
+                windows = task.stall_windows()
+                self.assertTrue(any(window['state'] == 'stalled' for window in windows['windows']))
+                observed = task.observe()
+                self.assertEqual(observed['identity']['task_id'], 'task')
+                self.assertIn('budget', observed)
+                evidence['caller_result'] = task.wait(timeout=5)
+                self.assertEqual(evidence['caller_result']['status'], 'succeeded')
+            except BaseException as error:
+                evidence['error'] = {'type': type(error).__name__, 'message': str(error),
+                    'traceback': traceback.format_exc()}
+                raise
+            finally:
+                capture('final_before_close')
+                evidence['received'] = received
+                path = root/'evidence.json'
+                path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+                print('dead_bridge_evidence=' + str(path), flush=True)
 
     def test_busy_kernel_cancellation_has_a_bounded_uncommitted_error(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -38,7 +38,7 @@ def child(payload, context):
 def parent(payload, context):
     try:
         value = context.children.run('child', {'fail': payload.get('fail', False)},
-                                     request_id='delivery', timeout_seconds=2)
+                                     request_id='delivery', timeout_seconds=payload.get('child_timeout', 2))
         return {'child': value}
     except ChildExecutionError as error:
         return {'code': error.code, 'message': str(error), 'child_error': error.result}
@@ -186,9 +186,12 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                             stream.write(json.dumps(call) + '\n')
                     if on_time_result:
                         held.set()
-                    # Only optional cross-store publication is held. Original
-                    # parent five-second and child two-second limits remain.
-                    released = release.wait(4)
+                        # The scenario's original child deadline includes native
+                        # startup. Hold only its optional response publication;
+                        # the saved cutoff and all business budgets stay fixed.
+                        released = release.wait(8)
+                    else:
+                        released = False
                     with finish_lock:
                         call['released_at'] = time.time()
                         call['release_signalled'] = released
@@ -202,15 +205,15 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                         root/'kernel.sqlite3', {'parent': parent, 'child': child},
                         isolation_mode='process', child_capacity=1) as runtime:
                     runtime.submit(runtime.command('parent', execution_id='parent', idempotency_key='parent',
-                        correlation_id='root', timeout_seconds=5, payload={'fail': fail}))
+                        correlation_id='root', timeout_seconds=12, payload={'fail': fail, 'child_timeout': 5}))
                     import dispatcher_sdk
                     report = {'sdk_import': dispatcher_sdk.__file__, 'python': sys.executable,
                         'runtime_type': type(runtime).__module__ + '.' + type(runtime).__qualname__,
                         'runtime_directory': str(root), 'kernel_path': str(runtime.kernel.db_path),
                         'observation_path': runtime._observation_path,
                         'isolation_mode': 'process', 'child_capacity': 1, 'fail': fail,
-                        'parent_timeout_seconds': 5, 'child_timeout_seconds': 2,
-                        'publication_hold_seconds': 4, 'original_return': None,
+                        'parent_timeout_seconds': 12, 'child_timeout_seconds': 5,
+                        'publication_hold_seconds': 8, 'original_return': None,
                         'runtime_error': None, 'diagnostic_errors': {}}
 
                     def error_facts(error):

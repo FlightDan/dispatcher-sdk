@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
 from dispatcher_sdk.execution_kernel.settlement import (
     SettlementBindingError, SettlementBusyError, SettlementConflictError, SettlementJournal,
 )
+from tests._acceptance_evidence import retained_directory
 
 
 def lease(attempt=1, fence=1):
@@ -31,11 +33,16 @@ def result(value=None, attempt=1, fence=1):
 
 class SettlementJournalTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.kernel_path = Path(self.directory.name) / "kernel.db"
+        if self._testMethodName == 'test_committed_original_result_survives_process_exit_and_reopen':
+            root = retained_directory('sdk-settlement-process-exit-')
+        else:
+            self.directory = tempfile.TemporaryDirectory()
+            self.addCleanup(self.directory.cleanup)
+            root = Path(self.directory.name)
+        self.kernel_path = root / "kernel.db"
         self.path = Path(str(self.kernel_path) + ".settlements.sqlite3")
-        self.journal = SettlementJournal(self.path, source_id="store-original", kernel_path=self.kernel_path)
+        self.journal = SettlementJournal(self.path, source_id="store-original", kernel_path=self.kernel_path,
+            timeout_seconds=1 if self._testMethodName == 'test_committed_original_result_survives_process_exit_and_reopen' else .1)
 
     def test_kernel_writer_cannot_block_independent_durable_result(self):
         kernel = SQLiteKernel(self.kernel_path)
@@ -63,27 +70,67 @@ class SettlementJournalTests(unittest.TestCase):
         self.assertEqual("pending", self.journal.record(lease(), result())["state"])
 
     def test_committed_original_result_survives_process_exit_and_reopen(self):
-        script = """import json,os,sys
+        script = """import json,os,sys,time,traceback
 from dispatcher_sdk.execution_kernel.contracts import ExecutionLease,ExecutionResultV2
 from dispatcher_sdk.execution_kernel.settlement import SettlementJournal
-journal=SettlementJournal(sys.argv[1],source_id='store-original',kernel_path=sys.argv[2])
-journal.record(ExecutionLease.from_dict(json.loads(sys.argv[3])),ExecutionResultV2.from_dict(json.loads(sys.argv[4])),
-    evidence={'telemetry_flush':{'final_flush_persisted':False}})
-note=journal.note(ExecutionLease.from_dict(json.loads(sys.argv[3])),'collector_flush',{'state':'pending'})
-print(note['note_id'],flush=True)
-os._exit(42)
+def event(stage, **facts):
+    value={'stage':stage,'at':time.time(),'monotonic':time.monotonic(),'pid':os.getpid(),**facts}
+    print(json.dumps(value),flush=True)
+timeout=float(sys.argv[5])
+try:
+    event('initialize_started',timeout_seconds=timeout)
+    journal=SettlementJournal(sys.argv[1],source_id='store-original',kernel_path=sys.argv[2],timeout_seconds=timeout)
+    event('initialize_committed')
+    event('record_started',timeout_seconds=timeout)
+    receipt=journal.record(ExecutionLease.from_dict(json.loads(sys.argv[3])),ExecutionResultV2.from_dict(json.loads(sys.argv[4])),
+        evidence={'telemetry_flush':{'final_flush_persisted':False}},timeout_seconds=timeout)
+    event('record_committed',receipt=receipt)
+    event('note_started',timeout_seconds=timeout)
+    note=journal.note(ExecutionLease.from_dict(json.loads(sys.argv[3])),'collector_flush',{'state':'pending'},timeout_seconds=timeout)
+    event('note_committed',note=note)
+    os._exit(42)
+except BaseException as error:
+    event('error',error_type=type(error).__name__,message=str(error),traceback=traceback.format_exc(),
+          sqlite_errorcode=getattr(error,'sqlite_errorcode',None))
+    raise
 """
         original = result({"raw": "provider-response", "sequence": [1, 2, 3]})
-        process = subprocess.run([sys.executable, "-c", script, str(self.path), str(self.kernel_path),
-            json.dumps(lease().to_dict()), json.dumps(original.to_dict())], timeout=10, capture_output=True)
-        self.assertEqual(42, process.returncode, process.stderr.decode(errors="replace"))
-        reopened = SettlementJournal(self.path, source_id="store-original", kernel_path=self.kernel_path)
-        receipt = reopened.pending()[0]
-        self.assertEqual(original.to_dict(), receipt["result"])
-        self.assertEqual(lease().to_dict(), receipt["lease"])
-        self.assertEqual("pending", receipt["state"])
-        self.assertEqual({"telemetry_flush": {"final_flush_persisted": False}}, receipt["evidence"])
-        self.assertEqual(process.stdout.decode().strip(), reopened.inspect_notes("execution")["notes"][0]["note_id"])
+        import dispatcher_sdk
+        evidence = {'test': self.id(), 'sdk_import': dispatcher_sdk.__file__, 'interpreter': sys.executable,
+            'journal_path': str(self.path), 'kernel_path': str(self.kernel_path), 'operation_timeout': 1,
+            'process_timeout': 10, 'original_lease': lease().to_dict(), 'original_result': original.to_dict()}
+        try:
+            process = subprocess.run([sys.executable, "-c", script, str(self.path), str(self.kernel_path),
+                json.dumps(lease().to_dict()), json.dumps(original.to_dict()), str(evidence['operation_timeout'])],
+                timeout=evidence['process_timeout'], capture_output=True)
+            evidence['child'] = {'returncode': process.returncode, 'stdout': process.stdout.decode(errors='replace'),
+                'stderr': process.stderr.decode(errors='replace')}
+            events = [json.loads(line) for line in evidence['child']['stdout'].splitlines()]
+            evidence['child']['events'] = events
+            self.assertEqual(42, process.returncode, evidence['child'])
+            reopened = SettlementJournal(self.path, source_id="store-original", kernel_path=self.kernel_path,
+                timeout_seconds=evidence['operation_timeout'])
+            pending = reopened.pending(timeout_seconds=evidence['operation_timeout'])
+            notes = reopened.inspect_notes("execution", timeout_seconds=evidence['operation_timeout'])
+            evidence.update(reopened_pending=pending, reopened_notes=notes)
+            self.assertEqual(1, len(pending), evidence)
+            receipt = pending[0]
+            self.assertEqual(original.to_dict(), receipt["result"])
+            self.assertEqual(lease().to_dict(), receipt["lease"])
+            self.assertEqual("pending", receipt["state"])
+            self.assertEqual({"telemetry_flush": {"final_flush_persisted": False}}, receipt["evidence"])
+            committed_note = next(event['note'] for event in events if event['stage'] == 'note_committed')
+            self.assertEqual(committed_note['note_id'], notes['notes'][0]['note_id'])
+        except BaseException as error:
+            evidence['error'] = {'type': type(error).__name__, 'message': str(error), 'traceback': traceback.format_exc()}
+            if isinstance(error, subprocess.TimeoutExpired):
+                evidence['child'] = {'stdout': (error.stdout or b'').decode(errors='replace'),
+                    'stderr': (error.stderr or b'').decode(errors='replace'), 'timeout': error.timeout}
+            raise
+        finally:
+            path = self.path.parent/'evidence.json'
+            path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+            print('settlement_process_exit_evidence=' + str(path), flush=True)
 
     def test_canonical_replay_preserves_record_and_conflicting_facts_fail(self):
         first = self.journal.record(lease(), result({"a": 1, "b": 2}))

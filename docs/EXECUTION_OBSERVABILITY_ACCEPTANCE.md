@@ -6,26 +6,28 @@ maintainability only. The user has activated the revised SDK-only Goal. ModPort 
 writes are outside the revised completion criteria. Historical integration evidence
 is retained below; it does not establish the new SDK-only A16.
 
-The implementation is not yet fully accepted. Latest frozen candidate `5d9db60`
-passed the installed public example and focused Linux checks, but its complete
-regression failed: 891 outer tests had two failures, one error and 16 skips;
-the nested installed suite had one failure and 16 skips across 886 tests.
-SDK defect diagnosis, the independent installed SDK end-to-end witness, complete
-candidate regression and native Windows/CI evidence remain required.
-No release is authorized by this work.
+The implementation is not yet fully accepted. Latest frozen candidate `80906d2`
+passed all five independent installed SDK scenarios and the public example. Its
+complete regression failed: 934 outer tests had four failures and 16 skips;
+the nested installed suite had one failure and 16 skips across 929 tests.
+Native Windows and the complete CI matrix remain required. No release is authorized.
 
-The current uncommitted corrective candidate is being validated. The standalone
-SDK consumer passed all five scenarios against source: streamed success, original
-tool failure, tool cutoff, silent-task conditional cancellation and cleanup
-recovery across controller processes. Its installed-wheel run is still required.
-Entry confirmation now shares one bounded handshake across isolation modes;
-completion retains observed budget floors with original result obligations;
-cancellation retries only provably uncommitted contention within its original
-caller window. A wider focused run exposed completion edge cases; after causal
-fixes and independent review, all 140 integrated checks passed. This includes
-actual Runtime/journal reopen under clock rollback. The full candidate regression
-and native matrix remain required; these partial passes do not establish final
-acceptance.
+The corrective candidate is being validated. The failed native child-delivery
+cases did not establish timely child entry within their original two-second
+window. They also exposed an SDK defect: inherited parent start time caused
+completion to reject a valid pre-entry failure. That correction preserves pending
+entry authority and original constraints. A separate native probe confirmed that
+parent-only timer observations were lost on clock rollback, allowing a second
+business attempt; timer floors now propagate with original result obligations.
+These corrections need a fresh complete candidate regression.
+
+The nested dead-bridge notification failure remains unattributed: its temporary
+store was deleted, and the log only shows that no dead notice arrived during the
+original wait. The fixture now retains observations, windows, bridge calls and
+health diagnostics; one focused execution passed with unchanged timing. The
+crash-journal subprocess exceeded its original default 0.1-second write window
+before commit. Its crash-survival fixture now declares one-second operation
+windows before launch and retains raw stages; the original failure is preserved.
 
 ## Candidate and reproducible commands
 
@@ -71,15 +73,28 @@ links or substitutes for the candidate CI artifacts.
 | A12 Conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; separate capacity keeps local deadlines working. Candidate matrix pending. |
 | A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Latest candidate regression pending. |
 | A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; separately installed historical `v0.7.0.dev0` writer | Actual old installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Full public API and pending-obligation upgrade regression pending. |
-| A15 Installed entry | Isolated wheel consumer suite and portable public example | `5d9db60` clean-wheel import and original parent12/child5/wait15 example passed. Its complete installed consumer suite failed; corrective candidate validation remains required. |
-| A16 Independent SDK end-to-end | Installed public APIs, real handlers/processes, local byte/tool fixtures and persisted recovery; no ModPort or external model dependency | Revised criterion is not yet accepted. The installed example and native module checks provide partial evidence; a reproducible public-entry witness must cover success/raw failure, output/silence, parent-child budgets, cancellation, cleanup failure and recovery without repeating business. Historical ModPort checks are not a substitute. |
+| A15 Installed entry | Isolated wheel consumer suite and portable public example | `80906d2` clean-wheel import and original parent12/child5/wait15 example passed. Its complete installed suite failed; corrective candidate validation remains required. |
+| A16 Independent SDK end-to-end | Installed public APIs, real handlers/processes, local byte/tool fixtures and persisted recovery; no ModPort or external model dependency | All five public-entry scenarios passed on installed `80906d2`: success/raw failure, output/silence, parent-child/tool budgets, cancellation and cleanup recovery without repeated business. Fresh corrective candidate and native matrix remain required. Historical ModPort checks are not a substitute. |
 | A17 Native Windows | `test_windows_runtime`, portable native observability/deadline/pressure suites | Linux mocks are not native acceptance. Windows x64/ARM64 jobs and raw Job evidence pending. Linux-only cgroup cases do not apply to Windows. |
-| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `5d9db60` outer run of 891 tests had 2 failures, 1 error and 16 skips; nested installed run of 886 tests had 1 failure and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
+| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `80906d2` outer run of 934 tests had 4 failures and 16 skips; nested installed run of 929 tests had 1 failure and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
 
 ## Retained raw host evidence
 
 | Command/result | Retained evidence |
 | --- | --- |
+| Revised public contention fixture passed with original writer/caller bounds and actual SQLite BUSY, one business call and one callback | `/tmp/sdk-final9-public-contention-fixture.log`; `/tmp/sdk-final9-fixture-evidence/sdk-public-admission-contention-jut999bg/evidence.json`; independent review included notification-result transaction setup |
+| Final native budget/startup/cancellation-tree boundary checks: 34 passed in 43.424s | `/tmp/sdk-final9-boundary.log`; `/tmp/sdk-final9-boundary-evidence`; original startup failure semantics preserved |
+| Public typing and documentation after corrective changes passed | `/tmp/sdk-observability-types-final9.log` (five fixtures); `/tmp/sdk-observability-docs-final9.log` (546 links, six README examples, zero skips) |
+| Combined corrective focus: 140 tests / one failure / one error / 16 platform skips; not a pass | `/tmp/sdk-final9-focused.log`; startup guard expectation exposed a classification distinction, and a public contention fixture failed before acquiring its writer |
+| Native startup cause distinction: inherited tool expiry is timeout; internal startup guard retains original startup failure | `/tmp/sdk-startup-authority-classification.log`; two checks passed in 2.551s; later original-decision capture included in next boundary run |
+| Supervisor-only native floor and deterministic signal interleaving checks passed | `/tmp/sdk-supervisor-floor-regression.log`; `/tmp/sdk-alarm-floor-interleaving-regression.log`; independent review verified separate alarm slot and original timeout decision |
+| Windows watchdog floor checks: 10 portable checks passed; not native Windows acceptance | `/tmp/sdk-windows-budget-floor-final.log` |
+| Frozen `80906d2` full regression failed: outer 934 / four failures / 16 skips; nested 929 / one failure / 16 skips | `/tmp/sdk-observability-full-regression-final8.log`; `/tmp/sdk-full-final8-evidence` |
+| Frozen installed public SDK: all five independent scenarios and original example passed | `/tmp/sdk-a16-installed-final8/summary.json`; `/tmp/sdk-observability-installed-import-final8.json`; `/tmp/sdk-observability-installed-example-final8.log` |
+| Parent-only native timer floor lost before correction: retry entered a second real worker after rollback | `/tmp/sdk-parent-deadline-floor-kp_0i4c_/evidence.json`; original 10-second budget and 90-second lease |
+| Integrated parent floor, child pre-entry and admission corrections: 28 checks passed in 33.838s | `/tmp/sdk-parent-floor-integration.log`; `/tmp/sdk-parent-budget-floor-ifllip6t/evidence.json`; supervisor/Windows follow-up pending |
+| Dead-bridge focused diagnostic passed with original timing; previous installed cause unknown | `/tmp/sdk-dead-bridge-88jtno88/evidence.json` |
+| Crash-journal subprocess committed, exited 42 and reopened exact original records with authored one-second operation windows | `/tmp/sdk-settlement-process-exit-dk36npow/evidence.json` |
 | Corrective integrated regression: 140 tests passed in 162.589s after fixing all preceding entry/completion failures | `/tmp/sdk-corrective-final-focused.log`; fresh wheel, complete suite and CI remain pending |
 | Actual Runtime and fresh settlement journal reopen under rollback: original result restored with one business call; 17 targeted checks passed in 5.089s | `/tmp/sdk-completion-reopen-local-proof-final.log`; `/tmp/sdk-runtime-budget-reopen-8elqhajx/evidence.json`; independent review found no remaining blocker |
 | Corrective public SDK source consumer: all five scenarios passed; no external provider or application adapter | `/tmp/sdk-a16-integrated-corrections-20261004/summary.json`; `/tmp/sdk-a16-integrated-corrections-20261004.log`; each scenario retains input, process, byte, budget and outcome records |
@@ -226,7 +241,7 @@ completion timestamps, deferred result settlement, transient SQLite errors
 misclassified as revoked authority, lost final-flush evidence, missing native
 bootstrap errors, original deadline cause, readonly receipt mutation, nested
 control deadlines, child storage replay, conservative clock receipt recovery,
-targeted execution capacity and query-size fallback. Current candidate-wide verification
+targeted execution capacity and query-size fallback. Further review verified timer-floor retention across parent/supervisor/Windows paths, signal interruption, inherited child pre-entry settlement and original startup-failure classification. Current candidate-wide verification
 remains required after those fixes.
 
 The independent journals retain facts; they do not authorize a new execution,

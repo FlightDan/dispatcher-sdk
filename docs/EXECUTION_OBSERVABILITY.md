@@ -226,6 +226,11 @@ receipt is retained as superseded. In-memory storage and unavailable receipt
 storage expose unknown retention rather than claiming durability.
 
 The retained obligation also carries the original observed budget checkpoint.
+Native parent timers and supervisors retain the exact samples that shortened
+their deadlines and merge those floors into the same obligation. Entry packets
+and later wall-clock rollback cannot replace a stronger timer observation.
+Cleanup may consume the reserved interval after timely business return; its
+retained floor constrains future admission without changing that return's cause.
 Kernel completion commits that checkpoint with the result, before releasing a
 retry. A clock rollback cannot restore time already observed as exhausted.
 Recovery tightens the existing budget without confirming an interrupted entry.

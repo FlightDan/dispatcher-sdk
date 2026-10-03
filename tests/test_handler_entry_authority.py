@@ -443,9 +443,40 @@ class AdmissionContentionTests(unittest.TestCase):
 
     def test_public_dispatcher_retries_real_writer_and_delivers_once(self):
         from dispatcher_sdk import Dispatcher
+        from contextlib import ExitStack, contextmanager
+        from tests._acceptance_evidence import retained_directory
+        import dispatcher_sdk
+        import traceback
+
+        self.root = retained_directory('sdk-public-admission-contention-')
         received = []
         call_log = self.root / "business-calls.txt"
         delivered = threading.Event()
+        writer_established = threading.Event()
+        establishment_gate = threading.RLock()
+        evidence = {'test': self.id(), 'sdk_import': dispatcher_sdk.__file__, 'interpreter': sys.executable,
+            'root': str(self.root), 'writer_timeout': 1, 'caller_timeout': 3,
+            'callback_wait': 2, 'events': []}
+
+        def note(stage, **facts):
+            evidence['events'].append({'stage': stage, 'at': time.time(), 'monotonic': time.monotonic(),
+                'thread': threading.current_thread().name, **facts})
+
+        def before_writer(transaction, owner):
+            @contextmanager
+            def guarded(*args, **kwargs):
+                if not writer_established.is_set():
+                    with establishment_gate:
+                        if not writer_established.is_set():
+                            note('setup_transaction', owner=owner)
+                            with transaction(*args, **kwargs) as value:
+                                yield value
+                            return
+                # Once the real writer owns SQLite, SDK transactions compete
+                # normally. This gate never replaces the BUSY/retry path.
+                with transaction(*args, **kwargs) as value:
+                    yield value
+            return guarded
 
         def echo(payload, context):
             with Path(payload["call_log"]).open("a") as stream:
@@ -456,29 +487,87 @@ class AdmissionContentionTests(unittest.TestCase):
 
         def callback(notification):
             received.append(notification)
+            note('callback', notification=notification)
             delivered.set()
 
         app = Dispatcher(self.root / "app.sqlite3", {"echo": echo}, isolation_mode="thread",
                          on_result=callback, callback_retry_delay=.01)
         self.addCleanup(app.close)
         ready, held, busy, failures = self.contend(app.runtime)
-        task = app.submit("echo", {"value": 8, "call_log": str(call_log)}, request_id="retry-admission")
-        app.start()
-        self.assertTrue(ready.wait(2), (app.health(), task.snapshot))
-        writer = self.writer(app.path)
-        held.set()
-        self.assertTrue(busy.wait(1), "a real SQLite BUSY collision is required")
-        writer.rollback()
-        result = task.wait(timeout=3)
-        self.assertEqual((result["status"], result["value"], result["attempt"]),
-                         ("succeeded", 16, 1))
-        self.assertTrue(delivered.wait(2))
-        self.assertEqual(len(call_log.read_text().splitlines()), 1)
-        self.assertEqual(len(received), 1)
-        self.assertGreaterEqual(len(failures), 1)
-        worker_errors = [item for item in app.health()["host"]["recent_errors"]
-                         if item["source"] == "worker"]
-        self.assertEqual(worker_errors, [])
+        task, writer = None, None
+        try:
+            with ExitStack() as guards:
+                for owner, instance in (('kernel', app.runtime.kernel), ('orchestrator', app.orchestrator),
+                                        ('inbox', app.inbox)):
+                    guards.enter_context(patch.object(instance, '_transaction',
+                        before_writer(instance._transaction, owner)))
+                guards.enter_context(patch.object(app.orchestrator, '_results_transaction',
+                    before_writer(app.orchestrator._results_transaction, 'results')))
+                task = app.submit("echo", {"value": 8, "call_log": str(call_log)}, request_id="retry-admission")
+                app.start()
+                reached = ready.wait(2)
+                note('admission_barrier', reached=reached)
+                self.assertTrue(reached, 'public host did not reach handler admission')
+                # Establish this one writer at the paused SDK admission point,
+                # excluding unrelated local writers only until BEGIN succeeds.
+                # The original one-second establishment window covers both
+                # the fixture gate and SQLite admission; it is never renewed.
+                writer_deadline = time.monotonic() + evidence['writer_timeout']
+                acquired = establishment_gate.acquire(timeout=evidence['writer_timeout'])
+                note('writer_gate', acquired=acquired)
+                if not acquired:
+                    raise TimeoutError('fixture writer establishment gate elapsed')
+                try:
+                    remaining = writer_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('fixture writer establishment window elapsed')
+                    writer = sqlite3.connect(app.path, timeout=remaining)
+                    writer.execute('BEGIN IMMEDIATE')
+                    writer_established.set()
+                    note('writer_acquired', in_transaction=writer.in_transaction)
+                finally:
+                    establishment_gate.release()
+                held.set()
+                collided = busy.wait(1)
+                note('sdk_busy', observed=collided)
+                self.assertTrue(collided, "a real SQLite BUSY collision is required")
+                writer.rollback()
+                note('writer_released')
+                result = task.wait(timeout=evidence['caller_timeout'])
+                evidence['result'] = result
+                self.assertEqual((result["status"], result["value"], result["attempt"]),
+                                 ("succeeded", 16, 1))
+                delivered_once = delivered.wait(evidence['callback_wait'])
+                note('callback_wait', delivered=delivered_once)
+                self.assertTrue(delivered_once)
+                evidence['business_calls'] = call_log.read_text().splitlines()
+                self.assertEqual(len(evidence['business_calls']), 1)
+                self.assertEqual(len(received), 1)
+                self.assertGreaterEqual(len(failures), 1)
+                worker_errors = [item for item in app.health()["host"]["recent_errors"]
+                                 if item["source"] == "worker"]
+                evidence['worker_errors'] = worker_errors
+                self.assertEqual(worker_errors, [])
+        except BaseException as error:
+            evidence['error'] = {'type': type(error).__name__, 'message': str(error),
+                'traceback': traceback.format_exc()}
+            raise
+        finally:
+            if writer is not None:
+                writer.rollback()
+                writer.close()
+            held.set()
+            evidence['busy_errors'] = [{'type': type(error).__name__, 'message': str(error),
+                'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None)} for error in failures]
+            evidence['received'] = received
+            for name, read in (('health', app.health), ('task', lambda: None if task is None else task.snapshot)):
+                try:
+                    evidence[name] = read()
+                except Exception as error:
+                    evidence[name] = {'error_type': type(error).__name__, 'error': str(error)}
+            path = self.root/'evidence.json'
+            path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+            print('public_admission_contention_evidence=' + str(path), flush=True)
 
     def test_startup_expiry_classifies_without_business_and_releases_capacity(self):
         runtime, marker = self.runtime(startup=.25)

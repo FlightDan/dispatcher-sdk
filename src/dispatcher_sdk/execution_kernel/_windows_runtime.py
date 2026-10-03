@@ -26,9 +26,9 @@ from typing import Any, Callable, Optional
 
 from ..durability import Durability, validate_durability
 from ._process_runtime import (
-    invoke_handler, _serialize_handler_outcome, _bounded_deadline,
+    invoke_handler, _serialize_handler_outcome,
     _budget_outcome, _confirmed_entry_packet, _close_context, _capture_completion_time,
-    _bootstrap_diagnostic, _observe_phase,
+    _bootstrap_diagnostic, _observe_phase, _budget_sample, _merge_budget_floor,
 )
 from .budget import BudgetClockUnknownError, BudgetEnvelope
 from ._registry import Handler
@@ -333,19 +333,40 @@ class _Watchdog:
         self.envelope, self.now = envelope, now
         self.cleanup = False
         self.clock_error: BudgetClockUnknownError | None = None
+        self.lock = threading.Lock()
         try:
-            self.inherited_work_deadline = _bounded_deadline(math.inf, envelope, now)
-            self.inherited_hard_deadline = _bounded_deadline(math.inf, envelope, now, hard=True)
+            with self.lock:
+                self._retain_sample_locked()
+                self.inherited_work_deadline = self._bound_locked(math.inf)
+                self.inherited_hard_deadline = self._bound_locked(math.inf, hard=True)
         except BudgetClockUnknownError as exc:
             self.clock_error = exc
             self.inherited_work_deadline = self.inherited_hard_deadline = time.monotonic()
-        self.lock = threading.Lock()
         self.changed = threading.Event()
         self.stopped = False
         self.expired = False
         self.error: Optional[BaseException] = None
         self.thread = threading.Thread(target=self._run, name="kernel-windows-deadline", daemon=True)
         self.thread.start()
+
+    def _retain_sample_locked(self) -> None:
+        if self.envelope is not None:
+            self.envelope = self.envelope.recheckpoint(sample=_budget_sample(self.now))
+
+    def _bound_locked(self, deadline: float, *, hard: bool = False) -> float:
+        if self.envelope is None:
+            return deadline
+        bound = self.envelope.deadline_monotonic(hard=hard, sample=self.envelope.checkpoint)
+        return deadline if bound is None else min(deadline, bound)
+
+    def snapshot(self) -> BudgetEnvelope | None:
+        """Return already observed authority without sampling a fresh wall clock."""
+        with self.lock:
+            return self.envelope
+
+    def hard_deadline_bound(self, deadline: float) -> float:
+        with self.lock:
+            return min(self.inherited_hard_deadline, self._bound_locked(deadline, hard=True))
 
     def business_deadline(self, seconds: float, *, envelope: BudgetEnvelope | None = None,
                           deadline: float | None = None) -> float:
@@ -358,9 +379,11 @@ class _Watchdog:
                 if self.envelope is not None:
                     envelope = BudgetEnvelope((*self.envelope.constraints, *envelope.constraints),
                                               envelope.checkpoint, envelope.started_at)
+                    envelope = _merge_budget_floor(envelope, self.envelope)
                 self.envelope = envelope
-            self.deadline = min(self.inherited_work_deadline, _bounded_deadline(
-                time.monotonic() + seconds if deadline is None else deadline, self.envelope, self.now))
+            self._retain_sample_locked()
+            self.deadline = min(self.inherited_work_deadline, self._bound_locked(
+                time.monotonic() + seconds if deadline is None else deadline))
             self.changed.set()
             return self.deadline
 
@@ -368,7 +391,7 @@ class _Watchdog:
         with self.lock:
             self.cleanup = True
             self.deadline = min(self.inherited_hard_deadline,
-                                _bounded_deadline(deadline, self.envelope, self.now, hard=True))
+                                self._bound_locked(deadline, hard=True))
             self.changed.set()
 
     def _run(self) -> None:
@@ -377,11 +400,10 @@ class _Watchdog:
                 if self.stopped:
                     return
                 try:
-                    self.inherited_work_deadline = _bounded_deadline(
-                        self.inherited_work_deadline, self.envelope, self.now)
-                    self.inherited_hard_deadline = _bounded_deadline(
-                        self.inherited_hard_deadline, self.envelope, self.now, hard=True)
-                    self.deadline = _bounded_deadline(self.deadline, self.envelope, self.now, hard=self.cleanup)
+                    self._retain_sample_locked()
+                    self.inherited_work_deadline = self._bound_locked(self.inherited_work_deadline)
+                    self.inherited_hard_deadline = self._bound_locked(self.inherited_hard_deadline, hard=True)
+                    self.deadline = self._bound_locked(self.deadline, hard=self.cleanup)
                     remaining = self.deadline - time.monotonic()
                 except BudgetClockUnknownError as exc:
                     self.clock_error = exc
@@ -563,7 +585,13 @@ def invoke_windows_handler(
     if type(start_timeout) not in (int, float) or not math.isfinite(start_timeout) or start_timeout <= 0:
         raise ValueError("start_timeout must be finite and positive")
     try:
-        start_deadline = _bounded_deadline(time.monotonic() + start_timeout, budget_envelope, now)
+        if budget_envelope is not None:
+            budget_envelope = budget_envelope.recheckpoint(sample=_budget_sample(now))
+            bound = budget_envelope.deadline_monotonic(sample=budget_envelope.checkpoint)
+            start_deadline = min(time.monotonic() + start_timeout,
+                                 math.inf if bound is None else bound)
+        else:
+            start_deadline = time.monotonic() + start_timeout
     except BudgetClockUnknownError as exc:
         return _budget_outcome({"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
                                "control_error": True, "retryable": False, "effect_ids": []}, budget_envelope)
@@ -628,7 +656,7 @@ def invoke_windows_handler(
                         budget_envelope = actual
                     deadline = watchdog.business_deadline(command.timeout_seconds, envelope=budget_envelope,
                                                          deadline=entry["deadline_monotonic"])
-                    hard_deadline = _bounded_deadline(entry["hard_deadline_monotonic"], budget_envelope, now, hard=True)
+                    hard_deadline = watchdog.hard_deadline_bound(entry["hard_deadline_monotonic"])
                     if on_entered is not None:
                         try:
                             on_entered(entry)
@@ -684,6 +712,14 @@ def invoke_windows_handler(
                     finally:
                         if registered and on_finished is not None:
                             on_finished(handle)
+        if watchdog is not None:
+            snapshot = getattr(watchdog, "snapshot", None)
+            observed = snapshot() if callable(snapshot) else None
+            if observed is not None and budget_envelope is not None:
+                try:
+                    budget_envelope = _merge_budget_floor(budget_envelope, observed)
+                except BudgetClockUnknownError as exc:
+                    watchdog.clock_error = exc
         if handle.revocation_reason is not None:
             return _budget_outcome({"kind": "authority_revoked", "reason": handle.revocation_reason, "effect_ids": []}, budget_envelope, entry)
         if watchdog is not None and getattr(watchdog, "clock_error", None) is not None:
