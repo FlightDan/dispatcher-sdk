@@ -149,6 +149,26 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                 cwd=root,
             )
 
+            # A public application consumer runs outside the source tree and
+            # reuses this wheel/interpreter. Its evidence survives this test's
+            # temporary install, including failures before the full suite.
+            evidence_parent = os.environ.get("SDK_ACCEPTANCE_EVIDENCE_DIR")
+            if evidence_parent:
+                Path(evidence_parent).mkdir(parents=True, exist_ok=True)
+            evidence = Path(tempfile.mkdtemp(prefix="sdk-observability-consumer-", dir=evidence_parent))
+            public_consumer = root / "public-consumer"
+            public_consumer.mkdir()
+            script = public_consumer / "sdk_observability_acceptance.py"
+            shutil.copy2(ROOT / "examples" / script.name, script)
+            print("sdk_observability_consumer_artifact=" + str(evidence), flush=True)
+            self._run([str(interpreter), str(script), "--evidence-dir", str(evidence)],
+                      cwd=public_consumer, timeout=180)
+            summary = json.loads((evidence / "summary.json").read_text(encoding="utf-8"))
+            environment_record = json.loads((evidence / "environment.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["passed"])
+            self.assertEqual(summary["scenarios"], ["success", "failure", "budget", "silence", "cleanup"])
+            self.assertTrue(Path(environment_record["sdk_import"]).is_relative_to(virtualenv))
+
             installed_suite = root / "installed-suite"
             shutil.copytree(ROOT / "tests", installed_suite / "tests",
                             ignore=shutil.ignore_patterns("__pycache__", "test_packaging.py",

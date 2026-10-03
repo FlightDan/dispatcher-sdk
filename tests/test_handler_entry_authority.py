@@ -237,7 +237,7 @@ class ThreadHandlerEntryGateTests(unittest.TestCase):
                                now=lambda: time.time() if self.wall is None else self.wall)
         self.addCleanup(self.runtime.close)
         self.addCleanup(self.release.set)
-        self.confirm = self.runtime.kernel.confirm_handler_entry
+        self.confirm = self.runtime.kernel._checkpoint_handler_entry
         finished = self.runtime._thread_finished
 
         def record_finished(*args):
@@ -257,7 +257,7 @@ class ThreadHandlerEntryGateTests(unittest.TestCase):
                 raise CASConflictError("injected entry acknowledgement failure")
             return self.confirm(*args, **kwargs)
 
-        self.confirm_patch = patch.object(self.runtime.kernel, "confirm_handler_entry",
+        self.confirm_patch = patch.object(self.runtime.kernel, "_checkpoint_handler_entry",
                                            side_effect=held_confirmation)
         self.confirm_patch.start()
         self.addCleanup(self.confirm_patch.stop)
@@ -416,7 +416,7 @@ class AdmissionContentionTests(unittest.TestCase):
 
     def contend(self, runtime):
         ready, held, busy = threading.Event(), threading.Event(), threading.Event()
-        original = runtime.kernel.prepare_execution_budget
+        original = runtime.kernel._prepare_handler_entry
         failures = []
 
         def prepare(lease, **kwargs):
@@ -430,7 +430,7 @@ class AdmissionContentionTests(unittest.TestCase):
                 busy.set()
                 raise
 
-        runtime.kernel.prepare_execution_budget = prepare
+        runtime.kernel._prepare_handler_entry = prepare
         self.addCleanup(held.set)
         return ready, held, busy, failures
 
@@ -522,7 +522,7 @@ class AdmissionContentionTests(unittest.TestCase):
         identifier = self.submit(runtime, "clock", managed=True)
         ready, held, busy, _ = self.contend(runtime)
         jumped = threading.Event()
-        original_prepare = runtime.kernel.prepare_execution_budget
+        original_prepare = runtime.kernel._prepare_handler_entry
 
         def after_helper_checkpoint(lease, **kwargs):
             # This call follows the helper's resample/recheckpoint, so the
@@ -531,7 +531,7 @@ class AdmissionContentionTests(unittest.TestCase):
                 jumped.set()
             return original_prepare(lease, **kwargs)
 
-        runtime.kernel.prepare_execution_budget = after_helper_checkpoint
+        runtime.kernel._prepare_handler_entry = after_helper_checkpoint
         driver, results, errors = self.drive(runtime, identifier)
         self.assertTrue(ready.wait(2))
         writer = self.writer(runtime.kernel.db_path)

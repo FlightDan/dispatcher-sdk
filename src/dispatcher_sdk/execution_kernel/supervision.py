@@ -207,6 +207,15 @@ class SupervisionMixin:
         keep that uncertainty instead of granting a new duration. Replaying
         preparation under the same live lease is safe before worker dispatch.
         """
+        return self._prepare_execution_budget(lease, timeout_seconds=timeout_seconds)
+
+    def _prepare_handler_entry(self, lease: ExecutionLease, *,
+                               timeout_seconds: float = .1) -> BudgetEnvelope:
+        """Fence every SDK entry until its current-attempt clock is confirmed."""
+        return self._prepare_execution_budget(lease, timeout_seconds=timeout_seconds, pending=True)
+
+    def _prepare_execution_budget(self, lease: ExecutionLease, *,
+                                  timeout_seconds: float, pending: bool = False) -> BudgetEnvelope:
         with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             self._assert_lease(connection, lease, timestamp=timestamp, states={"running"})
             self._authorize_managed_operation(
@@ -228,7 +237,7 @@ class SupervisionMixin:
                 raise ValueError("execution origin conflicts with inherited constraint")
             if existing is not None and existing["entry_state"] == "confirmed" and cutoff is None:
                 raise BudgetClockUnknownError("confirmed handler entry has no original execution cutoff")
-            state = "confirmed" if cutoff is not None else "pending"
+            state = "confirmed" if cutoff is not None and not pending else "pending"
             if existing is None:
                 connection.execute(
                     "INSERT INTO kernel_execution_limits(execution_id,envelope_json,entry_state,entry_attempt,entry_fence) "
@@ -246,6 +255,15 @@ class SupervisionMixin:
     def confirm_handler_entry(self, lease: ExecutionLease, envelope: BudgetEnvelope, *,
                               timeout_seconds: float = .1) -> BudgetEnvelope:
         """Confirm the worker's captured entry; persistence never resets its cutoff."""
+        return self._record_handler_entry(lease, envelope, timeout_seconds=timeout_seconds, pending=False)
+
+    def _checkpoint_handler_entry(self, lease: ExecutionLease, envelope: BudgetEnvelope, *,
+                                  timeout_seconds: float = .1) -> BudgetEnvelope:
+        """Persist actual entry facts without authorizing business or replay."""
+        return self._record_handler_entry(lease, envelope, timeout_seconds=timeout_seconds, pending=True)
+
+    def _record_handler_entry(self, lease: ExecutionLease, envelope: BudgetEnvelope, *,
+                              timeout_seconds: float, pending: bool) -> BudgetEnvelope:
         if type(envelope) is not BudgetEnvelope:
             raise TypeError("budget must be a BudgetEnvelope")
         with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
@@ -253,42 +271,106 @@ class SupervisionMixin:
             self._authorize_managed_operation(
                 connection, lease.execution_id, timestamp=timestamp, operation="handler entry confirmation"
             )
-            existing = connection.execute(
-                "SELECT * FROM kernel_execution_limits WHERE execution_id=?", (lease.execution_id,)
-            ).fetchone()
-            if (existing is None or existing["entry_state"] not in {"pending", "confirmed"}
-                    or (existing["entry_attempt"], existing["entry_fence"]) != (lease.attempt, lease.fence)):
+            envelope, _ = self._merge_handler_entry_budget(connection, row, lease, envelope)
+            connection.execute(
+                "UPDATE kernel_execution_limits SET envelope_json=?,entry_state=? WHERE execution_id=?",
+                (encode_json(envelope.to_dict()), "pending" if pending else "confirmed", lease.execution_id),
+            )
+            return envelope
+
+    def _merge_handler_entry_budget(self, connection, row, lease: ExecutionLease,
+                                   envelope: BudgetEnvelope, *, completion: bool = False):
+        """Validate and merge retained facts; callers own the transaction."""
+        if type(envelope) is not BudgetEnvelope:
+            raise TypeError("budget must be a BudgetEnvelope")
+        existing = connection.execute(
+            "SELECT * FROM kernel_execution_limits WHERE execution_id=?", (lease.execution_id,)
+        ).fetchone()
+        allowed_states = {"pending", "confirmed", "unentered"} if completion else {"pending", "confirmed"}
+        if existing is None or existing["entry_state"] not in allowed_states:
+            raise CASConflictError("handler entry has no matching durable admission")
+        old = BudgetEnvelope.from_dict(json.loads(existing["envelope_json"]))
+        origin = "execution:" + lease.execution_id
+        no_entry = (not any(item.origin_id == origin for item in envelope.constraints)
+                    and envelope.started_at is None)
+        # A child may be denied by its inherited deadline before SDK entry
+        # preparation. Its unentered metadata has no handler-attempt authority.
+        unprepared = (completion and no_entry and existing["entry_state"] == "unentered"
+                      and (existing["entry_attempt"], existing["entry_fence"]) == (None, None)
+                      and old.started_at is None
+                      and not any(item.origin_id == origin for item in old.constraints))
+        # A retry denied before its entry preparation still carries the
+        # original confirmed budget. Result ownership was checked against the
+        # current lease; normal validation below permits only equal or tighter
+        # inherited constraints (including a newly tightened managed Run).
+        inherited = (completion and existing["entry_state"] == "confirmed"
+                     and existing["entry_attempt"] < lease.attempt
+                     and existing["entry_fence"] < lease.fence
+                     and envelope.started_at == old.started_at)
+        if ((existing["entry_attempt"], existing["entry_fence"]) != (lease.attempt, lease.fence)
+                and not unprepared and not inherited):
+            raise CASConflictError("handler entry has no matching durable admission")
+        # Replay cannot erase a later checkpoint or a stronger wall floor.
+        if envelope.checkpoint.elapsed_at >= old.checkpoint.elapsed_at:
+            checkpoint = old.recheckpoint(sample=envelope.checkpoint).checkpoint
+            envelope = envelope.recheckpoint(sample=checkpoint)
+        else:
+            envelope = envelope.recheckpoint(sample=old.checkpoint)
+        values = {item.origin_id: item for item in envelope.constraints}
+        for previous in old.constraints:
+            current = values.get(previous.origin_id)
+            if (current is None or current.source != previous.source
+                    or current.deadline_at > previous.deadline_at
+                    or current.reserve_seconds < previous.reserve_seconds):
+                raise ValueError("handler entry weakens an admitted budget constraint")
+        cutoff = values.get(origin)
+        if completion and no_entry and (existing["entry_state"] == "pending" or unprepared):
+            pass
+        elif cutoff is None or cutoff.source != "execution" or envelope.started_at is None:
+            raise ValueError("handler entry requires its execution cutoff and actual entry timestamp")
+        if cutoff is not None and existing["entry_state"] == "pending" and not any(
+                item.origin_id == origin for item in old.constraints):
+            expected = envelope.started_at + self._command(row["command_json"]).timeout_seconds
+            if not math.isclose(cutoff.deadline_at, expected, rel_tol=0, abs_tol=1e-6):
+                raise ValueError("first handler cutoff does not match its actual entry timeout")
+        envelope = self._run_budget(connection, lease.execution_id, envelope).recheckpoint(
+            sample=sample_clock(wall_time=self._wall_time()))
+        return envelope, existing["entry_state"]
+
+    def _tighten_completion_budget(self, connection, row, lease: ExecutionLease,
+                                   envelope: BudgetEnvelope) -> BudgetEnvelope:
+        """Commit an original completion floor without finalizing entry."""
+        existing = connection.execute(
+            "SELECT * FROM kernel_execution_limits WHERE execution_id=?", (lease.execution_id,)
+        ).fetchone()
+        origin = "execution:" + lease.execution_id
+        if existing is None:
+            # Work can be refused by a Run/inherited cutoff before entry
+            # preparation. Preserve that refusal without inventing an entry.
+            if envelope.started_at is not None or any(item.origin_id == origin for item in envelope.constraints):
                 raise CASConflictError("handler entry has no matching durable admission")
-            old = BudgetEnvelope.from_dict(json.loads(existing["envelope_json"]))
-            # A replayed ACK can precede the persisted checkpoint. Preserve
-            # both elapsed continuity and the greatest effective wall time.
-            if envelope.checkpoint.elapsed_at >= old.checkpoint.elapsed_at:
-                checkpoint = old.recheckpoint(sample=envelope.checkpoint).checkpoint
-                envelope = envelope.recheckpoint(sample=checkpoint)
-            else:
-                envelope = envelope.recheckpoint(sample=old.checkpoint)
-            values = {item.origin_id: item for item in envelope.constraints}
-            for previous in old.constraints:
-                current = values.get(previous.origin_id)
-                if (current is None or current.source != previous.source
-                        or current.deadline_at > previous.deadline_at
-                        or current.reserve_seconds < previous.reserve_seconds):
-                    raise ValueError("handler entry weakens an admitted budget constraint")
-            origin = "execution:" + lease.execution_id
-            cutoff = values.get(origin)
-            if cutoff is None or cutoff.source != "execution" or envelope.started_at is None:
-                raise ValueError("handler entry requires its execution cutoff and actual entry timestamp")
-            if existing["entry_state"] == "pending":
-                expected = envelope.started_at + self._command(row["command_json"]).timeout_seconds
-                if not math.isclose(cutoff.deadline_at, expected, rel_tol=0, abs_tol=1e-6):
-                    raise ValueError("first handler cutoff does not match its actual entry timeout")
             envelope = self._run_budget(connection, lease.execution_id, envelope).recheckpoint(
                 sample=sample_clock(wall_time=self._wall_time()))
             connection.execute(
-                "UPDATE kernel_execution_limits SET envelope_json=?,entry_state='confirmed' WHERE execution_id=?",
-                (encode_json(envelope.to_dict()), lease.execution_id),
+                "INSERT INTO kernel_execution_limits(execution_id,envelope_json,entry_state,entry_attempt,entry_fence) "
+                "VALUES(?,?,'pending',?,?)",
+                (lease.execution_id, encode_json(envelope.to_dict()), lease.attempt, lease.fence),
             )
             return envelope
+        old = BudgetEnvelope.from_dict(json.loads(existing["envelope_json"]))
+        # A contained worker can have committed its entry before its packet
+        # reaches the parent. An incomplete parent envelope is not authority
+        # to remove those durable cutoffs or their captured entry timestamp.
+        values = {item.origin_id: item for item in envelope.constraints}
+        for previous in old.constraints:
+            values.setdefault(previous.origin_id, previous)
+        started_at = (old.started_at if any(item.origin_id == origin for item in old.constraints)
+                      else envelope.started_at)
+        envelope = BudgetEnvelope(tuple(values.values()), envelope.checkpoint, started_at)
+        envelope, _ = self._merge_handler_entry_budget(connection, row, lease, envelope, completion=True)
+        connection.execute("UPDATE kernel_execution_limits SET envelope_json=? WHERE execution_id=?",
+                           (encode_json(envelope.to_dict()), lease.execution_id))
+        return envelope
 
     def record_execution_budget(self, lease: ExecutionLease, envelope: BudgetEnvelope, *,
                                 timeout_seconds: float = .1) -> BudgetEnvelope:

@@ -9,6 +9,7 @@ import unittest
 
 from dispatcher_sdk import (Dispatcher, DeploymentMismatchError, RecoveryRequiredError,
                             SubmissionConflictError)
+from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
 
 
 def double(payload, context):
@@ -213,18 +214,27 @@ class DispatcherTests(unittest.TestCase):
         app = self.open()
         task = app.submit("double", 1, request_id="uncertain")
         app.orchestrator.flush()
-        kernel = app.runtime.kernel
-        lease = kernel.start(kernel.claim(
-            "interrupted-worker", registry_revision=task.snapshot["command"]["registry_revision"],
-            lease_seconds=0.1))
-        kernel.prepare_effect(lease, effect_id="external-write", name="write", request={"key": 1})
-        time.sleep(0.12)
-        kernel.reap()
-        app.orchestrator.sync()
-        with self.assertRaises(RecoveryRequiredError) as error:
-            task.wait()
-        self.assertEqual(error.exception.request_id, "uncertain")
-        self.assertEqual(kernel.get_effect("external-write").state, "indeterminate")
+        registry_revision = task.snapshot["command"]["registry_revision"]
+        clock = [app.runtime.kernel.current_time()]
+        # Exercise recovery after effect preparation, independently of the
+        # time spent committing the setup under SQLite FULL durability.
+        with SQLiteKernel(self.path, now=lambda: clock[0]) as kernel:
+            claimed = kernel.claim("interrupted-worker", registry_revision=registry_revision,
+                                   lease_seconds=0.1)
+            lease = kernel.start(claimed)
+            self.assertEqual(lease.expires_at, claimed.expires_at)
+            self.assertEqual(lease.expires_at, clock[0] + 0.1)
+            kernel.prepare_effect(lease, effect_id="external-write", name="write", request={"key": 1})
+            clock[0] = lease.expires_at + 0.02
+            kernel.reap()
+            app.orchestrator.sync()
+            with self.assertRaises(RecoveryRequiredError) as error:
+                task.wait()
+            self.assertEqual(error.exception.request_id, "uncertain")
+            self.assertEqual(kernel.get_effect("external-write").state, "indeterminate")
+            self.assertEqual(task.state, "recovery_required")
+            self.assertIsNone(task.snapshot["result"])
+            self.assertEqual(app.inbox.list_messages(state="consumed"), ())
 
 
 if __name__ == "__main__":

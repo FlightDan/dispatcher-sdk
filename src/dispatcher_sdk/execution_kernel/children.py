@@ -647,7 +647,14 @@ class HandlerChildren:
                 wait_expired = window.remaining() <= 0
             if not wait_expired:
                 raise
-            completed = self._completed_result(row, window)
+            try:
+                completed = self._completed_result(row, window)
+            except Exception as proof_error:
+                if _transient_control_error(proof_error):
+                    # Keep the original wait outcome and its identity while
+                    # retaining why the bounded delivery proof was unknown.
+                    raise exc from proof_error
+                raise
             if completed is None:
                 raise
             # The durable request remains the service's publication obligation.
@@ -701,10 +708,6 @@ class HandlerChildren:
                 raise ChildExecutionError("parent_authority_revoked", str(exc),
                                           execution_id=self.command.execution_id) from exc
             return None
-        except Exception as exc:
-            if _transient_control_error(exc):
-                return None
-            raise
 
     def _await_window(self, row: Mapping[str, Any], window: _RetryWindow) -> dict[str, Any]:
         while True:

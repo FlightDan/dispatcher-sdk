@@ -1,12 +1,31 @@
 # Execution observability acceptance evidence
 
 This index tracks [T01–T09 and A01–A18](EXECUTION_OBSERVABILITY_GOAL.md).
-The implementation is not yet fully accepted. Focused checks have passed on
-Linux x86_64. Installed candidate `269f143` completed a real two-turn production
-supervisor and native SSE summary, but failed the complete regression.
-The corrective source changes still need a fresh frozen installed candidate,
-complete regression, native Windows matrix and remaining live ModPort handoff.
+Scope revised on 2026-10-04: this Goal covers SDK functionality, robustness and
+maintainability only. The user has activated the revised SDK-only Goal. ModPort adaptation, production-provider requests and cross-project
+writes are outside the revised completion criteria. Historical integration evidence
+is retained below; it does not establish the new SDK-only A16.
+
+The implementation is not yet fully accepted. Latest frozen candidate `5d9db60`
+passed the installed public example and focused Linux checks, but its complete
+regression failed: 891 outer tests had two failures, one error and 16 skips;
+the nested installed suite had one failure and 16 skips across 886 tests.
+SDK defect diagnosis, the independent installed SDK end-to-end witness, complete
+candidate regression and native Windows/CI evidence remain required.
 No release is authorized by this work.
+
+The current uncommitted corrective candidate is being validated. The standalone
+SDK consumer passed all five scenarios against source: streamed success, original
+tool failure, tool cutoff, silent-task conditional cancellation and cleanup
+recovery across controller processes. Its installed-wheel run is still required.
+Entry confirmation now shares one bounded handshake across isolation modes;
+completion retains observed budget floors with original result obligations;
+cancellation retries only provably uncommitted contention within its original
+caller window. A wider focused run exposed completion edge cases; after causal
+fixes and independent review, all 140 integrated checks passed. This includes
+actual Runtime/journal reopen under clock rollback. The full candidate regression
+and native matrix remain required; these partial passes do not establish final
+acceptance.
 
 ## Candidate and reproducible commands
 
@@ -43,7 +62,7 @@ links or substitutes for the candidate CI artifacts.
 | A03 Unknown / old attempts | `test_observation_journal`, `test_observation_processes`, `test_stall_supervision` | Source regressions cover inaccessible identity, collector replacement and old reports. No PID-only exit inference. Full candidate regression pending. |
 | A04 Effective deadlines | Native Run/tool cutoff witness; `test_runtime_deadline_envelopes`, `test_execution_budget` | Actual shortest cutoff, stopped process tree, inherited parent window and reserve semantics covered. Reported tool cause keeps its original message. Candidate matrix pending. |
 | A05 Restart and short waits | Native controller crash after confirmed entry; native short `Task.wait`; budget/recovery tests | Original cutoff survives rollback/restart; exhausted business is refused; caller wait does not cancel. Candidate matrix pending. |
-| A06 Parent waits / capacity | `test_managed_children_capacity`, `test_runtime_deadline_envelopes`, native saturation pressure witness | Actual children return success and original failure; dedicated capacity and successor work covered. Installed ModPort path and matrix pending. |
+| A06 Parent waits / capacity | `test_managed_children_capacity`, `test_runtime_deadline_envelopes`, native saturation pressure witness | Actual children return success and original failure; dedicated capacity and successor work covered. Independent installed SDK end-to-end witness and matrix pending. |
 | A07 Rejection / partial registration | Child admission suite and native cross-store controller crash | Actual independent request reservation exists while Kernel child is absent; exit 73 and original-budget recovery close the wait without child business. Earlier stalled runs remain retained. Candidate matrix pending. |
 | A08 Cancellation / natural completion | Native pressure, Runtime lifecycle, Windows Job and sandbox tests | Linux descendant markers stop; Kernel winner and cleanup proof remain distinct. Current Windows Jobs pending. |
 | A09 Cleanup failure / exit cause | `test_sandbox_runtime` cleanup-failure restart with native worker business-call log; process exit classifiers; shared cgroup clue witness | Restart retries disposal only and keeps collected output; call count does not increase. Exit 137 remains status/unknown OOM even with readable shared cgroup counters. Provider is explicitly a persistent fake; native worker is real. Candidate matrix pending. |
@@ -52,15 +71,24 @@ links or substitutes for the candidate CI artifacts.
 | A12 Conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; separate capacity keeps local deadlines working. Candidate matrix pending. |
 | A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Latest candidate regression pending. |
 | A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; separately installed historical `v0.7.0.dev0` writer | Actual old installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Full public API and pending-obligation upgrade regression pending. |
-| A15 Installed entry | Isolated wheel consumer suite and portable public example | `269f143` clean-wheel import and original parent12/child5/wait15 example passed. Its complete installed consumer suite failed; corrective candidate validation remains required. |
-| A16 Current ModPort | Current SDKHandler/budget/raw stream adapters; staged actual reviewer → stdio MCP → host schedule → SDK child → host response witness | Installed `269f143` completed the production supervisor's two real model requests with a validated successful business decision and a genuine native SSE summary. The staged handoff then exposed lost resource waits; the SDK correction is independently reviewed but needs installed replay. Remaining live rework files await cross-project approval. No Minecraft Run was launched. |
+| A15 Installed entry | Isolated wheel consumer suite and portable public example | `5d9db60` clean-wheel import and original parent12/child5/wait15 example passed. Its complete installed consumer suite failed; corrective candidate validation remains required. |
+| A16 Independent SDK end-to-end | Installed public APIs, real handlers/processes, local byte/tool fixtures and persisted recovery; no ModPort or external model dependency | Revised criterion is not yet accepted. The installed example and native module checks provide partial evidence; a reproducible public-entry witness must cover success/raw failure, output/silence, parent-child budgets, cancellation, cleanup failure and recovery without repeating business. Historical ModPort checks are not a substitute. |
 | A17 Native Windows | `test_windows_runtime`, portable native observability/deadline/pressure suites | Linux mocks are not native acceptance. Windows x64/ARM64 jobs and raw Job evidence pending. Linux-only cgroup cases do not apply to Windows. |
-| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `269f143` outer run of 857 tests had 2 failures and 16 skips; nested installed run of 852 tests had 1 failure and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
+| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `5d9db60` outer run of 891 tests had 2 failures, 1 error and 16 skips; nested installed run of 886 tests had 1 failure and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
 
-## Current raw host evidence
+## Retained raw host evidence
 
 | Command/result | Retained evidence |
 | --- | --- |
+| Corrective integrated regression: 140 tests passed in 162.589s after fixing all preceding entry/completion failures | `/tmp/sdk-corrective-final-focused.log`; fresh wheel, complete suite and CI remain pending |
+| Actual Runtime and fresh settlement journal reopen under rollback: original result restored with one business call; 17 targeted checks passed in 5.089s | `/tmp/sdk-completion-reopen-local-proof-final.log`; `/tmp/sdk-runtime-budget-reopen-8elqhajx/evidence.json`; independent review found no remaining blocker |
+| Corrective public SDK source consumer: all five scenarios passed; no external provider or application adapter | `/tmp/sdk-a16-integrated-corrections-20261004/summary.json`; `/tmp/sdk-a16-integrated-corrections-20261004.log`; each scenario retains input, process, byte, budget and outcome records |
+| Cancellation admission: 12 integrated checks passed in 10.634s; independent review found no blockers | `/tmp/sdk-cancel-admission-integrated.log`; original-window writer/progress/commit evidence paths printed in the log |
+| Thread/native completion clock rollback: four actual worker checks passed in 6.494s; actual Runtime reopen subsequently exposed an additional validation-order gap | `/tmp/sdk-terminal-budget-outcomes.log`; `/tmp/sdk-runtime-budget-reopen-regression.log`; `/tmp/sdk-runtime-budget-reopen-r91fn9z3/evidence.json` |
+| Diagnostic retention and entry contention: 10 checks passed in 9.390s; five typing fixtures and six README examples passed | `/tmp/sdk-diagnostic-compatibility.log`; `/tmp/sdk-observability-types-corrective.log`; `/tmp/sdk-observability-docs-corrective.log` |
+| Wider corrective integration initially failed: 107 tests, two failures and nine errors; failures retained for causal fixes | `/tmp/sdk-budget-entry-integration.log`; complete corrective rerun pending |
+| Completion primitive and unentered-admission corrections: 14 checks passed in 4.751s | `/tmp/sdk-completion-unentered-edge.log` |
+| First revised source consumer success failed on explicit unknown progress receipt after its original 0.1s operation window; failure/budget/cleanup scenarios passed | `/tmp/sdk-harness-reviewed-ifl6ekyz`; subsequent consumer declares each original progress operation window, bounded by remaining execution time, and performs no retry loop |
 | 46 native/inspection/settlement checks passed in 56.209s | `/tmp/sdk-final-native-inspection-regression.log`; native directories printed in that log |
 | 35 settlement/readonly/native-pressure checks passed in 65.315s | `/tmp/sdk-final-readonly-settlement-pressure.log`; pressure JSON files printed in that log |
 | 29 nested control / durability / child checks passed in 10.940s | `/tmp/sdk-nested-bounded-control-final.log` |
@@ -90,9 +118,32 @@ links or substitutes for the candidate CI artifacts.
 | Expired receipt inspection and native revoked-parent recovery passed 14 in 18.210s | `/tmp/sdk-child-receipt-revoked-native.log`; `/tmp/sdk-observability-native-u5uuwwwd/recovered-registration.json` |
 | Final native startup, restart, deadlines, cancellation, bounded pressure and runtime checks passed 15 in 78.598s | `/tmp/sdk-corrections-native-final7.log`; native artifact paths printed in the log |
 | Final five public typing fixtures passed | `/tmp/sdk-observability-types-final7-frozen.log` |
+| Frozen `5d9db60` installed import and unchanged public example passed | `/tmp/sdk-observability-installed-import-final7.json`; `/tmp/sdk-observability-installed-example-final7.log` |
+| Frozen `5d9db60` complete regression failed: outer 891 in 1633.001s; nested 886 in 814.110s | `/tmp/sdk-observability-full-regression-final7.log` |
+| Installed SDK thread-entry probe retained real SQLite BUSY before business entry | `/tmp/sdk-thread-entry-writer-original-ry7d0y38/evidence.json` |
+| Historical staged ModPort handoff passed ten checks with installed `5d9db60`; outside revised A16 | `/tmp/modport-rework-installed-final7.log` |
 
-These focused results precede the final candidate freeze. Final installed and
-CI results will supersede them for acceptance while preserving failure history.
+These records span multiple candidates. Earlier focused passes do not supersede
+the latest frozen full-suite failure. Future installed and CI results must identify
+their candidate while preserving this failure history.
+
+The `5d9db60` outer errors were an expired lease during a recovery fixture, an
+installed-suite failure, and no dead notification within the application fixture's
+original bound. The installed failure returned `child_wait_timeout` instead of the
+expected successful child delivery. These require separate causal diagnosis;
+no ModPort code participates in these SDK regressions. A subsequent standalone
+installed SDK probe confirmed that a 0.25-second SQLite writer hold caused a single
+entry-confirmation attempt to fail within an original five-second execution window;
+business never ran, and the published error retained only the exception class.
+That probe demonstrates an SDK robustness/diagnostic issue, but does not by itself
+prove the cause of every full-suite failure. Work resumed under the revised SDK-only scope; these findings require corrected
+candidate evidence before they can be closed.
+
+## Historical findings and integration evidence
+
+The ModPort/provider requirements mentioned in this historical record belonged to
+the former A16. They no longer block the SDK-only Goal and authorize no further
+cross-project implementation or provider runs.
 
 The first frozen source commit, `0a1304f`, was not accepted: its installed
 public parent/child example failed with a real SQLite writer conflict.
@@ -132,15 +183,15 @@ After correcting the harness, native SSE reported one model request, 106 events,
 96 text chunks and 38,278 stdout bytes. The production supervisor's planning
 completed in 43.040s; execution exhausted its remaining 34.711s while retaining
 the production settlement reserve. Its SDK `succeeded` state records successful
-return of a failed business result and does not establish A16 completion.
+return of a failed business result and did not establish the former A16 completion.
 
 The later fresh 180-second temporary Run completed both formal supervisor turns
 and the native summary under its unchanged original deadline and seven claims.
 It used the installed `269f143` SDK and current production handlers. The supervisor
 reported two requests, ten model events, two text events and 1,909 stdout bytes;
 the summary reported one request, 98 events, 88 text events and 35,434 stdout bytes.
-This is genuine normal-provider evidence, but it does not cover the remaining
-live rework, cancellation or recovery requirements.
+This is genuine normal-provider evidence, but it did not cover all requirements of the former ModPort A16. Those application
+integration requirements are outside the revised Goal.
 
 The `269f143` full regression retained two failures: one source child result
 delivery proof and one nested installed retry-classification check. Receipt
@@ -162,6 +213,13 @@ existing sidecar without constructor I/O and validate it before the first bounde
 operation, retaining child availability without recreating missing storage.
 
 ## Review and limits
+
+T07/T09 must review ownership of budget, cancellation, state transitions and
+recovery obligations, and consolidate duplication introduced by this work.
+Public types, errors, docs and examples must agree. Avoid application-specific
+branches and unrelated repository-wide refactoring. External adapter failures
+require a contract check and an SDK-local reproduction before attribution;
+verified SDK defects remain in scope.
 
 Independent reviews found and verified fixes for entry authority, original
 completion timestamps, deferred result settlement, transient SQLite errors

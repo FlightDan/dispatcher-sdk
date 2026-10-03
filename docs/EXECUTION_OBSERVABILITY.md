@@ -86,6 +86,10 @@ The first actual handler entry establishes the execution cutoff. Retry, restart
 and lease renewal preserve it. Native same-boot elapsed time establishes
 continuity across processes where supported. An unprovable clock domain or
 unconfirmed admission is unknown and cannot grant a fresh business budget.
+The SDK records entry as pending before dispatch, then durably confirms the
+captured cutoff and observed clock floor before calling business code. Temporary
+storage contention may retry that confirmation within the original work window;
+it does not restart the timeout. An interrupted confirmation remains pending.
 Process hard deadlines operate independently of observation persistence.
 Thread mode can revoke authority and prevent result/effect commits, but cannot
 force an arbitrary Python thread to stop.
@@ -189,6 +193,10 @@ If the application authorizes cancellation for a stall, use
 policy and progress revision in the cancellation transaction. A confirmed
 progress commit that wins the race rejects the stale disposition. Ordinary
 `task.cancel()` retains explicit cancellation semantics.
+Cancellation retries temporary control-storage contention only when it can prove
+that the attempt made no writes. All such attempts share the original caller
+window and the same revision and supervision token. Cleanup and evidence
+collection after the cancellation decision retain their separate bounds.
 
 ## Independent reads and storage
 
@@ -216,6 +224,13 @@ request a bounded maintenance pass. It never invokes the handler. A cancellation
 reaper or newer attempt that already won remains authoritative; the original
 receipt is retained as superseded. In-memory storage and unavailable receipt
 storage expose unknown retention rather than claiming durability.
+
+The retained obligation also carries the original observed budget checkpoint.
+Kernel completion commits that checkpoint with the result, before releasing a
+retry. A clock rollback cannot restore time already observed as exhausted.
+Recovery tightens the existing budget without confirming an interrupted entry.
+A clock observation lost before any receipt or Kernel write is not a durable
+fact and cannot be reconstructed after process death.
 
 If both receipt persistence and Kernel completion are unavailable, the reserved
 slot keeps the exact original outcome for maintenance. `observe` exposes it as

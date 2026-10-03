@@ -7,6 +7,7 @@ from typing import Any, Optional
 import uuid
 
 from ._sqlite_base import encode_json
+from .budget import BudgetEnvelope, sample_clock
 from .contracts import (
     ExecutionCommandV2,
     ExecutionError,
@@ -164,6 +165,8 @@ class ExecutionCompletionMixin:
         lease: ExecutionLease,
         result: ExecutionResultV2,
         timestamp: float,
+        *,
+        budget_envelope: BudgetEnvelope | None = None,
     ) -> ExecutionCommandV2:
         if type(result) is not ExecutionResultV2:
             raise TypeError("complete requires ExecutionResultV2")
@@ -190,12 +193,21 @@ class ExecutionCompletionMixin:
                     "current_fence": row["fence"],
                 },
             )
-        if result.completed_at > timestamp or result.completed_at > lease.expires_at:
+        accepted_at = timestamp
+        if budget_envelope is not None:
+            # Exact ownership and causal identity above precede SDK receipt
+            # evidence. Its verified clock continuity can prove elapsed time
+            # after rollback, without changing the lease or global wall clock.
+            retained = self._tighten_completion_budget(connection, row, lease, budget_envelope)
+            effective = retained.checkpoint.effective_time(sample_clock(wall_time=timestamp))
+            if effective is not None:
+                accepted_at = max(accepted_at, effective)
+        if result.completed_at > accepted_at or result.completed_at > lease.expires_at:
             raise StaleFenceError(
                 "result completion time is after acceptance or lease expiry",
                 context={
                     "completed_at": result.completed_at,
-                    "accepted_at": timestamp,
+                    "accepted_at": accepted_at,
                     "lease_expires_at": lease.expires_at,
                 },
             )
@@ -243,13 +255,24 @@ class ExecutionCompletionMixin:
         return self._complete_result(lease, result, timeout_seconds=timeout_seconds,
                                      settlement=True)
 
+    def _complete_sdk_result(self, lease: ExecutionLease, result: ExecutionResultV2, *,
+                             budget_envelope: BudgetEnvelope | None,
+                             timeout_seconds: float = .1,
+                             settlement: bool = False) -> ExecutionSnapshot:
+        """Settle original SDK result and its observed budget in one transaction."""
+        return self._complete_result(lease, result, timeout_seconds=timeout_seconds,
+                                     settlement=settlement, budget_envelope=budget_envelope)
+
     def _complete_result(self, lease: ExecutionLease, result: ExecutionResultV2, *,
                          timeout_seconds: float | None = None,
-                         settlement: bool = False) -> ExecutionSnapshot:
+                         settlement: bool = False,
+                         budget_envelope: BudgetEnvelope | None = None) -> ExecutionSnapshot:
         if type(lease) is not ExecutionLease:
             raise TypeError("complete requires ExecutionLease")
         if type(result) is not ExecutionResultV2:
             raise TypeError("complete requires ExecutionResultV2")
+        if budget_envelope is not None and type(budget_envelope) is not BudgetEnvelope:
+            raise TypeError("budget must be a BudgetEnvelope or None")
         with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             row = self._get_row(connection, lease.execution_id)
             if row["state"] in TERMINAL_STATES:
@@ -258,6 +281,11 @@ class ExecutionCompletionMixin:
                 # values such as 1, 1.0, and True together.  Duplicate
                 # results must match the exact canonical contract payload.
                 if current is not None and current.to_json() == result.to_json():
+                    if budget_envelope is not None:
+                        # An earlier exact result receipt does not prove its
+                        # independently retained floor reached Kernel storage.
+                        self._validate_result(connection, row, lease, result, timestamp,
+                                              budget_envelope=budget_envelope)
                     return self._snapshot(row)
                 if current is not None and current.result_id == result.result_id:
                     raise ResultConflictError("duplicate result_id has different content")
@@ -281,7 +309,8 @@ class ExecutionCompletionMixin:
                 operation="execution completion",
                 settlement=True,
             )
-            command = self._validate_result(connection, row, lease, result, timestamp)
+            command = self._validate_result(connection, row, lease, result, timestamp,
+                                            budget_envelope=budget_envelope)
             parked = self._park_unfinished_effects(
                 connection, row, timestamp, trigger=f"complete:{result.status}"
             )

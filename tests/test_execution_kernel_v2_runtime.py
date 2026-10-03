@@ -1218,7 +1218,7 @@ class RuntimeTests(unittest.TestCase):
                 stack.submit(command)
                 finalizing = threading.Event()
                 release = threading.Event()
-                real_complete = stack.kernel.complete
+                real_complete = stack.kernel._complete_sdk_result
 
                 def pause_finalization(*args, **kwargs):
                     finalizing.set()
@@ -1248,7 +1248,7 @@ class RuntimeTests(unittest.TestCase):
                     except BaseException as exc:
                         cancel_errors.append(exc)
 
-                with patch.object(stack.kernel, "complete", new=pause_finalization):
+                with patch.object(stack.kernel, "_complete_sdk_result", new=pause_finalization):
                     driver = threading.Thread(target=drive)
                     driver.start()
                     self.assertTrue(finalizing.wait(1.0))

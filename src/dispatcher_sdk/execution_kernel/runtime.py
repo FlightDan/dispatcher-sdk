@@ -63,6 +63,8 @@ from ._process_runtime import (
     invoke_handler,
     invoke_process_handler,
     _capture_completion_time,
+    _confirm_handler_entry,
+    _control_error_details,
 )
 from .sqlite import SQLiteKernel
 from .sandbox import SandboxHandler, SandboxJournal
@@ -420,8 +422,11 @@ class InProcessRuntime:
                             result = None
                         else:
                             result = ExecutionResultV2.from_dict(record["result"])
-                            completed = self.kernel._restore_completion(lease, result,
-                                timeout_seconds=operation_timeout)
+                            retained_budget = record["evidence"].get("budget_envelope")
+                            completed = self.kernel._complete_sdk_result(lease, result,
+                                budget_envelope=(None if retained_budget is None else
+                                    BudgetEnvelope.from_dict(retained_budget)),
+                                timeout_seconds=operation_timeout, settlement=True)
                     state = "recovery_required" if completed.state == "recovery_required" else "recorded"
                     evidence = {**record["evidence"], "execution_state": completed.state,
                         "execution_revision": completed.revision}
@@ -808,10 +813,74 @@ class InProcessRuntime:
         receipt_id = None
         evidence_errors: list[Exception] = []
         duration = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
+        control_deadline = time.monotonic() + duration
+        if type(expected_supervision) is dict:
+            expected_supervision = dict(expected_supervision)
         cancellation_identity: ObservationIdentity | None = None
         observation_available = True
         requested_at = self.kernel._wall_time()
         pending_evidence: list[tuple[str, dict[str, Any], float]] = []
+
+        def remaining_control():
+            remaining = control_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Kernel control admission budget elapsed")
+            return remaining
+
+        def control_admission_error(error):
+            if isinstance(error, sqlite3.OperationalError):
+                code = getattr(error, "sqlite_errorcode", None)
+                if type(code) is int:
+                    return code & 255 in (getattr(sqlite3, "SQLITE_BUSY", 5),
+                                          getattr(sqlite3, "SQLITE_LOCKED", 6))
+                return code is None and str(error) in (
+                    "database is locked", "database table is locked", "database schema is locked")
+            return isinstance(error, TimeoutError) and str(error) in (
+                "Kernel control lock admission timed out", "Kernel control admission budget elapsed")
+
+        def bounded_control(operation):
+            last_admission_error = None
+            while True:
+                try:
+                    attempt_timeout = min(.1, remaining_control())
+                except TimeoutError:
+                    if last_admission_error is not None:
+                        raise last_admission_error
+                    raise
+                entered = returned = retry_uncommitted = False
+                operation_error = None
+                try:
+                    with self.kernel._control_lock(attempt_timeout):
+                        entered = True
+                        connection = self.kernel._connection
+                        was_in_transaction = connection.in_transaction
+                        changes_before = connection.total_changes
+                        try:
+                            answer = operation(min(.1, remaining_control()))
+                        except Exception as error:
+                            operation_error = error
+                            # Both snapshots are taken under this same lock.
+                            # Any write, even a rolled-back clock advance,
+                            # makes replay too uncertain to authorize here.
+                            retry_uncommitted = (not was_in_transaction and not connection.in_transaction
+                                and connection.total_changes == changes_before)
+                            raise
+                        returned = True
+                    return answer
+                except Exception as error:
+                    if not control_admission_error(error) or returned:
+                        raise
+                    if entered:
+                        if error is not operation_error or not retry_uncommitted:
+                            raise
+                    elif not (isinstance(error, TimeoutError) and str(error) in (
+                            "Kernel control lock admission timed out", "Kernel control admission budget elapsed")):
+                        raise
+                    last_admission_error = error
+                    remaining = control_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(.01, remaining))
 
         def record(stage, evidence, captured_at=None):
             nonlocal observation_available
@@ -833,11 +902,10 @@ class InProcessRuntime:
                 except Exception as exc:
                     evidence_errors.append(exc)
 
-        with self._bounded_lifecycle(duration):
+        with self._bounded_lifecycle(remaining_control()):
             if self._closed:
                 raise RuntimeError("runtime is closed")
-            with self.kernel._control_lock(min(duration, .1)):
-                before = self.kernel.get(execution_id)
+            before = bounded_control(lambda timeout: self.kernel.get(execution_id))
             cancellation_identity = ObservationIdentity(execution_id, before.attempt, before.fence)
             pending_evidence.append(("requested", {"state": "requested",
                 "expected_revision": expected_revision, "reason": reason}, requested_at))
@@ -845,17 +913,17 @@ class InProcessRuntime:
                 try:
                     receipt_id = self.cancellation_journal._begin(
                         before, expected_revision=expected_revision, reason=reason,
-                        isolation_mode=self.isolation_mode, timeout_seconds=min(duration, .1))
+                        isolation_mode=self.isolation_mode, timeout_seconds=min(.1, remaining_control()))
                 except Exception as exc:
                     evidence_errors.append(exc)
             try:
-                cancelled = self.kernel.cancel(
+                cancelled = bounded_control(lambda timeout: self.kernel.cancel(
                     execution_id,
                     expected_revision=expected_revision,
                     reason=reason,
                     expected_supervision=expected_supervision,
-                    timeout_seconds=min(duration, .1),
-                )
+                    timeout_seconds=timeout,
+                ))
             except EffectRecoveryRequiredError as exc:
                 # The durable state is now recovery_required, but cancellation
                 # authority still requires the running process tree to stop
@@ -1103,7 +1171,7 @@ class InProcessRuntime:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                prepared = self.kernel.prepare_execution_budget(lease,
+                prepared = self.kernel._prepare_handler_entry(lease,
                     timeout_seconds=min(.1, remaining))
                 checkpoint = inherited.recheckpoint(sample=prepared.checkpoint).checkpoint
                 prepared = prepared.recheckpoint(sample=checkpoint)
@@ -1265,7 +1333,7 @@ class InProcessRuntime:
         if entry_errors and outcome.get("kind") == "ok":
             outcome = {**outcome, "kind": "error", "code": "entry_confirmation_unknown",
                 "message": "handler entry could not be durably confirmed", "retryable": False,
-                "control_error": True, "details": {"cause": type(entry_errors[0]).__name__,
+                "control_error": True, "details": {**_control_error_details(entry_errors[0]),
                     "business_outcome": outcome}}
         if isinstance(handler, SandboxHandler):
             try:
@@ -1354,7 +1422,14 @@ class InProcessRuntime:
                         "execution work deadline elapsed before entry confirmation", details=view.to_dict())
             if not active.is_set() or self._stop_event.is_set():
                 raise RuntimeError("handler entry authority was revoked before invocation")
-            view = ctx.budget
+            # Entry was accepted at the committed checkpoint. Charge native
+            # elapsed time while releasing the gate, without introducing a new
+            # unconfirmed wall-clock floor between final ACK and invocation.
+            with ctx._budget_lock:
+                accepted = ctx.budget_envelope
+                sample = sample_clock()
+                sample = replace(sample, wall_at=accepted.checkpoint.wall_at)
+                view = accepted.view(sample=sample)
             if view.remaining_work_seconds is None or view.remaining_work_seconds <= 0:
                 raise HandlerExecutionError("execution_deadline_exhausted",
                     "execution has no trusted remaining work time", details=view.to_dict())
@@ -1433,34 +1508,23 @@ class InProcessRuntime:
             deadline = entered.get("deadline", time.monotonic())
             if "started_at" in entered:
                 try:
-                    confirmed = self.kernel.confirm_handler_entry(lease, entered["envelope"])
-                    with context._budget_lock:
-                        sample = context._sample()
-                        observed = context.budget_envelope.recheckpoint(sample=sample)
-                        confirmed = confirmed.recheckpoint(sample=sample)
-                        stricter_checkpoint = observed.checkpoint.wall_at > confirmed.checkpoint.wall_at
-                        if stricter_checkpoint:
-                            confirmed = replace(confirmed, checkpoint=observed.checkpoint)
-                    # Preserve a forward jump seen by the waiting worker even
-                    # if wall time rolled back before the first storage ACK.
-                    if stricter_checkpoint:
-                        confirmed = self.kernel.confirm_handler_entry(lease, confirmed)
-                    with context._budget_lock:
-                        sample = context._sample()
-                        observed = context.budget_envelope.recheckpoint(sample=sample)
-                        confirmed = confirmed.recheckpoint(sample=sample)
-                        if observed.checkpoint.wall_at > confirmed.checkpoint.wall_at:
-                            confirmed = replace(confirmed, checkpoint=observed.checkpoint)
-                        context._budget_envelope = confirmed
-                        if context.children is not None:
-                            context.children.budget_envelope = confirmed
+                    _confirm_handler_entry(context)
                 except Exception as exc:
                     active.clear()
                     future.cancel()
-                    return {"kind": "error", "code": "entry_confirmation_unknown",
-                        "message": "handler entry could not be durably confirmed", "retryable": False,
-                        "control_error": True, "effect_ids": effects.effect_ids,
-                        "details": {"cause": type(exc).__name__}}
+                    typed = isinstance(exc, HandlerExecutionError)
+                    code = exc.code if typed else "entry_confirmation_unknown"
+                    details = exc.details if typed else _control_error_details(exc)
+                    expired = code == "execution_deadline_exhausted"
+                    if expired and details.get("limiting_source") == "execution":
+                        code = "handler_timeout"
+                    return {"kind": "timeout" if expired else "error",
+                        "code": code, "message": str(exc) if typed else details["error"],
+                        "retryable": False, "control_error": True,
+                        "phase": "entry_authority", "effect_ids": effects.effect_ids,
+                        "started_at": entered["started_at"],
+                        "budget_envelope": context.budget_envelope.to_dict(),
+                        "limiting_source": details.get("limiting_source"), "details": details}
                 entry_confirmed.set()
             while True:
                 if future.done():
@@ -1628,7 +1692,13 @@ class InProcessRuntime:
             assert result is not None
             payload = result.to_dict()
             journal_payload = result
-        evidence = {"telemetry_flush": outcome.get("telemetry_flush"), "outcome_kind": outcome.get("kind")}
+        # The original observed clock floor is part of the result obligation.
+        # Retrying publication must never sample a new return-time budget or
+        # release a retry before this floor and the result commit together.
+        retained_budget = outcome.get("budget_envelope")
+        budget = None if retained_budget is None else BudgetEnvelope.from_dict(retained_budget)
+        evidence = {"telemetry_flush": outcome.get("telemetry_flush"), "outcome_kind": outcome.get("kind"),
+                    "budget_envelope": retained_budget}
         retained_key = self._pending_settlements.retain(admission, lease, payload, evidence)
         record = None
         if self._settlement_journal is not None:
@@ -1669,7 +1739,8 @@ class InProcessRuntime:
                     raise
             assert result is not None
             try:
-                completed = self.kernel.complete(lease, result, timeout_seconds=.1)
+                completed = self.kernel._complete_sdk_result(lease, result,
+                    budget_envelope=budget, timeout_seconds=.1)
             except Exception as exc:
                 if isinstance(exc, (StaleFenceError, InvalidStateTransitionError, ResultConflictError)):
                     # Cancellation/reap may have won while the independent

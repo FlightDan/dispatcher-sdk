@@ -131,6 +131,8 @@ def _serialize_handler_outcome(
                 "retryable": False,
                 "details": {"exception_type": type(exc).__name__},
                 "effect_ids": effects.effect_ids,
+                "budget_envelope": outcome.get("budget_envelope"),
+                "started_at": outcome.get("started_at"),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -147,6 +149,20 @@ def invoke_handler(
     on_entered: Optional[Callable[[HandlerContext], None]] = None,
 ) -> dict[str, Any]:
     """Normalize one handler call for both process and thread runtimes."""
+    outcome = _invoke_handler(handler, command, context, on_entered=on_entered)
+    envelope = getattr(context, "_budget_envelope", None)
+    if isinstance(envelope, BudgetEnvelope):
+        outcome.update(budget_envelope=envelope.to_dict(), started_at=envelope.started_at)
+    return outcome
+
+
+def _invoke_handler(
+    handler: Handler,
+    command: ExecutionCommandV2,
+    context: HandlerContext,
+    *,
+    on_entered: Optional[Callable[[HandlerContext], None]] = None,
+) -> dict[str, Any]:
 
     entered = False
     try:
@@ -184,16 +200,15 @@ def invoke_handler(
                 phase = exc.details.get("phase")
                 if type(phase) is str and phase.strip() and len(phase) <= 128:
                     outcome["phase"] = phase
-        envelope = getattr(context, "_budget_envelope", None)
-        if isinstance(envelope, BudgetEnvelope):
-            outcome.update(budget_envelope=envelope.to_dict(), started_at=envelope.started_at)
         return outcome
     except BaseException as exc:
         from .children import ChildExecutionError
         if isinstance(exc, ChildExecutionError):
+            details = {"child_execution_id": exc.execution_id, "child_result": exc.result}
+            if isinstance(exc.__cause__, Exception):
+                details["cause"] = _control_error_details(exc.__cause__)
             return {"kind": "error", "code": exc.code, "message": str(exc), "retryable": False,
-                "details": {"child_execution_id": exc.execution_id, "child_result": exc.result},
-                "effect_ids": context.effects.effect_ids}
+                "details": details, "effect_ids": context.effects.effect_ids}
         return {
             "kind": "error",
             "code": "handler_error",
@@ -246,59 +261,88 @@ def _entry_packet(context: HandlerContext, now: Any) -> dict[str, Any]:
             "process_evidence": {"source": "worker_self_report", "state": "alive", "pid": os.getpid()}}
 
 
-def _confirmed_entry_packet(context: HandlerContext, now: Any) -> dict[str, Any]:
-    # Retry only writer contention, retaining the one actual-entry cutoff.
-    # The supervisor independently bounds startup while no entry ACK exists.
+def _control_error_details(error: Exception) -> dict[str, Any]:
+    """Retain the actual control error without unbounded result payloads."""
+    raw = str(error).encode("utf-8", errors="replace")
+    details: dict[str, Any] = {"cause": type(error).__name__,
+        "error": raw[:4096].decode("utf-8", errors="ignore"),
+        "error_truncated": len(raw) > 4096}
+    code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        details["sqlite_errorcode"] = code
+    return details
+
+
+def _confirm_handler_entry(context: HandlerContext) -> None:
+    """Complete the SDK's durable pending-to-confirmed entry handshake."""
     captured = context.budget_envelope
-    while True:
+    last_error = None
+
+    def check_budget():
         view = context.budget
         if view.clock_status != "trusted":
             raise HandlerExecutionError("budget_clock_unknown", view.unknown_reason, details=view.to_dict())
         if not view.remaining_work_seconds:
+            details = view.to_dict()
+            if last_error is not None:
+                details["storage_error"] = _control_error_details(last_error)
             raise HandlerExecutionError("execution_deadline_exhausted",
-                "execution work deadline elapsed before durable entry confirmation", details=view.to_dict())
-        # Keep every observed forward wall jump when a BUSY retry later sees
-        # a rollback. Constraints and the original entry time stay immutable.
+                "execution work deadline elapsed before durable entry confirmation", details=details)
+        if not context.effects._is_active():
+            raise HandlerExecutionError("entry_confirmation_unknown",
+                "handler entry authority was revoked before confirmation")
+        return view
+
+    while True:
+        view = check_budget()
         captured = captured.recheckpoint(sample=context.budget_envelope.checkpoint)
         try:
-            envelope = context._kernel.confirm_handler_entry(context.lease, captured,
+            # Admission was already marked pending before dispatch, including
+            # retry attempts. A crash at this intermediate ACK cannot authorize
+            # another attempt using an unconfirmed, weaker clock floor.
+            recorded = context._kernel._checkpoint_handler_entry(context.lease, captured,
                 timeout_seconds=min(.1, view.remaining_work_seconds))
-            context.budget
-            latest = context.budget_envelope.checkpoint
-            confirmed_now = envelope.checkpoint.effective_time(latest)
-            if confirmed_now is None:
-                raise BudgetClockUnknownError("entry clock continuity cannot be established")
-            if latest.wall_at > confirmed_now:
-                captured = captured.recheckpoint(sample=latest)
-                continue
-            break
+            with context._budget_lock:
+                view = check_budget()
+                latest = context.budget_envelope.checkpoint
+                captured = recorded.recheckpoint(sample=latest)
+                # Only this bounded storage operation holds the local budget
+                # lock. A concurrent waiter cannot add a stronger observed floor
+                # between capture and the final durable confirmation.
+                confirmed = context._kernel.confirm_handler_entry(context.lease, captured,
+                    timeout_seconds=min(.1, view.remaining_work_seconds))
+                context._budget_envelope = confirmed
+                if context.children is not None:
+                    context.children.budget_envelope = confirmed
+            # The committed checkpoint defines the ACK boundary. Sampling wall
+            # time again here would create an unconfirmed floor after final ACK.
+            accepted = confirmed.view(sample=confirmed.checkpoint)
+            if not accepted.remaining_work_seconds:
+                raise HandlerExecutionError("execution_deadline_exhausted",
+                    "execution work deadline elapsed before durable entry confirmation",
+                    details=accepted.to_dict())
+            return
+        except HandlerExecutionError:
+            raise
         except Exception as exc:
             sqlite_code = getattr(exc, "sqlite_errorcode", None)
             busy = isinstance(exc, sqlite3.OperationalError) and (
                 (isinstance(sqlite_code, int) and sqlite_code & 0xff in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
                 or (sqlite_code is None and str(exc).lower() in {
                     "database is locked", "database table is locked", "database schema is locked"}))
-            if busy:
-                # Yield briefly; the next iteration resamples authoritative
-                # elapsed/wall time instead of granting a new entry interval.
+            control_busy = isinstance(exc, TimeoutError) and str(exc) in {
+                "Kernel control lock admission timed out", "Kernel control admission budget elapsed"}
+            if busy or control_busy:
+                last_error = exc
                 time.sleep(min(.01, view.remaining_work_seconds))
                 continue
             code = "budget_clock_unknown" if isinstance(exc, BudgetClockUnknownError) else "entry_confirmation_unknown"
-            raise HandlerExecutionError(code, str(exc), details={"cause": type(exc).__name__}) from exc
-    with context._budget_lock:
-        local = context.budget_envelope.checkpoint
-        if local.elapsed_at <= envelope.checkpoint.elapsed_at:
-            checkpoint = context.budget_envelope.recheckpoint(sample=envelope.checkpoint).checkpoint
-            envelope = envelope.recheckpoint(sample=checkpoint)
-        context._budget_envelope = envelope
-        if context.children is not None:
-            context.children.budget_envelope = envelope
-    view = context.budget
-    if view.clock_status != "trusted":
-        raise HandlerExecutionError("budget_clock_unknown", view.unknown_reason, details=view.to_dict())
-    if not view.remaining_work_seconds:
-        raise HandlerExecutionError("execution_deadline_exhausted",
-            "execution work deadline elapsed before durable entry confirmation", details=view.to_dict())
+            details = _control_error_details(exc)
+            raise HandlerExecutionError(code, details["error"], details=details) from exc
+
+
+def _confirmed_entry_packet(context: HandlerContext, now: Any) -> dict[str, Any]:
+    _confirm_handler_entry(context)
     return {**_entry_packet(context, now), "entry_confirmed": True}
 
 
@@ -308,12 +352,28 @@ def _budget_outcome(outcome: dict[str, Any], envelope: BudgetEnvelope | None,
         outcome = {**outcome, "kind": "timeout", "phase": outcome.get("phase", "entry_authority")}
     if outcome.get("code") == "budget_clock_unknown":
         outcome = {**outcome, "control_error": True}
-    if entry is None and type(outcome.get("budget_envelope")) is dict:
-        envelope = BudgetEnvelope.from_dict(outcome["budget_envelope"])
     if entry is not None:
         envelope = BudgetEnvelope.from_dict(entry["budget_envelope"])
+    retained = outcome.get("budget_envelope")
+    if retained is None and type(outcome.get("details")) is dict:
+        original = outcome["details"].get("business_outcome")
+        if type(original) is dict:
+            retained = original.get("budget_envelope")
+    if type(retained) is dict:
+        completed = BudgetEnvelope.from_dict(retained)
+        envelope = completed if envelope is None else envelope.recheckpoint(sample=completed.checkpoint)
     if envelope is None:
         return outcome
+    if (entry is not None and type(retained) is dict
+            and outcome.get("kind") in {"ok", "error"} and not outcome.get("control_error")):
+        view = envelope.view(sample=envelope.checkpoint)
+        if view.clock_status != "trusted":
+            outcome = {**outcome, "kind": "error", "code": "budget_clock_unknown",
+                "message": "execution clock continuity cannot be established", "control_error": True,
+                "retryable": False, "details": {"business_outcome": outcome}}
+        elif not view.remaining_work_seconds:
+            outcome = {**outcome, "kind": "timeout", "code": None, "message": None,
+                "limiting_source": view.limiting_source, "details": {"business_outcome": outcome}}
     constraint = None if envelope is None else min(
         envelope.constraints, key=lambda item: item.work_deadline_at, default=None)
     return {**outcome, "started_at": outcome.get("started_at") if entry is None else entry.get("started_at"),

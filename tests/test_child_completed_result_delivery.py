@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -9,8 +10,11 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from unittest.mock import patch
+
+from tests._acceptance_evidence import retained_directory
 
 from dispatcher_sdk.execution_kernel import Kernel, HandlerExecutionError
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, DeadlineConstraint, sample_clock
@@ -22,6 +26,8 @@ from dispatcher_sdk.observability import ObservationJournal
 
 
 def child(payload, context):
+    if 'return_after' in payload:
+        time.sleep(max(0, payload['return_after'] - time.time()))
     context.activity.report_bytes('stdout', b'real-child-output')
     if payload.get('fail'):
         raise HandlerExecutionError('original_provider_failure', 'raw child failure',
@@ -46,9 +52,20 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
     def test_public_child_result_survives_kernel_writer_held_until_wait_cutoff(self):
         from types import SimpleNamespace
         from dispatcher_sdk.execution_kernel.errors import ExecutionNotFoundError
-        root = Path(tempfile.mkdtemp(prefix='sdk-child-delivery-writer-cutoff-'))
+        root = retained_directory('sdk-child-delivery-writer-cutoff-')
         witness = SimpleNamespace(waiting=threading.Event(), resume=threading.Event(), row=None,
                                   calls=[], outcomes=[], errors=[], rescues=[])
+
+        def retain_observations():
+            # Also runs when setup or a timing assertion fails before the
+            # normal completed-result report can be assembled.
+            path = root / 'observations.json'
+            path.write_text(json.dumps({'row': witness.row, 'calls': witness.calls,
+                'errors': witness.errors, 'rescues': witness.rescues,
+                'outcomes': [item.to_dict() for item in witness.outcomes]}, indent=2), encoding='utf-8')
+            print('child_writer_cutoff_observations=' + str(path), flush=True)
+
+        self.addCleanup(retain_observations)
 
         def actual_child(payload, context):
             witness.calls.append(context.command.execution_id)
@@ -138,19 +155,47 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == 'posix', 'requires native POSIX process containment')
     def test_native_success_and_raw_failure_return_while_response_publication_is_held(self):
-        evidence_root = Path(tempfile.mkdtemp(prefix='sdk-child-completed-delivery-evidence-'))
+        evidence_root = retained_directory('sdk-child-completed-delivery-evidence-')
         for fail in (False, True):
-            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+            with self.subTest(fail=fail):
+                case = 'failure' if fail else 'success'
+                root = evidence_root/case
+                root.mkdir()
+                evidence_path = evidence_root/(case + '.json')
                 held = threading.Event()
                 release = threading.Event()
+                finish_lock = threading.Lock()
+                finish_calls = []
                 original_finish = _Store.finish
 
                 def delayed_finish(store, row, *args, **kwargs):
-                    held.set()
+                    cutoff = min(item.work_deadline_at for item in
+                        BudgetEnvelope.from_dict(json.loads(row['budget_json'])).constraints)
+                    published = kwargs.get('result')
+                    completed_at = published.get('completed_at') if isinstance(published, dict) else None
+                    on_time_result = (isinstance(published, dict)
+                        and published.get('status') in ('succeeded', 'failed')
+                        and type(completed_at) in (int, float) and math.isfinite(completed_at)
+                        and completed_at <= cutoff)
+                    call = {'event': 'finish_enter', 'called_at': time.time(), 'monotonic_at': time.monotonic(),
+                        'row': dict(row), 'args': args, 'kwargs': kwargs,
+                        'work_cutoff': cutoff, 'on_time_result': on_time_result}
+                    with finish_lock:
+                        finish_calls.append(call)
+                        with (root/'finish-calls.jsonl').open('a', encoding='utf-8') as stream:
+                            stream.write(json.dumps(call) + '\n')
+                    if on_time_result:
+                        held.set()
                     # Only optional cross-store publication is held. Original
                     # parent five-second and child two-second limits remain.
-                    release.wait(4)
+                    released = release.wait(4)
+                    with finish_lock:
+                        call['released_at'] = time.time()
+                        call['release_signalled'] = released
+                        with (root/'finish-calls.jsonl').open('a', encoding='utf-8') as stream:
+                            stream.write(json.dumps({'event': 'finish_release',
+                                'called_at': call['called_at'], 'released_at': call['released_at'],
+                                'release_signalled': released}) + '\n')
                     return original_finish(store, row, *args, **kwargs)
 
                 with patch.object(_Store, 'finish', delayed_finish), Kernel.open_sqlite(
@@ -158,36 +203,78 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                         isolation_mode='process', child_capacity=1) as runtime:
                     runtime.submit(runtime.command('parent', execution_id='parent', idempotency_key='parent',
                         correlation_id='root', timeout_seconds=5, payload={'fail': fail}))
+                    import dispatcher_sdk
+                    report = {'sdk_import': dispatcher_sdk.__file__, 'python': sys.executable,
+                        'runtime_type': type(runtime).__module__ + '.' + type(runtime).__qualname__,
+                        'runtime_directory': str(root), 'kernel_path': str(runtime.kernel.db_path),
+                        'observation_path': runtime._observation_path,
+                        'isolation_mode': 'process', 'child_capacity': 1, 'fail': fail,
+                        'parent_timeout_seconds': 5, 'child_timeout_seconds': 2,
+                        'publication_hold_seconds': 4, 'original_return': None,
+                        'runtime_error': None, 'diagnostic_errors': {}}
+
+                    def error_facts(error):
+                        return {'type': type(error).__module__ + '.' + type(error).__qualname__,
+                            'message': str(error), 'repr': repr(error),
+                            'code': getattr(error, 'code', None),
+                            'traceback': traceback.format_exc()}
+
+                    def write_evidence():
+                        with finish_lock:
+                            report['finish_calls'] = list(finish_calls)
+                            evidence_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
+
                     try:
-                        result = runtime.run_once()
+                        try:
+                            result = runtime.run_once()
+                            report['original_return'] = result.to_dict()
+                            report['parent_result'] = result.result.to_dict()
+                        except BaseException as error:
+                            report['runtime_error'] = error_facts(error)
+                            raise
+                        finally:
+                            report['captured_at'] = time.time()
+                            report['on_time_publication_held'] = held.is_set()
+                            try:
+                                observed_row = runtime._child_service.store.request('parent', 'delivery')
+                                report['request_while_publication_held'] = observed_row
+                                if observed_row is not None:
+                                    report['original_wait_work_cutoff'] = min(item.work_deadline_at for item in
+                                        BudgetEnvelope.from_dict(json.loads(observed_row['budget_json'])).constraints)
+                                    with runtime.kernel._control_lock(.1):
+                                        snapshot = runtime.kernel.get(observed_row['child_execution_id'])
+                                    report['authoritative_child_state'] = snapshot.state
+                                    report['authoritative_child_result'] = (None if snapshot.result is None
+                                        else snapshot.result.to_dict())
+                            except Exception as error:
+                                report['diagnostic_errors']['child_inspection'] = error_facts(error)
+                            write_evidence()
+                            print('child_completed_delivery_evidence=' + str(evidence_path), flush=True)
                         self.assertTrue(held.is_set(), result.result.to_dict())
                         self.assertEqual(result.state, 'succeeded', result.result.to_dict())
                         value = result.result.value
                         delivered = value['child_error'] if fail else value.get('child')
                         self.assertIsNotNone(delivered, value)
                         child_id = delivered['execution_id']
-                        actual = runtime.kernel.get(child_id).result.to_dict()
+                        actual = report['authoritative_child_result']
+                        self.assertEqual(actual['execution_id'], child_id)
                         self.assertEqual(delivered, actual)
                         if fail:
                             self.assertEqual(value['code'], 'original_provider_failure')
                             self.assertEqual(delivered['error']['details'], {'provider': 'local-fixture'})
                         else:
                             self.assertEqual(delivered['value'], {'value': 9})
-                        row = runtime._child_service.store.request('parent', 'delivery')
+                        row = report['request_while_publication_held']
                         self.assertEqual(row['state'], 'running')
                         self.assertIsNone(row['response_json'])
                         deadline = min(item.work_deadline_at for item in
                             BudgetEnvelope.from_dict(json.loads(row['budget_json'])).constraints)
                         self.assertLessEqual(delivered['completed_at'], deadline)
                         self.assertGreaterEqual(time.time(), deadline)
-                        import dispatcher_sdk
-                        evidence_path = evidence_root/('failure.json' if fail else 'success.json')
-                        evidence_path.write_text(json.dumps({'sdk_import': dispatcher_sdk.__file__,
-                            'parent_timeout_seconds': 5, 'child_timeout_seconds': 2,
-                            'parent_result': result.result.to_dict(), 'authoritative_child_result': actual,
-                            'request_while_publication_held': row, 'original_wait_work_cutoff': deadline},
-                            indent=2), encoding='utf-8')
-                        print('child_completed_delivery_evidence=' + str(evidence_path), flush=True)
+                    except BaseException as error:
+                        report['test_error'] = error_facts(error)
+                        write_evidence()
+                        raise
                     finally:
                         release.set()
 
@@ -209,7 +296,8 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                 with Kernel.open_sqlite(kernel.db_path, {'child': child}, isolation_mode='process') as runtime:
                     runtime.submit(runtime.command('child', execution_id='observed-child',
                         idempotency_key='observed-child', correlation_id='root',
-                        timeout_seconds=2, payload={}))
+                        timeout_seconds=2, payload={
+                            'return_after': envelope.constraints[-1].work_deadline_at + .02}))
                     result = runtime.run_once(execution_id='observed-child')
                     self.assertEqual(result.state, 'succeeded', str(result))
                     self.assertGreater(result.result.completed_at,

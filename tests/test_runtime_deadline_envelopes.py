@@ -101,7 +101,7 @@ class WorkerEntryProbe:
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        original = SQLiteKernel.confirm_handler_entry
+        original = SQLiteKernel._checkpoint_handler_entry
         root, mode = Path(self.directory), self.mode
 
         def confirmation(kernel, lease, envelope, **kwargs):
@@ -122,7 +122,7 @@ class WorkerEntryProbe:
                 time.sleep(.01)
             return original(kernel, lease, envelope, **kwargs)
 
-        SQLiteKernel.confirm_handler_entry = confirmation
+        SQLiteKernel._checkpoint_handler_entry = confirmation
 
     def __call__(self, payload, context):
         (Path(self.directory) / "business").write_text("invoked", encoding="ascii")
@@ -206,16 +206,17 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
         effects = Mock()
         effects._kernel._wall_time.return_value = sample_clock().wall_at
         envelope = BudgetEnvelope((), sample_clock()).enter_handler(timeout, origin_id="execution:deadline-test")
+        effects._kernel.confirm_handler_entry.side_effect = lambda lease, captured, **kwargs: captured
         return HandlerContext(command(timeout=timeout), None, effects, budget_envelope=envelope)
 
     def test_entry_busy_retries_emit_confirmed_marker_only_after_durable_success(self):
         context = self.entry_context(1)
         captured = context.budget_envelope
-        context._kernel.confirm_handler_entry.side_effect = [sqlite3.OperationalError("database is locked"), captured]
+        context._kernel._checkpoint_handler_entry.side_effect = [sqlite3.OperationalError("database is locked"), captured]
         with patch.object(process_runtime, "_entry_packet", return_value={"kind": "worker_entered"}):
             packet = process_runtime._confirmed_entry_packet(context, None)
         self.assertIs(packet["entry_confirmed"], True)
-        calls = context._kernel.confirm_handler_entry.call_args_list
+        calls = context._kernel._checkpoint_handler_entry.call_args_list
         self.assertEqual(2, len(calls))
         self.assertTrue(all(call.args[1].constraints == captured.constraints
             and call.args[1].started_at == captured.started_at for call in calls))
@@ -224,15 +225,15 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
     def test_permanent_entry_busy_exhausts_original_budget_without_ack(self):
         context = self.entry_context(.08)
         captured = context.budget_envelope
-        context._kernel.confirm_handler_entry.side_effect = sqlite3.OperationalError("database is locked")
+        context._kernel._checkpoint_handler_entry.side_effect = sqlite3.OperationalError("database is locked")
         with patch.object(process_runtime, "_entry_packet") as entry_packet:
             with self.assertRaises(HandlerExecutionError) as caught:
                 process_runtime._confirmed_entry_packet(context, None)
         self.assertEqual("execution_deadline_exhausted", caught.exception.code)
-        self.assertGreater(context._kernel.confirm_handler_entry.call_count, 1)
+        self.assertGreater(context._kernel._checkpoint_handler_entry.call_count, 1)
         self.assertTrue(all(call.args[1].constraints == captured.constraints
             and call.args[1].started_at == captured.started_at
-            for call in context._kernel.confirm_handler_entry.call_args_list))
+            for call in context._kernel._checkpoint_handler_entry.call_args_list))
         entry_packet.assert_not_called()
 
     def test_entry_busy_retry_persists_forward_wall_watermark_after_rollback(self):
@@ -250,7 +251,7 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 raise sqlite3.OperationalError("database is locked")
             return envelope
 
-        context._kernel.confirm_handler_entry.side_effect = confirm
+        context._kernel._checkpoint_handler_entry.side_effect = confirm
         with patch.object(process_runtime, "_entry_packet", return_value={}):
             packet = process_runtime._confirmed_entry_packet(context, None)
         self.assertTrue(packet["entry_confirmed"])
