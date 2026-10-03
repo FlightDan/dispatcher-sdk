@@ -3,9 +3,9 @@ from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
-import tempfile
 import threading
 import time
+from tests._acceptance_evidence import retained_directory
 import unittest
 
 import dispatcher_sdk
@@ -35,7 +35,7 @@ child.__execution_kernel_revision__ = "context-attachment-child-v1"
 
 class ContextJournalAttachmentTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="sdk-context-attachment-"))
+        self.root = retained_directory("sdk-context-attachment-")
         self.evidence = {"sdk_import": dispatcher_sdk.__file__, "case": self.id()}
         self.addCleanup(lambda: (self.root / "evidence.json").write_text(json.dumps(self.evidence, indent=2)))
         print("context_attachment_evidence=" + str(self.root / "evidence.json"), flush=True)

@@ -7,12 +7,30 @@ writes are outside the revised completion criteria. Historical integration evide
 is retained below; it does not establish the new SDK-only A16.
 
 The implementation is not yet fully accepted. The latest complete regression was
-on `80906d2`, which passed all five independent installed SDK scenarios and the
-public example. Its complete regression failed: 934 outer tests had four failures and 16 skips;
-the nested installed suite had one failure and 16 skips across 929 tests.
-Native Windows and the complete CI matrix remain required. No release is authorized.
+on frozen `c1471ee`: 949 outer tests had three failures and 16 skips; the nested
+installed suite had two failures, one error and 16 skips across 944 tests. Its
+standalone installed SDK consumer and the nested installed consumer each passed
+all five public scenarios; the original public example also passed. Complete
+corrective regression and native Windows/CI evidence remain required. No release
+is authorized.
 
-The subsequent frozen `2ab808e` candidate passed installed success, raw failure,
+One failure in both suites came from a fixture requiring exactly two cancellation
+attempts. Retained facts show two uncommitted BUSY attempts, followed by correct
+rejection of the unchanged stale token inside the original window. The fixture
+now checks those invariants rather than a scheduling-dependent count. Two
+cancellation fixtures failed before observing their business-entry markers within
+an assumed 0.5 seconds; their deleted stores prevent attribution beyond that
+precondition. Those fixtures now use an original five-second readiness bound,
+retain entry evidence and keep their original two-second execution budgets. The
+native cancellation witness also requires cancellation and synchronous cleanup
+before the original work cutoff, excluding natural timeout as a false pass.
+The nested parent/child fixture returned a value without `child`; its deleted
+store leaves the original child error unknown. One exact installed diagnostic
+passed with unchanged parent-five/child-two-second budgets. That fixture now
+always retains raw results, child errors and databases. These new focused passes
+do not turn the failed complete regression into a pass.
+
+The earlier frozen `2ab808e` candidate passed installed success, raw failure,
 tool-budget scenarios and the original public example. Its silence scenario failed
 before policy registration committed, at the original 0.1-second observation write
 window. Registering once before starting the public host removed competing execution
@@ -81,15 +99,20 @@ links or substitutes for the candidate CI artifacts.
 | A12 Conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; separate capacity keeps local deadlines working. Candidate matrix pending. |
 | A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Latest candidate regression pending. |
 | A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; separately installed historical `v0.7.0.dev0` writer | Actual old installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Full public API and pending-obligation upgrade regression pending. |
-| A15 Installed entry | Isolated wheel consumer suite and portable public example | `80906d2` clean-wheel import and original parent12/child5/wait15 example passed. Its complete installed suite failed; corrective candidate validation remains required. |
-| A16 Independent SDK end-to-end | Installed public APIs, real handlers/processes, local byte/tool fixtures and persisted recovery; no ModPort or external model dependency | All five public-entry scenarios passed on installed `80906d2`: success/raw failure, output/silence, parent-child/tool budgets, cancellation and cleanup recovery without repeated business. Fresh corrective candidate and native matrix remain required. Historical ModPort checks are not a substitute. |
+| A15 Installed entry | Isolated wheel consumer suite and portable public example | `c1471ee` clean-wheel import and original parent12/child5/wait15 example passed. Its complete installed suite failed; corrective candidate validation remains required. |
+| A16 Independent SDK end-to-end | Installed public APIs, real handlers/processes, local byte/tool fixtures and persisted recovery; no ModPort or external model dependency | All five public-entry scenarios passed on installed `c1471ee` and its isolated rebuilt consumer: success/raw failure, output/silence, parent-child/tool budgets, cancellation and cleanup recovery without repeated business. Fresh corrective candidate and native matrix remain required. Historical ModPort checks are not a substitute. |
 | A17 Native Windows | `test_windows_runtime`, portable native observability/deadline/pressure suites | Linux mocks are not native acceptance. Windows x64/ARM64 jobs and raw Job evidence pending. Linux-only cgroup cases do not apply to Windows. |
-| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `80906d2` outer run of 934 tests had 4 failures and 16 skips; nested installed run of 929 tests had 1 failure and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
+| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `c1471ee` outer run of 949 tests had 3 failures and 16 skips; nested installed run of 944 tests had 2 failures, 1 error and 16 skips. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
 
 ## Retained raw host evidence
 
 | Command/result | Retained evidence |
 | --- | --- |
+| Corrected cancellation admission assertions: 12 passed in 10.132s; both revised native/thread cancellation witnesses passed, followed by the reviewed native cutoff proof | `/tmp/sdk-final11-cancel-fixture.log`; `/tmp/sdk-final11-cancel-evidence`; `/tmp/sdk-final11-cancel-native.log`; `/tmp/sdk-final11-reviewed-cancel.log`; `/tmp/sdk-final11-reviewed-cancel-evidence` |
+| Exact installed child diagnostic passed once in 3.413s with original parent-five/child-two-second windows; prior failure cause remains unknown | `/tmp/sdk-final10-child-diagnostic/summary.json`; `/tmp/sdk-runtime-child-publication-e5om8c1k/evidence.json`; import points to final10 installed site-packages |
+| Frozen `c1471ee` full regression failed: outer 949 / three failures / 16 skips; nested 944 / two failures / one error / 16 skips | `/tmp/sdk-observability-full-regression-final10.log`; `/tmp/sdk-full-final10-evidence` |
+| Frozen installed `c1471ee`: five public scenarios and original example passed; fresh import is outside the checkout | `/tmp/sdk-a16-installed-final10/summary.json`; `/tmp/sdk-observability-installed-import-final10.json`; `/tmp/sdk-observability-installed-example-final10.log`; nested five scenarios `/tmp/sdk-full-final10-evidence/sdk-observability-consumer-we_e2bxv/summary.json` |
+| Original cancellation fixture false count assumption: two BUSY/no-write attempts then unchanged-token CASConflict; execution still running, progress revision one | `/tmp/sdk-full-final10-evidence/sdk-cancel-admission-ds12fnvx/evidence.json`; independent review accepted stronger original-window/authority assertions |
 | Final combined entry-packet, parent/supervisor/Windows floor and native deadline checks: 33 passed in 29.144s | `/tmp/sdk-final10-focused.log`; `/tmp/sdk-final10-focused-evidence`; full frozen regression remains required |
 | Entry-packet correction: one actual native business attempt, no false timeout/retry; native elapsed/reserve projection passed | `/tmp/sdk-entry-packet-clock-regression.log`; `/tmp/sdk-native-entry-packet-clock-htlryqe_/evidence.json`; `/tmp/sdk-entry-packet-native-elapsed-ggjqappz/evidence.json`; two tests passed in 1.371s |
 | Installed `2ab808e`: three scenarios and original example passed; silence failed before watch registration committed | `/tmp/sdk-a16-installed-final9`; `/tmp/sdk-a16-installed-final9.log`; `/tmp/sdk-observability-installed-import-final9.json`; `/tmp/sdk-observability-installed-example-final9.log` |

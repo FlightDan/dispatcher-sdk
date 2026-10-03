@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
-import tempfile
 import time
+from tests._acceptance_evidence import retained_directory
 import unittest
 from unittest.mock import patch
 
@@ -19,7 +19,7 @@ from dispatcher_sdk.observability import ObservationJournal
 
 class ChildCompletionReadonlyTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix='sdk-child-completion-readonly-'))
+        self.root = retained_directory('sdk-child-completion-readonly-')
         self.wall = [time.time()]
         self.kernel = SQLiteKernel(self.root/'kernel.sqlite3', now=lambda: self.wall[0])
         self.addCleanup(self.kernel.close)

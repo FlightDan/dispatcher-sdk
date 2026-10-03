@@ -198,6 +198,29 @@ cooperative_until_cancelled.__execution_kernel_revision__ = (
 )
 
 
+def gated_active_cancel_handler(payload, context):
+    """Hold actual business entry until cancellation within its original cutoff."""
+    import json
+
+    Path(payload["pid"]).write_text(str(os.getpid()), encoding="utf-8")
+    marker = Path(payload["started"])
+    temporary = marker.with_suffix(".writing")
+    temporary.write_text(json.dumps({"entered_at": time.time(),
+        "budget": context.budget.to_dict()}), encoding="utf-8")
+    os.replace(temporary, marker)
+    while not Path(payload["release"]).exists():
+        remaining = context.budget.remaining_work_seconds
+        if remaining <= 0:
+            raise TimeoutError("original handler work cutoff elapsed")
+        time.sleep(min(.005, remaining))
+    # A handler surviving cancellation can still perform the forbidden write.
+    Path(payload["late"]).write_text("late", encoding="utf-8")
+    return {"unexpected": True}
+
+
+gated_active_cancel_handler.__execution_kernel_revision__ = "runtime-active-cancel-gate-v1"
+
+
 class SlowJsonList(list):
     def __init__(self, path: str, delay: float) -> None:
         super().__init__(["encoded"])
@@ -1138,69 +1161,103 @@ class RuntimeTests(unittest.TestCase):
         "requires POSIX fork isolation",
     )
     def test_cancel_revokes_active_handler_without_run_once_exception(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            started = Path(temp) / "started.txt"
-            pid_file = Path(temp) / "handler.pid"
-            late = Path(temp) / "late.txt"
-            stack = Kernel.open_sqlite(
-                Path(temp) / "kernel.sqlite3",
-                {("lifecycle", 1): started_then_late_write_with_pid},
-                isolation_mode="process",
-            )
+        import json
+        import traceback
+        from tests._acceptance_evidence import retained_directory
+
+        root = retained_directory("sdk-native-active-cancel-")
+        started, pid_file, late, release = (root / name for name in
+            ("started.json", "handler.pid", "late.txt", "release"))
+        evidence = {"test": self.id(), "interpreter": sys.executable,
+            "execution_timeout": 2.0, "readiness_timeout": 5.0, "phases": []}
+        outcomes, errors = [], []
+        driver = None
+
+        stack = Kernel.open_sqlite(root / "kernel.sqlite3", {("lifecycle", 1): gated_active_cancel_handler},
+                                  isolation_mode="process")
+        command = make_command("cancel-active", stack.registry_revision, handler_id="lifecycle",
+            timeout=2.0, payload={"started": str(started), "pid": str(pid_file),
+                "late": str(late), "release": str(release)})
+        evidence["command"] = command.to_dict()
+
+        def capture(phase):
+            item = {"phase": phase, "at": time.time(), "monotonic": time.monotonic(),
+                "started": started.exists(), "late": late.exists(), "gate_open": release.exists(),
+                "driver_alive": driver is not None and driver.is_alive(),
+                "outcomes": [value.to_dict() for value in outcomes], "driver_errors": list(errors)}
             try:
-                command = make_command(
-                    "cancel-active",
-                    stack.registry_revision,
-                    handler_id="lifecycle",
-                    timeout=2.0,
-                    payload={
-                        "started": str(started),
-                        "pid": str(pid_file),
-                        "late": str(late),
-                        "sleep": 0.3,
-                    },
-                )
-                stack.submit(command)
-                outcomes = []
-                errors = []
+                item["kernel"] = stack.kernel.get(command.execution_id).to_dict()
+                item["entry"] = json.loads(started.read_text()) if started.exists() else None
+            except Exception as error:
+                item["inspection_error"] = {"type": type(error).__name__, "message": str(error)}
+            evidence["phases"].append(item)
+            (root / "evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
 
-                def drive():
-                    try:
-                        outcomes.append(stack.run_once())
-                    except BaseException as exc:
-                        errors.append(exc)
+        try:
+            stack.submit(command)
 
-                driver = threading.Thread(target=drive)
-                driver.start()
-                for _ in range(100):
-                    if started.exists() and pid_file.exists():
-                        break
-                    time.sleep(0.005)
-                self.assertTrue(started.exists())
-                handler_pid = int(pid_file.read_text(encoding="utf-8"))
-                running = stack.kernel.get(command.execution_id)
-                cancelled = stack.cancel(
-                    command.execution_id,
-                    expected_revision=running.revision,
-                    reason="operator cancellation",
-                )
-                driver.join(1.0)
-                self.assertFalse(driver.is_alive())
-                self.assertEqual(errors, [])
-                self.assertEqual(cancelled.state, "cancelled")
-                self.assertEqual(outcomes, [cancelled])
-                for _ in range(100):
-                    try:
-                        os.kill(handler_pid, 0)
-                    except ProcessLookupError:
-                        break
-                    time.sleep(0.005)
-                with self.assertRaises(ProcessLookupError):
+            def drive():
+                try:
+                    outcomes.append(stack.run_once())
+                except BaseException as error:
+                    errors.append({"type": type(error).__name__, "message": str(error),
+                        "traceback": traceback.format_exc()})
+
+            driver = threading.Thread(target=drive)
+            readiness_deadline = time.monotonic() + evidence["readiness_timeout"]
+            driver.start()
+            while not started.exists() and not outcomes and not errors and time.monotonic() < readiness_deadline:
+                time.sleep(.005)
+            capture("entry_wait_finished")
+            self.assertTrue(started.exists(), "actual handler entry was not observed; retained evidence: " + str(root))
+            handler_pid = int(pid_file.read_text(encoding="utf-8"))
+            running = stack.kernel.get(command.execution_id)
+            evidence["before_cancel"] = running.to_dict()
+            capture("before_cancel")
+            self.assertEqual(running.state, "running")
+            entry_budget = json.loads(started.read_text(encoding="utf-8"))["budget"]
+            work_cutoff = entry_budget["effective_work_deadline_at"]
+            self.assertEqual(entry_budget["clock_status"], "trusted")
+            self.assertLess(time.time(), work_cutoff)
+            cancelled = stack.cancel(command.execution_id, expected_revision=running.revision,
+                                     reason="operator cancellation")
+            evidence["cancelled"] = cancelled.to_dict()
+            evidence["cancel_returned_at"] = time.time()
+            release.touch()
+            driver.join(1.0)
+            capture("after_cancel")
+            # Natural budget expiry must not substitute for stopping an active
+            # handler. Cancellation and synchronous cleanup precede its cutoff.
+            self.assertLess(cancelled.result.completed_at, work_cutoff)
+            self.assertLess(evidence["cancel_returned_at"], work_cutoff)
+            self.assertFalse(driver.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(cancelled.state, "cancelled")
+            self.assertEqual(outcomes, [cancelled])
+            for _ in range(100):
+                try:
                     os.kill(handler_pid, 0)
-                time.sleep(0.35)
-                self.assertFalse(late.exists())
-            finally:
+                except ProcessLookupError:
+                    break
+                time.sleep(.005)
+            time.sleep(.35)
+            capture("containment_checked")
+            with self.assertRaises(ProcessLookupError):
+                os.kill(handler_pid, 0)
+            self.assertFalse(late.exists())
+        except BaseException as error:
+            evidence["error"] = {"type": type(error).__name__, "message": str(error),
+                "traceback": traceback.format_exc()}
+            raise
+        finally:
+            capture("before_close")
+            try:
                 stack.close()
+            finally:
+                if driver is not None:
+                    driver.join(1.0)
+                capture("after_close")
+                print("native_active_cancel_evidence=" + str(root / "evidence.json"), flush=True)
 
     def test_cancel_racing_terminal_commit_has_one_atomic_winner(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1274,43 +1331,86 @@ class RuntimeTests(unittest.TestCase):
                 stack.close()
 
     def test_thread_cancel_revokes_cooperative_handler_authority(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            started = Path(temp) / "started.txt"
-            late = Path(temp) / "late.txt"
-            stack = Kernel.open_sqlite(
-                Path(temp) / "kernel.sqlite3",
-                {("cooperative", 1): cooperative_until_cancelled},
-                isolation_mode="thread",
-            )
+        import json
+        import traceback
+        from tests._acceptance_evidence import retained_directory
+
+        root = retained_directory("sdk-thread-active-cancel-")
+        started, late, entry = (root / name for name in ("started.txt", "late.txt", "entry.json"))
+        evidence = {"test": self.id(), "interpreter": sys.executable,
+            "execution_timeout": 2.0, "readiness_timeout": 5.0, "handler_loop_timeout": 1.0, "phases": []}
+        outcomes, errors = [], []
+        driver = None
+
+        def recorded_handler(payload, context):
+            Path(payload["entry"]).write_text(json.dumps({"entered_at": time.time(),
+                "budget": context.budget.to_dict()}), encoding="utf-8")
+            return cooperative_until_cancelled(payload, context)
+
+        recorded_handler.__execution_kernel_revision__ = "runtime-cooperative-cancel-evidence-v1"
+        stack = Kernel.open_sqlite(root / "kernel.sqlite3", {("cooperative", 1): recorded_handler},
+                                  isolation_mode="thread")
+        command = make_command("thread-cancel-active", stack.registry_revision, handler_id="cooperative",
+            timeout=2.0, payload={"started": str(started), "late": str(late), "entry": str(entry)})
+        evidence["command"] = command.to_dict()
+
+        def capture(phase):
+            item = {"phase": phase, "at": time.time(), "monotonic": time.monotonic(),
+                "started": started.exists(), "late": late.exists(),
+                "driver_alive": driver is not None and driver.is_alive(),
+                "outcomes": [value.to_dict() for value in outcomes], "driver_errors": list(errors)}
             try:
-                command = make_command(
-                    "thread-cancel-active",
-                    stack.registry_revision,
-                    handler_id="cooperative",
-                    timeout=2.0,
-                    payload={"started": str(started), "late": str(late)},
-                )
-                stack.submit(command)
-                outcomes = []
-                driver = threading.Thread(target=lambda: outcomes.append(stack.run_once()))
-                driver.start()
-                for _ in range(100):
-                    if started.exists():
-                        break
-                    time.sleep(0.005)
-                self.assertTrue(started.exists())
-                running = stack.kernel.get(command.execution_id)
-                cancelled = stack.cancel(
-                    command.execution_id,
-                    expected_revision=running.revision,
-                    reason="cooperative cancellation",
-                )
-                driver.join(1.0)
-                self.assertFalse(driver.is_alive())
-                self.assertEqual(outcomes, [cancelled])
-                self.assertFalse(late.exists())
-            finally:
+                item["kernel"] = stack.kernel.get(command.execution_id).to_dict()
+                item["entry"] = json.loads(entry.read_text()) if entry.exists() else None
+            except Exception as error:
+                item["inspection_error"] = {"type": type(error).__name__, "message": str(error)}
+            evidence["phases"].append(item)
+            (root / "evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+
+        try:
+            stack.submit(command)
+
+            def drive():
+                try:
+                    outcomes.append(stack.run_once())
+                except BaseException as error:
+                    errors.append({"type": type(error).__name__, "message": str(error),
+                        "traceback": traceback.format_exc()})
+
+            driver = threading.Thread(target=drive)
+            readiness_deadline = time.monotonic() + evidence["readiness_timeout"]
+            driver.start()
+            while not started.exists() and not outcomes and not errors and time.monotonic() < readiness_deadline:
+                time.sleep(.005)
+            capture("entry_wait_finished")
+            self.assertTrue(started.exists(), "actual handler entry was not observed; retained evidence: " + str(root))
+            running = stack.kernel.get(command.execution_id)
+            evidence["before_cancel"] = running.to_dict()
+            capture("before_cancel")
+            self.assertEqual(running.state, "running")
+            cancelled = stack.cancel(command.execution_id, expected_revision=running.revision,
+                                     reason="cooperative cancellation")
+            evidence["cancelled"] = cancelled.to_dict()
+            driver.join(1.0)
+            capture("after_cancel")
+            self.assertFalse(driver.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(outcomes, [cancelled])
+            self.assertEqual(cancelled.state, "cancelled")
+            self.assertFalse(late.exists())
+        except BaseException as error:
+            evidence["error"] = {"type": type(error).__name__, "message": str(error),
+                "traceback": traceback.format_exc()}
+            raise
+        finally:
+            capture("before_close")
+            try:
                 stack.close()
+            finally:
+                if driver is not None:
+                    driver.join(1.0)
+                capture("after_close")
+                print("thread_active_cancel_evidence=" + str(root / "evidence.json"), flush=True)
 
     @unittest.skipUnless(
         os.name == "posix" and "fork" in multiprocessing.get_all_start_methods(),

@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
-import tempfile
 import time
 from types import SimpleNamespace
+from tests._acceptance_evidence import retained_directory
 import unittest
 
 from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError, BudgetEnvelope, sample_clock
@@ -19,7 +19,7 @@ from dispatcher_sdk.observability import ObservationJournal, ObservationOptions
 
 class ChildClockCheckpointTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="sdk-child-clock-checkpoint-"))
+        self.root = retained_directory("sdk-child-clock-checkpoint-")
         self.wall = [time.time()]
         self.kernel = SQLiteKernel(self.root / "kernel.sqlite3", now=lambda: self.wall[0],
                                    default_lease_seconds=90)

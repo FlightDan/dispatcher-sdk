@@ -183,16 +183,28 @@ class CancelAdmissionTests(unittest.TestCase):
             writer.close()
         updater = threading.Thread(target=progress)
         updater.start()
+        began = time.monotonic()
         try:
             with patch.object(self.runtime.kernel, 'cancel', side_effect=observe):
                 with self.assertRaises(CASConflictError):
                     self.cancel(timeout=1)
             self.assertEqual(self.runtime.kernel.get('parent').state, 'running')
             self.assertEqual(self.runtime.kernel.supervision_status('parent')['progress_revision'], 1)
-            self.assertEqual(len(self.calls), 2)
-            self.assertTrue(all(call['expected_supervision'] == self.token for call in self.calls))
             self.evidence['records'].append({'scenario': 'progress_invalidates_original_token',
-                'execution_state': 'running', 'original_token': self.token})
+                'execution_state': 'running', 'original_token': self.token,
+                'original_timeout': 1, 'began': began, 'elapsed': time.monotonic()-began})
+            # A real commit can span more than one short admission attempt.
+            # Every rejected attempt must preserve authority and spend the
+            # same caller window; the final stale token must never cancel.
+            self.assertGreaterEqual(len(self.calls), 2)
+            self.assertTrue(all(call['expected_supervision'] == self.token for call in self.calls))
+            self.assertTrue(all(call['at'] < began+1 for call in self.calls))
+            for call in self.calls[:-1]:
+                self.assertEqual(call['error_type'], 'OperationalError')
+                self.assertEqual(call['error'], 'database is locked')
+                self.assertEqual(call['changes_before'], call['changes_after'])
+                self.assertFalse(call['in_transaction_after'])
+            self.assertEqual(self.calls[-1]['error_type'], 'CASConflictError')
         finally:
             updater.join(1)
             if updater.is_alive():

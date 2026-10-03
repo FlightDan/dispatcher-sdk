@@ -5,9 +5,9 @@ import multiprocessing
 import os
 from pathlib import Path
 import sqlite3
-import tempfile
 import threading
 import time
+from tests._acceptance_evidence import retained_directory
 import unittest
 from unittest.mock import patch
 
@@ -21,7 +21,7 @@ from tests.test_execution_kernel_v2_runtime import make_command, started_then_la
 )
 class CancellationTelemetryOrderTests(unittest.TestCase):
     def test_diagnostic_writer_cannot_delay_process_revocation(self):
-        root = Path(tempfile.mkdtemp(prefix="sdk-cancel-telemetry-order-"))
+        root = retained_directory("sdk-cancel-telemetry-order-")
         trace = []
         evidence = {"artifact": str(root), "command_timeout": 2.0,
                     "business_sleep": .3, "diagnostic_writer_hold": .4}

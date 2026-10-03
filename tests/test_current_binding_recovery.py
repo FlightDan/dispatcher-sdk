@@ -2,9 +2,9 @@
 import json
 from pathlib import Path
 import sqlite3
-import tempfile
 import threading
 import time
+from tests._acceptance_evidence import retained_directory
 import unittest
 
 from dispatcher_sdk.execution_kernel import HandlerExecutionError, Kernel, RetryPolicy
@@ -16,7 +16,7 @@ from dispatcher_sdk.observability import ActivityRecorder, ObservationJournal, O
 
 class CurrentBindingRecoveryTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="sdk-current-binding-recovery-"))
+        self.root = retained_directory("sdk-current-binding-recovery-")
         self.evidence = {"test": self.id(), "records": []}
 
     def tearDown(self):

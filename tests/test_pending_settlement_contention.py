@@ -2,9 +2,9 @@
 import json
 from pathlib import Path
 import sqlite3
-import tempfile
 import threading
 import time
+from tests._acceptance_evidence import retained_directory
 import unittest
 
 import dispatcher_sdk
@@ -15,7 +15,7 @@ from tests.test_runtime_settlement import settlement_success, settlement_failure
 
 class PendingSettlementContentionTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="sdk-double-settlement-contention-"))
+        self.root = retained_directory("sdk-double-settlement-contention-")
         self.facts = {"sdk_import": dispatcher_sdk.__file__, "cases": []}
         self.addCleanup(lambda: (self.root / "evidence.json").write_text(json.dumps(self.facts, indent=2)))
         print("pending_settlement_evidence=" + str(self.root / "evidence.json"), flush=True)

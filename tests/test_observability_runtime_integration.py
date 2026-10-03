@@ -1,12 +1,13 @@
-from pathlib import Path
 import json
-import os
-import tempfile
+import sqlite3
+import sys
 import time
 import unittest
 
+import dispatcher_sdk
 from dispatcher_sdk.execution_kernel import Kernel
 from dispatcher_sdk.execution_kernel.children import ChildExecutionError
+from tests._acceptance_evidence import retained_directory
 
 
 def child_handler(payload, context):
@@ -26,7 +27,13 @@ def parent_handler(payload, context):
         child = context.children.run(payload.get('handler', 'child'), {'value': 9},
             request_id='one-child', timeout_seconds=2)
     except ChildExecutionError as exc:
-        return {'child_error': exc.result, 'code': exc.code}
+        cause = exc.__cause__
+        return {'child_error': exc.result, 'code': exc.code, 'child_error_message': str(exc),
+            'child_execution_id': exc.execution_id,
+            'child_error_cause': None if cause is None else {
+                'type': type(cause).__name__, 'message': str(cause),
+                'sqlite_errorcode': getattr(cause, 'sqlite_errorcode', None)},
+            'before': before, 'after': context.budget.to_dict()}
     progress = context.activity.progress('child-returned')
     return {'child': child, 'before': before, 'after': context.budget.to_dict(), 'progress': progress}
 
@@ -36,9 +43,38 @@ for handler in (parent_handler, child_handler, failing_child):
 
 
 class RuntimeObservationIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _database_evidence(root):
+        """Read retained facts after native cleanup, outside the business window."""
+        databases = {}
+        for path in root.glob('*.sqlite3'):
+            tables = {}
+            try:
+                with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=.1) as connection:
+                    connection.row_factory = sqlite3.Row
+                    names = connection.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name NOT LIKE 'sqlite_%'").fetchall()
+                    for name in names:
+                        quoted = name['name'].replace('"', '""')
+                        rows = connection.execute(f'SELECT * FROM "{quoted}" LIMIT 101').fetchall()
+                        tables[name['name']] = {'rows': [
+                            {key: {'bytes_hex': value.hex()} if isinstance(value, bytes) else value
+                             for key, value in dict(row).items()} for row in rows[:100]],
+                            'truncated': len(rows) > 100}
+                databases[path.name] = tables
+            except Exception as error:
+                databases[path.name] = {'error_type': type(error).__name__, 'error': str(error)}
+        return databases
+
     def execute(self, mode, *, fail=False):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / 'kernel.sqlite3'
+        root = retained_directory('sdk-runtime-child-publication-')
+        path = root / 'kernel.sqlite3'
+        evidence_path = root / 'evidence.json'
+        evidence = {'mode': mode, 'failed_child': fail, 'interpreter': sys.executable,
+            'sdk_module': dispatcher_sdk.__file__, 'kernel_path': str(path),
+            'original_parent_seconds': 5, 'original_child_call_seconds': 2}
+        before = None
+        try:
             with Kernel.open_sqlite(path, {'parent': parent_handler, 'child': child_handler,
                     'failing': failing_child}, isolation_mode=mode,
                     max_thread_workers=1, child_capacity=1) as runtime:
@@ -47,6 +83,9 @@ class RuntimeObservationIntegrationTests(unittest.TestCase):
                     payload={'handler': 'failing' if fail else 'child'}))
                 before = time.monotonic()
                 result = runtime.run_once()
+                evidence['result'] = result.to_dict()
+                evidence['returned_after_seconds'] = time.monotonic() - before
+                evidence_path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
                 self.assertEqual(result.state, 'succeeded', result.result.to_dict())
                 self.assertLess(time.monotonic() - before, 5)
                 # Business result delivery and durable wait publication are
@@ -54,6 +93,7 @@ class RuntimeObservationIntegrationTests(unittest.TestCase):
                 # original five-second caller bound; never rerun the handler.
                 observation = runtime.observation_journal.inspect('parent', timeout=.1)
                 first_observation = observation
+                evidence['first_observation'] = first_observation
                 end = before + 5
                 while not observation.get('child_waits') or any(
                         wait['state'] == 'open' for wait in observation['child_waits']):
@@ -65,12 +105,9 @@ class RuntimeObservationIntegrationTests(unittest.TestCase):
                     if remaining <= 0:
                         break
                     observation = runtime.observation_journal.inspect('parent', timeout=min(.1, remaining))
-                if first_observation != observation:
-                    evidence = Path(tempfile.mkdtemp(prefix='sdk-runtime-child-publication-')) / 'evidence.json'
-                    evidence.write_text(json.dumps({'mode': mode, 'failed_child': fail,
-                        'result': result.to_dict(), 'first_observation': first_observation,
-                        'final_observation': observation, 'caller_elapsed': time.monotonic() - before}, indent=2))
-                    print('runtime_child_publication_evidence=' + str(evidence), flush=True)
+                evidence['final_observation'] = observation
+                evidence['caller_elapsed'] = time.monotonic() - before
+                evidence_path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
                 self.assertEqual(observation['identity']['execution_id'], 'parent')
                 self.assertTrue(observation['child_waits'])
                 self.assertTrue(all(wait['state'] != 'open' for wait in observation['child_waits']))
@@ -80,14 +117,24 @@ class RuntimeObservationIntegrationTests(unittest.TestCase):
                     self.assertEqual(value['child_error']['error']['details']['provider'], 'fixture')
                     self.assertEqual(value['child_error']['causation_id'], 'parent')
                 else:
+                    self.assertIn('child', value, json.dumps(value, indent=2))
                     self.assertEqual(value['child']['value']['value'], 9)
                     self.assertEqual(value['progress']['state'], 'confirmed')
                     self.assertLessEqual(value['after']['remaining_work_seconds'],
                                          value['before']['remaining_work_seconds'])
                     child_id = value['child']['execution_id']
                     child_obs = runtime.observation_journal.inspect(child_id)
+                    evidence['child_observation'] = child_obs
                     self.assertEqual(child_obs['metrics']['stdout_bytes']['count'], 20)
                     self.assertEqual(runtime.kernel.get_execution_limits(child_id)['parent_execution_id'], 'parent')
+        except BaseException as error:
+            evidence['raised'] = {'type': type(error).__name__, 'message': str(error)}
+            raise
+        finally:
+            evidence['cleanup_completed_at'] = time.time()
+            evidence['databases'] = self._database_evidence(root)
+            evidence_path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+            print('runtime_child_publication_evidence=' + str(evidence_path), flush=True)
 
     def test_single_parent_thread_slot_has_independent_bounded_child_capacity(self):
         self.execute('thread')
