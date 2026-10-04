@@ -29,6 +29,14 @@ class ChildInspectionRetryTests(unittest.TestCase):
         path.write_text(json.dumps({'test': self.id(), 'records': self.records}, indent=2))
         print('child_inspection_retry_evidence=' + str(path), flush=True)
 
+    @staticmethod
+    def delay_binding():
+        # Windows monotonic samples may have coarse ticks. Require the same
+        # declared .03 seconds of measured metadata delay on every attempt.
+        deadline = time.monotonic() + .03
+        while (remaining := deadline - time.monotonic()) > 0:
+            time.sleep(remaining)
+
     def window(self, seconds):
         envelope = BudgetEnvelope((), sample_clock()).derive(source='tool', origin_id='original-call',
                                                   timeout_seconds=seconds)
@@ -47,7 +55,7 @@ class ChildInspectionRetryTests(unittest.TestCase):
             if len(calls) == 1:
                 # A deterministic metadata-admission delay expires the actual
                 # journal InspectionBudget. No exception is fabricated here.
-                time.sleep(.03)
+                self.delay_binding()
             return original_binding(connection)
 
         def read_request():
@@ -91,7 +99,7 @@ class ChildInspectionRetryTests(unittest.TestCase):
         original_binding = self.journal._validate_binding
 
         def delayed_binding(connection):
-            time.sleep(.03)
+            self.delay_binding()
             return original_binding(connection)
 
         def read_request():

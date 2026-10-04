@@ -4,7 +4,6 @@ from dataclasses import replace
 import json
 import sqlite3
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -12,6 +11,8 @@ from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel import HandlerExecutionError, Kernel, RetryPolicy
 from dispatcher_sdk.execution_kernel import runtime as runtime_module
+from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 
 def settlement_success(payload, context):
@@ -51,9 +52,14 @@ class Clock:
 
 class RuntimeSettlementTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = retained_directory("sdk-runtime-settlement-")
+        self.storage_evidence = StorageEvidence(self.root, self)
+        self.storage_evidence.start()
+        self.addCleanup(self.storage_evidence.stop)
+        self.addCleanup(self.storage_evidence.save)
+
+    def tearDown(self):
+        self.storage_evidence.save(phase="before_cleanup")
 
     def open(self, name, *, mode="thread", failure=False, clock=None):
         runtime = Kernel.open_sqlite(self.root / (name + ".sqlite3"),
@@ -96,7 +102,11 @@ class RuntimeSettlementTests(unittest.TestCase):
         driver.start()
         self.addCleanup(lambda: driver.join(3))
         self.addCleanup(writer_held.set)
-        self.assertTrue(outcome_ready.wait(3), "real handler did not produce an outcome")
+        ready = outcome_ready.wait(3)
+        if not ready:
+            self.storage_evidence.save(phase="outcome_wait_expired",
+                checkpoint={"original_wait": 3, "original_outcomes": retained, "driver_errors": [repr(e) for e in errors]})
+        self.assertTrue(ready, "real handler did not produce an outcome")
         self.assertEqual(len(call_log.read_text().splitlines()), 1)
         writer = sqlite3.connect(runtime.kernel.db_path, timeout=1)
         self.addCleanup(writer.close)

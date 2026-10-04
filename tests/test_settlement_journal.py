@@ -9,7 +9,6 @@ import os
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 import traceback
 import unittest
@@ -21,6 +20,7 @@ from dispatcher_sdk.execution_kernel.settlement import (
     SettlementBindingError, SettlementBusyError, SettlementConflictError, SettlementJournal,
 )
 from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 
 def lease(attempt=1, fence=1):
@@ -37,13 +37,19 @@ class SettlementJournalTests(unittest.TestCase):
         if self._testMethodName == 'test_committed_original_result_survives_process_exit_and_reopen':
             root = retained_directory('sdk-settlement-process-exit-')
         else:
-            self.directory = tempfile.TemporaryDirectory()
-            self.addCleanup(self.directory.cleanup)
-            root = Path(self.directory.name)
+            root = retained_directory('sdk-settlement-journal-')
+        self.root = root
+        self.storage_evidence = StorageEvidence(root, self)
+        self.storage_evidence.start()
+        self.addCleanup(self.storage_evidence.stop)
+        self.addCleanup(self.storage_evidence.save)
         self.kernel_path = root / "kernel.db"
         self.path = Path(str(self.kernel_path) + ".settlements.sqlite3")
         self.journal = SettlementJournal(self.path, source_id="store-original", kernel_path=self.kernel_path,
             timeout_seconds=1 if self._testMethodName == 'test_committed_original_result_survives_process_exit_and_reopen' else .1)
+
+    def tearDown(self):
+        self.storage_evidence.save(phase="before_cleanup")
 
     def test_kernel_writer_cannot_block_independent_durable_result(self):
         kernel = SQLiteKernel(self.kernel_path)
@@ -275,7 +281,7 @@ except BaseException as error:
     def test_notes_persist_independently_of_both_kernel_and_observation_writers(self):
         kernel = SQLiteKernel(self.kernel_path)
         self.addCleanup(kernel.close)
-        observation_path = Path(self.directory.name) / "observations.sqlite3"
+        observation_path = self.root / "observations.sqlite3"
         with closing(sqlite3.connect(observation_path)) as initialize, initialize:
             initialize.execute("CREATE TABLE pressure(value)")
         with (

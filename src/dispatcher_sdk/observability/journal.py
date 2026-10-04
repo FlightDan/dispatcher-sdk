@@ -11,11 +11,19 @@ import time
 from typing import Any, Iterator, Mapping
 
 from .._inspection import InspectionBudget, InspectionBudgetExceeded
+from .._sqlite_admission import retry_sqlite_admission
 from ..durability import Durability, validate_durability
 from .contracts import ObservationError, ObservationIdentity, ObservationOptions, identifier, positive
 
 
 SCHEMA_VERSION = 1
+
+
+class _ObservationWriteBudgetExceeded(TimeoutError):
+    """One write attempt expired; retry requires a confirmed rollback."""
+    rollback_confirmed = False
+
+
 SCHEMA = """
 CREATE TABLE obs_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  version INTEGER NOT NULL CHECK(version=1), kernel_path TEXT NOT NULL, source_id TEXT NOT NULL);
@@ -213,7 +221,7 @@ class ObservationJournal:
         if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
             raise ObservationError("existing observation journal requires WAL mode")
         if time.monotonic() >= deadline:
-            raise TimeoutError("observation schema admission budget elapsed")
+            raise _ObservationWriteBudgetExceeded("observation schema admission budget elapsed")
         self._schema_pending = False
 
     def _validate(self, connection: sqlite3.Connection) -> None:
@@ -273,24 +281,36 @@ class ObservationJournal:
             raise ObservationError("read-only observation journal cannot write")
         duration = self.options.write_timeout if timeout_seconds is None else min(
             self.options.write_timeout, positive(timeout_seconds, "timeout_seconds"))
-        connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True,
-                                     timeout=duration)
-        connection.row_factory = sqlite3.Row
         deadline = time.monotonic() + duration
+        connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True,
+                                     timeout=0)
+        connection.row_factory = sqlite3.Row
         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        def admit(operation, *, commit=False):
+            return retry_sqlite_admission(operation, deadline=deadline,
+                expired=_ObservationWriteBudgetExceeded("observation write admission budget elapsed"),
+                transaction_retained=(lambda: connection.in_transaction) if commit else None)
         try:
-            connection.execute("PRAGMA trusted_schema=OFF")
-            connection.execute(f"PRAGMA synchronous={2 if self.durability == 'full' else 1}")
-            connection.execute("BEGIN IMMEDIATE")
-            self._validate_binding(connection)
-            self._validate_existing_writer(connection, deadline=deadline)
+            admit(lambda: connection.execute("PRAGMA trusted_schema=OFF"))
+            admit(lambda: connection.execute(f"PRAGMA synchronous={2 if self.durability == 'full' else 1}"))
+            admit(lambda: connection.execute("BEGIN IMMEDIATE"))
+            admit(lambda: self._validate_binding(connection))
+            admit(lambda: self._validate_existing_writer(connection, deadline=deadline))
+            if time.monotonic() >= deadline:
+                raise _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
             now = float(self.clock())
             if not math.isfinite(now):
                 raise ObservationError("observation wall clock is not finite")
             yield connection, now
-            connection.commit()
-        except BaseException:
+            if time.monotonic() >= deadline:
+                raise _ObservationWriteBudgetExceeded("observation write operation budget elapsed")
+            admit(connection.commit, commit=True)
+        except BaseException as error:
+            transaction_was_open = connection.in_transaction
             connection.rollback()
+            if isinstance(error, _ObservationWriteBudgetExceeded):
+                error.rollback_confirmed = (not connection.in_transaction
+                    and (transaction_was_open or connection.total_changes == 0))
             raise
         finally:
             connection.close()

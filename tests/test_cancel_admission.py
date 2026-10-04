@@ -138,24 +138,51 @@ class CancelAdmissionTests(unittest.TestCase):
 
     def test_lifecycle_admission_spends_the_same_original_control_window(self):
         writer = self.writer()
-        ready, release = threading.Event(), threading.Event()
+        ready, admission_started, release = (threading.Event(), threading.Event(), threading.Event())
+        admission_start = []
+
         def hold_lifecycle():
             with self.runtime._lifecycle_lock:
                 ready.set()
-                release.wait(.18)
+                if not admission_started.wait(.5):
+                    return
+                release_at = admission_start[0] + .18
+                while not release.is_set():
+                    remaining = release_at - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    release.wait(remaining)
+
         holder = threading.Thread(target=hold_lifecycle)
         holder.start()
         self.assertTrue(ready.wait(.5))
         before = time.monotonic()
+        original_bounded_lifecycle = self.runtime._bounded_lifecycle
+
+        def observe_lifecycle_admission(timeout_seconds, **kwargs):
+            admission_start.append(time.monotonic())
+            admission_started.set()
+            return original_bounded_lifecycle(timeout_seconds, **kwargs)
+
         try:
-            with patch.object(self.runtime.kernel, 'cancel', side_effect=self.observed_cancel):
+            with patch.object(self.runtime, '_bounded_lifecycle', side_effect=observe_lifecycle_admission), \
+                    patch.object(self.runtime.kernel, 'cancel', side_effect=self.observed_cancel):
                 with self.assertRaises(sqlite3.OperationalError):
                     self.cancel(timeout=.25)
             self.assertTrue(self.calls)
-            self.assertLess(self.calls[0]['timeout_seconds'], .08)
-            self.assertTrue(all(call['at'] < before+.25 for call in self.calls))
+            first_call = self.calls[0]
+            elapsed_to_first_call = first_call['at'] - before
+            lifecycle_wait = first_call['at'] - admission_start[0]
+            remaining_after_minimum_lifecycle_wait = .25 - .18
             self.evidence['records'].append({'scenario': 'lifecycle_consumes_original_window',
-                'original_timeout': .25, 'elapsed': time.monotonic()-before})
+                'original_timeout': .25, 'elapsed_to_first_call': elapsed_to_first_call,
+                'lifecycle_wait': lifecycle_wait,
+                'remaining_after_minimum_lifecycle_wait': remaining_after_minimum_lifecycle_wait,
+                'first_kernel_timeout': first_call['timeout_seconds']})
+            self.assertGreaterEqual(lifecycle_wait, .18)
+            self.assertLess(first_call['timeout_seconds'], .08)
+            self.assertLessEqual(first_call['timeout_seconds'], remaining_after_minimum_lifecycle_wait)
+            self.assertTrue(all(call['at'] < before+.25 for call in self.calls))
         finally:
             release.set()
             holder.join(1)

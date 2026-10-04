@@ -15,6 +15,7 @@ import time
 from typing import Any, Iterator, Mapping
 from uuid import uuid4
 
+from .._sqlite_admission import retry_sqlite_admission
 from .contracts import ExecutionLease, ExecutionResultV2, _json_value
 
 
@@ -170,31 +171,33 @@ class SettlementJournal:
         deadline = time.monotonic() + _positive(timeout_seconds, "timeout_seconds")
         mode = "rwc" if initialize else "rw" if write else "ro"
         uri = Path(self.path).as_uri() + "?mode=" + mode
-        connection = sqlite3.connect(uri, uri=True, timeout=max(0, deadline - time.monotonic()), isolation_level=None)
+        connection = sqlite3.connect(uri, uri=True, timeout=0, isolation_level=None)
         connection.row_factory = sqlite3.Row
+        def admit(operation, *, commit=False):
+            return retry_sqlite_admission(operation, deadline=deadline,
+                expired=SettlementBusyError("settlement journal operation budget elapsed"),
+                transaction_retained=(lambda: connection.in_transaction) if commit else None)
         try:
-            connection.execute("PRAGMA trusted_schema=OFF")
+            admit(lambda: connection.execute("PRAGMA trusted_schema=OFF"))
             if write:
-                mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+                mode = admit(lambda: connection.execute("PRAGMA journal_mode").fetchone()[0])
                 if mode not in {"delete", "wal", "truncate", "persist"}:
                     raise SettlementBindingError("settlement journal requires persistent SQLite journaling")
-                connection.execute("PRAGMA synchronous=FULL")
-                if connection.execute("PRAGMA synchronous").fetchone()[0] != 2:
+                admit(lambda: connection.execute("PRAGMA synchronous=FULL"))
+                if admit(lambda: connection.execute("PRAGMA synchronous").fetchone()[0]) != 2:
                     raise SettlementBindingError("SQLite refused full settlement durability")
             else:
-                connection.execute("PRAGMA query_only=ON")
+                admit(lambda: connection.execute("PRAGMA query_only=ON"))
             connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
-            if write:
-                connection.execute("BEGIN IMMEDIATE")
-            else:
-                connection.execute("BEGIN")
+            admit(lambda: connection.execute("BEGIN IMMEDIATE" if write else "BEGIN"))
             if not initialize:
-                self._validate(connection)
+                admit(lambda: self._validate(connection))
+            if time.monotonic() >= deadline:
+                raise SettlementBusyError("settlement journal operation budget elapsed")
             yield connection
             if time.monotonic() >= deadline:
                 raise SettlementBusyError("settlement journal operation budget elapsed")
-            connection.execute(f"PRAGMA busy_timeout={max(1, int((deadline-time.monotonic())*1000))}")
-            connection.commit()
+            admit(connection.commit, commit=True)
         except sqlite3.OperationalError as exc:
             code = getattr(exc, "sqlite_errorcode", None)
             busy = (isinstance(code, int) and code & 255 in {5, 6, 9}) or (

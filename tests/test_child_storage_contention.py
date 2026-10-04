@@ -3,11 +3,12 @@ from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
-import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import patch
+
+from tests._acceptance_evidence import retained_directory
 
 from dispatcher_sdk.execution_kernel.children import HandlerChildren
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope
@@ -21,10 +22,15 @@ class WitnessList(list):
 
 class ChildStorageContentionTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = retained_directory("sdk-child-storage-contention-")
+        self.evidence = {"test": self.id(), "records": []}
+        self.addCleanup(self.retain_evidence)
         self.options = ObservationOptions(write_timeout=.05, query_timeout=.3, flush_interval=.1)
+
+    def retain_evidence(self):
+        path = self.root / "evidence.json"
+        path.write_text(json.dumps(self.evidence, indent=2), encoding="utf-8")
+        print("child_storage_contention_evidence=" + str(path), flush=True)
 
     def runtime(self, parent, child):
         parent.__execution_kernel_revision__ = "storage-contention-parent-v1"
@@ -70,6 +76,24 @@ class ChildStorageContentionTests(unittest.TestCase):
                 return result
             time.sleep(.02)
         self.fail("original bounded fixture window expired")
+
+    def witness_readiness(self, event, seconds, runtime, driver, outcomes, errors, **facts):
+        reached = event.wait(seconds)
+        record = {"readiness_reached": reached, "driver_alive": driver.is_alive(),
+            "outcomes": [item.to_dict() for item in outcomes],
+            "driver_errors": [{"type": type(error).__name__, "message": str(error)} for error in errors],
+            "original_readiness_timeout": seconds,
+            **{key: list(value) if isinstance(value, list) else value for key, value in facts.items()}}
+        self.evidence["records"].append(record)
+        if not reached:
+            for name, operation in (("parent", lambda: runtime.kernel.get("parent").to_dict()),
+                                    ("requests", lambda: self.requests(runtime))):
+                try:
+                    with runtime.kernel._control_lock(.1):
+                        record[name] = operation()
+                except Exception as error:
+                    record[name + "_error"] = {"type": type(error).__name__, "message": str(error)}
+        self.assertTrue(reached, json.dumps(record, indent=2))
 
     def finish(self, driver, outcomes, errors):
         driver.join(8)
@@ -129,7 +153,8 @@ class ChildStorageContentionTests(unittest.TestCase):
         runtime = self.runtime(parent, child)
         with patch.object(HandlerChildren, "_await", gated_await):
             driver, outcomes, errors = self.drive(runtime)
-            self.assertTrue(waiting.wait(2))
+            self.witness_readiness(waiting, 2, runtime, driver, outcomes, errors,
+                parent_timeout=6, child_timeout=3, calls=calls, await_rows=row_seen)
             self.poll(lambda: self.requests(runtime)[0]["state"] == "completed", seconds=2)
             raw_result = runtime.kernel.get(row_seen[0]["child_execution_id"]).result.to_dict()
             with self.writer(runtime.kernel.db_path):
@@ -195,7 +220,8 @@ class ChildStorageContentionTests(unittest.TestCase):
             return context.children.run("child", {}, request_id="one", timeout_seconds=.25)
         runtime = self.runtime(parent, child)
         driver, outcomes, errors = self.drive(runtime, timeout=.55)
-        self.assertTrue(entered.wait(.4))
+        self.witness_readiness(entered, .4, runtime, driver, outcomes, errors,
+            parent_timeout=.55, child_timeout=.25, calls=calls)
         with self.writer(runtime.observation_journal.path):
             release.set()
             time.sleep(.8)

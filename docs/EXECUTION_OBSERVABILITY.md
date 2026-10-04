@@ -273,6 +273,14 @@ deadlines. Preserve the original control deadline across retries; a SQLite busy
 error is a storage-admission failure and does not establish revoked authority.
 The default control timeout remains unchanged.
 
+Journal admission retries use each operation's original write window. An
+expired observation write can retry only after its rollback is confirmed, inside
+the caller's existing window; generic errors and uncertain commits do not grant
+another attempt. Native filesystem durability I/O cannot be preempted by a Python
+wait deadline. A successful late COMMIT retains its actual receipt; it never
+justifies replaying business. Storage still owned by a stopped SDK worker remains
+pending cleanup as described above.
+
 The Kernel layout is version 4. Use the explicit copy-upgrade API for older
 supported layouts; normal opens do not migrate them. Observation journals are
 separate, source-bound files containing windows, waits and notification handoff

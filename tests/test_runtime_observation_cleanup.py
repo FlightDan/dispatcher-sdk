@@ -14,6 +14,8 @@ from dispatcher_sdk.execution_kernel.runtime import _ObservationCleanupPendingEr
 from dispatcher_sdk.execution_kernel.sandbox_contracts import SandboxOutcomeUnknown
 from dispatcher_sdk.execution_kernel.settlement import SettlementJournal
 from dispatcher_sdk.observability import ActivityRecorder, ObservationIdentity, ObservationJournal
+from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 
 def completed_handler(payload, context):
@@ -21,6 +23,22 @@ def completed_handler(payload, context):
 
 
 class RuntimeObservationCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.root = retained_directory("sdk-runtime-observation-cleanup-")
+        self.storage_evidence = StorageEvidence(self.root, self)
+        self.storage_evidence.start()
+        self.addCleanup(self.storage_evidence.stop)
+        self.addCleanup(self.storage_evidence.save)
+
+    def tearDown(self):
+        self.storage_evidence.save(phase="before_cleanup")
+
+    @contextmanager
+    def kernel_storage(self):
+        path = self.root / ("kernel-" + str(len(list(self.root.iterdir()))))
+        path.mkdir()
+        yield str(path)
+
     @contextmanager
     def held_observer(self, runtime, *, expected_close_error=None):
         entered, release, joining, released_connection = (threading.Event() for _ in range(4))
@@ -73,7 +91,7 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                     raise
 
     def test_close_waits_for_owned_real_sqlite_connection(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.kernel_storage() as temporary:
             path = Path(temporary) / "runtime.sqlite3"
             runtime = Kernel.open_sqlite(path, {"work": completed_handler}, isolation_mode="thread")
             with self.held_observer(runtime) as (result, released_connection, release, joining):
@@ -107,8 +125,8 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                     closer.join(5)
 
     def test_pending_cleanup_retains_temporary_storage_until_repeated_close(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            observation = tempfile.TemporaryDirectory()
+        with self.kernel_storage() as temporary:
+            observation = tempfile.TemporaryDirectory(dir=self.root)
             path = Path(observation.name) / "observations.sqlite3"
             runtime = Kernel.open_sqlite(Path(temporary) / "runtime.sqlite3", {"work": completed_handler},
                 isolation_mode="thread", observation_path=str(path))
@@ -141,7 +159,7 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                 self.assertFalse(path.exists())
 
     def test_cleanup_retry_does_not_clear_original_sandbox_error(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.kernel_storage() as temporary:
             path = Path(temporary) / "runtime.sqlite3"
             runtime = Kernel.open_sqlite(path, {"work": completed_handler}, isolation_mode="thread")
             error = SandboxOutcomeUnknown("original sandbox cleanup is unresolved")
@@ -161,7 +179,7 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                     self.assertEqual(reader.get("original").to_dict(), result.to_dict())
 
     def test_settlement_retry_cannot_clear_pending_real_connection_cleanup(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.kernel_storage() as temporary:
             runtime = Kernel.open_sqlite(Path(temporary) / "runtime.sqlite3", {"work": completed_handler},
                 isolation_mode="thread")
             with self.held_observer(runtime) as (result, released_connection, release, joining):
@@ -196,8 +214,8 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
 
         late_handler.__execution_kernel_revision__ = "late-observer-cleanup-fixture-v1"
 
-        with tempfile.TemporaryDirectory() as temporary:
-            observation = tempfile.TemporaryDirectory()
+        with self.kernel_storage() as temporary:
+            observation = tempfile.TemporaryDirectory(dir=self.root)
             path = Path(observation.name) / "observations.sqlite3"
             runtime = Kernel.open_sqlite(Path(temporary) / "runtime.sqlite3", {"work": late_handler},
                 isolation_mode="thread", observation_path=str(path))
@@ -225,7 +243,7 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                 runtime.close()
 
     def test_expired_flusher_close_still_stops_existing_process_observer(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.kernel_storage() as temporary:
             runtime = Kernel.open_sqlite(Path(temporary) / "runtime.sqlite3", {"work": completed_handler},
                 isolation_mode="thread")
             runtime.submit(runtime.command("work", execution_id="flush", idempotency_key="flush",
@@ -286,8 +304,8 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                     release.wait()
                 yield current
 
-        with tempfile.TemporaryDirectory() as temporary:
-            observation = tempfile.TemporaryDirectory()
+        with self.kernel_storage() as temporary:
+            observation = tempfile.TemporaryDirectory(dir=self.root)
             path = Path(observation.name) / "observations.sqlite3"
             runtime = Kernel.open_sqlite(Path(temporary) / "runtime.sqlite3", {"work": handler},
                 isolation_mode="thread", lease_seconds=5, observation_path=str(path))
@@ -307,7 +325,11 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                 runner = threading.Thread(target=run)
                 runner.start()
                 try:
-                    self.assertTrue(entered.wait(3))
+                    entered_on_time = entered.wait(3)
+                    if not entered_on_time:
+                        self.storage_evidence.save(phase="initialization_entry_wait_expired",
+                            checkpoint={"original_wait": 3, "entered": entered_on_time})
+                    self.assertTrue(entered_on_time)
                     contexts = tuple(runtime._thread_contexts.values())
                     self.assertEqual(len(contexts), 1)
                     context = contexts[0]
@@ -321,7 +343,11 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                     self.assertTrue(runtime._retired_observation_contexts)
                     self.assertEqual(calls, [])
                     release.set()
-                    self.assertTrue(context._observation_start_done.wait(3))
+                    start_done = context._observation_start_done.wait(3)
+                    if not start_done:
+                        self.storage_evidence.save(phase="initialization_wait_expired",
+                            checkpoint={"original_wait": 3, "start_done": start_done})
+                    self.assertTrue(start_done)
                     runtime.close()
                     self.assertFalse(path.exists())
                     self.assertEqual(runtime._retired_observation_contexts, [])
@@ -339,8 +365,8 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
 
     def test_sdk_sampler_and_settlement_connections_keep_storage_pending(self):
         for service in ("sampler", "settlement"):
-            with self.subTest(service=service), tempfile.TemporaryDirectory() as temporary:
-                observation = tempfile.TemporaryDirectory()
+            with self.subTest(service=service), self.kernel_storage() as temporary:
+                observation = tempfile.TemporaryDirectory(dir=self.root)
                 path = Path(observation.name) / "observations.sqlite3"
                 runtime = Kernel.open_sqlite(Path(temporary) / "runtime.sqlite3", {"work": completed_handler},
                     isolation_mode="thread", observation_path=str(path))

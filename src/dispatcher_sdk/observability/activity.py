@@ -12,7 +12,7 @@ import uuid
 from .._sqlite_errors import is_sqlite_contention
 
 from .contracts import ObservationIdentity, ObservationOptions, identifier, positive
-from .journal import ObservationJournal, _bounded_json, _json
+from .journal import ObservationJournal, _ObservationWriteBudgetExceeded, _bounded_json, _json
 
 
 class ActivityRecorder:
@@ -383,7 +383,8 @@ class ActivityRecorder:
 
     @staticmethod
     def _transient_storage_error(error: Exception) -> bool:
-        return is_sqlite_contention(error)
+        return (is_sqlite_contention(error)
+                or (isinstance(error, _ObservationWriteBudgetExceeded) and error.rollback_confirmed))
 
     def flush(self) -> dict[str, Any]:
         """Persist one finite batch; failures keep bounded detail for replay."""

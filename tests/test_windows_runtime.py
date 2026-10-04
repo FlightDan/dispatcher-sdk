@@ -16,6 +16,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+from tests._acceptance_evidence import retained_directory
+
 from dispatcher_sdk.execution_kernel import ExecutionCommandV2, Kernel, RetryPolicy, SQLiteKernel, ScriptSpec, script_handler
 from dispatcher_sdk.execution_kernel import _windows_runtime as windows_runtime
 from dispatcher_sdk.execution_kernel._windows_runtime import invoke_windows_handler, _WinAPI, _ExtendedLimits
@@ -125,7 +127,8 @@ def _venv_flush_host(directory):
                 command=command, lease=lease, now=None, start_timeout=30,
                 on_started=lambda handle: launcher.append(handle.pid) or True)
     evidence = {"outcome": outcome, "launcher_pid": launcher[0], "interpreter": sys.executable,
-                "sdk_import": windows_runtime.__file__, "flushed_pid": _read_pid(root / "flushed")}
+                "sdk_import": windows_runtime.__file__, "flushed_pid": _read_pid(root / "flushed"),
+                "host_pid": os.getpid()}
     (root / "venv-outcome.json").write_text(json.dumps(evidence), encoding="utf-8")
 
 
@@ -230,7 +233,14 @@ def _pid_alive(pid):
             return False
         raise ctypes.WinError(error)
     try:
-        return api.WaitForSingleObject(process, 0) == 258
+        result = api.WaitForSingleObject(process, 0)
+        if result == 0:  # WAIT_OBJECT_0: acquired process handle is signaled.
+            return False
+        if result == 258:  # WAIT_TIMEOUT: acquired process is still active.
+            return True
+        if result == 0xFFFFFFFF:  # WAIT_FAILED cannot establish exit.
+            raise ctypes.WinError(ctypes.get_last_error())
+        raise RuntimeError(f"unexpected process wait result: {result}")
     finally:
         api.CloseHandle(process)
 
@@ -696,21 +706,28 @@ class WindowsRuntimeTests(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_venv_redirector_preserves_actual_worker_until_final_flush(self):
-        environment = self.root / "venv"
+        # Preserve the interpreter and outcome, including failed cleanup facts.
+        # Windows image deletion is separate from the Job containment receipt.
+        root = retained_directory("sdk-windows-venv-flush-")
+        environment = root / "venv"
         created = subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(environment)],
                                  timeout=60, capture_output=True, text=True)
         self.assertEqual(created.returncode, 0, created.stderr)
         code = "import sys; sys.path[:]=%r; from %s import _venv_flush_host; _venv_flush_host(%r)" % (
-            _test_import_path(), _TEST_MODULE, str(self.root))
+            _test_import_path(), _TEST_MODULE, str(root))
         completed = subprocess.run([str(environment / "Scripts" / "python.exe"), "-c", code],
                                    timeout=60, capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        record = json.loads((self.root / "venv-outcome.json").read_text(encoding="utf-8"))
-        print("WINDOWS_VENV_FLUSH_OUTCOME " + json.dumps(record), flush=True)
+        record = json.loads((root / "venv-outcome.json").read_text(encoding="utf-8"))
         self.assertEqual(record["outcome"]["kind"], "ok", record)
         worker = record["outcome"]["value"]["worker_pid"]
         self.assertNotEqual(worker, record["launcher_pid"], "fixture did not enter the redirector path")
         self.assertEqual(record["flushed_pid"], worker, record)
+        record["processes_after_host_return"] = {name: {"pid": record[name], "alive": _pid_alive(record[name])}
+            for name in ("launcher_pid", "flushed_pid", "host_pid")}
+        (root / "venv-outcome.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+        print("WINDOWS_VENV_FLUSH_OUTCOME " + json.dumps({"path": str(root), **record}), flush=True)
+        self.assertTrue(all(not item["alive"] for item in record["processes_after_host_return"].values()), record)
 
     def test_incompatible_outer_job_fails_without_unpickling(self):
         code = "import sys; sys.path[:]=%r; from %s import _incompatible_outer_job; _incompatible_outer_job(%r)" % (

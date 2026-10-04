@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import multiprocessing
 from multiprocessing.connection import Connection
 import os
@@ -12,6 +13,8 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+
+from tests._acceptance_evidence import retained_directory
 
 from dispatcher_sdk.execution_kernel import (
     ExecutionCommandV2,
@@ -516,25 +519,29 @@ class RuntimeTests(unittest.TestCase):
                 stack.close()
 
     def test_handler_context_executes_and_records_effect_once(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            stack = Kernel.open_sqlite(
-                Path(temp) / "kernel.sqlite3",
-                {("effect", 1): effect_handler},
-            )
-            try:
-                stack.submit(
-                    make_command(
-                        "effects",
-                        stack.registry_revision,
-                        handler_id="effect",
-                    )
+        root = retained_directory("sdk-effect-handler-outcome-")
+        stack = Kernel.open_sqlite(
+            root / "kernel.sqlite3",
+            {("effect", 1): effect_handler},
+        )
+        try:
+            stack.submit(
+                make_command(
+                    "effects",
+                    stack.registry_revision,
+                    handler_id="effect",
                 )
-                result = stack.run_once()
-                self.assertEqual(result.state, "succeeded")
-                self.assertEqual(result.result.effect_ids, ["effect-runtime"])
-                self.assertEqual(stack.kernel.get_effect("effect-runtime").state, "committed")
-            finally:
-                stack.close()
+            )
+            result = stack.run_once()
+            record = {"test": self.id(), "interpreter": sys.executable,
+                "result": result.to_dict(), "original_timeout": 1}
+            (root / "evidence.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+            print("effect_handler_evidence=" + str(root / "evidence.json"), flush=True)
+            self.assertEqual(result.state, "succeeded", result.to_dict())
+            self.assertEqual(result.result.effect_ids, ["effect-runtime"])
+            self.assertEqual(stack.kernel.get_effect("effect-runtime").state, "committed")
+        finally:
+            stack.close()
 
     def test_runtime_parks_and_human_recovery_safely_continues(self) -> None:
         for decision in ("applied", "not_applied"):

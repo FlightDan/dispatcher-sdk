@@ -1,7 +1,8 @@
 """Real SQLite pressure and recorder semantics, without business Run execution."""
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, contextmanager
+from copy import deepcopy
 import json
 from pathlib import Path
 import sqlite3
@@ -9,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dispatcher_sdk.observability import (
@@ -26,6 +28,86 @@ class _Clock:
 
 
 class ObservationJournalTests(unittest.TestCase):
+    def test_expired_real_write_rolls_back_and_only_proved_expiry_is_retryable(self):
+        from dispatcher_sdk.execution_kernel.children import _transient_control_error
+        from dispatcher_sdk.observability.journal import _ObservationWriteBudgetExceeded
+
+        with self.assertRaises(_ObservationWriteBudgetExceeded) as caught:
+            with self.journal._transaction() as (connection, now):
+                connection.execute("INSERT INTO obs_current VALUES(?,?,?,?,?)", ("expired", 1, 1, "{}", now))
+                time.sleep(self.journal.options.write_timeout + .02)
+        self.assertTrue(caught.exception.rollback_confirmed)
+        with closing(sqlite3.connect(self.journal.path)) as connection:
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM obs_current WHERE execution_id='expired'").fetchone()[0])
+        for classifier in (ActivityRecorder._transient_storage_error, _transient_control_error):
+            self.assertTrue(classifier(caught.exception))
+            self.assertFalse(classifier(_ObservationWriteBudgetExceeded("unconfirmed expiry")))
+            self.assertFalse(classifier(TimeoutError("unrelated timeout")))
+
+    def test_close_retries_exact_final_batch_after_proved_write_rollback(self):
+        recorder = self.recorder()
+        recorder.report_bytes("stdout", b"original final bytes")
+        original_transaction = self.journal._transaction
+        original_write = self.journal.write_batch
+        batches, expired = [], []
+
+        @contextmanager
+        def transaction(**kwargs):
+            first = not expired
+            if first:
+                expired.append(True)
+            with original_transaction(**kwargs) as current:
+                yield current
+                if first:
+                    time.sleep(self.journal.options.write_timeout + .02)
+
+        def write(*args, **kwargs):
+            batches.append(deepcopy(kwargs))
+            return original_write(*args, **kwargs)
+
+        with patch.object(self.journal, "_transaction", transaction), patch.object(self.journal, "write_batch", write):
+            receipt = recorder.close(timeout=1)
+        self.assertTrue(receipt["final_flush_persisted"], receipt)
+        self.assertTrue(receipt["source_closed"], receipt)
+        self.assertEqual(2, len(batches))
+        self.assertEqual(batches[0], batches[1])
+        report = self.journal.inspect("execution")
+        self.assertEqual(len(b"original final bytes"), report["metrics"]["stdout_bytes"]["count"])
+        self.assertEqual(b"original final bytes"[-self.options.tail_bytes:].decode(), report["tails"]["stdout"])
+
+    def test_child_store_retries_proved_rollback_inside_original_window(self):
+        from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, sample_clock
+        from dispatcher_sdk.execution_kernel.children import _RetryWindow, _Store, _retry
+        envelope = BudgetEnvelope((), sample_clock()).derive(source="tool", origin_id="original-call",
+                                                            timeout_seconds=1)
+        window = _RetryWindow(envelope, SimpleNamespace(_wall_time=time.time))
+        original_constraints, original_deadline = window.envelope.constraints, window.deadline
+        store = _Store(self.journal)
+        attempts, errors = [], []
+
+        def bookkeeping():
+            attempts.append(True)
+            try:
+                with store.transaction() as (connection, now):
+                    connection.execute("INSERT INTO obs_current VALUES(?,?,?,?,?)", ("child-bookkeeping", 1, 1, "{}", now))
+                    if len(attempts) == 1:
+                        time.sleep(self.journal.options.write_timeout + .02)
+            except TimeoutError as error:
+                errors.append(error)
+                raise
+            return "committed once"
+
+        self.assertEqual("committed once", _retry(window, bookkeeping, store=store))
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(1, len(errors))
+        self.assertTrue(errors[0].rollback_confirmed)
+        self.assertEqual(original_constraints, window.envelope.constraints)
+        self.assertLessEqual(window.deadline, original_deadline)
+        with closing(sqlite3.connect(self.journal.path)) as connection:
+            self.assertEqual(1, connection.execute(
+                "SELECT COUNT(*) FROM obs_current WHERE execution_id='child-bookkeeping'").fetchone()[0])
+
     def setUp(self):
         root = tempfile.TemporaryDirectory()
         self.addCleanup(root.cleanup)

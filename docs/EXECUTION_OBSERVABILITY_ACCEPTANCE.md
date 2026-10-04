@@ -146,6 +146,82 @@ bounds unchanged (`/tmp/sdk-contention-packaging-fixture-python310.log`). The
 intermediate full log remains `/tmp/sdk-platform-lifetime-installed310-regression.log`.
 A freshly rebuilt candidate must still pass every required matrix environment.
 
+Frozen candidate `5c5746f4f0e17e383788b79a33187c7d2df72087` completed
+[run 37194290510](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37194290510)
+with all eight Linux jobs passed, native Windows ARM64 3.11/3.12 passed,
+and six other Windows jobs failed. History scanning passed. Every Linux outer
+suite ran 969 cases with exactly 17 Windows-only skips; both audited Python 3.10
+installed suites ran 964 cases with the same 17 skips, return code zero and their
+original 900-second limit. Types, documentation and examples passed in all eight
+Linux jobs. Native Windows ARM64 3.12 outer/installed suites passed with 55
+POSIX/Linux or platform-specific inapplicable skips; all mandatory native Windows
+cases actually ran, including `pythonw`. Its five installed public scenarios and
+four actual post-close database-release probes passed. These partial passes do
+not establish complete matrix acceptance.
+
+The final local installed Python 3.10 regression for that frozen source passed
+967 cases in 756.565 seconds with 17 Windows-only skips. The local harness excluded
+only two isolated-consumer methods and included all three packaging methods;
+CI separately passed the complete source rebuild and isolated installation.
+The original local log's prose label incorrectly described five excluded cases.
+Actual filtering, the exact preserved harness and the clarification are retained
+at `/tmp/sdk-platform-lifetime-final-installed310-harness.py` and
+`/tmp/sdk-platform-lifetime-final-installed310-scope.json`; historical logs are
+unchanged. Final wheel public scenarios and the original example passed outside
+the checkout with isolated imports. Logs and evidence are
+`/tmp/sdk-platform-lifetime-final-installed310-regression.log`,
+`/tmp/sdk-platform-lifetime-final-public310-evidence/summary.json`,
+`/tmp/sdk-platform-lifetime-final-public310.log` and
+`/tmp/sdk-platform-lifetime-final-example310.log`.
+
+Failed native logs and artifacts remain under `/tmp/sdk-ci-audit-job-<job-id>.log`
+and `/tmp/sdk-ci-audit-evidence-37194290510`. Failure categories include cancellation
+fixture clock anchoring, child read-delay and readiness fixtures, handler outcome
+admission/settlement waits, observation initialization, and temporary venv image
+deletion. The ARM-host Python 3.10 worker-preservation/flush assertions passed
+before its test-owned image deletion failed; the file lock's owner is unknown.
+The current fixture retains that environment and explicitly observes the host,
+launcher and worker after return. It does not claim the image lock was released.
+Actual SDK-owned database-release requirements remain independently tested.
+A genuine SQLite VFS locked-sidecar reproduction separately confirmed settlement
+admission with a 0.1-second budget taking 0.741 seconds in the native busy handler.
+That defect is distinct from the still-unattributed uncontended write latency.
+New corrections must pass a fresh complete matrix. Old failed jobs remain failed.
+
+The scoped journal correction disables native busy sleeps and retries only
+admission/configuration/validation or a genuine busy COMMIT with its original
+transaction still open, against the same original deadline. Transaction bodies
+are not replayed. Original vs corrected real VFS probes took 0.741/0.100 seconds
+for settlement and 0.742/0.100 seconds for observations, keeping each original
+0.1-second budget, 0.5-second gate and raw lock error. An actual observation
+transaction held 0.06 seconds inside its original 0.03-second window committed
+under the old code; the corrected code confirmed rollback and no row. Only that
+proved attempt expiry is eligible for bounded final-batch or child-bookkeeping
+retry. Native late successful durability commits preserve their receipt, and
+unknown commits are never replayed. Evidence:
+`/tmp/sdk-settlement-busy-native-baseline.log`,
+`/tmp/sdk-settlement-busy-native-revised.log`,
+`/tmp/sdk-observation-write-native-baseline.log` and
+`/tmp/sdk-observation-write-native-revised.log`.
+
+The related focused storage/persistence suite passed 113 tests in 93.801 seconds
+(`/tmp/sdk-final-storage-persistence-focused.log`). The final observation module
+passed 30 tests, and five real Python 3.10 rollback/lock regressions passed.
+Permanent real-SQL tests protect expired rollback, exact final-batch replay and
+one durable child-bookkeeping row within unchanged original constraints.
+Actual COMMIT probes retained one body INSERT across two genuine busy COMMIT
+attempts; uncertain and permanent failures each made only one COMMIT attempt.
+Logs: `/tmp/sdk-final-storage-new-regressions.log`,
+`/tmp/sdk-final-storage-python310-regressions.log` and
+`/tmp/sdk-final-storage-commit-probe.log`. Four packaging/import checks,
+five public typing fixtures and the documentation check (546 links, six README
+examples, zero skips) passed. A fresh corrected Python 3.10 installation also
+passed all five public scenarios and the original example, outside the checkout
+with isolated imports (`/tmp/sdk-journal-admission-public310.log`,
+`/tmp/sdk-journal-admission-public310-evidence/summary.json` and
+`/tmp/sdk-journal-admission-example310.log`). Independent review found no remaining
+scoped blocker; the next complete matrix remains required.
+
 T01–T07 implementation and Linux evidence are present. T08 has local installation
 and regression evidence but still needs the native matrix; T09 independent review
 and corrections are complete locally, while final acceptance depends on T08.

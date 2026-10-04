@@ -61,6 +61,9 @@ def _transient_control_error(error: Exception) -> bool:
         return True
     if is_sqlite_contention(error):
         return True
+    from ..observability.journal import _ObservationWriteBudgetExceeded
+    if isinstance(error, _ObservationWriteBudgetExceeded):
+        return error.rollback_confirmed
     return isinstance(error, TimeoutError) and str(error) in (
         "Kernel control lock admission timed out", "Kernel control admission budget elapsed",
         "child lifecycle admission timed out", "observation schema admission budget elapsed")
