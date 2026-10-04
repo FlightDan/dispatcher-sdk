@@ -299,8 +299,12 @@ class ObservationJournal:
     def _read_connection(self, timeout: float, budget: InspectionBudget | None = None):
         budget = budget or InspectionBudget(positive(timeout, "timeout"), None)
         budget.check()
+        # SQLite's busy handler counts requested sleep durations, which can
+        # overrun a wall-clock budget on a coarse or delayed host scheduler.
+        # Let the Python admission loop observe the original deadline between
+        # immediate reads instead of spending it inside native busy sleeps.
         connection = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True,
-                                     timeout=min(timeout, budget.sqlite_timeout_seconds))
+                                     timeout=0)
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA query_only=ON")
@@ -309,7 +313,6 @@ class ObservationJournal:
             connection.execute("BEGIN")
             while True:
                 budget.check()
-                connection.execute(f"PRAGMA busy_timeout={max(1, int(budget.sqlite_timeout_seconds * 1000))}")
                 try:
                     self._validate_binding(connection)
                     break

@@ -1,6 +1,6 @@
 """Bounded admission and durable response semantics before runtime integration."""
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import json
 from pathlib import Path
 import sqlite3
@@ -26,7 +26,7 @@ class RequestJournal:
     def __init__(self, path):
         self.path, self.source_id = Path(path), "test-store"
         self.options = SimpleNamespace(query_timeout=.5, write_timeout=.2)
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.executescript(CHILD_SCHEMA)
 
     @contextmanager

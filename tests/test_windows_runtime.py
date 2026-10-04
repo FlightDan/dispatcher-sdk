@@ -19,6 +19,7 @@ from unittest.mock import patch
 from dispatcher_sdk.execution_kernel import ExecutionCommandV2, Kernel, RetryPolicy, SQLiteKernel, ScriptSpec, script_handler
 from dispatcher_sdk.execution_kernel import _windows_runtime as windows_runtime
 from dispatcher_sdk.execution_kernel._windows_runtime import invoke_windows_handler, _WinAPI, _ExtendedLimits
+from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, DeadlineConstraint, sample_clock
 
 
 def _echo(payload, context):
@@ -86,6 +87,46 @@ def _stream_failure(payload, context):
     sys.stdout.write("pythonw-stdout\n")
     sys.stderr.write("pythonw-stderr\n")
     raise RuntimeError("intentional stream probe")
+
+
+def _final_flush_gate(payload, context):
+    root = Path(payload["root"])
+    close = context.close
+
+    def flush():
+        while not (root / "release-flush").exists():
+            if not context.budget.remaining_work_seconds:
+                raise TimeoutError("original worker budget expired before flush release")
+            time.sleep(.01)
+        receipt = close()
+        (root / "flushed").write_text(str(os.getpid()), encoding="ascii")
+        return receipt
+
+    context.close = flush
+    return {"worker_pid": os.getpid()}
+
+
+def _venv_flush_host(directory):
+    root = Path(directory)
+    stopped = windows_runtime.WindowsProcessHandle.stop_descendants
+    launcher = []
+
+    def release_after_descendant_stop(handle, until):
+        quiet = stopped(handle, until)
+        (root / "release-flush").touch()
+        return quiet
+
+    with SQLiteKernel(root / "venv.db") as kernel:
+        command = _command({"root": str(root)})
+        kernel.submit(command)
+        lease = kernel.claim_and_start("venv")
+        with patch.object(windows_runtime.WindowsProcessHandle, "stop_descendants", release_after_descendant_stop):
+            outcome = invoke_windows_handler(db_path=str(kernel.db_path), handler=_final_flush_gate,
+                command=command, lease=lease, now=None, start_timeout=30,
+                on_started=lambda handle: launcher.append(handle.pid) or True)
+    evidence = {"outcome": outcome, "launcher_pid": launcher[0], "interpreter": sys.executable,
+                "sdk_import": windows_runtime.__file__, "flushed_pid": _read_pid(root / "flushed")}
+    (root / "venv-outcome.json").write_text(json.dumps(evidence), encoding="utf-8")
 
 
 def _no_console_host(directory):
@@ -202,6 +243,64 @@ class UnsupportedWindowsBackendTests(unittest.TestCase):
 
 
 class WindowsDescendantContainmentTests(unittest.TestCase):
+    def test_redirector_worker_handle_survives_flush_and_does_not_preserve_reused_pid(self):
+        opened, killed, closed = [], [], []
+        members = [7, 8, 9]
+        replaced = [False]
+
+        class DLL:
+            def OpenProcess(self, rights, inherit, pid):
+                opened.append(pid)
+                return pid + (200 if replaced[0] else 100)
+
+            def IsProcessInJob(self, process, job, assigned):
+                assigned._obj.value = True
+                return True
+
+            def WaitForSingleObject(self, process, milliseconds):
+                return 0 if process == 108 and replaced[0] else 258
+
+            def TerminateProcess(self, process, code):
+                killed.append(process)
+                members.remove(process % 100)
+                return True
+
+            def CloseHandle(self, process):
+                closed.append(process)
+                return True
+
+        api = SimpleNamespace(dll=DLL(), process_ids=lambda job: tuple(members),
+                              check=lambda result, operation: self.assertTrue(result, operation))
+        handle = windows_runtime.WindowsProcessHandle(api, 99,
+            SimpleNamespace(dwProcessId=7, hProcess=107, hThread=None))
+        handle.preserve_worker(8)
+        self.assertTrue(handle.stop_descendants(time.monotonic() + 1))
+        self.assertEqual(killed, [109], "actual interpreter was killed before its final flush")
+        replaced[0] = True
+        self.assertTrue(handle.stop_descendants(time.monotonic() + 1))
+        self.assertEqual(killed, [109, 208], "a recycled worker PID inherited flush protection")
+        self.assertEqual(opened, [8, 9, 8])
+        handle._contained = True
+        handle.close()
+        self.assertEqual(closed, [109, 208, 108, 107, 99])
+
+    def test_ready_worker_outside_job_is_rejected_and_acquired_handle_is_closed(self):
+        closed = []
+
+        def membership(process, job, assigned):
+            assigned._obj.value = False
+            return True
+
+        api = SimpleNamespace(dll=SimpleNamespace(OpenProcess=lambda *args: 108,
+            IsProcessInJob=membership, CloseHandle=closed.append),
+            check=lambda result, operation: self.assertTrue(result, operation))
+        handle = windows_runtime.WindowsProcessHandle(api, 99,
+            SimpleNamespace(dwProcessId=7, hProcess=107, hThread=None))
+        with self.assertRaisesRegex(RuntimeError, "outside its containment Job"):
+            handle.preserve_worker(8)
+        self.assertEqual(closed, [108])
+        self.assertIsNone(handle._worker_process)
+
     def test_job_member_handles_are_verified_and_original_worker_is_preserved(self):
         opened, killed, closed = [], [], []
         members = [[7, 8, 9], [7, 10], [7], [7]]
@@ -311,7 +410,10 @@ for fd in (0, 1, 2):
                         pass
 
                     def resume(self):
-                        (roots[0] / "ready").write_text("ready", encoding="ascii")
+                        (roots[0] / "ready").write_text(json.dumps({"worker_pid": 7}), encoding="ascii")
+
+                    def preserve_worker(self, pid):
+                        self_test.assertEqual(pid, 7)
 
                     def exited(self):
                         # The loop has already observed no outcome file.
@@ -355,6 +457,76 @@ for fd in (0, 1, 2):
                 else:
                     self.assertEqual(outcome, {"kind": "authority_revoked",
                         "reason": "execution_cancelled", "effect_ids": []})
+
+
+class WindowsStartupGuardTests(unittest.TestCase):
+    def test_actual_watchdog_expiry_during_registration_preserves_startup_failure(self):
+        for inherited, phase in ((False, "registration"), (True, "registration"),
+                                 (False, "ready_identity"), (True, "ready_identity"),
+                                 (False, "ready_revocation"), (True, "ready_revocation")):
+            with self.subTest(inherited=inherited, phase=phase):
+                terminated = threading.Event()
+                roots = []
+                self_test = self
+
+                def create(api, arguments):
+                    roots.append(Path(arguments[-1]))
+                    return None, None
+
+                class Handle:
+                    revocation_reason = None
+                    exitcode = 70
+
+                    def __init__(self, *args):
+                        pass
+
+                    def terminate(self):
+                        terminated.set()
+                        return True
+
+                    def resume(self):
+                        (roots[0] / "ready").write_text(json.dumps({"worker_pid": 7}), encoding="ascii")
+
+                    def preserve_worker(self, pid):
+                        if phase == "ready_revocation":
+                            self.revocation_reason = "execution_cancelled"
+                            self_test.assertFalse((roots[0] / "go").exists())
+                            raise OSError("worker was cancelled before its ready handle could be acquired")
+                        self_test.assertTrue(terminated.wait(1), "startup watchdog did not stop during ready acquisition")
+                        self_test.assertFalse((roots[0] / "go").exists())
+                        raise OSError("worker was stopped before its ready handle could be acquired")
+
+                    def close(self):
+                        pass
+
+                envelope = None
+                if inherited:
+                    sample = sample_clock()
+                    envelope = BudgetEnvelope((DeadlineConstraint("parent:original", "parent", sample.wall_at + 60),), sample)
+
+                def registered(handle):
+                    if phase == "registration":
+                        self.assertTrue(terminated.wait(1), "actual startup watchdog did not independently stop")
+                    return True
+
+                with patch.object(windows_runtime, "_WinAPI", return_value=object()), \
+                        patch.object(windows_runtime, "_create_suspended", side_effect=create), \
+                        patch.object(windows_runtime, "WindowsProcessHandle", Handle):
+                    outcome = invoke_windows_handler(db_path="/unused/kernel.db", handler=_echo,
+                        command=_command({}), lease=None, now=None, start_timeout=.1,
+                        on_started=registered, budget_envelope=envelope)
+                if phase == "ready_revocation":
+                    self.assertEqual(outcome.get("kind"), "authority_revoked", outcome)
+                    self.assertEqual(outcome.get("reason"), "execution_cancelled", outcome)
+                else:
+                    self.assertEqual(outcome.get("kind"), "error", outcome)
+                    self.assertEqual(outcome.get("code"), "handler_process_start_failure", outcome)
+                    self.assertTrue(outcome["details"]["startup_window_elapsed"])
+                    self.assertFalse(outcome["details"]["invocation_permitted"])
+                if envelope is not None:
+                    retained = BudgetEnvelope.from_dict(outcome["budget_envelope"])
+                    self.assertEqual(retained.constraints, envelope.constraints)
+                    self.assertGreater(retained.view(sample=retained.checkpoint).remaining_work_seconds, 0)
 
 
 @unittest.skipUnless(os.name == "nt", "requires real Windows file sharing")
@@ -511,8 +683,34 @@ class WindowsRuntimeTests(unittest.TestCase):
             time.sleep(.5)
             return True
         outcome = self.invoke(_RestoredHandler(str(marker)), on_started=registered, start_timeout=.1)
-        self.assertEqual(outcome["code"], "handler_process_start_failure", outcome)
+        evidence_parent = os.environ.get("SDK_ACCEPTANCE_EVIDENCE_DIR")
+        if evidence_parent:
+            Path(evidence_parent).mkdir(parents=True, exist_ok=True)
+        evidence = Path(tempfile.mkdtemp(prefix="sdk-windows-startup-", dir=evidence_parent))
+        record = {"test": self.id(), "interpreter": sys.executable, "sdk_import": windows_runtime.__file__,
+                  "start_timeout": .1, "execution_timeout": 20, "outcome": outcome,
+                  "unpickled": marker.exists()}
+        (evidence / "outcome.json").write_text(json.dumps(record), encoding="utf-8")
+        print("WINDOWS_STARTUP_OUTCOME " + json.dumps({"path": str(evidence), **record}), flush=True)
+        self.assertEqual(outcome.get("code"), "handler_process_start_failure", outcome)
         self.assertFalse(marker.exists())
+
+    def test_venv_redirector_preserves_actual_worker_until_final_flush(self):
+        environment = self.root / "venv"
+        created = subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(environment)],
+                                 timeout=60, capture_output=True, text=True)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        code = "import sys; sys.path[:]=%r; from %s import _venv_flush_host; _venv_flush_host(%r)" % (
+            _test_import_path(), _TEST_MODULE, str(self.root))
+        completed = subprocess.run([str(environment / "Scripts" / "python.exe"), "-c", code],
+                                   timeout=60, capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        record = json.loads((self.root / "venv-outcome.json").read_text(encoding="utf-8"))
+        print("WINDOWS_VENV_FLUSH_OUTCOME " + json.dumps(record), flush=True)
+        self.assertEqual(record["outcome"]["kind"], "ok", record)
+        worker = record["outcome"]["value"]["worker_pid"]
+        self.assertNotEqual(worker, record["launcher_pid"], "fixture did not enter the redirector path")
+        self.assertEqual(record["flushed_pid"], worker, record)
 
     def test_incompatible_outer_job_fails_without_unpickling(self):
         code = "import sys; sys.path[:]=%r; from %s import _incompatible_outer_job; _incompatible_outer_job(%r)" % (

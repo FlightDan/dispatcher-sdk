@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
+from types import SimpleNamespace
 from tests._acceptance_evidence import retained_directory
 import unittest
 from unittest.mock import patch
@@ -149,10 +150,15 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         finally:
             self.kernel._connection.rollback()
         before = self.watermark()
-        with self.kernel._control_lock(.005):
-            time.sleep(.01)
-            with self.assertRaises(TimeoutError):
-                self.kernel._verify_active_lease_readonly(self.lease)
+        clock = [time.monotonic()]
+        control_clock = SimpleNamespace(**{**vars(time), 'monotonic': lambda: clock[0]})
+        with patch('dispatcher_sdk.execution_kernel._sqlite_base.time', control_clock):
+            with self.kernel._control_lock(.005):
+                # A short real sleep need not cross a coarse monotonic tick.
+                # Advance the original caller's clock beyond its same cutoff.
+                clock[0] += .01
+                with self.assertRaises(TimeoutError):
+                    self.kernel._verify_active_lease_readonly(self.lease)
         self.assertEqual(self.watermark(), before)
 
 

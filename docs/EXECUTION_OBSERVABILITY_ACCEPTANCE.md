@@ -6,7 +6,7 @@ maintainability only. The user has activated the revised SDK-only Goal. ModPort 
 writes are outside the revised completion criteria. Historical integration evidence
 is retained below; it does not establish the new SDK-only A16.
 
-Local Linux acceptance passed on implementation commit
+The last complete local Linux acceptance passed on implementation commit
 `969f0da7f2bdbcda9dc4235e0744e0176e0475b2` (Linux x86_64, Python 3.12).
 The complete regression ran 952 tests in 1629.062 seconds with zero failures or
 errors and 16 platform skips. Its freshly rebuilt and installed SDK also passed
@@ -34,6 +34,46 @@ the exact command, original timeout, return code and complete stdout/stderr unde
 each public consumer's `installed-suite` directory, including failure and timeout.
 Three bounded local success/failure/timeout probes verified retention at
 `/tmp/sdk-installed-suite-log-check-0290z0z5`. No release is authorized.
+
+CI then exposed new platform issues. Both Linux Python 3.13 installed suites
+captured unrelated descriptor closures through a globally patched `os.close`.
+Windows suites exposed unclosed test-owned SQLite connections, POSIX-only mocked
+signal attributes, coarse-clock assumptions and atomic snapshot reader sharing.
+These fixture corrections preserve their original deadlines and required cases.
+Raw task logs are retained as `/tmp/sdk-ci-job-<job-id>.log`; the parsed inventory
+is `/tmp/sdk-ci-all-failures.json`, with native artifacts under
+`/tmp/sdk-ci-evidence-37189113536`. The old failed runs remain failed.
+
+Three additional SDK corrections are required before final acceptance:
+
+- Native Windows venv launchers can have a different PID from the actual
+  interpreter. Descendant cleanup killed that interpreter before its final
+  activity flush. Its Job-verified acquired handle is now preserved while live;
+  recycled PIDs are not protected. Internal startup-cap expiry is also distinct
+  from inherited work expiry, including readiness/cancellation races.
+- Elapsed projection now subtracts elapsed samples before adding the wall floor.
+  The previous operation order reduced `105` to `104.99999999999994` on unchanged
+  samples, weakening an already retained floor. No assertion tolerance was added.
+- Read admission leaves SQLite busy waiting disabled and uses the existing
+  Python loop within the same original query budget. A genuine locked-database
+  VFS slow-sleep probe reproduced about 0.401 seconds for the original 0.08-second
+  query; revised admission took about 0.080 seconds and passed the original
+  0.2-second gate. Permanent SQL errors still propagate immediately.
+
+Focused checks and independent Windows control review passed locally. Integrated
+correction regression passed 266 tests in 219.563 seconds with 17 native Windows
+skips; raw log is `/tmp/sdk-ci-corrections-integrated.log`, with retained evidence
+at `/tmp/sdk-ci-corrections-integrated-evidence`. Five public typing fixtures and
+546 documentation links/six README examples passed (`/tmp/sdk-ci-corrections-types.log`,
+`/tmp/sdk-ci-corrections-docs.log`). The fresh complete candidate matrix is still required. The earlier
+`969f0da` complete pass does not establish acceptance of these corrections.
+The Windows 3.12 stall collection-gap failure remains unattributed because its
+temporary store was deleted. This suite now retains its databases, policy/window
+rows, source summaries and flush receipts. One unchanged scenario passed locally;
+that does not explain the historical failure. Worker expiry fixtures now use a
+caller-provided wall sample scoped to the actual handler, retaining real
+`context.budget` and original watchdog cutoffs; they no longer rely on deleting
+or replacing a shared Windows clock file or writing evidence after hard stop.
 
 T01–T07 implementation and Linux evidence are present. T08 has local installation
 and regression evidence but still needs the native matrix; T09 independent review
@@ -143,8 +183,9 @@ The status below describes current evidence, not final Goal acceptance. Raw
 host paths identify retained artifacts for this run; they are not portable
 links or substitutes for the candidate CI artifacts.
 All Linux-applicable witnesses below passed in the complete source and installed
-candidate regression. Native Windows and the remaining CI environments are
-unverified, including platform-specific cases skipped on Linux.
+`969f0da` regression. Subsequent platform corrections described above still need
+candidate regression and native matrix verification, including cases skipped on
+Linux.
 
 | Scenario | Implementation and witness | Current evidence / remaining requirement |
 | --- | --- | --- |

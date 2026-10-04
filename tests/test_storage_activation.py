@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 import json
 import os
@@ -90,23 +91,23 @@ class IdentityRegistryActivationTests(unittest.TestCase):
         }
 
     def test_empty_identity_registry_passes_preflight_without_writes(self):
-        with sqlite3.connect(self.source) as connection:
+        with closing(sqlite3.connect(self.source)) as connection, connection:
             before = connection.execute("SELECT * FROM runtime_sandbox_meta").fetchall()
         with mock.patch.object(activation, "inspect_storage", return_value=self.inspection):
             activation._preflight(self.snapshot, {})
-        with sqlite3.connect(self.source) as connection:
+        with closing(sqlite3.connect(self.source)) as connection, connection:
             self.assertEqual(connection.execute("SELECT * FROM runtime_sandbox_meta").fetchall(), before)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM runtime_sandbox_journals").fetchone()[0], 0)
 
     def test_nonempty_registry_preserves_external_cleanup_rejection(self):
-        with sqlite3.connect(self.source) as connection:
+        with closing(sqlite3.connect(self.source)) as connection, connection:
             connection.execute("INSERT INTO runtime_sandbox_journals VALUES('missing-cleanup.sqlite3')")
         with mock.patch.object(activation, "inspect_storage", return_value=self.inspection):
             with self.assertRaisesRegex(ActivationPreconditionError, "external resources"):
                 activation._preflight(self.snapshot, {})
 
     def test_damaged_identity_registry_is_rejected(self):
-        with sqlite3.connect(self.source) as connection:
+        with closing(sqlite3.connect(self.source)) as connection, connection:
             connection.execute("DELETE FROM runtime_sandbox_meta")
         with mock.patch.object(activation, "inspect_storage", return_value=self.inspection):
             with self.assertRaisesRegex(ActivationPreconditionError, "registry validation failed"):

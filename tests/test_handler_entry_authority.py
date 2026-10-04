@@ -1,5 +1,6 @@
 """Durable first-entry authority, independent of handler or telemetry setup."""
 
+from contextlib import closing
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -171,7 +172,7 @@ class HandlerEntryAuthorityTests(unittest.TestCase):
 
     def test_sqlite_contention_is_bounded_and_does_not_confirm_entry(self):
         entered = self.enter(self.kernel.prepare_execution_budget(self.lease))
-        with sqlite3.connect(self.path) as other:
+        with closing(sqlite3.connect(self.path)) as other, other:
             other.execute("BEGIN IMMEDIATE")
             started = time.monotonic()
             with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):

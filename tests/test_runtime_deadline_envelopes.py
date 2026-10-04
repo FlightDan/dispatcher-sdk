@@ -10,6 +10,8 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+from contextlib import closing
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -156,11 +158,12 @@ class WorkerEntryConfirmationTests(unittest.TestCase):
                     self.assertFalse((root / "business").exists())
                     self.assertEqual("pending", runtime.kernel.get_execution_limits("probe")["entry_state"])
                     if mode == "lock":
-                        with sqlite3.connect(root / "kernel.db", timeout=.1) as writer:
-                            writer.execute("BEGIN IMMEDIATE")
-                            (root / "release").write_text("released", encoding="ascii")
-                            time.sleep(.25)
-                            self.assertFalse((root / "business").exists())
+                        with closing(sqlite3.connect(root / "kernel.db", timeout=.1)) as writer:
+                            with writer:
+                                writer.execute("BEGIN IMMEDIATE")
+                                (root / "release").write_text("released", encoding="ascii")
+                                time.sleep(.25)
+                                self.assertFalse((root / "business").exists())
                 finally:
                     (root / "release").write_text("released", encoding="ascii")
                     driver.join(15)
@@ -293,28 +296,30 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                     self.assertEqual({"status": 401, "provider": "fixture"}, child_result["error"]["details"])
 
     def test_flush_descendant_pid_reuse_outside_lineage_is_not_signalled(self):
-        with patch.object(process_runtime.os, "pidfd_open", return_value=99, create=True), patch.object(
-                process_runtime.signal, "pidfd_send_signal", create=True) as signal_process, patch.object(
-                process_runtime.os, "close") as close, patch.object(process_runtime, "_descendant_process_ids",
-                side_effect=[(42, 43), (43,)]):
+        close = Mock()
+        signal_process = Mock()
+        kill_signal = object()
+        process_os = SimpleNamespace(pidfd_open=Mock(return_value=99), close=close)
+        process_signal = SimpleNamespace(pidfd_send_signal=signal_process, SIGKILL=kill_signal)
+        with patch.object(process_runtime, "os", process_os), patch.object(
+                process_runtime, "signal", process_signal), patch.object(
+                process_runtime, "_descendant_process_ids", side_effect=[(42, 43), (43,)]):
             self.assertTrue(process_runtime._stop_flush_descendants(1, 43))
         signal_process.assert_not_called()
         close.assert_called_once_with(99)
 
     def test_flush_descendant_signal_uses_acquired_process_handle(self):
-        native_close = process_runtime.os.close
-
-        def close_descriptor(descriptor):
-            if descriptor != 99:
-                native_close(descriptor)
-
-        with patch.object(process_runtime.os, "pidfd_open", return_value=99, create=True), patch.object(
-                process_runtime.signal, "pidfd_send_signal", create=True) as signal_process, patch.object(
-                process_runtime.os, "close", side_effect=close_descriptor) as close, patch.object(process_runtime, "_descendant_process_ids",
+        close = Mock()
+        signal_process = Mock()
+        kill_signal = object()
+        process_os = SimpleNamespace(pidfd_open=Mock(return_value=99), close=close)
+        process_signal = SimpleNamespace(pidfd_send_signal=signal_process, SIGKILL=kill_signal)
+        with patch.object(process_runtime, "os", process_os), patch.object(
+                process_runtime, "signal", process_signal), patch.object(process_runtime, "_descendant_process_ids",
                 return_value=(42, 43)):
             self.assertTrue(process_runtime._stop_flush_descendants(1, 43))
-        signal_process.assert_called_once_with(99, process_runtime.signal.SIGKILL)
-        self.assertEqual(1, sum(call.args == (99,) for call in close.call_args_list))
+        signal_process.assert_called_once_with(99, kill_signal)
+        close.assert_called_once_with(99)
 
     @staticmethod
     def capture_process_cleanup(receipts):
@@ -423,10 +428,13 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
         guard.entered(packet)
         self.assertLessEqual(guard.deadline - time.monotonic(), 7)
         self.assertGreater(guard.hard_deadline - guard.deadline, 2.9)
-        with patch.object(process_runtime.signal, "setitimer"):
+        interval_timer = object()
+        timer_api = SimpleNamespace(ITIMER_REAL=interval_timer, setitimer=Mock())
+        with patch.object(process_runtime, "signal", timer_api):
             guard.begin_cleanup()
         self.assertTrue(guard.cleanup)
         self.assertLessEqual(guard.deadline, guard.hard_deadline)
+        timer_api.setitimer.assert_called_once()
 
     def test_posix_timer_detects_suspend_elapsed_without_a_storage_read(self):
         native = sample_clock()
@@ -469,7 +477,8 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
         try:
             actual = inherited.enter_handler(10, origin_id="execution:a")
             deadline = watchdog.business_deadline(100, envelope=actual, deadline=time.monotonic() + 100)
-            self.assertLessEqual(deadline - time.monotonic(), .2)
+            self.assertEqual(actual.constraints[0], inherited.constraints[0])
+            self.assertLessEqual(deadline, watchdog.inherited_work_deadline)
             self.assertTrue(terminated.wait(2))
             self.assertTrue(watchdog.expired)
         finally:

@@ -71,7 +71,7 @@ class ClockCheckpoint:
                 or self.domain_scope != sample.domain_scope
                 or sample.elapsed_at < self.elapsed_at):
             return None
-        result = max(sample.wall_at, self.wall_at + sample.elapsed_at - self.elapsed_at)
+        result = max(sample.wall_at, self.wall_at + (sample.elapsed_at - self.elapsed_at))
         return result if math.isfinite(result) else None
 
     def to_dict(self) -> dict[str, Any]:

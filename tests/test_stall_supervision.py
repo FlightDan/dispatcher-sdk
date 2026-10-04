@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -14,6 +15,7 @@ from dispatcher_sdk.execution_kernel import CASConflictError, ExecutionCommandV2
 from dispatcher_sdk.execution_kernel.budget import ClockCheckpoint
 from dispatcher_sdk.observability import ActivityRecorder, ObservationIdentity, ObservationJournal, ObservationOptions, StallPolicy
 from dispatcher_sdk.observability.supervision import StallSupervisor
+from tests._acceptance_evidence import retained_directory
 
 
 class _Clock:
@@ -61,9 +63,7 @@ def _notification_process(root, current, action, start=None):
 
 class StallSupervisionTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = retained_directory('sdk-stall-supervision-')
         self.clock = _Clock()
         self.kernel = SQLiteKernel(self.root / "kernel.sqlite3", now=self.clock)
         self.addCleanup(self.kernel.close)
@@ -79,9 +79,23 @@ class StallSupervisionTests(unittest.TestCase):
         self.recorder = ActivityRecorder(self.journal, self.identity, clock=self.clock, monotonic=lambda: self.clock.elapsed)
         self.recorder.enable_stream("stdout")
         self.recorder.phase("handler_entered")
-        self.recorder.flush()
+        self.flush_receipts = [self.recorder.flush()]
         self.policy = StallPolicy("policy", sample_interval=2, consecutive_windows=3)
         self.service = self.open_service()
+        self.addCleanup(self.retain_diagnostics)
+
+    def retain_diagnostics(self):
+        record = {'test': self.id(), 'clock': vars(self.clock), 'flush_receipts': self.flush_receipts,
+                  'local_activity': self.recorder.snapshot()}
+        try:
+            with self.journal._read_connection(1) as (connection, _):
+                for table in ('obs_policies', 'obs_windows', 'obs_outbox', 'obs_sources'):
+                    record[table] = [dict(row) for row in connection.execute(f'SELECT * FROM {table}')]
+        except Exception as error:
+            record['diagnostic_error'] = {'type': type(error).__name__, 'message': str(error)}
+        path = self.root / 'evidence.json'
+        path.write_text(json.dumps(record, default=str, indent=2), encoding='utf-8')
+        print('stall_supervision_evidence=' + str(path), flush=True)
 
     def open_service(self, bridge=None, **kwargs):
         return StallSupervisor(self.journal, self.kernel, bridge, clock=self.clock, clock_sample=self.clock.sample,
@@ -93,7 +107,7 @@ class StallSupervisionTests(unittest.TestCase):
     def advance(self, seconds=2, *, flush=True):
         self.clock.advance(seconds)
         if flush:
-            self.recorder.flush()
+            self.flush_receipts.append(self.recorder.flush())
         return self.service.tick()
 
     def policy_row(self):
@@ -322,7 +336,7 @@ class StallSupervisionTests(unittest.TestCase):
                                         source_scope="handler", clock=self.clock,
                                         monotonic=lambda: self.clock.elapsed)
         self.recorder.enable_stream("stdout")
-        self.recorder.flush()
+        self.flush_receipts.append(self.recorder.flush())
         self.watch(StallPolicy("policy", sample_interval=2, consecutive_windows=1))
         self.service.tick()
         self.recorder.phase("phase", details={"too_large": "x" * 10000})
@@ -340,7 +354,7 @@ class StallSupervisionTests(unittest.TestCase):
                                         source_scope="handler", clock=self.clock,
                                         monotonic=lambda: self.clock.elapsed)
         self.recorder.enable_stream("stdout")
-        self.recorder.flush()
+        self.flush_receipts.append(self.recorder.flush())
         self.service.tick()
         self.advance()
         self.assertEqual(len(self.service.outbox()), 1)

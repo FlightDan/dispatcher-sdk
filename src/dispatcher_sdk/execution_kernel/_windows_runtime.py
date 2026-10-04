@@ -217,6 +217,8 @@ class WindowsProcessHandle:
         self._closed = False
         self._contained = False
         self._exitcode: Optional[int] = None
+        self._worker_pid: Optional[int] = None
+        self._worker_process: Any = None
 
     @property
     def revocation_reason(self) -> Optional[str]:
@@ -277,6 +279,36 @@ class WindowsProcessHandle:
                 self._revocation_reason = reason
             return self.terminate()
 
+    def preserve_worker(self, pid: int) -> None:
+        """Pin the interpreter identity before permitting its invocation.
+
+        A Windows venv executable can launch the interpreter as another Job
+        member. That interpreter owns the final flush, rather than the launcher.
+        """
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("Windows worker readiness lacks a valid process identity")
+        with self._lock:
+            if self._worker_pid is not None:
+                if pid != self._worker_pid:
+                    raise RuntimeError("Windows worker entry changed its ready process identity")
+                return
+            if self._closed or self._contained:
+                raise RuntimeError("Windows worker exited before invocation permission")
+            process = self._api.dll.OpenProcess(0x00101001, False, pid)
+            self._api.check(process, "OpenProcess ready worker")
+            try:
+                assigned = wintypes.BOOL()
+                self._api.check(self._api.dll.IsProcessInJob(process, self._job, ctypes.byref(assigned)),
+                                "IsProcessInJob ready worker")
+                if not assigned.value:
+                    raise RuntimeError("Windows ready worker is outside its containment Job")
+                if self._api.dll.WaitForSingleObject(process, 0) != _WAIT_TIMEOUT:
+                    raise RuntimeError("Windows worker exited before invocation permission")
+            except BaseException:
+                self._api.dll.CloseHandle(process)
+                raise
+            self._worker_pid, self._worker_process = pid, process
+
     def stop_descendants(self, until: float) -> bool:
         """Stop Job members while preserving the original worker's flush."""
         with self._lock:
@@ -284,7 +316,11 @@ class WindowsProcessHandle:
                 return self._contained
             quiet_since = None
             while time.monotonic() < until:
-                pids = tuple(pid for pid in self._api.process_ids(self._job) if pid != self.pid)
+                preserved = {self.pid}
+                if (self._worker_process is not None
+                        and self._api.dll.WaitForSingleObject(self._worker_process, 0) == _WAIT_TIMEOUT):
+                    preserved.add(self._worker_pid)
+                pids = tuple(pid for pid in self._api.process_ids(self._job) if pid not in preserved)
                 if not pids:
                     quiet_since = time.monotonic() if quiet_since is None else quiet_since
                     if time.monotonic() - quiet_since >= _POLL_SECONDS:
@@ -320,9 +356,10 @@ class WindowsProcessHandle:
                 if not self.terminate():
                     raise RuntimeError("Windows Job did not reach zero active processes")
             finally:
-                for resource in (self._info.hThread, self._info.hProcess, self._job):
+                for resource in (self._worker_process, self._info.hThread, self._info.hProcess, self._job):
                     if resource:
                         self._api.dll.CloseHandle(resource)
+                self._worker_process = None
                 self._closed = True
 
 
@@ -635,13 +672,22 @@ def invoke_windows_handler(
             handle.resume()
             while not watchdog.expired and handle.revocation_reason is None:
                 if not invocation_permitted and (root / "ready").exists():
+                    try:
+                        ready = json.loads((root / "ready").read_text(encoding="utf-8"))
+                        handle.preserve_worker(ready["worker_pid"])
+                    except Exception as exc:
+                        # A cutoff or cancellation can stop the worker while
+                        # its ready identity is being acquired. Keep that
+                        # authority outcome rather than replacing it with the
+                        # resulting OpenProcess/readiness error.
+                        if not watchdog.expired and handle.revocation_reason is None:
+                            outcome = {"kind": "error", "code": "handler_process_start_failure",
+                                "message": str(exc), "retryable": False, "effect_ids": [],
+                                "details": _bootstrap_diagnostic(exc, "worker_ready_identity")}
+                        break
+                    if watchdog.expired or handle.revocation_reason is not None:
+                        break
                     if on_phase is not None:
-                        try:
-                            ready = json.loads((root / "ready").read_text(encoding="utf-8"))
-                            if type(ready) is not dict:
-                                ready = {"source": "worker_ready_file"}
-                        except (OSError, ValueError):
-                            ready = {"source": "worker_ready_file", "metadata_unknown": True}
                         _observe_phase(on_phase, "worker_ready", ready)
                     _atomic_write(root / "go", "invoke")
                     invocation_permitted = True
@@ -649,6 +695,7 @@ def invoke_windows_handler(
                         deadline = watchdog.business_deadline(command.timeout_seconds)
                 if entry is None and (root / "entered.json").exists():
                     entry = json.loads((root / "entered.json").read_text(encoding="utf-8"))
+                    handle.preserve_worker(entry["worker_pid"])
                     actual = BudgetEnvelope.from_dict(entry["budget_envelope"])
                     if budget_envelope is not None:
                         actual = BudgetEnvelope((*budget_envelope.constraints, *actual.constraints),
@@ -748,10 +795,20 @@ def invoke_windows_handler(
                     except (ValueError, KeyError, TypeError, OSError) as exc:
                         capture_unknown = f"{type(exc).__name__}: {exc}"[:2048]
             timeout = {"kind": "timeout", "effect_ids": [] if type(outcome) is not dict else outcome.get("effect_ids", [])}
+            admission_work_expired = (budget_envelope is not None and
+                budget_envelope.view(sample=budget_envelope.checkpoint).remaining_work_seconds == 0)
+            if entry is None and deadline is None and not admission_work_expired:
+                # An internal startup cap does not establish spent business
+                # authority. Inherited Run/tool exhaustion remains a timeout.
+                timeout.update(kind="error", code="handler_process_start_failure",
+                    message="handler startup window elapsed before confirmed handler entry", retryable=False)
+                timeout["details"] = {"phase": "admission", "startup_window_elapsed": True,
+                                      "invocation_permitted": invocation_permitted, "exitcode": handle.exitcode}
             if type(outcome) is dict:
-                timeout["details"] = {"business_outcome": outcome}
+                timeout["details"] = {**timeout.get("details", {}), "business_outcome": outcome}
             elif capture_unknown is not None:
-                timeout["details"] = {"business_outcome_capture": {"state": "unknown", "reason": capture_unknown}}
+                timeout["details"] = {**timeout.get("details", {}),
+                    "business_outcome_capture": {"state": "unknown", "reason": capture_unknown}}
             return _budget_outcome(timeout, budget_envelope, entry)
         # The worker can atomically publish between the loop's file check and
         # its exit check. After containment no writer remains, so recover that

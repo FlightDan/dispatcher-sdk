@@ -87,7 +87,8 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
 
         def observe_rescue(capability, row, window):
             error = sys.exc_info()[1]
-            witness.rescues.append({'exception_type': type(error).__name__, 'message': str(error)})
+            witness.rescues.append({'exception_type': type(error).__name__, 'message': str(error),
+                                   'code': getattr(error, 'code', None)})
             return original_completed(capability, row, window)
 
         with Kernel.open_sqlite(root/'kernel.sqlite3', {'parent': actual_parent, 'child': actual_child},
@@ -148,7 +149,11 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
             self.assertEqual(witness.errors, [], report)
             self.assertEqual(witness.calls, [child_id])
             self.assertEqual(len(witness.rescues), 1, report)
-            self.assertIn(witness.rescues[0]['exception_type'], ('OperationalError', 'TimeoutError'))
+            rescue = witness.rescues[0]
+            if rescue['exception_type'] == 'ChildExecutionError':
+                self.assertEqual(rescue['code'], 'child_wait_timeout')
+            else:
+                self.assertIn(rescue['exception_type'], ('OperationalError', 'TimeoutError'))
             self.assertEqual(witness.outcomes[0].state, 'succeeded', report)
             self.assertEqual(witness.outcomes[0].result.value, child_result)
             self.assertLessEqual(child_result['completed_at'], cutoff)

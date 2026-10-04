@@ -138,7 +138,11 @@ class ChildInspectionRetryTests(unittest.TestCase):
         capability.store = self.store
         row = {'budget_json': json.dumps(window.envelope.to_dict())}
         proof_error = InspectionBudgetExceeded('bounded completion proof read expired')
-        with patch.object(self.store, 'attach'), patch.object(capability, '_await_window',
+        # Keep this protocol check on the exhausted original local window.
+        # Reconstructing a different window while injecting its predecessor's
+        # error need not prove that the new local timer has expired.
+        with patch('dispatcher_sdk.execution_kernel.children._RetryWindow', return_value=window), \
+                patch.object(self.store, 'attach'), patch.object(capability, '_await_window',
                 side_effect=original_error), patch.object(capability, '_completed_result',
                 side_effect=proof_error) as proof:
             with self.assertRaises(InspectionBudgetExceeded) as delivered:
@@ -148,7 +152,8 @@ class ChildInspectionRetryTests(unittest.TestCase):
             proof.assert_called_once()
         for proof_error in (RuntimeError('permanent proof error'),
                 ChildExecutionError('parent_authority_revoked', 'actual revoked parent')):
-            with patch.object(self.store, 'attach'), patch.object(capability, '_await_window',
+            with patch('dispatcher_sdk.execution_kernel.children._RetryWindow', return_value=window), \
+                    patch.object(self.store, 'attach'), patch.object(capability, '_await_window',
                     side_effect=original_error), patch.object(capability, '_completed_result',
                     side_effect=proof_error) as proof:
                 with self.assertRaises(type(proof_error)) as delivered:

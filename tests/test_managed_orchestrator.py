@@ -1,5 +1,6 @@
 """Managed registration and control receipts use real SQLite transactions."""
 
+from contextlib import closing
 from pathlib import Path
 import tempfile
 import time
@@ -53,7 +54,7 @@ class ManagedOrchestratorTests(unittest.TestCase):
         self.assertEqual(created, self.sdk.register_managed_run("run", **self.arguments))
         with self.assertRaises(CommandConflict):
             self.sdk.register_managed_run("run", **{**self.arguments, "max_claims": 3})
-        with self.sdk._connect() as connection:
+        with closing(self.sdk._connect()) as connection, connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM sdk_outbox").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM sdk_executions").fetchone()[0], 2)
 
@@ -64,7 +65,7 @@ class ManagedOrchestratorTests(unittest.TestCase):
         ]}
         with self.assertRaises(Exception):
             self.sdk.register_managed_run("run", **bad)
-        with self.sdk._connect() as connection:
+        with closing(self.sdk._connect()) as connection, connection:
             for table in ("sdk_runs", "sdk_managed_runs", "sdk_executions", "sdk_outbox"):
                 self.assertEqual(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
 
@@ -77,7 +78,7 @@ class ManagedOrchestratorTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(CommandConflict, "Kernel control identity"):
             self.sdk.register_managed_run("run", **self.arguments)
-        with self.sdk._connect() as connection:
+        with closing(self.sdk._connect()) as connection, connection:
             self.assertIsNone(connection.execute(
                 "SELECT 1 FROM sdk_managed_runs WHERE run_id='run'"
             ).fetchone())
@@ -95,7 +96,7 @@ class ManagedOrchestratorTests(unittest.TestCase):
         passive = Orchestrator(self.path.parent / "passive.sqlite3", object())
         with self.assertRaises(OrchestrationError):
             passive.register_managed_run("run", **self.arguments)
-        with passive._connect() as connection:
+        with closing(passive._connect()) as connection, connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM sdk_runs").fetchone()[0], 0)
 
     def test_control_request_receipt_is_durable(self):

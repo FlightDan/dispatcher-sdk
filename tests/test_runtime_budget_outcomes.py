@@ -3,32 +3,49 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
+import sys
 import threading
 import time
 import unittest
 
 from tests._acceptance_evidence import retained_directory
 
+import dispatcher_sdk
 from dispatcher_sdk.execution_kernel import HandlerExecutionError, Kernel
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, sample_clock
 from dispatcher_sdk.execution_kernel.contracts import ExecutionResultV2, RetryPolicy
 
 
-class FileClock:
-    def __init__(self, path):
-        self.path = str(path)
+class HandlerClock:
+    """A caller-provided clock with forward samples scoped to the handler.
+
+    The instance is pickleable; each process/thread initializes its own local
+    sample. Host deadline observers continue sampling the original real clock.
+    """
+    _sample = threading.local()
+
+    def __init__(self, fixed_wall=None):
+        self.fixed_wall = fixed_wall
 
     def __call__(self):
-        value = json.loads(Path(self.path).read_text(encoding='utf-8'))
+        value = getattr(self._sample, 'wall', self.fixed_wall)
         return time.time() if value is None else value
 
-
-def set_clock(root, value):
-    temporary = root / 'clock.new'
-    temporary.write_text(json.dumps(value), encoding='utf-8')
-    os.replace(temporary, root / 'clock.json')
+    @classmethod
+    @contextmanager
+    def sample_wall(cls, value):
+        previous = getattr(cls._sample, 'wall', None)
+        cls._sample.wall = value
+        try:
+            yield
+        finally:
+            if previous is None:
+                del cls._sample.wall
+            else:
+                cls._sample.wall = previous
 
 
 def observe_expired_then_roll_back(payload, context):
@@ -36,12 +53,25 @@ def observe_expired_then_roll_back(payload, context):
     with (root / 'calls.jsonl').open('a', encoding='utf-8') as stream:
         stream.write(json.dumps({'attempt': context.lease.attempt, 'pid': os.getpid()}) + '\n')
     if context.lease.attempt == 1:
-        set_clock(root, context.budget.effective_work_deadline_at + 1)
-        observed = context.budget.to_dict()
-        set_clock(root, None)
-        (root / 'observed.json').write_text(json.dumps(observed), encoding='utf-8')
+        forward = context.budget.effective_work_deadline_at + 1
+        with HandlerClock.sample_wall(forward):
+            observed = context.budget.to_dict()
+            (root / 'observed.json').write_text(json.dumps(observed), encoding='utf-8')
+        # The real context must retain its expired floor after the fixture
+        # restores normal sampling; no host-visible file triggers an early kill.
+        restored = context.budget.to_dict()
+        (root / 'observed-after-rollback.json').write_text(json.dumps(restored), encoding='utf-8')
+        (root / 'clock-sampling.json').write_text(json.dumps({'pid': os.getpid(),
+            'thread_id': threading.get_ident(), 'forward_wall': forward, 'restored_real_wall': time.time(),
+            'interpreter': sys.executable, 'sdk_import': dispatcher_sdk.__file__,
+            'source': 'caller-provided HandlerClock',
+            'scope': 'handler calling thread; host deadline clock unchanged'}), encoding='utf-8')
         if payload['failure']:
+            (root / 'handler-outcome.json').write_text(json.dumps({'kind': 'error',
+                'code': 'original_failure', 'message': 'raw original failure', 'retryable': True}), encoding='utf-8')
             raise HandlerExecutionError('original_failure', 'raw original failure', retryable=True)
+        (root / 'handler-outcome.json').write_text(json.dumps({'kind': 'ok',
+            'value': {'original': 42, 'attempt': context.lease.attempt}}), encoding='utf-8')
     return {'original': 42, 'attempt': context.lease.attempt}
 
 
@@ -51,11 +81,11 @@ observe_expired_then_roll_back.__execution_kernel_revision__ = 'observed-termina
 class RuntimeBudgetOutcomeTests(unittest.TestCase):
     def run_expired_completion(self, isolation, failure):
         root = retained_directory('sdk-terminal-budget-outcome-')
-        set_clock(root, None)
-        evidence = {'isolation': isolation, 'failure': failure, 'timeout_seconds': 10, 'lease_seconds': 90}
+        evidence = {'isolation': isolation, 'failure': failure, 'timeout_seconds': 10, 'lease_seconds': 90,
+            'clock_sampling': 'caller clock forward sample only in actual handler; original host cutoff retained'}
         try:
             with Kernel.open_sqlite(root / 'kernel.sqlite3', {'work': observe_expired_then_roll_back},
-                                   isolation_mode=isolation, now=FileClock(root / 'clock.json'),
+                                   isolation_mode=isolation, now=HandlerClock(),
                                    lease_seconds=90) as runtime:
                 runtime.submit(runtime.command('work', execution_id='original', idempotency_key='original',
                     correlation_id='original', timeout_seconds=10,
@@ -64,23 +94,35 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
                 first = runtime.run_once(execution_id='original')
                 evidence['first'] = first.to_dict()
                 evidence['first_limits'] = runtime.kernel.get_execution_limits('original')
+                evidence['first_receipts'] = runtime._settlement_journal.inspect('original', timeout_seconds=.5)
                 second = runtime.run_once(execution_id='original')
                 evidence['second'] = second.to_dict()
                 evidence['second_limits'] = runtime.kernel.get_execution_limits('original')
                 evidence['observed'] = json.loads((root / 'observed.json').read_text())
+                evidence['after_rollback'] = json.loads((root / 'observed-after-rollback.json').read_text())
+                evidence['sampling'] = json.loads((root / 'clock-sampling.json').read_text())
+                evidence['handler_outcome'] = json.loads((root / 'handler-outcome.json').read_text())
+                evidence['final_receipts'] = runtime._settlement_journal.inspect('original', timeout_seconds=.5)
                 evidence['calls'] = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
                 self.assertEqual([item['attempt'] for item in evidence['calls']], [1], evidence)
                 self.assertEqual(first.state, 'queued', evidence)
                 self.assertEqual(second.state, 'dead', evidence)
                 self.assertEqual(evidence['observed']['remaining_work_seconds'], 0)
+                self.assertEqual(evidence['after_rollback']['remaining_work_seconds'], 0)
                 before, after = (evidence[key]['envelope'] for key in ('first_limits', 'second_limits'))
                 self.assertEqual(before['constraints'], after['constraints'])
                 self.assertEqual(before['started_at'], after['started_at'])
                 self.assertGreaterEqual(before['checkpoint']['wall_at'], evidence['observed']['observed_at'])
                 self.assertGreaterEqual(after['checkpoint']['wall_at'], before['checkpoint']['wall_at'])
                 self.assertEqual(second.result.error.details['last_result']['status'], 'timed_out')
+                original = next(receipt for receipt in evidence['first_receipts'] if receipt['identity']['attempt'] == 1)
+                after_retry = next(receipt for receipt in evidence['final_receipts'] if receipt['identity']['attempt'] == 1)
+                self.assertEqual(after_retry['result'], original['result'])
                 if isolation == 'process':
                     self.assertNotEqual(evidence['calls'][0]['pid'], os.getpid())
+                    retained_outcome = original['result']['error']['details']['business_outcome']
+                    for key, value in evidence['handler_outcome'].items():
+                        self.assertEqual(retained_outcome[key], value, evidence)
         except BaseException as error:
             evidence['error'] = {'type': type(error).__name__, 'message': str(error)}
             raise
@@ -103,15 +145,15 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
 
     def test_runtime_and_journal_reopen_restore_original_expired_floor_under_wall_rollback(self):
         root = retained_directory('sdk-runtime-budget-reopen-')
-        set_clock(root, None)
         evidence = {'timeout_seconds': 10, 'lease_seconds': 90,
+            'clock_sampling': 'caller clock forward sample only in actual handler; original host cutoff retained',
             'barrier': 'actual outcome normalization pauses only until external SQLite writer is held'}
         runtime = reopened = writer = driver = None
         outcome_ready, writer_held = threading.Event(), threading.Event()
         originals, results, errors = [], [], []
         try:
             runtime = Kernel.open_sqlite(root / 'kernel.sqlite3', {'work': observe_expired_then_roll_back},
-                isolation_mode='thread', now=FileClock(root / 'clock.json'), lease_seconds=90)
+                isolation_mode='thread', now=HandlerClock(), lease_seconds=90)
             runtime.submit(runtime.command('work', execution_id='original', idempotency_key='original',
                 correlation_id='original', timeout_seconds=10,
                 payload={'root': str(root), 'failure': False}))
@@ -152,6 +194,10 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
             evidence['pending_receipt'] = receipt
             evidence['before_limits'] = runtime.kernel.get_execution_limits('original')
             evidence['observed'] = json.loads((root / 'observed.json').read_text())
+            evidence['after_rollback'] = json.loads((root / 'observed-after-rollback.json').read_text())
+            evidence['sampling'] = json.loads((root / 'clock-sampling.json').read_text())
+            evidence['handler_outcome'] = json.loads((root / 'handler-outcome.json').read_text())
+            self.assertEqual(evidence['after_rollback']['remaining_work_seconds'], 0)
             original = originals[0]
             retained = BudgetEnvelope.from_dict(receipt['evidence']['budget_envelope'])
             self.assertEqual(ExecutionResultV2.from_dict(receipt['result']).to_json(), original.to_json())
@@ -169,9 +215,9 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
             writer.rollback()
             writer.close()
             writer = None
-            set_clock(root, original.started_at)
+            evidence['reopened_wall'] = original.started_at
             reopened = Kernel.open_sqlite(root / 'kernel.sqlite3', {'work': observe_expired_then_roll_back},
-                isolation_mode='thread', now=FileClock(root / 'clock.json'), lease_seconds=90)
+                isolation_mode='thread', now=HandlerClock(fixed_wall=original.started_at), lease_seconds=90)
             self.assertIsNot(reopened._settlement_journal, runtime._settlement_journal)
             before_recovery = reopened._settlement_journal.inspect('original', timeout_seconds=.5)[0]
             evidence['reopened_receipt'] = before_recovery

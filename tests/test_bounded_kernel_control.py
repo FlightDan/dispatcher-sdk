@@ -1,4 +1,5 @@
 """Public Kernel control waits stay finite without revoking valid leases."""
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -29,7 +30,7 @@ class BoundedKernelControlTests(unittest.TestCase):
                 original.submit(command())
                 lease = original.claim_and_start("worker")
                 with SQLiteKernel(path, control_timeout_seconds=.05) as bounded:
-                    with sqlite3.connect(path) as writer:
+                    with closing(sqlite3.connect(path)) as writer, writer:
                         writer.execute("BEGIN IMMEDIATE")
                         for operation in (lambda: bounded.verify(lease), lambda: bounded.submit(command())):
                             began = time.monotonic()
@@ -82,7 +83,7 @@ class BoundedKernelControlTests(unittest.TestCase):
                     with SQLiteKernel(path, control_timeout_seconds=control_timeout) as bounded:
                         children = HandlerChildren(bounded, parent, lease, envelope, {"capacity": 1},
                             journal=runtime.observation_journal)
-                        with sqlite3.connect(path) as writer:
+                        with closing(sqlite3.connect(path)) as writer, writer:
                             writer.execute("BEGIN IMMEDIATE")
                             began = time.monotonic()
                             with self.assertRaises(sqlite3.OperationalError) as caught:

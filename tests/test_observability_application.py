@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import traceback
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -110,7 +111,17 @@ class ObservabilityApplicationTests(unittest.TestCase):
             self.assertEqual(page['notifications'][0]['notification_id'], 'large-notice')
             self.assertFalse(dispatcher.stall_notification_page(after=page['cursor'])['has_more'])
             started = time.monotonic()
-            expired = dispatcher.stall_notification_page(timeout=.000001)
+            clock = [started]
+
+            def advance_query_clock():
+                # Some supported monotonic clocks have ticks longer than this
+                # query budget. Observe expiry explicitly within the real API.
+                clock[0] += .000002
+                return clock[0]
+
+            query_clock = SimpleNamespace(**{**vars(time), 'monotonic': advance_query_clock})
+            with patch('dispatcher_sdk._inspection.time', query_clock):
+                expired = dispatcher.stall_notification_page(timeout=.000001)
             self.assertTrue(expired['timed_out'])
             self.assertLess(time.monotonic()-started, .1)
 

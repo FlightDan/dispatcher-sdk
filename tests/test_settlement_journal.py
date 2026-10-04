@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
@@ -47,7 +48,7 @@ class SettlementJournalTests(unittest.TestCase):
     def test_kernel_writer_cannot_block_independent_durable_result(self):
         kernel = SQLiteKernel(self.kernel_path)
         self.addCleanup(kernel.close)
-        with sqlite3.connect(self.kernel_path) as writer:
+        with closing(sqlite3.connect(self.kernel_path)) as writer, writer:
             writer.execute("BEGIN IMMEDIATE")
             began = time.monotonic()
             receipt = self.journal.record(lease(), result("business-finished"), timeout_seconds=.1)
@@ -57,7 +58,7 @@ class SettlementJournalTests(unittest.TestCase):
             self.assertEqual([], kernel.events_since(0))
 
     def test_journal_writer_contention_is_bounded_and_leaves_no_fake_receipt(self):
-        with sqlite3.connect(self.path) as writer:
+        with closing(sqlite3.connect(self.path)) as writer, writer:
             writer.execute("BEGIN EXCLUSIVE")
             began = time.monotonic()
             with self.assertRaises(SettlementBusyError) as caught:
@@ -188,7 +189,7 @@ except BaseException as error:
                 SettlementJournal(self.path, source_id=source_id, kernel_path=kernel_path)
         with self.assertRaises(SettlementBindingError):
             SettlementJournal(self.kernel_path, source_id="store-original", kernel_path=self.kernel_path)
-        with sqlite3.connect(self.path) as writer:
+        with closing(sqlite3.connect(self.path)) as writer, writer:
             writer.execute("CREATE TABLE unrelated(value)")
         with self.assertRaises(SettlementBindingError):
             self.journal.pending()
@@ -218,7 +219,7 @@ except BaseException as error:
         self.assertFalse(self.path.exists())
 
     def test_unsafe_sqlite_journal_mode_cannot_issue_durable_receipt(self):
-        with sqlite3.connect(self.path) as writer:
+        with closing(sqlite3.connect(self.path)) as writer, writer:
             writer.execute("PRAGMA journal_mode=OFF")
         # OFF is connection-local in SQLite: test a writer which actually
         # reopens with disabled rollback journaling, rather than assuming its
@@ -275,9 +276,14 @@ except BaseException as error:
         kernel = SQLiteKernel(self.kernel_path)
         self.addCleanup(kernel.close)
         observation_path = Path(self.directory.name) / "observations.sqlite3"
-        with sqlite3.connect(observation_path) as initialize:
+        with closing(sqlite3.connect(observation_path)) as initialize, initialize:
             initialize.execute("CREATE TABLE pressure(value)")
-        with sqlite3.connect(self.kernel_path) as kernel_writer, sqlite3.connect(observation_path) as observation_writer:
+        with (
+            closing(sqlite3.connect(self.kernel_path)) as kernel_writer,
+            kernel_writer,
+            closing(sqlite3.connect(observation_path)) as observation_writer,
+            observation_writer,
+        ):
             kernel_writer.execute("BEGIN IMMEDIATE")
             observation_writer.execute("BEGIN IMMEDIATE")
             began = time.monotonic()
@@ -308,10 +314,10 @@ except BaseException as error:
 
     def test_notes_read_only_missing_store_and_unshipped_version_one_are_not_repaired(self):
         self.journal.note(lease(), "phase", {"raw": "fact"})
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             before = list(connection.iterdump())
         self.journal.inspect_notes("execution")
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             self.assertEqual(list(connection.iterdump()), before)
         with self.journal._connection(.1) as reader:
             with self.assertRaises(sqlite3.OperationalError):
@@ -321,14 +327,14 @@ except BaseException as error:
             self.journal.inspect_notes("execution")
         self.assertFalse(self.path.exists())
         from dispatcher_sdk.execution_kernel import settlement
-        with sqlite3.connect(self.path) as old:
+        with closing(sqlite3.connect(self.path)) as old, old:
             for statement in settlement._SCHEMA[:3]:
                 old.execute(statement.replace("version=2", "version=1"))
             old.execute("INSERT INTO settlement_meta VALUES(1,1,?,?)", ("store-original", str(self.kernel_path)))
             before = list(old.iterdump())
         with self.assertRaises(SettlementBindingError):
             SettlementJournal(self.path, source_id="store-original", kernel_path=self.kernel_path)
-        with sqlite3.connect(self.path) as old:
+        with closing(sqlite3.connect(self.path)) as old, old:
             self.assertEqual(list(old.iterdump()), before)
 
     def test_oversized_notes_are_not_loaded_and_cursor_continues_to_small_note(self):
@@ -361,7 +367,7 @@ except BaseException as error:
         self.assertFalse(page["complete"])
         self.assertTrue(page["timed_out"])
         self.assertEqual(page["cursor"], 0)
-        with sqlite3.connect(self.path) as writer:
+        with closing(sqlite3.connect(self.path)) as writer, writer:
             writer.execute("BEGIN EXCLUSIVE")
             began = time.monotonic()
             page = self.journal.inspect_notes("execution", timeout_seconds=.04)

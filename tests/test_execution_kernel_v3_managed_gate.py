@@ -1,5 +1,6 @@
 """Focused contract tests for the Kernel v3 managed claim gate."""
 
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -112,7 +113,7 @@ class ManagedGateTests(unittest.TestCase):
         # Build an exact v2 store containing one ordinary queued execution and
         # its event, then verify the copy-upgrade changes only schema objects.
         legacy_path = Path(self.temporary.name) / "legacy-v2.sqlite3"
-        with sqlite3.connect(legacy_path) as legacy:
+        with closing(sqlite3.connect(legacy_path)) as legacy, legacy:
             legacy.executescript(KERNEL_SCHEMA_V2)
             command = ExecutionCommandV2(
                 execution_id="legacy:one",
@@ -150,7 +151,7 @@ class ManagedGateTests(unittest.TestCase):
                 "UPDATE kernel_clock SET watermark=1,event_sequence=1 WHERE singleton=1"
             )
 
-        with sqlite3.connect(legacy_path) as upgraded:
+        with closing(sqlite3.connect(legacy_path)) as upgraded, upgraded:
             upgrade_kernel_schema_v2_to_v3(upgraded)
             self.assertEqual(
                 upgraded.execute(

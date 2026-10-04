@@ -77,6 +77,18 @@ class ExecutionBudgetTests(unittest.TestCase):
         self.assertEqual(persisted.checkpoint.wall_at, 1020)
         self.assertEqual(persisted.view(sample=checkpoint(901, 125)).remaining_work_seconds, 5)
 
+    def test_elapsed_projection_never_subtracts_an_unchanged_wall_floor(self):
+        # Adding the absolute elapsed value before subtracting it loses bits:
+        # 105 + 333.2 - 333.2 is below 105 on these exact input floats.
+        original = checkpoint(wall=105, elapsed=333.2)
+        rollback = checkpoint(wall=100, elapsed=333.2)
+        self.assertEqual(original.effective_time(rollback), 105)
+        envelope = BudgetEnvelope((DeadlineConstraint('original', 'tool', 105),), original)
+        for _ in range(20):
+            envelope = envelope.recheckpoint(sample=rollback)
+            self.assertEqual(envelope.checkpoint.wall_at, 105)
+            self.assertEqual(envelope.view(sample=rollback).remaining_work_seconds, 0)
+
     def test_same_boot_restart_accounts_for_downtime_plus_rollback(self):
         envelope = BudgetEnvelope((DeadlineConstraint("run-a", "run", 1100),), checkpoint())
         restored = BudgetEnvelope.from_dict(json.loads(json.dumps(envelope.to_dict())))
