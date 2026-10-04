@@ -422,4 +422,9 @@ Choose the entry points you need:
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development and tests,
 [SECURITY.md](SECURITY.md) for vulnerability reports, and
 [PROVENANCE.md](PROVENANCE.md) for source provenance.
-Licensed under [Apache-2.0](LICENSE).
+
+## License
+
+Dispatcher SDK is open source under the [Apache License, Version 2.0](LICENSE).
+See [LICENSE](LICENSE) for the full terms and [NOTICE](NOTICE) for copyright and
+attribution notices. Both files are included in the source distribution and wheel.

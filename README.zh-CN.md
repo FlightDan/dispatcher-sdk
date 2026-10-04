@@ -395,4 +395,9 @@ python examples/dependent_tasks.py
 
 开发和测试见 [CONTRIBUTING.md](CONTRIBUTING.md)，漏洞报告见
 [SECURITY.md](SECURITY.md)，源码来源见 [PROVENANCE.md](PROVENANCE.md)。
-项目采用 [Apache-2.0](LICENSE) 许可证。
+
+## 开源许可证
+
+Dispatcher SDK 采用 [Apache License 2.0](LICENSE) 开源许可证。
+完整条款见 [LICENSE](LICENSE)，版权与署名信息见 [NOTICE](NOTICE)。
+源码分发包和 wheel 安装包均包含这两个文件。
