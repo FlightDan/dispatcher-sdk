@@ -21,6 +21,7 @@ import time
 from typing import Any, Iterator, Mapping
 import uuid
 
+from .._inspection import InspectionBudgetExceeded
 from .budget import BudgetEnvelope, BudgetClockUnknownError, sample_clock
 from .contracts import ExecutionCommandV2, ExecutionLease, RetryPolicy
 from .errors import ExecutionNotFoundError, StaleFenceError, InvalidStateTransitionError
@@ -54,6 +55,9 @@ _MAX_RECORD_BYTES = 256 * 1024
 
 
 def _transient_control_error(error: Exception) -> bool:
+    if isinstance(error, InspectionBudgetExceeded):
+        # This expires one read attempt, not the original child wait window.
+        return True
     if isinstance(error, sqlite3.OperationalError):
         code = getattr(error, "sqlite_errorcode", None)
         return ((code is not None and code & 255 in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
