@@ -96,47 +96,153 @@ class ChildClockCheckpointTests(unittest.TestCase):
         self.assertEqual("running", self.kernel.get("parent").state)
 
     def test_locked_observation_writer_preserves_floor_in_independent_note_after_reopen(self):
-        row, original_window = self.enqueue("writer-held")
-        original = json.loads(row["budget_json"])
-        baseline = self.wall[0]
-        writer = sqlite3.connect(self.journal.path, timeout=1)
-        writer.execute("BEGIN IMMEDIATE")
-        try:
-            self.wall[0] = baseline + 4
-            started = time.monotonic()
-            narrowed_remaining = original_window.remaining()
-            self.assertLess(time.monotonic() - started, 1)
-            self.wall[0] = baseline
-            stored = self.persisted_row(row)
-            self.assertEqual(original, json.loads(stored["budget_json"]))
-            notes = self.facts.inspect_notes(row["child_execution_id"])
-            matching = [note for note in notes["notes"] if note["phase"] == "child_budget_checkpoint"]
-            self.assertTrue(matching, notes)
-            self.assertTrue(all(note["identity"]["attempt"] == note["identity"]["fence"] == 0
-                                for note in matching))
-            self.assertTrue(all(note["evidence"]["wait_id"] == row["wait_id"] for note in matching))
-            # A new service has no in-memory floor; only the persisted receipt can restore it.
-            reopened_journal = ObservationJournal(self.journal.path, kernel_path=self.kernel.db_path,
-                source_id=self.journal.source_id, options=self.journal.options)
-            service = ChildService(SimpleNamespace(kernel=self.kernel), reopened_journal)
-            restored = _RetryWindow(BudgetEnvelope.from_dict(json.loads(stored["budget_json"])), self.kernel)
-            service.store.attach(stored, restored)
-            restored_remaining = restored.remaining()
-            self.assertLessEqual(restored_remaining, narrowed_remaining + .1)
-            self.assertEqual(original_window.envelope.constraints, restored.envelope.constraints)
-            self.evidence["records"].append({"held_writer_row": stored, "notes": notes,
-                "narrowed_remaining": narrowed_remaining, "reopened_remaining": restored_remaining})
-        finally:
-            writer.rollback()
-            writer.close()
-            self.wall[0] = baseline
-        fresh = service.store.request(row["parent_execution_id"], row["request_id"])
-        service.store.attach(fresh, restored)
-        committed = service.store.request(row["parent_execution_id"], row["request_id"])
-        committed_budget = BudgetEnvelope.from_dict(json.loads(committed["budget_json"]))
-        self.assertEqual(original_window.envelope.constraints, committed_budget.constraints)
-        self.assertLessEqual(_RetryWindow(committed_budget, self.kernel).remaining(), narrowed_remaining + .1)
-        self.evidence["records"].append({"unlocked_checkpoint": committed})
+        from contextlib import ExitStack
+        from copy import deepcopy
+        import traceback
+        from unittest.mock import patch
+        from tests._storage_evidence import StorageEvidence
+
+        storage = StorageEvidence(self.root, self)
+        storage.start(include_kernel=True)
+        self.addCleanup(storage.stop)
+        self.addCleanup(lambda: storage.save(checkpoint=self.evidence))
+        stages = self.evidence["helper_stages"] = []
+        self.evidence["stage_limit"] = 128
+
+        def error_facts(error):
+            return {"type": type(error).__name__, "message": str(error),
+                    "traceback": traceback.format_exc(),
+                    "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                    "sqlite_errorname": getattr(error, "sqlite_errorname", None)}
+
+        def stage(name, operation, **inputs):
+            record = {"stage": name, "wall": self.wall[0], "inputs": deepcopy(inputs)}
+            if len(stages) < 128:
+                stages.append(record)
+            else:
+                self.evidence["stage_overflow"] = True
+            record["began"] = time.monotonic()
+            try:
+                result = operation()
+                record["elapsed"] = time.monotonic() - record["began"]
+                record["returned"] = True
+                if isinstance(result, (dict, float)):
+                    record["result"] = deepcopy(result)
+                return result
+            except BaseException as error:
+                record["error"] = error_facts(error)
+                raise
+            finally:
+                record.setdefault("elapsed", time.monotonic() - record["began"])
+
+        with ExitStack() as patches:
+            def trace_store(store, label):
+                original_facts = store._facts
+
+                def facts(*args, **kwargs):
+                    journal = stage(label + "._facts", lambda: original_facts(*args, **kwargs),
+                                    arguments=args, options=kwargs)
+                    if journal is not None and kwargs.get("writer"):
+                        original_note = journal.note
+
+                        def note(*note_args, **note_kwargs):
+                            return stage(label + ".facts.note",
+                                lambda: original_note(*note_args, **note_kwargs),
+                                arguments=note_args, options=note_kwargs)
+
+                        journal.note = note
+                    return journal
+
+                patches.enter_context(patch.object(store, "_facts", facts))
+
+            trace_store(self.children.store, "original_store")
+            try:
+                row, original_window = stage("enqueue", lambda: self.enqueue("writer-held"))
+                original = json.loads(row["budget_json"])
+                baseline = self.wall[0]
+                writer = stage("writer.connect", lambda: sqlite3.connect(self.journal.path, timeout=1))
+                writer_owned = [True]
+
+                def cleanup_writer():
+                    if not writer_owned[0]:
+                        return
+                    writer_owned[0] = False
+                    primary = sys.exc_info()[1]
+                    errors = []
+                    try:
+                        try:
+                            stage("writer.rollback", writer.rollback)
+                        except BaseException as error:
+                            errors.append(error)
+                            self.evidence.setdefault("writer_cleanup_errors", []).append(error_facts(error))
+                    finally:
+                        try:
+                            try:
+                                stage("writer.close", writer.close)
+                            except BaseException as error:
+                                errors.append(error)
+                                self.evidence.setdefault("writer_cleanup_errors", []).append(error_facts(error))
+                        finally:
+                            self.wall[0] = baseline
+                    if errors and primary is None:
+                        raise errors[0]
+
+                self.addCleanup(cleanup_writer)
+                try:
+                    stage("writer.begin", lambda: writer.execute("BEGIN IMMEDIATE"))
+                    self.wall[0] = baseline + 4
+                    started = time.monotonic()
+                    narrowed_remaining = stage("original_window.remaining", original_window.remaining,
+                                               envelope=original_window.envelope.to_dict())
+                    self.assertLess(time.monotonic() - started, 1)
+                    self.wall[0] = baseline
+                    stored = stage("persisted_row", lambda: self.persisted_row(row))
+                    self.assertEqual(original, json.loads(stored["budget_json"]))
+                    notes = stage("inspect_notes", lambda: self.facts.inspect_notes(row["child_execution_id"]))
+                    matching = [note for note in notes["notes"] if note["phase"] == "child_budget_checkpoint"]
+                    self.assertTrue(matching, notes)
+                    self.assertTrue(all(note["identity"]["attempt"] == note["identity"]["fence"] == 0
+                                        for note in matching))
+                    self.assertTrue(all(note["evidence"]["wait_id"] == row["wait_id"] for note in matching))
+                    # A new service has no in-memory floor; only the persisted receipt can restore it.
+                    reopened_journal = ObservationJournal(self.journal.path, kernel_path=self.kernel.db_path,
+                        source_id=self.journal.source_id, options=self.journal.options)
+                    service = ChildService(SimpleNamespace(kernel=self.kernel), reopened_journal)
+                    trace_store(service.store, "reopened_store")
+                    restored = _RetryWindow(BudgetEnvelope.from_dict(json.loads(stored["budget_json"])), self.kernel)
+                    stage("reopened_store.attach", lambda: service.store.attach(stored, restored))
+                    restored_remaining = stage("restored.remaining", restored.remaining,
+                                               envelope=restored.envelope.to_dict())
+                    self.assertLessEqual(restored_remaining, narrowed_remaining + .1)
+                    self.assertEqual(original_window.envelope.constraints, restored.envelope.constraints)
+                    self.evidence["records"].append({"held_writer_row": stored, "notes": notes,
+                        "narrowed_remaining": narrowed_remaining, "reopened_remaining": restored_remaining})
+                finally:
+                    cleanup_writer()
+                fresh = service.store.request(row["parent_execution_id"], row["request_id"])
+                stage("unlocked_store.attach", lambda: service.store.attach(fresh, restored))
+                committed = service.store.request(row["parent_execution_id"], row["request_id"])
+                committed_budget = BudgetEnvelope.from_dict(json.loads(committed["budget_json"]))
+                self.assertEqual(original_window.envelope.constraints, committed_budget.constraints)
+                self.assertLessEqual(_RetryWindow(committed_budget, self.kernel).remaining(), narrowed_remaining + .1)
+                self.evidence["records"].append({"unlocked_checkpoint": committed})
+
+            except BaseException as error:
+                self.evidence["original_error"] = error_facts(error)
+                if "original_window" in locals():
+                    self.evidence["failed_window"] = original_window.envelope.to_dict()
+                with self.children.store._floor_lock:
+                    self.evidence["in_memory_floors"] = {
+                        key: value.to_dict() for key, value in self.children.store._floors.items()}
+                raise
+            finally:
+                try:
+                    storage.save(phase="before-cleanup", checkpoint=self.evidence)
+                except BaseException as error:
+                    self.evidence["capture_error"] = error_facts(error)
+                    if "original_error" not in self.evidence:
+                        raise
+                    print("child_clock_checkpoint_capture_error=" + str(error), flush=True)
 
     def test_late_older_checkpoint_cannot_widen_persisted_floor(self):
         row, window = self.enqueue("out-of-order")

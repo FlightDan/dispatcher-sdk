@@ -488,9 +488,16 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux") or os.name == "nt", "requires supported real process containment")
     def test_real_child_stops_at_inherited_parent_deadline(self):
+        from tests._storage_evidence import StorageEvidence
+
         root = retained_directory("sdk-inherited-parent-deadline-")
+        storage_evidence = StorageEvidence(root, self)
+        storage_evidence.start(include_kernel=True)
+        self.addCleanup(storage_evidence.stop)
+        self.addCleanup(storage_evidence.save)
         payload = {key: str(root / key) for key in ("entered", "escaped")}
         receipts, invocations = [], deque(maxlen=16)
+        original_results = deque(maxlen=16)
         evidence_lock = threading.Lock()
         evidence = {"test": self.id(), "interpreter": sys.executable,
             "sdk_import": dispatcher_sdk.__file__, "runtime_import": runtime_module.__file__,
@@ -559,10 +566,32 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 with evidence_lock:
                     invocation["elapsed"] = time.monotonic() - invocation["began"]
 
+        def raise_secondary(error, error_traceback):
+            raise error.with_traceback(error_traceback)
+
+        def capture_secondary(label, error):
+            evidence.setdefault("secondary_errors", []).append({"stage": label, **raw_error(error)})
+            # unittest reports cleanup errors separately from the original
+            # assertion; diagnostic failure must not replace its traceback.
+            self.addCleanup(raise_secondary, error, error.__traceback__)
+
+        runtime = None
         try:
-            with Runtime(str(root / "kernel.db"), {"deadline-parent": inherited_deadline_parent,
-                    "deadline-child": inherited_deadline_child}, isolation_mode="process") as runtime, patch.object(
-                    backend, name, capture_invocation), self.capture_process_cleanup(receipts):
+            runtime = Runtime(str(root / "kernel.db"), {"deadline-parent": inherited_deadline_parent,
+                "deadline-child": inherited_deadline_child}, isolation_mode="process")
+            with patch.object(backend, name, capture_invocation), self.capture_process_cleanup(receipts):
+                original_result = runtime._outcome_result
+
+                def capture_result(*args, **kwargs):
+                    result = original_result(*args, **kwargs)
+                    with evidence_lock:
+                        original_results.append({"captured_at": time.monotonic(),
+                            "result": result.to_dict()})
+                    return result
+
+                result_patch = patch.object(runtime, "_outcome_result", capture_result)
+                result_patch.start()
+                self.addCleanup(result_patch.stop)
                 parent = runtime.command("deadline-parent", execution_id="parent", idempotency_key="parent",
                     correlation_id="inherited", timeout_seconds=5, payload=payload)
                 evidence["submitted_parent"] = parent.to_dict()
@@ -574,63 +603,184 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 evidence["runtime_at_return"] = {"settlement_error": runtime._settlement_error,
                     "observation_error": runtime._observation_error,
                     "diagnostic_errors": dict(runtime._diagnostic_errors),
+                    "lifecycle_lock": repr(runtime._lifecycle_lock),
+                    "threads": [{"name": thread.name, "ident": thread.ident,
+                        "native_id": thread.native_id, "alive": thread.is_alive()}
+                        for thread in threading.enumerate()],
                     "original_pending": [{"identity": entry.identity, "payload": entry.payload,
                         "evidence": entry.evidence} for entry in runtime._pending_settlements.entries()]}
-                self.assertEqual("timed_out", result.state)
-                self.assertLess(time.monotonic() - began, 12)
+                storage_evidence.save(phase="original-run-once-return", checkpoint={
+                    "parent_returned": evidence["parent_returned"],
+                    "parent_elapsed": evidence["parent_elapsed"],
+                    "runtime_at_return": evidence["runtime_at_return"]})
+                self.assertLess(evidence["parent_elapsed"], 12)
+                self.assertIn(result.state, {"running", "timed_out"})
                 self.assertTrue(Path(payload["entered"]).exists(), "child never reached actual handler entry")
-                waits = runtime.observe("parent")["child_waits"]
+                # One existing maintenance window covers both exact outcomes.
+                # recover_completions publishes retained facts without another
+                # run_once, handler invocation, or execution-budget renewal.
+                settlement_began = time.monotonic()
+                end = settlement_began + 3
+                evidence["settlement_deadline"] = end
+                def maintenance_remaining(stage):
+                    remaining = end-time.monotonic()
+                    evidence["maintenance_stage"] = stage
+                    evidence["settlement_elapsed"] = time.monotonic()-settlement_began
+                    self.assertGreater(remaining, 0,
+                        "original shared settlement window expired at " + stage)
+                    return remaining
+
+                def maintenance_read(stage, read, execution_id):
+                    with runtime.kernel._control_lock(maintenance_remaining(stage)):
+                        value = read(execution_id)
+                    maintenance_remaining(stage + " completed")
+                    return value
+
+                initial = runtime.observe("parent", timeout=maintenance_remaining("parent observation"))
+                maintenance_remaining("parent observation completed")
+                evidence["original_settlement_observation"] = initial
+                waits = initial["child_waits"]
                 self.assertEqual(1, len(waits))
                 child_id = waits[0]["target_execution_id"]
-                limits = runtime.kernel.get_execution_limits(child_id)
+                limits = maintenance_read("child limits", runtime.kernel.get_execution_limits, child_id)
                 self.assertTrue(any(item["source"] == "parent" for item in limits["envelope"]["constraints"]))
-                end = time.monotonic() + 3
-                while runtime.kernel.get(child_id).state in {"queued", "leased", "running"} and time.monotonic() < end:
-                    time.sleep(.02)
-                self.assertIn(runtime.kernel.get(child_id).state, {"timed_out", "cancelled", "dead"})
+                reports = []
+                evidence["settlement_reports"] = reports
+                while True:
+                    final_parent = maintenance_read("parent winner", runtime.kernel.get, "parent")
+                    final_child = maintenance_read("child winner", runtime.kernel.get, child_id)
+                    evidence["canonical_parent"] = final_parent.to_dict()
+                    evidence["canonical_child"] = final_child.to_dict()
+                    if final_parent.state == "timed_out" and final_child.state in {"timed_out", "cancelled", "dead"}:
+                        break
+                    reports.extend(runtime.recover_completions(
+                        timeout_seconds=min(.5, maintenance_remaining("completion recovery"))))
+                    remaining = end-time.monotonic()
+                    if remaining > 0:
+                        time.sleep(min(.02, remaining))
+                evidence["settlement_elapsed"] = time.monotonic()-settlement_began
+                storage_evidence.save(phase="settlement-boundary", checkpoint={
+                    "original_parent": evidence["parent_returned"],
+                    "canonical_parent": evidence["canonical_parent"],
+                    "canonical_child": evidence["canonical_child"],
+                    "elapsed": evidence["settlement_elapsed"], "deadline": end,
+                    "reports": reports})
+                self.assertEqual("timed_out", final_parent.state)
+                self.assertIn(final_child.state, {"timed_out", "cancelled", "dead"})
+                with evidence_lock:
+                    originals = {item["result"]["execution_id"]: item["result"]
+                                 for item in original_results}
+                    native = list(invocations)
+                self.assertEqual({"parent", child_id}, set(originals))
+                self.assertEqual(originals["parent"], final_parent.result.to_dict())
+                if final_child.state == "timed_out":
+                    self.assertEqual(originals[child_id], final_child.result.to_dict())
+                else:
+                    # A cancellation/reaper winner is immutable. Maintenance
+                    # keeps the native timeout as a superseded obligation;
+                    # it must never replace that winner to satisfy this test.
+                    reports.extend(runtime.recover_completions(
+                        timeout_seconds=min(.5, maintenance_remaining("superseded completion recovery"))))
+                    child_observation = runtime.observe(child_id,
+                        timeout=maintenance_remaining("superseded child observation"))
+                    maintenance_remaining("superseded child observation completed")
+                    evidence["child_settlement_observation"] = child_observation
+                    superseded = [receipt for receipt in child_observation.get("settlement_obligations", ())
+                        if receipt.get("state") == "superseded"
+                        and receipt.get("result", {}).get("result_id") == originals[child_id]["result_id"]]
+                    self.assertEqual(1, len(superseded), "original native timeout needs a superseded receipt")
+                    self.assertEqual(originals[child_id], superseded[0]["result"])
+                    self.assertEqual({"execution_id": child_id, "attempt": final_child.attempt,
+                        "fence": final_child.fence}, superseded[0]["identity"])
+                    evidence["superseded_child_original"] = superseded[0]
+                    preserved_winner = maintenance_read(
+                        "preserved child winner", runtime.kernel.get, child_id).to_dict()
+                    evidence["preserved_child_winner"] = preserved_winner
+                    self.assertEqual(evidence["canonical_child"], preserved_winner)
+                    self.assertNotEqual(originals[child_id]["result_id"], final_child.result.result_id)
+                maintenance_remaining("exact settlement proof completed")
+                evidence["settlement_elapsed"] = time.monotonic()-settlement_began
+                self.assertLess(evidence["settlement_elapsed"], 3)
+                self.assertEqual(2, len(native), "maintenance must not replay either handler")
+                self.assertEqual({"parent", child_id}, {item["command"]["execution_id"] for item in native})
+                self.assertTrue(all(item["outcome"]["kind"] == "timeout" for item in native))
+                entered_pids = {str(event["arguments"][0]["worker_pid"]) for item in native
+                    if item["command"]["execution_id"] == child_id for event in item["callbacks"]
+                    if event["callback"] == "on_entered"}
+                self.assertEqual({Path(payload["entered"]).read_text(encoding="ascii")}, entered_pids)
                 self.assertEqual(["job_empty" if os.name == "nt" else "tree_reaped"] * 2, receipts)
                 time.sleep(1.2)
                 self.assertFalse(Path(payload["escaped"]).exists())
         except BaseException as error:
             evidence["fixture_error"] = raw_error(error)
+            try:
+                storage_evidence.save(phase="original-failure", checkpoint={
+                    "fixture_error": evidence["fixture_error"],
+                    "parent_returned": evidence.get("parent_returned"),
+                    "canonical_parent": evidence.get("canonical_parent"),
+                    "canonical_child": evidence.get("canonical_child"),
+                    "maintenance_stage": evidence.get("maintenance_stage"),
+                    "settlement_elapsed": evidence.get("settlement_elapsed"),
+                    "settlement_deadline": evidence.get("settlement_deadline")})
+            except BaseException as capture_error:
+                capture_secondary("original-failure storage evidence", capture_error)
             raise
         finally:
-            with evidence_lock:
-                evidence["invocations"] = deepcopy(list(invocations))
-            for invocation in evidence["invocations"]:
-                invocation["callbacks"] = list(invocation["callbacks"])
-            evidence["cleanup_receipts"] = list(receipts)
-            evidence["markers"] = {}
-            for key, path in payload.items():
+            if runtime is not None:
                 try:
-                    evidence["markers"][key] = {"path": path, "contents": Path(path).read_text(encoding="ascii")}
-                except OSError as error:
-                    evidence["markers"][key] = {"path": path, "read_error": raw_error(error)}
-            evidence["storage"] = {}
-            stores = {"kernel.db": ("kernel_executions", "kernel_execution_limits", "kernel_events"),
-                "kernel.db.observations.sqlite3": ("sdk_child_requests", "sdk_child_waits", "obs_current", "obs_processes", "obs_events"),
-                "kernel.db.settlements.sqlite3": ("settlement_records", "settlement_notes")}
-            for filename, tables in stores.items():
-                snapshot = {"path": str(root / filename), "tables": {}}
-                evidence["storage"][filename] = snapshot
-                deadline = time.monotonic() + .2
-                try:
-                    with closing(sqlite3.connect((root / filename).as_uri() + "?mode=ro", uri=True, timeout=0)) as connection:
-                        connection.row_factory = sqlite3.Row
-                        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
-                        for table in tables:
-                            sql = f"SELECT * FROM {table} LIMIT 65"
-                            try:
-                                rows = connection.execute(sql).fetchall()
-                                snapshot["tables"][table] = {"sql": sql, "rows": [dict(row) for row in rows[:64]],
-                                    "truncated": len(rows) > 64}
-                            except sqlite3.Error as error:
-                                snapshot["tables"][table] = {"sql": sql, "read_error": raw_error(error)}
-                except sqlite3.Error as error:
-                    snapshot["read_error"] = raw_error(error)
-            path = root / "evidence.json"
-            path.write_text(json.dumps(evidence, indent=2, default=repr), encoding="utf-8")
-            print("inherited_parent_deadline_evidence=" + str(path), flush=True)
+                    runtime.close()
+                    evidence["runtime_cleanup"] = {"returned": True}
+                except BaseException as cleanup_error:
+                    evidence["runtime_cleanup"] = {"error": raw_error(cleanup_error)}
+                    capture_secondary("Runtime.close", cleanup_error)
+            try:
+                storage_evidence.save(phase="runtime-cleanup", checkpoint={
+                    "fixture_error": evidence.get("fixture_error"),
+                    "runtime_cleanup": evidence.get("runtime_cleanup"),
+                    "secondary_errors": evidence.get("secondary_errors", [])})
+            except BaseException as capture_error:
+                capture_secondary("runtime-cleanup storage evidence", capture_error)
+            try:
+                with evidence_lock:
+                    evidence["invocations"] = deepcopy(list(invocations))
+                    evidence["original_results"] = deepcopy(list(original_results))
+                for invocation in evidence["invocations"]:
+                    invocation["callbacks"] = list(invocation["callbacks"])
+                evidence["cleanup_receipts"] = list(receipts)
+                evidence["markers"] = {}
+                for key, path in payload.items():
+                    try:
+                        evidence["markers"][key] = {"path": path, "contents": Path(path).read_text(encoding="ascii")}
+                    except OSError as error:
+                        evidence["markers"][key] = {"path": path, "read_error": raw_error(error)}
+                evidence["storage"] = {}
+                stores = {"kernel.db": ("kernel_executions", "kernel_execution_limits", "kernel_events"),
+                    "kernel.db.observations.sqlite3": ("sdk_child_requests", "sdk_child_waits", "obs_current", "obs_processes", "obs_events"),
+                    "kernel.db.settlements.sqlite3": ("settlement_records", "settlement_notes")}
+                for filename, tables in stores.items():
+                    snapshot = {"path": str(root / filename), "tables": {}}
+                    evidence["storage"][filename] = snapshot
+                    deadline = time.monotonic() + .2
+                    try:
+                        with closing(sqlite3.connect((root / filename).as_uri() + "?mode=ro", uri=True, timeout=0)) as connection:
+                            connection.row_factory = sqlite3.Row
+                            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                            for table in tables:
+                                sql = f"SELECT * FROM {table} LIMIT 65"
+                                try:
+                                    rows = connection.execute(sql).fetchall()
+                                    snapshot["tables"][table] = {"sql": sql, "rows": [dict(row) for row in rows[:64]],
+                                        "truncated": len(rows) > 64}
+                                except sqlite3.Error as error:
+                                    snapshot["tables"][table] = {"sql": sql, "read_error": raw_error(error)}
+                    except sqlite3.Error as error:
+                        snapshot["read_error"] = raw_error(error)
+                path = root / "evidence.json"
+                path.write_text(json.dumps(evidence, indent=2, default=repr), encoding="utf-8")
+                print("inherited_parent_deadline_evidence=" + str(path), flush=True)
+            except BaseException as capture_error:
+                capture_secondary("final raw evidence", capture_error)
+                print("inherited_parent_deadline_evidence_error=" + repr(capture_error), flush=True)
 
     def test_callable_entry_ack_follows_authority_setup(self):
         events = []

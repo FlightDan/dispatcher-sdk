@@ -51,23 +51,119 @@ class ScriptSpecTests(unittest.TestCase):
                      "requires a real supported process backend")
 class PortableScriptStreamTests(unittest.TestCase):
     def test_no_newline_raw_stdout_survives_native_process_timeout(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with Kernel.open_sqlite(root / "kernel.db", script_handlers(), isolation_mode="process") as runtime:
-                source = "import sys,time\nsys.stdout.buffer.write(b'raw-without-newline\\xff')\nsys.stdout.flush()\ntime.sleep(3)\nopen('escaped', 'w').write('escaped')\n"
-                runtime.submit(ScriptSpec(source, (sys.executable, "-u"), root, root / "logs").command(
-                    execution_id="raw-timeout", idempotency_key="raw-timeout", registry_revision=runtime.registry_revision,
-                    correlation_id="raw-timeout", timeout_seconds=2))
-                result = runtime.run_once()
-                self.assertEqual("recovery_required", result.state)
-                effect = runtime.kernel.get_effect(result.recovery_effect_id)
-                logs = list(Path(effect.request["output_root"]).glob("*/stdout.log"))
-                self.assertEqual(1, len(logs))
-                self.assertEqual(b"raw-without-newline\xff", logs[0].read_bytes())
-                observation = runtime.observe("raw-timeout")
-                self.assertEqual(20, observation["metrics"]["stdout_bytes"]["count"])
-                time.sleep(1.2)
-                self.assertFalse((root / "escaped").exists())
+        import json
+        import sqlite3
+        import traceback
+        import dispatcher_sdk
+        from tests._acceptance_evidence import retained_directory
+        from tests._storage_evidence import StorageEvidence
+
+        root = retained_directory("sdk-script-raw-timeout-")
+        evidence = {"test": self.id(), "root": str(root), "interpreter": sys.executable,
+                    "sdk_import": dispatcher_sdk.__file__, "execution_timeout": 2,
+                    "script_sleep": 3, "post_timeout_sleep": 1.2, "capture_errors": [],
+                    "snapshot_limits": {"total_seconds": .2, "tables_per_store": 32,
+                        "rows_per_table": 32, "cell_bytes": 32768,
+                        "oversized_cells": "NULL in snapshot; original retained in database"}}
+        storage = StorageEvidence(root, self)
+        storage.start(include_kernel=True)
+        self.addCleanup(storage.stop)
+
+        def error_facts(error):
+            return {"type": type(error).__name__, "message": str(error),
+                    "traceback": traceback.format_exc(),
+                    "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                    "sqlite_errorname": getattr(error, "sqlite_errorname", None)}
+
+        def save_evidence(phase="cleanup"):
+            try:
+                storage.save(phase=phase, checkpoint=evidence)
+                (root / "evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+            except BaseException as error:
+                evidence["capture_errors"].append({"phase": phase, **error_facts(error)})
+                print("script_raw_timeout_capture_error=" + json.dumps(evidence["capture_errors"][-1]), flush=True)
+                if "original_error" not in evidence and "cleanup_error" not in evidence:
+                    raise
+            finally:
+                print("script_raw_timeout_evidence=" + str(root / "evidence.json"), flush=True)
+
+        self.addCleanup(save_evidence)
+        try:
+            runtime = Kernel.open_sqlite(root / "kernel.db", script_handlers(), isolation_mode="process")
+
+            def close_runtime():
+                try:
+                    runtime.close()
+                    evidence["runtime_closed"] = True
+                except BaseException as error:
+                    evidence["cleanup_error"] = error_facts(error)
+                    raise  # unittest records cleanup separately from the original failure.
+
+            self.addCleanup(close_runtime)
+            source = "import sys,time\nsys.stdout.buffer.write(b'raw-without-newline\\xff')\nsys.stdout.flush()\ntime.sleep(3)\nopen('escaped', 'w').write('escaped')\n"
+            command = ScriptSpec(source, (sys.executable, "-u"), root, root / "logs").command(
+                execution_id="raw-timeout", idempotency_key="raw-timeout", registry_revision=runtime.registry_revision,
+                correlation_id="raw-timeout", timeout_seconds=2)
+            evidence["command"] = command.to_dict()
+            runtime.submit(command)
+            began = time.monotonic()
+            result = runtime.run_once()
+            evidence.update(run_once_elapsed=time.monotonic() - began, result=result.to_dict())
+            self.assertEqual("recovery_required", result.state)
+            effect = runtime.kernel.get_effect(result.recovery_effect_id)
+            evidence["effect"] = effect.to_dict()
+            logs = list(Path(effect.request["output_root"]).glob("*/stdout.log"))
+            evidence["stdout_logs"] = [str(path) for path in logs]
+            self.assertEqual(1, len(logs))
+            raw = logs[0].read_bytes()
+            evidence["stdout"] = {"path": str(logs[0]), "bytes": len(raw),
+                                  "raw_hex": raw[:4096].hex(), "truncated": len(raw) > 4096}
+            self.assertEqual(b"raw-without-newline\xff", raw)
+            observation = runtime.observe("raw-timeout")
+            evidence["observation"] = observation
+            self.assertEqual(20, observation["metrics"]["stdout_bytes"]["count"])
+            time.sleep(1.2)
+            evidence["escaped_exists"] = (root / "escaped").exists()
+            self.assertFalse((root / "escaped").exists())
+        except BaseException as error:
+            evidence["original_error"] = error_facts(error)
+            raise
+        finally:
+            # These are read-only diagnostics after the original assertions;
+            # retained stores remain available even when collection is partial.
+            snapshot = []
+            deadline = time.monotonic() + .2
+            for database in (root / "kernel.db", root / "kernel.db.observations.sqlite3",
+                             root / "kernel.db.settlements.sqlite3"):
+                connection = None
+                record = {"path": str(database)}
+                try:
+                    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0)
+                    connection.row_factory = sqlite3.Row
+                    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                    record["tables"] = {}
+                    tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name LIMIT 32").fetchall()
+                    for table in tables:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("raw storage evidence snapshot budget elapsed")
+                        name = table["name"].replace('"', '""')
+                        columns = connection.execute(f'PRAGMA table_info("{name}")').fetchall()
+                        projection = ",".join('CASE WHEN length(CAST("' + column["name"].replace('"', '""') +
+                            '" AS BLOB))<=32768 THEN "' + column["name"].replace('"', '""') + '" END AS "' +
+                            column["name"].replace('"', '""') + '"' for column in columns)
+                        rows = connection.execute(f'SELECT {projection} FROM "{name}" ORDER BY rowid DESC LIMIT 32').fetchall()
+                        record["tables"][table["name"]] = [dict(row) for row in rows]
+                except Exception as error:
+                    record["error"] = error_facts(error)
+                finally:
+                    if connection is not None:
+                        try:
+                            connection.close()
+                        except Exception as error:
+                            record["close_error"] = error_facts(error)
+                snapshot.append(record)
+            evidence["raw_storage_snapshot"] = snapshot
+            save_evidence(phase="before_cleanup")
 
 
 @unittest.skipUnless(os.name == "posix" and "fork" in multiprocessing.get_all_start_methods(),

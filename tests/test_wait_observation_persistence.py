@@ -281,9 +281,9 @@ class WaitObservationTests(unittest.TestCase):
         policy = StallPolicy('separate', wait_exemptions=('memory',))
         service = StallSupervisor(self.journal, self.kernel, clock=self.clock,
                                   clock_sample=self.clock.sample)
-        service.watch(self.identity, policy, target={})
-        with self.journal._read_connection(3) as (connection, _):
-            row = dict(connection.execute("SELECT * FROM obs_policies WHERE state='active'").fetchone())
+        # Wait classification uses the actual claimed identity. Policy
+        # activation/replay is separately covered by test_stall_supervision.
+        row = self.identity.to_dict()
         status = self.kernel.supervision_status('work')
         with recorder.wait('memory'):
             recorder.flush()
@@ -302,9 +302,7 @@ class WaitObservationTests(unittest.TestCase):
         policy = StallPolicy('legacy-owner', wait_exemptions=('memory',))
         service = StallSupervisor(self.journal, self.kernel, clock=self.clock,
                                   clock_sample=self.clock.sample)
-        service.watch(self.identity, policy, target={})
-        with self.journal._read_connection(3) as (connection, _):
-            row = dict(connection.execute("SELECT * FROM obs_policies WHERE state='active'").fetchone())
+        row = self.identity.to_dict()
         self.journal.record_wait(self.identity, 'legacy', details={
             'reason': 'memory', '_collector_source_id': []})
         status = self.kernel.supervision_status('work')

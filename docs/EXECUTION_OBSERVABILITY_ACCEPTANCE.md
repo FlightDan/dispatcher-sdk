@@ -6,7 +6,7 @@ maintainability only. The user has activated the revised SDK-only Goal. ModPort 
 writes are outside the revised completion criteria. Historical integration evidence
 is retained below; it does not establish the new SDK-only A16.
 
-Latest completed candidate `12771d9ea00fcd58f4948d58f12c4aa903be8f12` failed all
+Earlier candidate `12771d9ea00fcd58f4948d58f12c4aa903be8f12` failed all
 16 environments in [run 37200662333](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37200662333);
 history scanning passed. Every outer suite ran 975 cases and each installed suite
 970, retaining the original 900-second installed-suite deadline. A shared stale
@@ -16,7 +16,7 @@ the original CAS error, unchanged authority, durable original request and separa
 nonpersistent failure facts. No successful matrix is claimed for this candidate.
 
 Eight Windows environments retained 40 installed public scenarios, 32 actual
-post-close SQLite rename/delete probes, 16 actual launcher/worker final-flush and
+post-close SQLite rename-and-restore round trips, 16 actual launcher/worker final-flush and
 PID checks, and 16 `pythonw` cases. They do not override other failures. Raw inventory
 and retained native data are `/tmp/sdk-ci-audit-summary-37200662333.json` and
 `/tmp/sdk-ci-audit-evidence-37200662333`. Typing passed everywhere; docs/examples
@@ -49,7 +49,108 @@ import is `/tmp/sdk-scope-final-installed310/lib/python3.10/site-packages/dispat
 Five public typing fixtures, 550 documentation links/six README examples and 26
 upgrade/settlement/packaging checks passed (`/tmp/sdk-scope-final-types.log`,
 `/tmp/sdk-scope-final-docs.log`, `/tmp/sdk-scope-final-upgrades312.log`).
-The corrected complete matrix remains pending.
+Corrected implementation candidate `6d3239f8fe63e7cd0bf675deea0cd1820aec6c9b`
+was pushed and [run 37203657162](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37203657162)
+started and completed all 16 environments: 11 passed and five Windows
+environments failed. History scanning passed. All eight Linux environments
+completed successfully: each ran 979
+tests with exactly 17 Windows-only skips, five typing fixtures, 551 documentation
+links/six README examples without skips, and both example steps. Actual installed
+Python 3.10 x64/ARM64 suites ran 974 tests under their original 900-second deadline
+and passed five public scenarios from site-packages; raw logs and artifacts are
+under `/tmp/sdk-ci-audit-evidence-37203657162`. Windows x64 Python 3.10/3.11/3.13
+passed; x64 3.12 and all four ARM-host environments failed. Every installed suite
+ran 974 tests under its original 900-second deadline; 13 passed, three failed and
+none timed out. Typing passed in all 16 environments; docs/examples passed in
+11 and were skipped after failures in five. Windows README checks ran four
+applicable examples and skipped the two POSIX-only examples. No applicable
+mandatory native case was skipped. Final raw inventory is
+`/tmp/sdk-ci-audit-summary-37203657162.json`, with complete errors at
+`/tmp/sdk-ci-audit-failures-37203657162.json`. No successful matrix, release or
+merge is claimed.
+
+The current failures retain distinct facts. Physical script output was exactly
+20 bytes before its observation lacked `stdout_bytes`; that older fixture
+deleted its store, so the missing metric's cause remains unknown. The fixture
+now retains raw output, observation, SQL and separate cleanup errors without
+changing its 2-second deadline. Two inherited-deadline witnesses returned
+`running` after bounded lifecycle-lock settlement admission; both native
+process outcomes were timeout, both containers were empty and the exact
+parent timeout result remained durably pending. The fixture is being corrected
+to verify that documented deferred settlement within its existing maintenance
+window. Two wait-classification fixtures assumed immediate policy activation;
+retained ARM3.11 facts show Kernel selection committed but the sidecar transaction
+spent .031s in its .03s window and rolled back to `registering_policy`. Those
+classification checks now use the actual claimed identity; policy activation
+and recovery retain their separate integration coverage. Native pressure marker
+reads also raised an access PermissionError; bounded retries retain the unknown
+access/sharing facts inside the existing stage deadline. Finally, an independent
+child-clock checkpoint note exhausted its original .1s operation budget before
+COMMIT. Its precise native SQL-stage cause remains unknown. A separate real
+dual-writer probe confirmed a recovery defect: both sidecar checkpoint paths
+failed with original `SettlementBusyError`/`SQLITE_BUSY`, leaving the request
+budget unchanged and no independent note. After wall-clock rollback, a fresh
+ChildService restored 9.786 seconds against the original window's 6.087 seconds;
+actual `Runtime.submit_child` admitted the child as queued. The probe stopped
+before business and cancelled that admission. Raw evidence and its exact chained
+error are `/tmp/sdk-a05-floor-loss-tdrj4k5y/evidence.json`; the script is
+`/tmp/sdk_a05_checkpoint_floor_probe.py`. This probe failed during settlement
+writer initialization, not the native pre-COMMIT note-expiry stage. It establishes
+A05 as incomplete, without attributing that older native failure's precise cause.
+The defect is not fixed: an in-memory floor cannot prove recovery after a crash,
+and persisting only to Kernel would not cover simultaneous failure of all stores.
+
+The diagnostic/classification corrections passed 18 focused source tests in
+22.168 seconds (`/tmp/sdk-ci-native-corrections-integrated310.log`), and three
+native Linux pressure cases passed in 25.773 seconds
+(`/tmp/sdk-ci-native-pressure-corrections310.log`). These runs used `PYTHONPATH=src`
+with `/tmp/sdk-scope-final-installed310/bin/python`, so they are source verification,
+not fresh installed or Windows acceptance. A causally corrected real-lock probe
+returned the actual original `running` snapshot, then recovered the exact parent
+and child timeout results in .127 seconds of its single three-second maintenance
+window (`/tmp/sdk-inherited-parent-deferred-maintenance-corrected-probe/probe-result.json`).
+Automatic SDK maintenance completed before the first explicit observe; this
+does not prove that the probe required an explicit `recover_completions` call.
+The earlier failed probe remains at
+`/tmp/sdk-inherited-parent-deferred-maintenance-probe/probe-result.json`; it held
+the lock through a later unconditional cleanup acquisition and incorrectly
+required a timeout child winner rather than the original allowed cancellation
+winner with an exact superseded timeout receipt. Independent review of the new
+fixtures identified cleanup and unbounded-read issues. Those corrections now
+passed independent review: all canonical/limits/winner reads share the original
+three-second control window, and primary failures survive diagnostic and Runtime
+cleanup errors. The corrected inherited-deadline method passed once in 9.488
+seconds (`/tmp/sdk-inherited-parent-maintenance-bound310.log`,
+`/tmp/sdk-inherited-parent-deadline-v4ldu7a_/evidence.json`); its caller spent
+6.233 seconds of the original 12-second bound, exact settlement proof .054
+seconds of the original three-second window, and two real containment receipts
+confirmed stopped process trees. This ordinary run returned `timed_out` already,
+so it does not exercise an explicit recovery iteration. The corrected
+checkpoint writer cleanup also passed once in 1.216 seconds
+(`/tmp/sdk-child-clock-checkpoint-cleanup310.log`,
+`/tmp/sdk-child-clock-checkpoint-yjjy57pg/evidence.json`); independent review found
+no remaining cleanup blocker. Documentation checked 551 local links and all six
+README examples (`/tmp/sdk-ci-native-corrections-docs.log`). Production SDK source
+remains unchanged by these diagnostic and fixture corrections; the confirmed
+A05 defect and missing A12 path are not counted as fixed.
+
+Final focused source commands (these do not establish installed/native Windows
+acceptance):
+
+```bash
+PYTHONPATH=src:. /tmp/sdk-journal-admission-installed310/bin/python -m unittest tests.test_runtime_deadline_envelopes.RuntimeDeadlineEnvelopeTests.test_real_child_stops_at_inherited_parent_deadline -v
+PYTHONPATH=src /tmp/sdk-scope-final-installed310/bin/python -m unittest tests.test_child_clock_checkpoint.ChildClockCheckpointTests.test_locked_observation_writer_preserves_floor_in_independent_note_after_reopen -v
+/tmp/sdk-scope-final-installed310/bin/python scripts/check_docs.py
+```
+
+A fresh requirement-by-requirement audit found a separate A12 implementation
+gap: `subscribe_stalls` currently supports a fixed synchronous callback only.
+This proves callback isolation, not managed supervisor-agent execution with
+independently reserved capacity, memory/budget admission and a visible shortage
+outcome. The full Goal retains that requirement. Its public execution contract
+is being clarified before implementation; even a green current matrix will not
+close T06/T07/T09 or G1/G2/G5 while that path and its real-process witness are
+missing.
 
 ### Local observation cost measurement
 
@@ -361,17 +462,19 @@ NOTICE. Packaging retains both files. The dedicated README check passed 550
 local links and six examples without skips; `/tmp/sdk-readme-license-docs.log`
 records this documentation-only change.
 
-T01–T07 implementation and Linux evidence are present. T08 has local installation
-and regression evidence but still needs the native matrix; T09 independent review
-and corrections are complete locally, while final acceptance depends on T08.
+T01–T07 have implementation and Linux evidence for the existing paths, but
+T01/T06/T07 still require the supervisor-agent contract and A12 path. T08 has
+local installation and regression evidence but still needs the native matrix.
+T09 has independent corrective reviews; its final closure also requires the new
+A12 path and T08 acceptance.
 
 | Completion condition | Current status |
 | --- | --- |
-| G1 All mandatory scenarios | Pending native Windows and CI; local applicable scenarios passed |
-| G2 Installed public API, types, docs and examples | Passed on Linux; imported package is outside the checkout |
+| G1 All mandatory scenarios | Incomplete: A12 managed supervisor-agent path is missing; native Windows and CI pending |
+| G2 Installed public API, types, docs and examples | Existing paths passed on Linux outside checkout; supervisor-agent contract and installed witness missing |
 | G3 Same candidate across required platforms | Pending Windows and CI for this implementation |
 | G4 Compatibility and explicit storage upgrade | Linux regression passed; native matrix still required |
-| G5 Ownership and maintainability review | Reviewed with corrections verified locally; limitations retained below |
+| G5 Ownership and maintainability review | Existing paths reviewed; supervisor-agent admission/ownership still require implementation and review |
 
 ## Earlier local failures and corrections
 
@@ -479,14 +582,14 @@ Linux.
 | A02 Raw output and progress | Same native suite: segmented bytes, heartbeat, tool response, new/replayed progress; `test_observation_processes` | Linux focused passed; original byte files and separate metric snapshots retained. Candidate matrix pending. |
 | A03 Unknown / old attempts | `test_observation_journal`, `test_observation_processes`, `test_stall_supervision` | Source and installed regressions cover inaccessible identity, collector replacement and old reports. No PID-only exit inference. Native matrix pending. |
 | A04 Effective deadlines | Native Run/tool cutoff witness; `test_runtime_deadline_envelopes`, `test_execution_budget` | Actual shortest cutoff, stopped process tree, inherited parent window and reserve semantics covered. Reported tool cause keeps its original message. Candidate matrix pending. |
-| A05 Restart and short waits | Native controller crash after confirmed entry; native short `Task.wait`; budget/recovery tests | Original cutoff survives rollback/restart; exhausted business is refused; caller wait does not cancel. Candidate matrix pending. |
+| A05 Restart and short waits | Native controller crash after confirmed entry; native short `Task.wait`; budget/recovery tests; real dual-writer floor-loss probe | Existing restart/short-wait cases passed. A confirmed defect remains: failed checkpoint writes followed by rollback let a fresh ChildService recover a longer window and actually admit a queued child. No business ran in the probe; A05 remains incomplete. |
 | A06 Parent waits / capacity | `test_managed_children_capacity`, `test_runtime_deadline_envelopes`, public native parent/child witness | Actual children return success and original failure; parent retains a touched 16 MiB buffer and actual memory readings while waiting; peak capacity two and queued successor work passed locally. This is observed process memory, not a new global memory reservation API. Native matrix pending. |
 | A07 Rejection / partial registration | Child admission suite and native cross-store controller crash | Actual independent request reservation exists while Kernel child is absent; exit 73 and original-budget recovery close the wait without child business. Earlier stalled runs remain retained. Candidate matrix pending. |
 | A08 Cancellation / natural completion | Native pressure, Runtime lifecycle, Windows Job and sandbox tests | Linux descendant markers stop; Kernel winner and cleanup proof remain distinct. Current Windows Jobs pending. |
 | A09 Cleanup failure / exit cause | `test_sandbox_runtime` cleanup-failure restart with native worker business-call log; process exit classifiers; shared cgroup clue witness | Restart retries disposal only and keeps collected output; call count does not increase. Exit 137 remains status/unknown OOM even with readable shared cgroup counters. Provider is explicitly a persistent fake; native worker is real. Candidate matrix pending. |
 | A10 Stall windows | `test_stall_supervision` | Complete consecutive windows, activity distinctions, exemptions, unknown gaps, replacement and rollback passed. Native matrix pending. |
 | A11 Durable notification | Two real evaluator processes; abrupt exit after orchestration enqueue; repeated native crashes through delivery exhaustion and explicit retry | Same notice ID, one application notification, bounded attempts and explicit dead state passed. Native matrix pending. |
-| A12 Conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; separate capacity keeps local deadlines working. Candidate matrix pending. |
+| A12 Supervision capacity and conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; fixed callback capacity keeps local deadlines working. Managed supervisor-agent capacity, memory/budget admission and shortage witness are missing; A12 is incomplete independently of current CI. |
 | A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Linux regression passed; native matrix pending. |
 | A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; historical `v0.7.0.dev0` writer; real pending outcome and original sidecar owner | Historical installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Core copy preserves history, remains inactive, and does not migrate external journals. Original owner recovers the exact pending result without business replay. Native matrix pending. |
 | A15 Installed entry | Isolated wheel consumer suite and portable public example | `969f0da` rebuilt-wheel consumer, complete source/installed suites and separately installed original portable example passed. Native matrix pending. |

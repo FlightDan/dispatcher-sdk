@@ -167,6 +167,23 @@ class ObservabilityPressureTests(unittest.TestCase):
                 return json.load(reader)
         except FileNotFoundError:
             return None
+        except PermissionError as error:
+            native_code = getattr(error, "winerror", None)
+            if os.name != "nt" or not (native_code in (5, 32, 33)
+                    or (native_code is None and error.errno == 13)):
+                raise
+            # The caller's existing stage loop owns all retries and its one
+            # original deadline. Access/sharing failures remain unknown facts.
+            errors = self.evidence.setdefault("snapshot_read_errors", [])
+            if len(errors) < 128:
+                errors.append({"path": str(path), "at": time.time(),
+                    "type": type(error).__name__, "message": str(error),
+                    "errno": error.errno, "winerror": native_code,
+                    "reason": "native_access_or_sharing_unknown"})
+            else:
+                self.evidence["snapshot_read_errors_omitted"] = self.evidence.get(
+                    "snapshot_read_errors_omitted", 0) + 1
+            return None
 
     def encoded(self, report):
         return len(json.dumps(report, ensure_ascii=False, separators=(",", ":")).encode())
