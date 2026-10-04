@@ -17,9 +17,15 @@ and six README examples with no skips.
 
 The Goal is not complete: native Windows and the existing 16-environment CI
 matrix have not run for this candidate. The 16 Linux skips do not count as
-Windows acceptance. The previous attempt to push the working branch was rejected
-by automatic approval review because exporting the source and Git history to the
-GitHub destination lacked explicit authorization. No release is authorized.
+Windows acceptance. The user explicitly authorized the source/history push on
+2026-10-04; branch `work/execution-observability-20261003` was pushed successfully.
+The first [CI run](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37188996228)
+on `889d1d9` failed before creating any jobs. Its workflow referenced `runner.temp`
+in job-level `env`, where GitHub does not allow the runner context. Evidence
+directory setup now runs as a Python step through `GITHUB_ENV`; artifact upload
+uses the same runner temporary directory. SDK code and test budgets are unchanged.
+Raw run metadata is retained at `/tmp/sdk-ci-run-37188996228.json`. This failed
+run is not matrix acceptance. No release is authorized.
 
 T01–T07 implementation and Linux evidence are present. T08 has local installation
 and regression evidence but still needs the native matrix; T09 independent review

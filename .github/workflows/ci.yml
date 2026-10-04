@@ -35,14 +35,21 @@ jobs:
             python_arch: x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    env:
-      SDK_ACCEPTANCE_EVIDENCE_DIR: ${{ runner.temp }}/sdk-execution-acceptance
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.python_arch }}
+      - name: Configure acceptance evidence directory
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "sdk-execution-acceptance"
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+              stream.write(f"SDK_ACCEPTANCE_EVIDENCE_DIR={evidence}\n")
       - name: Report runner and interpreter architecture
         shell: bash
         run: |
@@ -84,7 +91,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: execution-acceptance-${{ matrix.os }}-py${{ matrix.python-version }}-${{ matrix.python_arch }}
-          path: ${{ env.SDK_ACCEPTANCE_EVIDENCE_DIR }}
+          path: ${{ runner.temp }}/sdk-execution-acceptance
           if-no-files-found: warn
   secrets:
     runs-on: ubuntu-latest
