@@ -36,17 +36,33 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                                   msg=f"external Kernel import in {source}: {module}")
 
     def _run(self, command: list[str], *, cwd: Path,
-             timeout: float = 300) -> subprocess.CompletedProcess[str]:
+             timeout: float = 300,
+             evidence_directory: Path | None = None) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
         environment["PYTHONNOUSERSITE"] = "1"
         environment["PIP_NO_CACHE_DIR"] = "1"
+
+        def record(stdout, stderr, returncode, *, timed_out=False):
+            if evidence_directory is None:
+                return
+            evidence_directory.mkdir(parents=True, exist_ok=True)
+            for name, value in (("stdout.log", stdout), ("stderr.log", stderr)):
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="replace")
+                (evidence_directory / name).write_text(value or "", encoding="utf-8")
+            (evidence_directory / "command.json").write_text(json.dumps({
+                "command": command, "cwd": str(cwd), "timeout_seconds": timeout,
+                "returncode": returncode, "timed_out": timed_out,
+            }, indent=2), encoding="utf-8")
+
         try:
             completed = subprocess.run(
                 command, cwd=cwd, env=environment, capture_output=True,
                 text=True, check=False, timeout=timeout,
             )
         except subprocess.TimeoutExpired as error:
+            record(error.stdout, error.stderr, None, timed_out=True)
             def tail(value):
                 if isinstance(value, bytes):
                     value = value.decode("utf-8", errors="replace")
@@ -54,6 +70,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
 
             self.fail(f"command timed out after {timeout}s: {command!r}\n"
                       f"stdout tail:\n{tail(error.stdout)}\nstderr tail:\n{tail(error.stderr)}")
+        record(completed.stdout, completed.stderr, completed.returncode)
         self.assertEqual(
             completed.returncode,
             0,
@@ -181,7 +198,8 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
             self._run([str(interpreter), "-m", "unittest", "discover", "-s", "tests", "-v"],
                       # This runs the complete suite again, including SQLite
                       # FULL durability fixtures; it needs its own suite budget.
-                      cwd=installed_suite, timeout=900)
+                      cwd=installed_suite, timeout=900,
+                      evidence_directory=evidence / "installed-suite")
 
             consumer = root / "consumer.py"
             consumer.write_text(

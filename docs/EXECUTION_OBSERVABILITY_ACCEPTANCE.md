@@ -25,7 +25,15 @@ in job-level `env`, where GitHub does not allow the runner context. Evidence
 directory setup now runs as a Python step through `GITHUB_ENV`; artifact upload
 uses the same runner temporary directory. SDK code and test budgets are unchanged.
 Raw run metadata is retained at `/tmp/sdk-ci-run-37188996228.json`. This failed
-run is not matrix acceptance. No release is authorized.
+run is not matrix acceptance. The corrected workflow launched
+[run 37189113536](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37189113536)
+on `0fc705d`; all 16 environments started and the history scan passed, while tests
+remain in progress. Independent platform-evidence review identified that successful
+nested installed-suite output was captured but discarded. The fixture now saves
+the exact command, original timeout, return code and complete stdout/stderr under
+each public consumer's `installed-suite` directory, including failure and timeout.
+Three bounded local success/failure/timeout probes verified retention at
+`/tmp/sdk-installed-suite-log-check-0290z0z5`. No release is authorized.
 
 T01–T07 implementation and Linux evidence are present. T08 has local installation
 and regression evidence but still needs the native matrix; T09 independent review
