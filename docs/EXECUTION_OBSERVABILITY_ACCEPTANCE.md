@@ -6,15 +6,36 @@ maintainability only. The user has activated the revised SDK-only Goal. ModPort 
 writes are outside the revised completion criteria. Historical integration evidence
 is retained below; it does not establish the new SDK-only A16.
 
-The implementation is not yet fully accepted. The latest complete regression was
-on frozen `a876f9d`: 949 outer tests had one failure and 16 skips; the nested
-complete installed suite passed. Its rebuilt installed consumer passed all five
-public scenarios; the earlier `c1471ee`
-standalone consumer and original public example also passed. Complete
-corrective regression and native Windows/CI evidence remain required. No release
-is authorized.
+Local Linux acceptance passed on implementation commit
+`969f0da7f2bdbcda9dc4235e0744e0176e0475b2` (Linux x86_64, Python 3.12).
+The complete regression ran 952 tests in 1629.062 seconds with zero failures or
+errors and 16 platform skips. Its freshly rebuilt and installed SDK also passed
+the complete isolated suite and all five public end-to-end scenarios. The original
+portable example also passed in a separate fresh installation with isolated
+imports outside the checkout. Five public typing fixtures passed. The latest documentation check passed 546 local links
+and six README examples with no skips.
 
-The latest source failure exposed an SDK defect: `InspectionBudgetExceeded`
+The Goal is not complete: native Windows and the existing 16-environment CI
+matrix have not run for this candidate. The 16 Linux skips do not count as
+Windows acceptance. The previous attempt to push the working branch was rejected
+by automatic approval review because exporting the source and Git history to the
+GitHub destination lacked explicit authorization. No release is authorized.
+
+T01–T07 implementation and Linux evidence are present. T08 has local installation
+and regression evidence but still needs the native matrix; T09 independent review
+and corrections are complete locally, while final acceptance depends on T08.
+
+| Completion condition | Current status |
+| --- | --- |
+| G1 All mandatory scenarios | Pending native Windows and CI; local applicable scenarios passed |
+| G2 Installed public API, types, docs and examples | Passed on Linux; imported package is outside the checkout |
+| G3 Same candidate across required platforms | Pending Windows and CI for this implementation |
+| G4 Compatibility and explicit storage upgrade | Linux regression passed; native matrix still required |
+| G5 Ownership and maintainability review | Reviewed with corrections verified locally; limitations retained below |
+
+## Earlier local failures and corrections
+
+The `a876f9d` source failure exposed an SDK defect: `InspectionBudgetExceeded`
 from one bounded observation read escaped child waiting even with about 2.8
 seconds left in the original call window. The child had already succeeded and
 its response publication was deliberately held. A real journal-read reproduction
@@ -22,8 +43,8 @@ failed on the frozen code; the correction classifies only this SDK-owned read
 expiry for retry inside the same original window. Persistent expiry retains the
 last original error; completion proof remains a single bounded read, and generic
 timeouts, permanent errors and revoked parent authority remain immediate.
-Independent review found no control/replay blocker. Corrective complete regression
-is still required.
+Independent review found no control/replay blocker. The corrected code passed the
+complete Linux regression on `969f0da`.
 
 The earlier `e14faf5` installed failures were a raw parent `OperationalError: database is
 locked` around the original two-second child-call cutoff, and a receipt-contention
@@ -63,14 +84,14 @@ collectors without changing that window; one independent installed run then pass
 No complete `2ab808e` regression was launched. A separate native probe found a
 remaining entry-packet wall sample that shortened a deadline without retaining its
 floor; the packet now derives both bounds from the committed ACK and native elapsed
-time. The corrective candidate is being validated. The failed native child-delivery
+time. The correction is included in the passing Linux candidate. The failed native child-delivery
 cases did not establish timely child entry within their original two-second
 window. They also exposed an SDK defect: inherited parent start time caused
 completion to reject a valid pre-entry failure. That correction preserves pending
 entry authority and original constraints. A separate native probe confirmed that
 parent-only timer observations were lost on clock rollback, allowing a second
 business attempt; timer floors now propagate with original result obligations.
-These corrections need a fresh complete candidate regression.
+These corrections are included in the passing `969f0da` Linux regression.
 
 The nested dead-bridge notification failure remains unattributed: its temporary
 store was deleted, and the log only shows that no dead notice arrived during the
@@ -107,32 +128,38 @@ are also required. The latter runs all six README examples on Linux.
 The status below describes current evidence, not final Goal acceptance. Raw
 host paths identify retained artifacts for this run; they are not portable
 links or substitutes for the candidate CI artifacts.
+All Linux-applicable witnesses below passed in the complete source and installed
+candidate regression. Native Windows and the remaining CI environments are
+unverified, including platform-specific cases skipped on Linux.
 
 | Scenario | Implementation and witness | Current evidence / remaining requirement |
 | --- | --- | --- |
-| A01 Startup phases | `test_observability_native_acceptance`: queue, real deserialization, ready, entry, model request, raw bootstrap failure | Linux focused passed; readiness and entry facts also survive an unavailable activity writer in independent notes. Installed candidate and Windows pending. |
+| A01 Startup phases | `test_observability_native_acceptance`: queue, real deserialization, ready, entry, model request, raw bootstrap failure | Linux source and installed candidate passed; readiness and entry facts survive an unavailable activity writer. Windows pending. |
 | A02 Raw output and progress | Same native suite: segmented bytes, heartbeat, tool response, new/replayed progress; `test_observation_processes` | Linux focused passed; original byte files and separate metric snapshots retained. Candidate matrix pending. |
-| A03 Unknown / old attempts | `test_observation_journal`, `test_observation_processes`, `test_stall_supervision` | Source regressions cover inaccessible identity, collector replacement and old reports. No PID-only exit inference. Full candidate regression pending. |
+| A03 Unknown / old attempts | `test_observation_journal`, `test_observation_processes`, `test_stall_supervision` | Source and installed regressions cover inaccessible identity, collector replacement and old reports. No PID-only exit inference. Native matrix pending. |
 | A04 Effective deadlines | Native Run/tool cutoff witness; `test_runtime_deadline_envelopes`, `test_execution_budget` | Actual shortest cutoff, stopped process tree, inherited parent window and reserve semantics covered. Reported tool cause keeps its original message. Candidate matrix pending. |
 | A05 Restart and short waits | Native controller crash after confirmed entry; native short `Task.wait`; budget/recovery tests | Original cutoff survives rollback/restart; exhausted business is refused; caller wait does not cancel. Candidate matrix pending. |
-| A06 Parent waits / capacity | `test_managed_children_capacity`, `test_runtime_deadline_envelopes`, native saturation pressure witness | Actual children return success and original failure; dedicated capacity and successor work covered. Independent installed SDK end-to-end witness and matrix pending. |
+| A06 Parent waits / capacity | `test_managed_children_capacity`, `test_runtime_deadline_envelopes`, native saturation pressure witness | Actual children return success and original failure; dedicated capacity and successor work passed, including installed end-to-end witnesses. Native matrix pending. |
 | A07 Rejection / partial registration | Child admission suite and native cross-store controller crash | Actual independent request reservation exists while Kernel child is absent; exit 73 and original-budget recovery close the wait without child business. Earlier stalled runs remain retained. Candidate matrix pending. |
 | A08 Cancellation / natural completion | Native pressure, Runtime lifecycle, Windows Job and sandbox tests | Linux descendant markers stop; Kernel winner and cleanup proof remain distinct. Current Windows Jobs pending. |
 | A09 Cleanup failure / exit cause | `test_sandbox_runtime` cleanup-failure restart with native worker business-call log; process exit classifiers; shared cgroup clue witness | Restart retries disposal only and keeps collected output; call count does not increase. Exit 137 remains status/unknown OOM even with readable shared cgroup counters. Provider is explicitly a persistent fake; native worker is real. Candidate matrix pending. |
-| A10 Stall windows | `test_stall_supervision` | Complete consecutive windows, activity distinctions, exemptions, unknown gaps, replacement and rollback covered. Candidate regression pending. |
-| A11 Durable notification | Two real evaluator processes; abrupt exit after orchestration enqueue; repeated native crashes through delivery exhaustion and explicit retry | Same notice ID, one application notification, bounded attempts and explicit dead state verified. Candidate regression pending. |
+| A10 Stall windows | `test_stall_supervision` | Complete consecutive windows, activity distinctions, exemptions, unknown gaps, replacement and rollback passed. Native matrix pending. |
+| A11 Durable notification | Two real evaluator processes; abrupt exit after orchestration enqueue; repeated native crashes through delivery exhaustion and explicit retry | Same notice ID, one application notification, bounded attempts and explicit dead state passed. Native matrix pending. |
 | A12 Conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; separate capacity keeps local deadlines working. Candidate matrix pending. |
-| A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Latest candidate regression pending. |
-| A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; separately installed historical `v0.7.0.dev0` writer | Actual old installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Full public API and pending-obligation upgrade regression pending. |
-| A15 Installed entry | Isolated wheel consumer suite and portable public example | `a876f9d` rebuilt-wheel consumer and complete installed suite passed; its source suite failed. `c1471ee` original parent12/child5/wait15 example passed. Corrective candidate validation remains required. |
-| A16 Independent SDK end-to-end | Installed public APIs, real handlers/processes, local byte/tool fixtures and persisted recovery; no ModPort or external model dependency | All five public-entry scenarios passed on the `a876f9d` isolated rebuilt consumer: success/raw failure, output/silence, parent-child/tool budgets, cancellation and cleanup recovery without repeated business. Fresh corrective candidate and native matrix remain required. Historical ModPort checks are not a substitute. |
+| A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Linux regression passed; native matrix pending. |
+| A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; separately installed historical `v0.7.0.dev0` writer | Historical installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Full public API and pending-obligation upgrade regression passed on Linux. Native matrix pending. |
+| A15 Installed entry | Isolated wheel consumer suite and portable public example | `969f0da` rebuilt-wheel consumer, complete source/installed suites and separately installed original portable example passed. Native matrix pending. |
+| A16 Independent SDK end-to-end | Installed public APIs, real handlers/processes, local byte/tool fixtures and persisted recovery; no ModPort or external model dependency | All five public-entry scenarios passed on the `969f0da` isolated rebuilt consumer: success/raw failure, output/silence, parent-child/tool budgets, cancellation and cleanup recovery without repeated business. Native matrix remains required. Historical ModPort checks are not a substitute. |
 | A17 Native Windows | `test_windows_runtime`, portable native observability/deadline/pressure suites | Linux mocks are not native acceptance. Windows x64/ARM64 jobs and raw Job evidence pending. Linux-only cgroup cases do not apply to Windows. |
-| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `a876f9d` outer run of 949 tests had 1 failure and 16 skips; nested complete installed suite passed. Corrective full candidate and native matrix remain pending. Skips and partial passes do not fulfill required platforms. |
+| A18 Complete candidate regression | Existing 16 environment combinations, public types, README and portable examples | `969f0da` complete regression passed: 952 tests, 16 platform skips; nested complete installed suite passed. Public types passed. Native matrix remains pending; Linux skips do not fulfill required platforms. |
 
 ## Retained raw host evidence
 
 | Command/result | Retained evidence |
 | --- | --- |
+| Final documentation: 546 local links and six README examples passed, zero skipped | `/tmp/sdk-observability-docs-final13.log` |
+| Frozen `969f0da` original portable example passed from a fresh wheel installation, isolated imports outside checkout | `/tmp/sdk-observability-installed-import-final13.json`; `/tmp/sdk-observability-installed-example-final13.log`; `/tmp/sdk-observability-wheel-final13.log`; `/tmp/sdk-observability-install-final13.log` |
+| Frozen `969f0da`: complete regression passed, 952 tests / 1629.062s / 16 platform skips; rebuilt installed complete suite and five public scenarios passed | `/tmp/sdk-observability-full-regression-final13.log`; `/tmp/sdk-full-final13-evidence`; `/tmp/sdk-full-final13-evidence/sdk-observability-consumer-qyjjnd4h/summary.json`; its `environment.json` records the actual `/tmp/tmpekzukomp/venv/lib/python3.12/site-packages` import |
 | Integrated read-expiry, native held-publication, receipt and readonly-delivery checks: 29 passed in 37.976s; final three read-expiry checks and five public typing fixtures passed | `/tmp/sdk-final13-child-inspection.log`; `/tmp/sdk-final13-child-inspection-evidence`; `/tmp/sdk-final13-inspection-final.log`; `/tmp/sdk-final13-inspection-final-evidence`; `/tmp/sdk-observability-types-final13.log` |
 | Frozen `a876f9d`: outer 949 / one failure / 16 skips; complete nested installed suite passed, including all five public scenarios | `/tmp/sdk-observability-full-regression-final12.log`; `/tmp/sdk-full-final12-evidence`; `/tmp/sdk-full-final12-evidence/sdk-observability-consumer-_fob56cj/summary.json` |
 | Parent aborted on one read expiry despite remaining original budget and authoritative child success | `/tmp/sdk-full-final12-evidence/sdk-child-completed-delivery-evidence-vix3480r/success.json`; same run's installed success/failure witnesses are in `sdk-child-completed-delivery-evidence-zmt_6_5w` |
@@ -208,9 +235,10 @@ links or substitutes for the candidate CI artifacts.
 | Installed SDK thread-entry probe retained real SQLite BUSY before business entry | `/tmp/sdk-thread-entry-writer-original-ry7d0y38/evidence.json` |
 | Historical staged ModPort handoff passed ten checks with installed `5d9db60`; outside revised A16 | `/tmp/modport-rework-installed-final7.log` |
 
-These records span multiple candidates. Earlier focused passes do not supersede
-the latest frozen full-suite failure. Future installed and CI results must identify
-their candidate while preserving this failure history.
+These records span multiple candidates. The latest Linux complete regression
+passed on `969f0da`; earlier failures remain historical failures, including cases
+whose exact cause could not be recovered. Future CI results must identify their
+candidate while preserving this history.
 
 The `5d9db60` outer errors were an expired lease during a recovery fixture, an
 installed-suite failure, and no dead notification within the application fixture's
@@ -311,8 +339,7 @@ completion timestamps, deferred result settlement, transient SQLite errors
 misclassified as revoked authority, lost final-flush evidence, missing native
 bootstrap errors, original deadline cause, readonly receipt mutation, nested
 control deadlines, child storage replay, conservative clock receipt recovery,
-targeted execution capacity and query-size fallback. Further review verified timer-floor retention across parent/supervisor/Windows paths, signal interruption, inherited child pre-entry settlement and original startup-failure classification. Current candidate-wide verification
-remains required after those fixes.
+targeted execution capacity and query-size fallback. Further review verified timer-floor retention across parent/supervisor/Windows paths, signal interruption, inherited child pre-entry settlement and original startup-failure classification. The final review also verified that SDK-owned read expiry retries cannot extend the child window or bypass incomplete checkpoint facts. Complete Linux source and installed verification passed; native Windows and CI remain required.
 
 The independent journals retain facts; they do not authorize a new execution,
 extend an original budget or prove application consumption. Missing storage,

@@ -115,8 +115,8 @@ exhausted deadlines, cycles and exhausted capacity do not create an unlimited
 worker pool. Durable wait/request records expose incomplete registration and
 recovery rather than claiming a cross-database atomic commit.
 
-The SDK retries short SQLite writer conflicts within the captured child-call
-window. It retains the same request, child identity and deadline; applications
+The SDK retries short SQLite writer conflicts and SDK-owned per-read timeouts
+within the captured child-call window. It retains the same request, child identity and deadline; applications
 do not need a retry loop. A committed child result survives a failed response
 write, and recovery reconciles that result without invoking the handler again.
 If publication still lags when the call window ends, one bounded authoritative
