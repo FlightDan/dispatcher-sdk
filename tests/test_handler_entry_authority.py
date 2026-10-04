@@ -22,6 +22,8 @@ from dispatcher_sdk.execution_kernel.budget import (
     sample_clock,
 )
 from dispatcher_sdk.execution_kernel.runtime import Runtime
+from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 
 class HandlerEntryAuthorityTests(unittest.TestCase):
@@ -372,9 +374,14 @@ class AdmissionContentionTests(unittest.TestCase):
             return {"entered": True}
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = retained_directory("sdk-entry-admission-")
+        self.storage_evidence = StorageEvidence(self.root, self)
+        self.storage_evidence.start(include_kernel=True)
+        self.addCleanup(self.storage_evidence.stop)
+        self.addCleanup(self.storage_evidence.save)
+
+    def tearDown(self):
+        self.storage_evidence.save(phase="before-cleanup")
 
     def runtime(self, *, mode="thread", now=None, startup=.5, handler=None):
         marker = self.root / (mode + "-business")

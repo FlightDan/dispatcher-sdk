@@ -287,8 +287,17 @@ class ObservabilityApplicationTests(unittest.TestCase):
                 print('dead_bridge_evidence=' + str(path), flush=True)
 
     def test_busy_kernel_cancellation_has_a_bounded_uncommitted_error(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary)/'kernel.sqlite3'
+        from tests._storage_evidence import StorageEvidence
+
+        root = retained_directory('sdk-busy-kernel-cancellation-')
+        evidence = StorageEvidence(root, self)
+        evidence.start(include_kernel=True)
+        self.addCleanup(evidence.stop)
+        self.addCleanup(evidence.save)
+        runtime = None
+        elapsed, raw_error = None, None
+        try:
+            path = root/'kernel.sqlite3'
             runtime = Kernel.open_sqlite(path, {'quiet': quiet_handler}, isolation_mode='thread')
             command = runtime.command('quiet', execution_id='queued', idempotency_key='queued',
                 correlation_id='test', payload={'seconds': .1}, timeout_seconds=1)
@@ -298,16 +307,39 @@ class ObservabilityApplicationTests(unittest.TestCase):
                 blocker.execute('BEGIN IMMEDIATE')
                 started = time.monotonic()
                 with self.assertRaises(sqlite3.OperationalError):
-                    runtime.cancel('queued', expected_revision=queued.revision, timeout_seconds=.2)
-                self.assertLess(time.monotonic()-started, .6)
+                    try:
+                        runtime.cancel('queued', expected_revision=queued.revision, timeout_seconds=.2)
+                    except BaseException as error:
+                        elapsed = time.monotonic()-started
+                        raw_error = {'type': type(error).__name__, 'message': str(error),
+                            'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None),
+                            'sqlite_errorname': getattr(error, 'sqlite_errorname', None),
+                            'traceback': traceback.format_exc()}
+                        raise
+                evidence.save(phase='cancel-return', checkpoint={'elapsed': elapsed, 'timeout_seconds': .2,
+                    'elapsed_bound': .6, 'raw_error': raw_error, 'queued_revision': queued.revision,
+                    'kernel_in_transaction': runtime.kernel._connection.in_transaction})
+                self.assertLess(elapsed, .6)
             finally:
-                blocker.rollback()
-                blocker.close()
-            self.assertEqual(runtime.kernel.get('queued').state, 'queued')
-            try:
-                runtime.cancel('queued', expected_revision=queued.revision)
-                self.assertEqual(runtime.kernel.get('queued').state, 'cancelled')
-            finally:
+                try:
+                    blocker.rollback()
+                finally:
+                    blocker.close()
+            unchanged = runtime.kernel.get('queued')
+            self.assertEqual((unchanged.state, unchanged.revision), ('queued', queued.revision))
+            runtime.cancel('queued', expected_revision=queued.revision)
+            cancelled = runtime.kernel.get('queued')
+            self.assertEqual(cancelled.state, 'cancelled')
+            evidence.save(phase='cancel-confirmed', checkpoint={'uncommitted_state': unchanged.state,
+                'uncommitted_revision': unchanged.revision, 'cancelled_state': cancelled.state,
+                'cancelled_revision': cancelled.revision})
+        except BaseException as error:
+            evidence.save(phase='failure', checkpoint={'elapsed': elapsed, 'raw_cancellation_error': raw_error,
+                'raw_test_error': {'type': type(error).__name__, 'message': str(error),
+                    'traceback': traceback.format_exc()}})
+            raise
+        finally:
+            if runtime is not None:
                 runtime.close()
 
     def test_thread_wall_forward_exhaustion_does_not_commit_success(self):

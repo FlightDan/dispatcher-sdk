@@ -12,6 +12,7 @@ from unittest.mock import patch
 from tests._acceptance_evidence import retained_directory
 
 from dispatcher_sdk.execution_kernel import Kernel
+from dispatcher_sdk.observability import ObservationOptions
 from dispatcher_sdk.execution_kernel.errors import CASConflictError, EffectRecoveryRequiredError
 import dispatcher_sdk.execution_kernel.runtime as runtime_module
 
@@ -293,6 +294,10 @@ class CancelAdmissionTests(unittest.TestCase):
         self.assertIs(caught.exception, raw)
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.runtime.kernel.get('parent').state, 'cancelled')
+        local = self.runtime.observe('parent')['local_cancellation_diagnostics']
+        self.assertFalse(local['persisted'])
+        self.assertEqual(local['notes'][-1]['details']['authority'], 'unknown')
+        self.assertEqual(local['notes'][-1]['details']['message'], str(raw))
 
     def test_retained_transaction_after_busy_is_not_retried(self):
         raw = self.actual_busy()
@@ -330,8 +335,84 @@ class CancelAdmissionTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 self.cancel(timeout=.12)
         self.assertEqual(self.calls, [])
-        self.assertIn('failure', stages)
+        self.assertEqual(stages, [])
+        local = self.runtime.observe('parent')['local_cancellation_diagnostics']
+        self.assertEqual([note['phase'] for note in local['notes']],
+                         ['cancellation_requested', 'cancellation_failure'])
+        self.assertTrue(all(not note['persisted'] for note in local['notes']))
+        self.assertTrue(all(note['request_receipt_id'] == 'receipt' and note['request_persisted']
+                            for note in local['notes']))
         self.assertEqual(self.runtime.kernel.get('parent').state, 'running')
+
+    def test_failed_cancel_local_diagnostics_are_bounded_without_journal_io(self):
+        options = ObservationOptions(queue_items=2, queue_bytes=1200, query_bytes=4096)
+        with Kernel.open_sqlite(self.root/'bounded.sqlite3', {'unused': unused},
+                               isolation_mode='thread', observation_options=options) as runtime:
+            queued = runtime.submit(runtime.command('unused', execution_id='bounded',
+                idempotency_key='bounded', correlation_id='bounded', timeout_seconds=5, payload={}))
+            raw = RuntimeError('original failure ' + 'x' * 16000)
+            with patch.object(runtime.kernel, 'cancel', side_effect=raw), \
+                    patch.object(runtime, '_diagnostic_note') as notes, \
+                    patch.object(runtime_module.ObservationJournal, 'phase') as phases:
+                for _ in range(3):
+                    with self.assertRaises(RuntimeError) as caught:
+                        runtime.cancel('bounded', expected_revision=queued.revision, timeout_seconds=.2)
+                    self.assertIs(caught.exception, raw)
+                notes.assert_not_called()
+                phases.assert_not_called()
+            with patch.object(runtime, 'observation_journal', None), \
+                    patch.object(runtime_module.sqlite3, 'connect', side_effect=AssertionError('unexpected query SQL')):
+                report = runtime.observe('bounded')
+            self.assertFalse(report['complete'])
+            local = report['local_cancellation_diagnostics']
+            self.assertLessEqual(len(local['notes']), 2)
+            self.assertTrue(local['loss_observed'])
+            self.assertEqual(local['loss_scope'], 'runtime')
+            self.assertLessEqual(len(json.dumps(report, ensure_ascii=False).encode('utf-8')), options.query_bytes)
+            self.assertEqual(runtime.kernel.get('bounded').revision, queued.revision)
+            self.evidence['records'].append({'scenario': 'bounded_local_failure_no_storage', 'report': report})
+
+    def test_failed_cancel_historical_filters_and_restart_do_not_claim_durability(self):
+        path = self.root/'historical.sqlite3'
+        with Kernel.open_sqlite(path, {'unused': unused}, isolation_mode='thread') as runtime:
+            queued = runtime.submit(runtime.command('unused', execution_id='historical',
+                idempotency_key='historical', correlation_id='historical', timeout_seconds=5, payload={}))
+            raw = RuntimeError('control operation raised before returning')
+            with patch.object(runtime.kernel, 'cancel', side_effect=raw):
+                with self.assertRaises(RuntimeError) as caught:
+                    runtime.cancel('historical', expected_revision=queued.revision)
+                self.assertIs(caught.exception, raw)
+            lease = runtime.kernel.claim_and_start('manual-owner', execution_id='historical')
+            self.assertGreater(lease.attempt, queued.attempt)
+            for filters in ({'attempt': queued.attempt}, {'fence': queued.fence},
+                            {'attempt': queued.attempt, 'fence': queued.fence}):
+                report = runtime.observe('historical', **filters)
+                local = report['local_cancellation_diagnostics']
+                self.assertEqual(len(local['notes']), 2)
+                self.assertTrue(all(note['identity'] == {'execution_id': 'historical',
+                    'attempt': queued.attempt, 'fence': queued.fence} for note in local['notes']))
+                self.assertTrue(all(note['identity_scope'] == 'kernel_execution' and
+                                    note['workflow_metadata'] == 'unknown' for note in local['notes']))
+                self.evidence['records'].append({'scenario': 'historical_local_failure',
+                    'filters': filters, 'local': local})
+            self.assertNotIn('local_cancellation_diagnostics', runtime.observe('historical'))
+        with Kernel.open_sqlite(path, {'unused': unused}, isolation_mode='thread') as reopened:
+            self.assertNotIn('local_cancellation_diagnostics',
+                             reopened.observe('historical', attempt=queued.attempt, fence=queued.fence))
+            self.assertEqual(reopened.kernel.get('historical').attempt, lease.attempt)
+
+    def test_secondary_diagnostic_rendering_cannot_replace_original_error(self):
+        class Unrenderable(RuntimeError):
+            def __str__(self):
+                raise ValueError('secondary rendering failure')
+        raw = Unrenderable()
+        with patch.object(self.runtime.kernel, 'cancel', side_effect=raw):
+            with self.assertRaises(Unrenderable) as caught:
+                self.cancel()
+        self.assertIs(caught.exception, raw)
+        local = self.runtime.observe('parent')['local_cancellation_diagnostics']
+        self.assertTrue(local['loss_observed'])
+        self.assertEqual(local['loss_scope'], 'runtime')
 
     def test_real_kernel_lock_admission_release_uses_the_original_deadline(self):
         ready = threading.Event()

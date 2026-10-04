@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections import deque
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -10,13 +11,104 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import threading
 from ..storage_connection import connect as storage_connect
 import time
 from typing import Any
 import uuid
 
 from ..durability import Durability, configure_sqlite_connection, validate_durability
+from .._inspection import InspectionBudgetExceeded
 from .contracts import ExecutionSnapshot, _json_value
+
+
+class _LocalCancellationDiagnostics:
+    """Bounded facts from raised control operations, with no storage authority."""
+
+    def __init__(self, options):
+        self._items = min(64, options.queue_items)
+        self._bytes = min(options.queue_bytes, options.query_bytes // 2, 64 * 4096)
+        self._notes = deque()
+        self._used = 0
+        self._lost = False
+        self._lock = threading.Lock()
+
+    def capture(self, identity, stages, receipt_id):
+        # This path must not wait on readers or mask the original exception.
+        if not self._lock.acquire(blocking=False):
+            self._lost = True
+            return
+        try:
+            for stage, details, captured_at in stages:
+                bounded, truncated = {}, False
+                for key, value in details.items():
+                    if isinstance(value, str) and len(value) > 256:
+                        value, truncated = value[:256], True
+                    bounded[key] = value
+                note = {"identity": {"execution_id": identity.execution_id,
+                    "attempt": identity.attempt, "fence": identity.fence},
+                    "identity_scope": "kernel_execution", "workflow_metadata": "unknown",
+                    "phase": "cancellation_" + stage,
+                    "captured_at": captured_at, "details": bounded, "persisted": False,
+                    "request_receipt_id": receipt_id, "request_persisted": True if receipt_id is not None else None,
+                    "details_truncated": truncated}
+                encoded = json.dumps(note, ensure_ascii=False, allow_nan=False)
+                size = len(encoded.encode("utf-8"))
+                self._lost = self._lost or truncated
+                if size > min(4096, self._bytes):
+                    self._lost = True
+                    continue
+                while self._notes and (len(self._notes) >= self._items or self._used + size > self._bytes):
+                    _, _, previous_size = self._notes.popleft()
+                    self._used -= previous_size
+                    self._lost = True
+                key = (identity.execution_id, identity.attempt, identity.fence)
+                self._notes.append((key, encoded, size))
+                self._used += size
+        except Exception:
+            self._lost = True
+        finally:
+            self._lock.release()
+
+    def capture_raised_operation(self, identity, stages, receipt_id, error):
+        try:
+            failure = ("failure", {"phase": "kernel_cancel", "operation_raised": True,
+                "authority": "unknown", "type": type(error).__name__, "message": str(error),
+                "sqlite_errorcode": getattr(error, "sqlite_errorcode", None)}, time.time())
+            self.capture(identity, [*stages, failure], receipt_id)
+        except BaseException:
+            # Even error rendering is best effort; the caller re-raises the
+            # exact original control exception, never this secondary failure.
+            self._lost = True
+
+    def view(self, execution_id, *, attempt=None, fence=None, budget):
+        try:
+            budget.check()
+        except InspectionBudgetExceeded:
+            return {"view": "local", "persisted": False, "complete": False,
+                "notes": [], "timed_out": True, "unknown_reason": "local_diagnostics_query_timeout"}
+        if not self._lock.acquire(blocking=False):
+            return {"view": "local", "persisted": False, "complete": False,
+                "notes": [], "unknown_reason": "local_diagnostics_busy"}
+        try:
+            encoded = [text for key, text, _ in self._notes if key[0] == execution_id
+                and (attempt is None or key[1] == attempt) and (fence is None or key[2] == fence)]
+            lost = self._lost
+        finally:
+            self._lock.release()
+        if not encoded and not lost:
+            return None
+        notes = []
+        try:
+            for text in encoded:
+                budget.check()
+                notes.append(json.loads(text))
+        except InspectionBudgetExceeded:
+            return {"view": "local", "persisted": False, "complete": False,
+                "notes": [], "timed_out": True, "unknown_reason": "local_diagnostics_query_timeout"}
+        return {"view": "local", "persisted": False, "complete": False,
+            "notes": notes, "loss_observed": lost, "loss_scope": "runtime",
+            "unknown_reason": "cancellation_diagnostics_not_persisted"}
 
 
 CANCELLATION_SCHEMA_VERSION = 1

@@ -24,6 +24,13 @@ execution or replaces revision/fence checks.
 - Phase receipts are appended only after the corresponding fact is observed.
   Missing receipts remain unknown. Kernel cancellation, process termination,
   provider calls and journal writes cannot be one atomic transaction.
+- When the Kernel cancellation operation raises, Runtime preserves that exact
+  exception and captures bounded local facts without another synchronous
+  diagnostic write. `observe` exposes them as `local_cancellation_diagnostics`,
+  separately from durable phase receipts. They have no authority and do not
+  survive Runtime restart. A request receipt, if already persisted, remains
+  durable; absent failure receipts do not prove that the control operation made
+  no commit. The caller must inspect canonical authority before a new action.
 - Failure to record evidence after cancellation cannot prevent process cleanup.
   The Runtime attempts cleanup and reports the evidence-write failure; callers
   must re-read authority before retrying. Failure to persist the initial request

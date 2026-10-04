@@ -1,12 +1,19 @@
 """Real local worker interruption with a persistent fake remote provider."""
 
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from contextlib import closing
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import tempfile
+import sqlite3
+import sys
+import threading
 import time
+import traceback
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +21,11 @@ from dispatcher_sdk.execution_kernel import (
     Runtime, SandboxHandler, SandboxObservation, SandboxOutcomeUnknown,
     SandboxSpec, EffectRecoveryRequiredError, RetryPolicy, SandboxJournal,
 )
+import dispatcher_sdk
+from dispatcher_sdk.execution_kernel import runtime as runtime_module
+from dispatcher_sdk.execution_kernel import _windows_runtime as windows_runtime
+from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 
 @dataclass(frozen=True)
@@ -82,10 +94,145 @@ class CountingFileBackend(FileBackend):
 @unittest.skipUnless(os.name in {"posix", "nt"}, "requires native process isolation")
 class SandboxRuntimeTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = retained_directory("sdk-sandbox-runtime-")
+        self.storage_evidence = StorageEvidence(self.root, self)
+        self.storage_evidence.start()
+        self.addCleanup(self.storage_evidence.stop)
+        self.trace = deque(maxlen=256)
+        self.trace_lock = threading.Lock()
+        original_initialize = Runtime.__init__
+
+        def initialize(instance, *args, **kwargs):
+            original_initialize(instance, *args, **kwargs)
+            for target, names in ((instance, ("run_once", "recover_sandboxes", "recover_completions", "close")),
+                    (instance.kernel, ("require_effect_recovery", "_require_effect_recovery", "_complete_sdk_result", "resolve_effect"))):
+                for name in names:
+                    original = getattr(target, name)
+                    current = patch.object(target, name, self.observe_call(name, original,
+                        runtime=instance if target is instance and name == "run_once" else None))
+                    current.start()
+                    self.addCleanup(current.stop)
+            self.record({"operation": "runtime_initialized", "path": instance.kernel.db_path,
+                "isolation_mode": instance.isolation_mode,
+                "handlers": [{"handler_id": handler.handler_id, "journal_path": handler.journal_path,
+                    "poll_interval": handler.poll_interval, "operation_timeout": handler.operation_timeout,
+                    "backend": {key: getattr(handler.backend, key, None) for key in ("name", "revision", "mode", "root")}}
+                    for handler in instance.handlers.values() if isinstance(handler, SandboxHandler)]})
+
+        current = patch.object(Runtime, "__init__", initialize)
+        current.start()
+        self.addCleanup(current.stop)
+        backend = windows_runtime if os.name == "nt" else runtime_module
+        name = "invoke_windows_handler" if os.name == "nt" else "invoke_process_handler"
+        original_invoke = getattr(backend, name)
+
+        def invoke(**kwargs):
+            for label in ("on_started", "on_finished", "on_entered", "on_phase", "on_cleanup_confirmed"):
+                if kwargs.get(label) is not None:
+                    kwargs[label] = self.observe_call(label, kwargs[label])
+            return self.observe_call("native_invoke", original_invoke)(**kwargs)
+
+        current = patch.object(backend, name, invoke)
+        current.start()
+        self.addCleanup(current.stop)
+        self.addCleanup(self.save_evidence)
+        self.addCleanup(self.storage_evidence.save)
         self.spec = SandboxSpec("fixture-image", "print('hello')", ("/usr/bin/python3",), "/tmp")
+
+    def tearDown(self):
+        self.storage_evidence.save(phase="before_cleanup")
+        self.save_evidence(phase="before_cleanup")
+
+    @staticmethod
+    def evidence_value(value):
+        if hasattr(value, "to_dict"):
+            return SandboxRuntimeTests.evidence_value(value.to_dict())
+        if isinstance(value, dict):
+            return {str(key): SandboxRuntimeTests.evidence_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [SandboxRuntimeTests.evidence_value(item) for item in value]
+        if isinstance(value, (str, int, float, bool, type(None))):
+            return value
+        return {"type": type(value).__name__, "pid": getattr(value, "pid", None)}
+
+    @staticmethod
+    def raw_error(error):
+        return {"type": type(error).__name__, "message": str(error), "repr": repr(error),
+            "errno": getattr(error, "errno", None), "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+            "sqlite_errorname": getattr(error, "sqlite_errorname", None), "traceback": traceback.format_exc()}
+
+    def record(self, event):
+        with self.trace_lock:
+            self.trace.append(event)
+
+    def observe_call(self, label, original, *, runtime=None):
+        def observed(*args, **kwargs):
+            event = {"operation": label, "began": time.monotonic(), "thread": threading.current_thread().name,
+                "args": self.evidence_value(args), "kwargs": self.evidence_value(kwargs)}
+            self.record(event)
+            try:
+                result = original(*args, **kwargs)
+            except BaseException as error:
+                failure = self.raw_error(error)
+                with self.trace_lock:
+                    event["error"] = failure
+                raise
+            else:
+                returned = self.evidence_value(result)
+                facts = None if runtime is None else {"settlement_error": runtime._settlement_error,
+                    "observation_error": runtime._observation_error,
+                    "original_pending": [{"identity": entry.identity, "payload": entry.payload,
+                        "evidence": entry.evidence} for entry in runtime._pending_settlements.entries()]}
+                with self.trace_lock:
+                    event["returned"] = returned
+                    if facts is not None:
+                        event["runtime_at_return"] = facts
+                return result
+            finally:
+                with self.trace_lock:
+                    event["elapsed"] = time.monotonic() - event["began"]
+        return observed
+
+    def save_evidence(self, *, phase="cleanup"):
+        with self.trace_lock:
+            events = deepcopy(list(self.trace))
+        report = {"test": self.id(), "interpreter": sys.executable, "sdk_import": dispatcher_sdk.__file__,
+            "runtime_import": runtime_module.__file__, "phase": phase, "events": events, "markers": {}, "storage": {}}
+        for name in ("created", "alive", "started", "collected", "terminated", "reject_cleanup", "allow_start", "business-calls.jsonl"):
+            path = self.root / name
+            try:
+                with path.open("rb") as stream:
+                    data = stream.read(65537)
+                report["markers"][name] = {"path": str(path), "contents": data[:65536].decode("utf-8", errors="replace"),
+                    "truncated": len(data) > 65536}
+            except OSError as error:
+                report["markers"][name] = {"path": str(path), "read_error": self.raw_error(error)}
+        allowed = {"kernel_executions", "kernel_effects", "kernel_effect_events", "kernel_execution_limits", "kernel_events",
+            "sandbox_operations", "sandbox_history", "sandbox_meta", "settlement_records", "settlement_notes"}
+        for path in self.root.iterdir():
+            if path.suffix not in {".db", ".sqlite3"}:
+                continue
+            snapshot = {"path": str(path), "tables": {}}
+            report["storage"][path.name] = snapshot
+            deadline = time.monotonic() + .2
+            try:
+                with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0)) as connection:
+                    connection.row_factory = sqlite3.Row
+                    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                    tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name LIMIT 32").fetchall()
+                    for table in (row[0] for row in tables if row[0] in allowed):
+                        sql = f"SELECT * FROM {table} LIMIT 65"
+                        try:
+                            rows = connection.execute(sql).fetchall()
+                            snapshot["tables"][table] = {"sql": sql, "rows": [dict(row) for row in rows[:64]],
+                                "truncated": len(rows) > 64}
+                        except sqlite3.Error as error:
+                            snapshot["tables"][table] = {"sql": sql, "read_error": self.raw_error(error)}
+            except sqlite3.Error as error:
+                snapshot["read_error"] = self.raw_error(error)
+        path = self.root / ("evidence.json" if phase == "cleanup" else "sandbox-before-cleanup.json")
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print("sandbox_runtime_evidence=" + str(path), flush=True)
 
     def runtime(self, mode="success", timeout=10):
         handler = SandboxHandler(FileBackend(str(self.root), mode), str(self.root / "sandbox.db"),
@@ -178,6 +325,13 @@ class SandboxRuntimeTests(unittest.TestCase):
         handler = SandboxHandler(CountingFileBackend(str(self.root)), str(self.root / "sandbox.db"),
             poll_interval=.01, operation_timeout=.2)
         runtime = Runtime(str(self.root / "kernel.db"), {handler.handler_id: handler})
+        close_verified = False
+
+        def close_owned_runtime():
+            if not close_verified:
+                runtime.close()
+
+        self.addCleanup(close_owned_runtime)
         command = runtime.command(handler.handler_id, execution_id="restart-cleanup", idempotency_key="restart-cleanup",
             correlation_id="run", timeout_seconds=10, payload=self.spec.to_payload())
         runtime.submit(command)
@@ -190,6 +344,7 @@ class SandboxRuntimeTests(unittest.TestCase):
         self.assertEqual(original["result"]["output"]["artifact"], "retained")
         with self.assertRaises(SandboxOutcomeUnknown):
             runtime.close()
+        close_verified = True
         (self.root / "reject_cleanup").unlink()
         reopened_handler = SandboxHandler(CountingFileBackend(str(self.root)), str(self.root / "sandbox.db"),
             poll_interval=.01, operation_timeout=.2)

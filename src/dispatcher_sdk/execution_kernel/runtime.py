@@ -71,7 +71,7 @@ from .sqlite import SQLiteKernel
 from .sandbox import SandboxHandler, SandboxJournal
 from .sandbox_contracts import SandboxOutcomeUnknown
 from ._sandbox_registry import register_journals, journal_paths
-from .cancellation import CancellationJournal
+from .cancellation import CancellationJournal, _LocalCancellationDiagnostics
 from .settlement import SettlementJournal, merge_diagnostic_notes
 from .pending_settlements import PendingSettlements, SettlementAdmission
 
@@ -190,6 +190,7 @@ class InProcessRuntime:
         self._settlement_journal: SettlementJournal | None = None
         self._settlement_error: str | None = None
         self._diagnostic_errors: dict[str, str] = {}
+        self._local_cancellation_diagnostics = _LocalCancellationDiagnostics(self.observation_options)
         self._settlement_thread: threading.Thread | None = None
         self._settlement_lock = threading.Lock()
         self._settlement_inflight_lock = threading.Lock()
@@ -697,12 +698,15 @@ class InProcessRuntime:
     def observe(self, execution_id: str, *, timeout: float | None = None,
                 attempt: int | None = None, fence: int | None = None) -> dict[str, Any]:
         """Query a bounded persisted view without driving or reaping execution."""
-        if self.observation_journal is None:
-            return {"execution_id": execution_id, "view": "persisted", "complete": False,
-                "unknown_reason": "observation_unavailable", "error": self._observation_error}
         duration = self.observation_options.query_timeout if timeout is None else timeout
         from .._inspection import InspectionBudget
         budget = InspectionBudget(duration, None)
+        if self.observation_journal is None:
+            report = {"execution_id": execution_id, "view": "persisted", "complete": False,
+                "unknown_reason": "observation_unavailable", "error": self._observation_error}
+            self._include_local_cancellation_diagnostics(report, execution_id,
+                attempt=attempt, fence=fence, budget=budget)
+            return ObservationJournal._bound_without_storage(report, options=self.observation_options, budget=budget)
         report = {"execution_id": execution_id, "view": "persisted", "complete": False,
             "current": False, "unknown_reason": "observation_query_unavailable"}
         connection = None
@@ -796,7 +800,22 @@ class InProcessRuntime:
                 unknown_reason="original_result_not_durably_persisted")
         if report.get("collection_gaps", 0) > 0:
             report.update(complete=False, unknown_reason="telemetry_collection_incomplete")
-        return report if reader is None else reader._bound_report(report, budget=budget)
+        self._include_local_cancellation_diagnostics(report, execution_id, attempt=attempt, fence=fence, budget=budget)
+        return (ObservationJournal._bound_without_storage(report, options=self.observation_options, budget=budget)
+                if reader is None else reader._bound_report(report, budget=budget))
+
+    def _include_local_cancellation_diagnostics(self, report, execution_id, *, attempt, fence, budget):
+        identity = report.get("identity") or {}
+        if attempt is None and fence is None:
+            identity = report.get("execution") or identity
+        elif ((attempt is not None and identity.get("attempt") != attempt)
+                or (fence is not None and identity.get("fence") != fence)):
+            identity = {}
+        local = self._local_cancellation_diagnostics.view(execution_id,
+            attempt=identity.get("attempt") if attempt is None else attempt,
+            fence=identity.get("fence") if fence is None else fence, budget=budget)
+        if local is not None:
+            report.update(complete=False, local_cancellation_diagnostics=local)
 
     def observation_events(self, execution_id: str, *, after: int = 0,
                            limit: int | None = None, timeout: float | None = None):
@@ -1015,10 +1034,11 @@ class InProcessRuntime:
                 cancelled = None
                 recovery_error = exc
             except BaseException as exc:
-                for stage, evidence, captured_at in pending_evidence:
-                    record(stage, evidence, captured_at)
-                pending_evidence.clear()
-                record("failure", {"phase": "kernel_cancel", "type": type(exc).__name__, "message": str(exc)})
+                # A raised operation may even follow a commit. Preserve its
+                # facts without inferring authority or opening new diagnostic
+                # write windows after the original control deadline.
+                self._local_cancellation_diagnostics.capture_raised_operation(
+                    cancellation_identity, pending_evidence, receipt_id, exc)
                 raise
             authority = cancelled if cancelled is not None else self.kernel.get(execution_id)
             pending_evidence.append(("authority_revoked", {"state": "confirmed",

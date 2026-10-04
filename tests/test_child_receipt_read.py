@@ -8,6 +8,7 @@ from unittest.mock import patch
 import unittest
 
 from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError, BudgetEnvelope
+from dispatcher_sdk.execution_kernel import children as children_module
 from dispatcher_sdk.execution_kernel.children import _RetryWindow
 from dispatcher_sdk.execution_kernel.settlement import SettlementBusyError
 from tests import test_child_clock_checkpoint as checkpoint_fixture
@@ -76,8 +77,19 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
         original = BudgetEnvelope.from_dict(json.loads(row['budget_json']))
         writer = self.exclusive_writer()
         before = time.monotonic()
+        actual_windows = []
+        actual_deadlines_at_call = []
+        original_window_factory = children_module._RetryWindow
+
+        def observe_window(*args, **kwargs):
+            actual = original_window_factory(*args, **kwargs)
+            actual_windows.append(actual)
+            actual_deadlines_at_call.append(actual.deadline)
+            return actual
+
         try:
-            with patch.object(self.children, '_completed_result') as rescue:
+            with patch.object(self.children, '_completed_result') as rescue, \
+                    patch.object(children_module, '_RetryWindow', side_effect=observe_window):
                 remaining_at_call = window.remaining()
                 window_at_call = window.envelope.to_dict()
                 deadline_at_call = window.deadline
@@ -87,24 +99,35 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
                 except Exception as error:
                     caught, raw_traceback = error, traceback.format_exc()
                 elapsed = time.monotonic() - before
-                remaining_at_end = window.remaining()
+                # _await reconstructs the authoritative wait window from the
+                # persisted envelope; the helper returned by short_row is a
+                # separate local timer and can differ by a coarse host tick.
+                actual_window = actual_windows[0] if len(actual_windows) == 1 else None
+                remaining_at_end = None if actual_window is None else actual_window.remaining()
+                setup_window_remaining_at_end = window.remaining()
                 row_budget_at_end = BudgetEnvelope.from_dict(json.loads(row['budget_json']))
                 self.evidence['records'].append({'scenario': 'persistent_receipt_contention',
                     'elapsed': elapsed, 'began': before,
                     'remaining_at_call': remaining_at_call, 'remaining_at_end': remaining_at_end,
-                    'original_deadline_at_call': deadline_at_call,
+                    'setup_window_remaining_at_end': setup_window_remaining_at_end,
+                    'setup_deadline_at_call': deadline_at_call,
+                    'actual_deadlines_at_call': actual_deadlines_at_call,
                     'error_type': None if caught is None else type(caught).__name__,
                     'error': None if caught is None else str(caught), 'traceback': raw_traceback,
                     'sqlite_errorcode': getattr(caught, 'sqlite_errorcode', None), 'returned': returned,
                     'completed_result_rescue_calls': rescue.call_count,
                     'writer_in_transaction': writer.in_transaction,
-                    'original_budget': original.to_dict(), 'window_at_call': window_at_call,
-                    'window_at_end': window.envelope.to_dict(), 'row_budget_at_end': row_budget_at_end.to_dict()})
+                    'original_budget': original.to_dict(), 'setup_window_at_call': window_at_call,
+                    'setup_window_at_end': window.envelope.to_dict(),
+                    'actual_window_at_end': None if actual_window is None else actual_window.envelope.to_dict(),
+                    'row_budget_at_end': row_budget_at_end.to_dict()})
                 # Setup already spent part of the original .3-second window.
                 # Exhaustion, rather than a new minimum wait, is the contract.
                 self.assertIsInstance(caught, SettlementBusyError)
                 rescue.assert_not_called()
+                self.assertEqual(len(actual_windows), 1, raw_traceback)
                 self.assertEqual(remaining_at_end, 0)
+                self.assertEqual(actual_window.envelope.constraints, original.constraints)
                 self.assertEqual(window.envelope.constraints, original.constraints)
                 self.assertEqual(row_budget_at_end.constraints, original.constraints)
                 self.assertTrue(writer.in_transaction)

@@ -4,9 +4,7 @@ from __future__ import annotations
 from contextlib import closing, contextmanager
 from copy import deepcopy
 import json
-from pathlib import Path
 import sqlite3
-import tempfile
 import threading
 import time
 import unittest
@@ -17,6 +15,8 @@ from dispatcher_sdk.observability import (
     ActivityRecorder, ObservationError, ObservationIdentity, ObservationJournal,
     ObservationOptions, StallPolicy,
 )
+from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 
 class _Clock:
@@ -109,9 +109,11 @@ class ObservationJournalTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM obs_current WHERE execution_id='child-bookkeeping'").fetchone()[0])
 
     def setUp(self):
-        root = tempfile.TemporaryDirectory()
-        self.addCleanup(root.cleanup)
-        self.root = Path(root.name)
+        self.root = retained_directory("sdk-observation-journal-")
+        self.storage_evidence = StorageEvidence(self.root, self)
+        self.storage_evidence.start()
+        self.addCleanup(self.storage_evidence.stop)
+        self.addCleanup(self.storage_evidence.save)
         self.clock = _Clock()
         self.options = ObservationOptions(tail_bytes=16, write_timeout=.03)
         self.journal = self.open_journal()
@@ -542,8 +544,6 @@ class ObservationJournalTests(unittest.TestCase):
         self.assertFalse(recorder.close(timeout=.1)["final_flush_persisted"])
 
     def test_close_reuses_flusher_and_bounds_all_resource_waits(self):
-        recorder = self.recorder(start=True)
-        flusher = recorder._thread
         class SlowObserver:
             def __init__(self):
                 self._stop = threading.Event()
@@ -553,15 +553,105 @@ class ObservationJournalTests(unittest.TestCase):
             def close(self, *, timeout):
                 time.sleep(timeout)
                 return {"unfinished_collector": True}
-        recorder._process_observer = SlowObserver()
-        recorder.report_bytes("stdout", b"last")
-        started = time.monotonic()
-        result = recorder.close(timeout=.4)
-        self.assertLess(time.monotonic() - started, .44)
-        self.assertIs(recorder._thread, flusher)
-        self.assertTrue(result["final_flush_persisted"])
-        self.assertTrue(result["source_closed"])
-        self.assertTrue(result["process_observer"]["unfinished_collector"])
+
+        for pressure in (False, True):
+            with self.subTest(competing_writer=pressure):
+                recorder = self.recorder(start=True)
+                flusher = recorder._thread
+                recorder._process_observer = SlowObserver()
+                recorder.report_bytes("stdout", b"last")
+                durable, locked, release = (threading.Event() for _ in range(3))
+                stages, writer_errors = [], []
+                original_write = self.journal.write_batch
+                original_close_source = self.journal.close_source
+
+                def hold_writer():
+                    try:
+                        if not durable.wait(2):
+                            return
+                        with closing(sqlite3.connect(self.journal.path, timeout=.03)) as connection:
+                            connection.execute("BEGIN IMMEDIATE")
+                            locked.set()
+                            release.wait(2)
+                            connection.rollback()
+                    except Exception as error:
+                        writer_errors.append(repr(error))
+
+                def write(*args, **kwargs):
+                    stages.append({"stage": "write", "at": time.monotonic(), "sequence": kwargs["sequence"]})
+                    result = original_write(*args, **kwargs)
+                    stages.append({"stage": "write_confirmed", "at": time.monotonic()})
+                    if pressure:
+                        durable.set()
+                        if not locked.wait(2):
+                            raise RuntimeError("competing SQLite writer did not acquire its lock")
+                    return result
+
+                def close_source(*args, **kwargs):
+                    stages.append({"stage": "source_close", "at": time.monotonic()})
+                    return original_close_source(*args, **kwargs)
+
+                writer = threading.Thread(target=hold_writer, name="observation-close-competing-writer") if pressure else None
+                if writer is not None:
+                    writer.start()
+                with patch.object(self.journal, "write_batch", write), patch.object(self.journal, "close_source", close_source):
+                    try:
+                        started = time.monotonic()
+                        result = deepcopy(recorder.close(timeout=.4))
+                        elapsed = time.monotonic() - started
+                        original_deadline = recorder._close_deadline
+                        self.storage_evidence.save(phase="close-pressured" if pressure else "close-nominal",
+                            checkpoint={"receipt": result, "elapsed": elapsed, "original_deadline": original_deadline,
+                                "close_complete": recorder._close_complete.is_set(), "flusher_alive": flusher.is_alive(),
+                                "stages": list(stages)})
+                        self.assertLess(elapsed, .44)
+                        self.assertIs(recorder._thread, flusher)
+                        if pressure:
+                            self.assertFalse(result["source_closed"], result)
+                        if result["state"] == "persisted":
+                            self.assertTrue(result["final_flush_persisted"], result)
+                            self.assertTrue(result["source_closed"], result)
+                        else:
+                            self.assertFalse(result["source_closed"], result)
+                    finally:
+                        release.set()
+                        if writer is not None:
+                            writer.join(2)
+                        # This drains ownership only. It cannot renew close's
+                        # deadline, replay a batch, or upgrade its returned receipt.
+                        drained = recorder._join_owned_workers(time.monotonic() + 2)
+                self.assertEqual(writer_errors, [])
+                if writer is not None:
+                    self.assertFalse(writer.is_alive())
+                    self.assertTrue(locked.is_set(), stages)
+                self.assertEqual(drained["state"], "closed", drained)
+                self.assertTrue(recorder._close_complete.is_set())
+                self.assertEqual(recorder._close_deadline, original_deadline)
+                self.assertIs(recorder._thread, flusher)
+                completed = deepcopy(recorder._close_result)
+                with closing(sqlite3.connect(self.journal.path)) as connection:
+                    row = connection.execute("SELECT state,sequence,metrics_json FROM obs_sources WHERE source_id=?",
+                                             (recorder.source_id,)).fetchone()
+                self.storage_evidence.save(phase="drained-pressured" if pressure else "drained-nominal",
+                    checkpoint={"original_receipt": result, "completed_receipt": completed, "ownership": drained,
+                        "source_row": row, "original_deadline": original_deadline, "stages": stages})
+                if completed["final_flush_persisted"]:
+                    self.assertEqual(json.loads(row[2])["stdout_bytes"]["count"], 4)
+                if completed["source_closed"]:
+                    self.assertTrue(completed["final_flush_persisted"], completed)
+                    self.assertEqual(row[0], "closed")
+                elif row is not None:
+                    self.assertEqual(row[0], "active")
+                if "process_observer" in completed:
+                    self.assertTrue(completed["process_observer"]["unfinished_collector"])
+                # Native Windows rename must succeed after actual handles are
+                # released; a green lifetime receipt alone does not prove that.
+                renamed = self.journal.path.with_suffix(".released")
+                self.journal.path.rename(renamed)
+                renamed.rename(self.journal.path)
+                self.storage_evidence.save(phase="released-pressured" if pressure else "released-nominal",
+                    checkpoint={"original_receipt": result, "completed_receipt": completed,
+                        "ownership": drained, "rename_roundtrip": True, "source_row": row})
 
 
 if __name__ == "__main__":

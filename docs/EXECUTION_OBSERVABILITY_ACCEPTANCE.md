@@ -222,6 +222,70 @@ with isolated imports (`/tmp/sdk-journal-admission-public310.log`,
 `/tmp/sdk-journal-admission-example310.log`). Independent review found no remaining
 scoped blocker; the next complete matrix remains required.
 
+Candidate `c152c07ca366a58d51b0e8adfc129a9cdc5b99ae` completed
+[run 37197108556](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37197108556):
+all eight Linux environments and native Windows ARM64 Python 3.12 passed;
+seven Windows environments failed. History scanning passed separately. Outer
+suites ran 972 cases and installed suites 967, with their original 900-second
+installed-suite timeout. The Linux suites retained exactly 17 Windows-only skips;
+Windows retained 55 inapplicable skips without skipping mandatory native cases.
+All eight Windows environments passed five installed public scenarios and four
+actual post-close SDK database-release probes. Actual venv launcher/worker and
+`pythonw` cases ran on every Windows environment. This is partial evidence,
+not acceptance of the full matrix. Raw inventories and evidence are retained at
+`/tmp/sdk-ci-audit-summary-37197108556.json`,
+`/tmp/sdk-ci-audit-windows-37197108556.json` and
+`/tmp/sdk-ci-audit-evidence-37197108556`.
+
+The failures include inherited-parent child readiness/terminal publication,
+observation initialization and final source-close timing, a missing active policy
+projection, handler completion timing, sandbox deferred completion/readiness,
+and cancellation/child receipt elapsed bounds. Historical temporary databases
+were deleted in several cases, so those exact native causes remain unknown.
+Affected fixtures now retain original SQLite operations, worker stacks, process
+entry/cleanup events and settlement facts, including failure paths. Required
+deadlines and authority assertions are unchanged. A child-receipt fixture now
+checks the actual RetryWindow used by the operation rather than a separately
+constructed timer with a different coarse-clock projection.
+
+A real busy-Kernel cancellation probe separately confirmed four synchronous
+diagnostic writes after the original 0.2-second control deadline, increasing
+caller return to 0.321 seconds. Raised control operations now capture bounded
+local facts without fresh diagnostic write windows, preserve the exact original
+exception and leave authority unknown even if a commit preceded the exception.
+Fifteen real Python 3.10 cancellation tests passed in 9.260 seconds, including
+real commit-then-error, no diagnostic SQL, bounded loss, historical filters and
+restart-locality. Logs are `/tmp/sdk-cancel-original-deadline-trace.py`,
+`/tmp/sdk-cancel-original-deadline-trace-x_942qqt/cancel-return.json` and
+`/tmp/sdk-local-cancel-new-contracts310.log`. This does not explain every native
+elapsed failure or establish the next candidate's matrix acceptance.
+
+A real final-batch/sidecar-writer probe confirmed that a bounded recorder close
+can persist its final batch while source close remains pending. The close fixture
+now distinguishes nominal completion from that pending receipt and separately
+checks ownership drain after releasing the writer; it never renews the original
+close deadline or upgrades a degraded receipt. Evidence is
+`/tmp/sdk-recorder-close-lock-window-evidence.json`. A new evidence-only Kernel
+connection tracer also exposed a local fixture deadlock: copying events under
+its lock triggered a connection destructor which reentered that lock. Its
+snapshot now permits reentry and copies outside the lock. The interrupted local
+probe remains failed, with its causal stack retained at
+`/tmp/sdk-admission-cleanup-stack-probe.log`.
+
+The corrected integrated control/Host, persistence, deadline and sandbox suite
+passed 166 tests in 129.039 seconds (`/tmp/sdk-next-corrections-integrated.log`).
+Five public typing fixtures and the documentation check passed 550 links and
+six README examples without skips (`/tmp/sdk-next-corrections-types.log`,
+`/tmp/sdk-next-corrections-docs.log`). Independent review found no remaining
+source blocker, including original deadlines, raw-error identity, maintenance
+participation and startup dispatch ownership. Native Windows acceptance of this
+new candidate remains required.
+
+Both READMEs now explain the existing Apache 2.0 license and link LICENSE and
+NOTICE. Packaging retains both files. The dedicated README check passed 550
+local links and six examples without skips; `/tmp/sdk-readme-license-docs.log`
+records this documentation-only change.
+
 T01–T07 implementation and Linux evidence are present. T08 has local installation
 and regression evidence but still needs the native matrix; T09 independent review
 and corrections are complete locally, while final acceptance depends on T08.

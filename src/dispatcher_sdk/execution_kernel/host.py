@@ -765,6 +765,10 @@ class RuntimeHost:
                     break
                 if self._retry_ready("startup", now):
                     startup_ready = self._startup()
+                    if startup_ready and not self._stop_event.is_set():
+                        # Startup already reconciled storage. Dispatch the
+                        # first worker before another full maintenance cycle.
+                        self._fill_workers(force=True)
                 if not startup_ready:
                     self._wait(self._retry_at.get("startup", now))
             # Let already-produced terminal results/outbox acks leave the

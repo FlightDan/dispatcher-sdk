@@ -16,12 +16,14 @@ class StorageEvidence:
     def __init__(self, root, test):
         self.root, self.test = root, test
         self.events = deque(maxlen=2048)
-        self._lock = threading.Lock()
+        # Allocation may collect an already-closed participating connection.
+        # Its destructor forwards through traced close on this same thread.
+        self._lock = threading.RLock()
         self.operations = 0
         self.runtimes = []
         self.patches = []
 
-    def start(self):
+    def start(self, *, include_kernel=False):
         from dispatcher_sdk.execution_kernel import runtime, settlement
         from dispatcher_sdk.observability import journal
         owner, identifiers = self, count(1)
@@ -77,6 +79,17 @@ class StorageEvidence:
             current = patch.object(module, "sqlite3", proxy)
             current.start()
             self.patches.append(current)
+        if include_kernel:
+            from dispatcher_sdk import storage_connection
+
+            # Keep the host-owned maintenance participation factory. The MRO
+            # forwards traced close through its original lock-release method.
+            class ParticipatingConnection(Connection, storage_connection._ParticipatingConnection):
+                pass
+
+            current = patch.object(storage_connection, "_ParticipatingConnection", ParticipatingConnection)
+            current.start()
+            self.patches.append(current)
         original = runtime.InProcessRuntime.__init__
 
         def initialize(instance, *args, **kwargs):
@@ -95,8 +108,13 @@ class StorageEvidence:
 
     def save(self, *, phase="cleanup", checkpoint=None):
         with self._lock:
-            operations, events = self.operations, deepcopy(list(self.events))
+            operations = self.operations
+            snapshots = tuple(self.events)
+            events = [dict(event) for event in snapshots]
             runtimes = tuple(self.runtimes)
+        # Deep copying can run connection destructors; do not hold the evidence
+        # lock while copying the stable per-event snapshots.
+        events = deepcopy(events)
         frames = sys._current_frames()
         workers = [{"name": thread.name, "alive": thread.is_alive(),
                     "stack": traceback.format_stack(frames[thread.ident]) if thread.ident in frames else []}

@@ -785,10 +785,17 @@ class ObservationJournal:
             report["output"][stream] = {"known": metric is not None,
                                          "first_missing": None if metric is None else metric["first_at"] is None}
 
+    @classmethod
+    def _bound_without_storage(cls, report, *, options, budget):
+        """Use the same pure report bounds even when journal opening failed."""
+        bounder = cls.__new__(cls)
+        bounder.options = options
+        return bounder._bound_report(report, budget=budget)
+
     def _bound_report(self, report: dict[str, Any], budget: InspectionBudget | None = None) -> dict[str, Any]:
         budget = budget or InspectionBudget(self.options.query_timeout, None)
         sections = ("metrics", "sources", "waits", "child_waits", "child_requests", "processes", "phases", "retired_sources", "tails",
-                    "diagnostics", "settlement_obligations", "result", "budget", "settlement", "supervision")
+                    "diagnostics", "local_cancellation_diagnostics", "settlement_obligations", "result", "budget", "settlement", "supervision")
         original = {name: report[name] for name in sections if isinstance(report.get(name), (dict, list))}
         for name in original:
             report[name] = {} if isinstance(original[name], dict) else []

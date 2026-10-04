@@ -12,6 +12,8 @@ import threading
 import time
 import traceback
 from contextlib import closing
+from collections import deque
+from copy import deepcopy
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -486,16 +488,94 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux") or os.name == "nt", "requires supported real process containment")
     def test_real_child_stops_at_inherited_parent_deadline(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            payload = {key: str(root / key) for key in ("entered", "escaped")}
-            receipts = []
+        root = retained_directory("sdk-inherited-parent-deadline-")
+        payload = {key: str(root / key) for key in ("entered", "escaped")}
+        receipts, invocations = [], deque(maxlen=16)
+        evidence_lock = threading.Lock()
+        evidence = {"test": self.id(), "interpreter": sys.executable,
+            "sdk_import": dispatcher_sdk.__file__, "runtime_import": runtime_module.__file__,
+            "backend_import": (windows_runtime if os.name == "nt" else process_runtime).__file__,
+            "bounds": {"parent_timeout": 5, "child_timeout": 30, "child_sleep": 6,
+                "elapsed_limit": 12, "child_settlement_wait": 3, "escape_wait": 1.2},
+            "payload": payload}
+        backend = windows_runtime if os.name == "nt" else runtime_module
+        name = "invoke_windows_handler" if os.name == "nt" else "invoke_process_handler"
+        original_invoke = getattr(backend, name)
+
+        def raw_error(error):
+            return {"type": type(error).__name__, "message": str(error), "repr": repr(error),
+                "errno": getattr(error, "errno", None),
+                "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                "traceback": traceback.format_exc()}
+
+        def capture_callback(callback, label, events):
+            def observed(*args, **kwargs):
+                facts = [deepcopy(arg) if isinstance(arg, (dict, str, int, float, bool, type(None))) else
+                    {"type": type(arg).__name__, "pid": getattr(arg, "pid", None)} for arg in args]
+                event = {"callback": label, "began": time.monotonic(), "arguments": facts}
+                with evidence_lock:
+                    events.append(event)
+                try:
+                    result = callback(*args, **kwargs)
+                except BaseException as error:
+                    failure = raw_error(error)
+                    with evidence_lock:
+                        event["error"] = failure
+                    raise
+                else:
+                    with evidence_lock:
+                        event["returned"] = result
+                    return result
+                finally:
+                    with evidence_lock:
+                        event["elapsed"] = time.monotonic() - event["began"]
+            return observed
+
+        def capture_invocation(**kwargs):
+            events = deque(maxlen=128)
+            invocation = {"began": time.monotonic(), "thread": threading.current_thread().name,
+                "command": kwargs["command"].to_dict(), "lease": kwargs["lease"].to_dict(),
+                "start_timeout": kwargs["start_timeout"], "db_path": kwargs["db_path"],
+                "durability": kwargs.get("durability"), "callbacks": events,
+                "envelope": None if kwargs.get("budget_envelope") is None else kwargs["budget_envelope"].to_dict()}
+            with evidence_lock:
+                invocations.append(invocation)
+            for label in ("on_started", "on_finished", "on_cleanup_confirmed", "on_entered", "on_phase"):
+                callback = kwargs.get(label)
+                if callback is not None:
+                    kwargs[label] = capture_callback(callback, label, events)
+            try:
+                outcome = original_invoke(**kwargs)
+            except BaseException as error:
+                failure = raw_error(error)
+                with evidence_lock:
+                    invocation["error"] = failure
+                raise
+            else:
+                with evidence_lock:
+                    invocation["outcome"] = deepcopy(outcome)
+                return outcome
+            finally:
+                with evidence_lock:
+                    invocation["elapsed"] = time.monotonic() - invocation["began"]
+
+        try:
             with Runtime(str(root / "kernel.db"), {"deadline-parent": inherited_deadline_parent,
-                    "deadline-child": inherited_deadline_child}, isolation_mode="process") as runtime, self.capture_process_cleanup(receipts):
-                runtime.submit(runtime.command("deadline-parent", execution_id="parent", idempotency_key="parent",
-                    correlation_id="inherited", timeout_seconds=5, payload=payload))
+                    "deadline-child": inherited_deadline_child}, isolation_mode="process") as runtime, patch.object(
+                    backend, name, capture_invocation), self.capture_process_cleanup(receipts):
+                parent = runtime.command("deadline-parent", execution_id="parent", idempotency_key="parent",
+                    correlation_id="inherited", timeout_seconds=5, payload=payload)
+                evidence["submitted_parent"] = parent.to_dict()
+                runtime.submit(parent)
                 began = time.monotonic()
                 result = runtime.run_once()
+                evidence["parent_elapsed"] = time.monotonic() - began
+                evidence["parent_returned"] = result.to_dict()
+                evidence["runtime_at_return"] = {"settlement_error": runtime._settlement_error,
+                    "observation_error": runtime._observation_error,
+                    "diagnostic_errors": dict(runtime._diagnostic_errors),
+                    "original_pending": [{"identity": entry.identity, "payload": entry.payload,
+                        "evidence": entry.evidence} for entry in runtime._pending_settlements.entries()]}
                 self.assertEqual("timed_out", result.state)
                 self.assertLess(time.monotonic() - began, 12)
                 self.assertTrue(Path(payload["entered"]).exists(), "child never reached actual handler entry")
@@ -511,6 +591,46 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 self.assertEqual(["job_empty" if os.name == "nt" else "tree_reaped"] * 2, receipts)
                 time.sleep(1.2)
                 self.assertFalse(Path(payload["escaped"]).exists())
+        except BaseException as error:
+            evidence["fixture_error"] = raw_error(error)
+            raise
+        finally:
+            with evidence_lock:
+                evidence["invocations"] = deepcopy(list(invocations))
+            for invocation in evidence["invocations"]:
+                invocation["callbacks"] = list(invocation["callbacks"])
+            evidence["cleanup_receipts"] = list(receipts)
+            evidence["markers"] = {}
+            for key, path in payload.items():
+                try:
+                    evidence["markers"][key] = {"path": path, "contents": Path(path).read_text(encoding="ascii")}
+                except OSError as error:
+                    evidence["markers"][key] = {"path": path, "read_error": raw_error(error)}
+            evidence["storage"] = {}
+            stores = {"kernel.db": ("kernel_executions", "kernel_execution_limits", "kernel_events"),
+                "kernel.db.observations.sqlite3": ("sdk_child_requests", "sdk_child_waits", "obs_current", "obs_processes", "obs_events"),
+                "kernel.db.settlements.sqlite3": ("settlement_records", "settlement_notes")}
+            for filename, tables in stores.items():
+                snapshot = {"path": str(root / filename), "tables": {}}
+                evidence["storage"][filename] = snapshot
+                deadline = time.monotonic() + .2
+                try:
+                    with closing(sqlite3.connect((root / filename).as_uri() + "?mode=ro", uri=True, timeout=0)) as connection:
+                        connection.row_factory = sqlite3.Row
+                        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                        for table in tables:
+                            sql = f"SELECT * FROM {table} LIMIT 65"
+                            try:
+                                rows = connection.execute(sql).fetchall()
+                                snapshot["tables"][table] = {"sql": sql, "rows": [dict(row) for row in rows[:64]],
+                                    "truncated": len(rows) > 64}
+                            except sqlite3.Error as error:
+                                snapshot["tables"][table] = {"sql": sql, "read_error": raw_error(error)}
+                except sqlite3.Error as error:
+                    snapshot["read_error"] = raw_error(error)
+            path = root / "evidence.json"
+            path.write_text(json.dumps(evidence, indent=2, default=repr), encoding="utf-8")
+            print("inherited_parent_deadline_evidence=" + str(path), flush=True)
 
     def test_callable_entry_ack_follows_authority_setup(self):
         events = []

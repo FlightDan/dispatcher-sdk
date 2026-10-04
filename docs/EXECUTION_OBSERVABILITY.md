@@ -197,6 +197,10 @@ Cancellation retries temporary control-storage contention only when it can prove
 that the attempt made no writes. All such attempts share the original caller
 window and the same revision and supervision token. Cleanup and evidence
 collection after the cancellation decision retain their separate bounds.
+If the control operation raises, Runtime re-raises that original exception and
+captures bounded local diagnostics without opening another diagnostic SQL write
+window. A raised operation can follow a commit; it does not prove that authority
+was unchanged. Re-read the canonical execution before deciding what to do next.
 
 ## Independent reads and storage
 
@@ -248,6 +252,15 @@ the original receipts without reopening business; a fresh Runtime restores
 them through the existing fenced settlement path.
 
 `observe` also returns bounded `diagnostics` pages from this independent store.
+Raised cancellation operations can additionally produce
+`local_cancellation_diagnostics`. These notes are separate from persisted phases
+and their event cursor. They carry the known Kernel execution/attempt/fence;
+workflow metadata remains unknown. Default queries select the current identity
+when it is available, while explicit attempt/fence filters select matching
+historical notes. Query time and response size retain their original bounds.
+Notes are marked `persisted=False` and disappear when Runtime restarts. A known
+request receipt remains identified separately. Queue or detail loss is marked
+at Runtime scope and does not establish loss for a particular execution.
 Runtime storage also remains owned by observation workers which outlive a
 recorder's bounded close wait. Runtime `close()` drains those stopped workers;
 if they still hold storage, it raises `RuntimeError` and retains pending cleanup.
@@ -257,8 +270,8 @@ only after its owned workers stop, including observation initialization, the sta
 sampler and the settlement worker. Their cleanup shares one absolute deadline. A late handler cannot register a new process
 collector after its recorder closes.
 
-Cancellation stages, the actual handler outcome and the driver close receipt
-remain visible when the activity writer is locked. Lost details or an
+Available cancellation stages, the actual handler outcome and the driver close
+receipt remain separately queryable when the activity writer is locked. Lost details or an
 unconfirmed final flush make the observation incomplete even after the execution
 becomes terminal. Settlement updates retain the original diagnostic evidence.
 Cancellation retains the original requested/revoked timestamps but writes

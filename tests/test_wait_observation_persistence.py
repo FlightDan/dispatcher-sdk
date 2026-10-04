@@ -1,8 +1,6 @@
 """Wait projection against real SQLite contention and Kernel authority."""
 from contextlib import closing
-from pathlib import Path
 import sqlite3
-import tempfile
 import threading
 import time
 import unittest
@@ -16,6 +14,8 @@ from dispatcher_sdk.observability.contracts import ObservationIdentity, Observat
 from dispatcher_sdk.observability.journal import ObservationJournal
 from dispatcher_sdk.observability.activity import ActivityRecorder
 from dispatcher_sdk.observability.supervision import StallSupervisor
+from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 
 class Clock:
@@ -31,9 +31,11 @@ class Clock:
 
 class WaitObservationTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = retained_directory('sdk-wait-observation-')
+        self.storage_evidence = StorageEvidence(self.root, self)
+        self.storage_evidence.start()
+        self.addCleanup(self.storage_evidence.stop)
+        self.addCleanup(self.storage_evidence.save)
         self.clock = Clock()
         self.kernel = SQLiteKernel(self.root / 'kernel.sqlite3', now=self.clock)
         self.addCleanup(self.kernel.close)
