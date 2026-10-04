@@ -761,12 +761,19 @@ class WindowsRuntimeTests(unittest.TestCase):
     def test_auto_runtime_cancel_and_close_contain_descendants_before_return(self):
         for action in ("cancel", "close"):
             with self.subTest(action=action):
-                runtime = Kernel.open_sqlite(self.root / f"runtime-{action}.db", {"test": _tree})
+                evidence_parent = os.environ.get("SDK_ACCEPTANCE_EVIDENCE_DIR")
+                if evidence_parent:
+                    Path(evidence_parent).mkdir(parents=True, exist_ok=True)
+                root = Path(tempfile.mkdtemp(prefix=f"sdk-windows-runtime-{action}-", dir=evidence_parent))
+                runtime = Kernel.open_sqlite(root / f"runtime-{action}.db", {"test": _tree})
                 errors, results = [], []
                 driver = None
+                recorders = []
+                evidence = {"test": self.id(), "action": action, "interpreter": sys.executable,
+                    "sdk_import": windows_runtime.__file__, "execution_timeout": 60, "started_at": time.time()}
                 try:
                     self.assertEqual(runtime.isolation_mode, "process")
-                    pidfile = self.root / f"runtime-{action}.pid"
+                    pidfile = root / f"runtime-{action}.pid"
                     command = ExecutionCommandV2.from_dict({
                         **_command({"pidfile": str(pidfile), "block": True}, 60).to_dict(),
                         "registry_revision": runtime.registry_revision})
@@ -781,6 +788,9 @@ class WindowsRuntimeTests(unittest.TestCase):
                     driver = threading.Thread(target=drive)
                     driver.start()
                     child_pid = _wait_pid(pidfile)
+                    evidence["child_pid"] = child_pid
+                    recorders = list(runtime._execution_recorders.values())
+                    evidence["before_stop"] = runtime.observe(command.execution_id)
                     if action == "cancel":
                         current = runtime.kernel.get(command.execution_id)
                         cancelled = runtime.cancel(command.execution_id,
@@ -788,16 +798,50 @@ class WindowsRuntimeTests(unittest.TestCase):
                         self.assertEqual(cancelled.state, "cancelled")
                     else:
                         runtime.close()
+                    evidence["control_returned_at"] = time.time()
                     # The public API return is the containment boundary.
                     self.assertFalse(_pid_alive(child_pid))
                     driver.join(10)
                     self.assertFalse(driver.is_alive())
                     self.assertEqual(errors, [])
                     self.assertEqual(len(results), 1)
-                finally:
                     runtime.close()
-                    if driver is not None:
-                        driver.join(10)
+                    evidence["close_returned_at"] = time.time()
+                    evidence["results"] = [result.to_dict() for result in results]
+                    evidence["collectors"] = [{"receipt": recorder._close_result,
+                        "flusher_alive": recorder._thread is not None and recorder._thread.is_alive(),
+                        "process_observer": None if recorder._process_observer is None else recorder._process_observer.snapshot()}
+                        for recorder in recorders]
+                    evidence["stall_health"] = runtime._stall_supervisor.health()
+                    evidence["child_health"] = runtime._child_service.health()
+                    evidence["settlement_alive"] = runtime._settlement_thread.is_alive()
+                    # Windows rename requires every SQLite handle to release
+                    # delete sharing. Check the actual return boundary before
+                    # a deleted temporary fixture can conceal a live collector.
+                    sidecar = Path(runtime._observation_path)
+                    renamed = sidecar.with_name(sidecar.name + ".closed-probe")
+                    try:
+                        sidecar.rename(renamed)
+                        renamed.rename(sidecar)
+                    except OSError as error:
+                        evidence["storage_release"] = {"state": "failed", "type": type(error).__name__,
+                            "message": str(error), "winerror": getattr(error, "winerror", None)}
+                        raise
+                    evidence["storage_release"] = {"state": "passed", "path": str(sidecar)}
+                except BaseException as error:
+                    evidence["error"] = {"type": type(error).__name__, "message": str(error)}
+                    raise
+                finally:
+                    try:
+                        runtime.close()
+                        if driver is not None:
+                            driver.join(10)
+                    finally:
+                        evidence["finished_at"] = time.time()
+                        evidence["driver_errors"] = [{"type": type(error).__name__, "message": str(error)} for error in errors]
+                        path = root / "evidence.json"
+                        path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+                        print("WINDOWS_RUNTIME_CLOSE_EVIDENCE " + str(path), flush=True)
 
     def test_script_artifacts_and_effect_are_committed(self):
         spec = ScriptSpec(source="import sys\nprint('native stdout')\nprint('native stderr', file=sys.stderr)\n",

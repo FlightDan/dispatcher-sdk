@@ -7,7 +7,7 @@ import threading
 import time
 import unittest
 
-from dispatcher_sdk.execution_kernel import ExecutionCommandV2, RetryPolicy, SQLiteKernel, Kernel
+from dispatcher_sdk.execution_kernel import ExecutionCommandV2, RetryPolicy, SQLiteKernel, Kernel, ExecutionNotFoundError
 from dispatcher_sdk.execution_kernel.children import HandlerChildren, ChildExecutionError
 
 
@@ -23,6 +23,47 @@ def command():
 
 
 class BoundedKernelControlTests(unittest.TestCase):
+    def test_slow_real_begin_cannot_admit_mutations_after_original_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with SQLiteKernel(Path(directory) / "kernel.sqlite3", control_timeout_seconds=.05) as kernel:
+                statements = []
+                def trace(statement):
+                    statements.append(statement)
+                    if statement == "BEGIN IMMEDIATE":
+                        time.sleep(.08)
+                kernel._connection.set_trace_callback(trace)
+                try:
+                    with self.assertRaises(TimeoutError):
+                        kernel.submit(command())
+                finally:
+                    kernel._connection.set_trace_callback(None)
+                self.assertFalse(kernel._connection.in_transaction)
+                self.assertFalse(any(sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+                    for sql in statements), statements)
+                with self.assertRaises(ExecutionNotFoundError):
+                    kernel.get("bounded")
+                self.assertEqual(kernel.submit(command()).state, "queued")
+
+    def test_control_admission_keeps_authority_during_pragma_access_and_after_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with SQLiteKernel(Path(directory) / "kernel.sqlite3", control_timeout_seconds=.05) as kernel:
+                kernel.submit(command())
+                with kernel._busy_timeout_access():
+                    original = kernel._connection.execute("PRAGMA busy_timeout").fetchone()[0]
+                    for sql in ("PRAGMA writable_schema=ON", "CREATE TABLE foreign_table(value)"):
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            kernel._connection.execute(sql)
+                with self.assertRaisesRegex(RuntimeError, "operation failed"):
+                    with kernel._control_lock(.04):
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            kernel._connection.execute("PRAGMA busy_timeout")
+                        raise RuntimeError("operation failed")
+                with kernel._busy_timeout_access():
+                    self.assertEqual(kernel._connection.execute("PRAGMA busy_timeout").fetchone()[0], original)
+                with self.assertRaises(sqlite3.DatabaseError):
+                    kernel._connection.execute("PRAGMA writable_schema=ON")
+                self.assertEqual(kernel.get("bounded").state, "queued")
+
     def test_real_writer_bounds_verify_and_submit_without_changing_authority(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "kernel.sqlite3"

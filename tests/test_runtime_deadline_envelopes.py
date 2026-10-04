@@ -10,11 +10,13 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+import traceback
 from contextlib import closing
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+import dispatcher_sdk
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, ClockCheckpoint, DeadlineConstraint, sample_clock
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
@@ -24,6 +26,7 @@ from dispatcher_sdk.execution_kernel.errors import HandlerExecutionError
 import dispatcher_sdk.execution_kernel.runtime as runtime_module
 from dispatcher_sdk.execution_kernel import _process_runtime as process_runtime
 from dispatcher_sdk.execution_kernel import _windows_runtime as windows_runtime
+from tests._acceptance_evidence import retained_directory
 
 
 def command(payload=None, timeout=10):
@@ -48,19 +51,41 @@ def orphan_with_held_final_flush(payload, context):
     original_close = context.activity.close
 
     def held_close():
-        Path(payload["flush_started"]).write_text("started", encoding="ascii")
+        release = Path(payload["release"])
+        while not release.exists():
+            time.sleep(.002)
+        Path(payload["flush_started"]).write_text(json.dumps({
+            "pid": os.getpid(), "started_at": time.monotonic(),
+        }), encoding="ascii")
         time.sleep(.4)
         receipt = original_close()
-        Path(payload["flush_done"]).write_text("flushed", encoding="ascii")
+        Path(payload["flush_done"]).write_text(json.dumps({
+            "pid": os.getpid(), "finished_at": time.monotonic(),
+        }), encoding="ascii")
         return receipt
 
     context.activity.close = held_close
     context.activity.phase("business_returning")
     containment = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
                    else {"start_new_session": True})
-    subprocess.Popen([sys.executable, "-c",
-        "import pathlib,sys,time; time.sleep(.15); pathlib.Path(sys.argv[1]).write_text('escaped')",
-        payload["orphan"]], **containment)
+    child = (
+        "import json,os,pathlib,sys,time; "
+        "ready,release,escaped=map(pathlib.Path,sys.argv[1:]); "
+        "ready.write_text(json.dumps({'pid':os.getpid(),'ready_at':time.monotonic()}),encoding='ascii'); "
+        "exec('while not release.exists():\\n time.sleep(.002)'); "
+        "escaped.write_text(json.dumps({'pid':os.getpid(),'escaped_at':time.monotonic()}),encoding='ascii')"
+    )
+    subprocess.Popen([sys.executable, "-c", child, payload["orphan_ready"], payload["release"],
+                      payload["orphan"]], **containment)
+    remaining = context.budget.remaining_work_seconds
+    ready_deadline = time.monotonic() + (0 if remaining is None else remaining)
+    while not Path(payload["orphan_ready"]).exists() and time.monotonic() < ready_deadline:
+        time.sleep(.002)
+    if not Path(payload["orphan_ready"]).exists():
+        raise TimeoutError("orphan did not become ready before business return")
+    Path(payload["business_returning"]).write_text(json.dumps({
+        "pid": os.getpid(), "returned_at": time.monotonic(),
+    }), encoding="ascii")
     return {"completed": True}
 
 
@@ -286,8 +311,10 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                         correlation_id="provider-failure", timeout_seconds=12, payload={}))
                     result = runtime.run_once()
                     self.assertEqual("failed", result.state)
-                    self.assertEqual("provider_denied", result.result.error.code)
                     details = result.result.error.details
+                    child_result = details.get("child_result") if type(details) is dict else None
+                    self.assertEqual("provider_denied", result.result.error.code,
+                        f"parent_error={result.result.error.to_dict()!r}; child_result={child_result!r}")
                     child_result = details["child_result"]
                     self.assertEqual(child_result["execution_id"], details["child_execution_id"])
                     self.assertEqual("parent", child_result["causation_id"])
@@ -339,24 +366,123 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
 
         return patch.object(backend, name, capture)
 
+    @staticmethod
+    def capture_actual_descendant_stop(paths, root):
+        if os.name == "nt":
+            original = windows_runtime.WindowsProcessHandle.stop_descendants
+
+            def stop_descendants(handle, until):
+                contained = original(handle, until)
+                if not Path(paths["stop_result"]).exists():
+                    Path(paths["stop_result"]).write_text(json.dumps({
+                        "host_pid": os.getpid(), "launcher_pid": handle.pid,
+                        "worker_pid": handle._worker_pid, "contained": contained,
+                        "returned_at": time.monotonic(),
+                    }), encoding="ascii")
+                    Path(paths["release"]).write_text("released", encoding="ascii")
+                return contained
+
+            return patch.object(windows_runtime.WindowsProcessHandle, "stop_descendants", stop_descendants)
+
+        hook = root / "sitecustomize.py"
+        hook.write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "from dispatcher_sdk.execution_kernel import _process_runtime\n"
+            "_original_stop = _process_runtime._stop_flush_descendants\n"
+            "def _record_stop(root_pid, worker_pid):\n"
+            "    contained = _original_stop(root_pid, worker_pid)\n"
+            "    result = Path(os.environ['DISPATCHER_SDK_TEST_STOP_RESULT'])\n"
+            "    if not result.exists():\n"
+            "        result.write_text(json.dumps({'supervisor_pid': root_pid, 'worker_pid': worker_pid, "
+            "'contained': contained, "
+            "'returned_at': __import__('time').monotonic()}), encoding='ascii')\n"
+            "        Path(os.environ['DISPATCHER_SDK_TEST_STOP_RELEASE']).write_text('released', encoding='ascii')\n"
+            "    return contained\n"
+            "_process_runtime._stop_flush_descendants = _record_stop\n",
+            encoding="utf-8")
+        python_path = os.pathsep.join(filter(None, (
+            str(root), str(Path(__file__).resolve().parents[1] / "src"), os.environ.get("PYTHONPATH"),
+        )))
+        return patch.dict(os.environ, {
+            "PYTHONPATH": python_path,
+            "DISPATCHER_SDK_TEST_STOP_RESULT": paths["stop_result"],
+            "DISPATCHER_SDK_TEST_STOP_RELEASE": paths["release"],
+        })
+
     @unittest.skipUnless(sys.platform.startswith("linux") or os.name == "nt", "requires supported real process containment")
     def test_business_return_stops_orphan_before_held_final_journal_flush(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            paths = {key: str(root / key) for key in ("orphan", "flush_started", "flush_done")}
-            receipts = []
+        root = retained_directory("sdk-orphan-final-flush-")
+        keys = ("orphan", "orphan_ready", "release", "business_returning", "stop_result",
+                "flush_started", "flush_done")
+        paths = {key: str(root / key) for key in keys}
+        receipts = []
+        result = None
+        evidence = {
+            "test": self.id(),
+            "interpreter": {"executable": sys.executable, "version": sys.version},
+            "sdk_import": {"module": dispatcher_sdk.__file__, "runtime_module": runtime_module.__file__},
+            "limits": {"execution_timeout_seconds": 3, "held_final_flush_seconds": .4},
+            "result": None,
+            "result_error": None,
+            "runtime_exception": None,
+            "process_cleanup_receipts": receipts,
+        }
+        try:
             with Runtime(str(root / "kernel.db"), {"held-flush": orphan_with_held_final_flush},
                          isolation_mode="process") as runtime:
                 runtime.submit(runtime.command("held-flush", execution_id="held-flush", idempotency_key="held-flush",
                     correlation_id="held-flush", timeout_seconds=3, payload=paths))
-                with self.capture_process_cleanup(receipts):
+                stop_boundary = self.capture_actual_descendant_stop(paths, root)
+                with self.capture_process_cleanup(receipts), stop_boundary:
                     result = runtime.run_once()
-                self.assertEqual("succeeded", result.state)
-                self.assertEqual({"completed": True}, result.result.value)
-                self.assertTrue(Path(paths["flush_started"]).exists())
-                self.assertTrue(Path(paths["flush_done"]).exists())
-                self.assertFalse(Path(paths["orphan"]).exists())
-                self.assertEqual(["job_empty" if os.name == "nt" else "tree_reaped"], receipts)
+                evidence["result"] = result.to_dict()
+                evidence["result_error"] = (None if result.result is None or result.result.error is None
+                    else result.result.error.to_dict())
+        except BaseException as exc:
+            evidence["runtime_exception"] = {
+                "type": type(exc).__name__, "message": str(exc), "repr": repr(exc),
+                "traceback": traceback.format_exc(),
+            }
+            raise
+        finally:
+            evidence["markers"] = {}
+            for key, marker in paths.items():
+                try:
+                    contents = Path(marker).read_text(encoding="utf-8")
+                except Exception as exc:
+                    evidence["markers"][key] = {
+                        "path": marker,
+                        "read_error": {"type": type(exc).__name__, "message": str(exc),
+                                       "repr": repr(exc), "errno": getattr(exc, "errno", None)},
+                    }
+                else:
+                    evidence["markers"][key] = {"path": marker, "contents": contents}
+            evidence_path = root / "evidence.json"
+            evidence_path.write_text(json.dumps(evidence, indent=2, allow_nan=False), encoding="utf-8")
+            print("orphan_final_flush_evidence=" + str(evidence_path), flush=True)
+
+        self.assertIsNotNone(result)
+        self.assertEqual("succeeded", result.state)
+        self.assertEqual({"completed": True}, result.result.value)
+        self.assertTrue(Path(paths["orphan_ready"]).exists(), "orphan never reached its release gate")
+        self.assertTrue(Path(paths["release"]).exists(), "descendant stop boundary never released the fixture")
+        stop_result = json.loads(Path(paths["stop_result"]).read_text(encoding="ascii"))
+        self.assertIs(stop_result["contained"], True, f"descendant stop failed: {stop_result!r}")
+        self.assertTrue(Path(paths["flush_started"]).exists())
+        self.assertTrue(Path(paths["flush_done"]).exists())
+        ready = json.loads(Path(paths["orphan_ready"]).read_text(encoding="ascii"))
+        business_returning = json.loads(Path(paths["business_returning"]).read_text(encoding="ascii"))
+        flush_started = json.loads(Path(paths["flush_started"]).read_text(encoding="ascii"))
+        flush_done = json.loads(Path(paths["flush_done"]).read_text(encoding="ascii"))
+        self.assertTrue(ready["pid"] > 0)
+        # The ready/release files enforce the causal ordering. Windows
+        # clocks may give adjacent stages the same monotonic tick.
+        self.assertLessEqual(business_returning["returned_at"], stop_result["returned_at"])
+        self.assertLessEqual(stop_result["returned_at"], flush_started["started_at"])
+        self.assertLess(flush_started["started_at"], flush_done["finished_at"])
+        self.assertFalse(Path(paths["orphan"]).exists(), "orphan escaped after stop release")
+        self.assertEqual(["job_empty" if os.name == "nt" else "tree_reaped"], receipts)
 
     @unittest.skipUnless(sys.platform.startswith("linux") or os.name == "nt", "requires supported real process containment")
     def test_real_child_stops_at_inherited_parent_deadline(self):

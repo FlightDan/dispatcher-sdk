@@ -37,6 +37,7 @@ from .budget import BudgetClockUnknownError, BudgetEnvelope, sample_clock
 from .children import ChildService
 
 from ..durability import Durability, validate_durability
+from .._sqlite_errors import is_sqlite_contention
 
 from .context import HandlerContext, HandlerEffects
 from .contracts import (
@@ -83,6 +84,10 @@ class _ProcessRegistration(threading.Event):
 
 class _UnpersistedSettlementsError(RuntimeError):
     """Local cleanup finished, but original result retention is unresolved."""
+
+
+class _ObservationCleanupPendingError(RuntimeError):
+    """Stopped SDK storage workers have not yet released runtime storage."""
 
 
 class InProcessRuntime:
@@ -147,11 +152,16 @@ class InProcessRuntime:
         # admission. Close still waits for this independently guarded count.
         self._lifecycle_condition = threading.Condition()
         self._close_complete = threading.Event()
+        self._close_retry_lock = threading.Lock()
         self._close_error: BaseException | None = None
         self._stop_event = threading.Event()
         self._active_runs = 0
         self._process_supervisors: dict[tuple[str, int, int], Any] = {}
         self._execution_recorders: dict[tuple[str, int, int], ActivityRecorder] = {}
+        self._retired_recorders: list[ActivityRecorder] = []
+        self._retired_observation_contexts: list[HandlerContext] = []
+        self._observation_cleanup_report: list[dict[str, Any]] = []
+        self._observation_cleanup_pending = False
         # Exists from the moment a claimed execution enters process
         # invocation until its supervisor has been reaped.  Cancellation
         # waits on this marker so a start/register race cannot report success
@@ -255,12 +265,8 @@ class InProcessRuntime:
                 first_closer = True
         if not first_closer:
             close_complete.wait()
-            if isinstance(self._close_error, _UnpersistedSettlementsError):
-                self._persist_pending_settlements(time.monotonic() + 1, limit=64)
-                if not self._pending_settlements.identities():
-                    self._close_error = None
-            if self._close_error is not None:
-                raise self._close_error
+            with self._close_retry_lock:
+                self._retry_close_cleanup()
             return
         try:
             self.request_stop()
@@ -273,6 +279,7 @@ class InProcessRuntime:
             with self._lifecycle_condition:
                 while self._active_runs:
                     self._lifecycle_condition.wait()
+            observation_pending = self._drain_observation_workers(time.monotonic() + 1.0)
             try:
                 self._persist_pending_settlements(time.monotonic() + 1, limit=64)
                 unresolved = self.recover_sandboxes(all_pages=True)
@@ -280,15 +287,87 @@ class InProcessRuntime:
                     raise SandboxOutcomeUnknown("remote cleanup remains pending in the sandbox journal")
                 if self._pending_settlements.identities():
                     raise _UnpersistedSettlementsError("runtime closed with original outcomes not yet durably persisted")
+                if observation_pending:
+                    raise _ObservationCleanupPendingError("runtime storage cleanup remains pending")
             finally:
                 self.kernel.close()
-                if self._temporary_observation is not None:
+                if self._temporary_observation is not None and not observation_pending:
                     self._temporary_observation.cleanup()
         except BaseException as exc:
             self._close_error = exc
             raise
         finally:
             self._close_complete.set()
+
+    def _retry_close_cleanup(self) -> None:
+        observation_pending = False
+        if (self._retired_recorders or self._retired_observation_contexts or self._observation_cleanup_pending
+                or isinstance(self._close_error, _ObservationCleanupPendingError)):
+            observation_pending = self._drain_observation_workers(time.monotonic() + 1.0)
+            if not observation_pending:
+                if isinstance(self._close_error, _ObservationCleanupPendingError):
+                    self._close_error = None
+                if self._temporary_observation is not None:
+                    self._temporary_observation.cleanup()
+        if isinstance(self._close_error, _UnpersistedSettlementsError):
+            self._persist_pending_settlements(time.monotonic() + 1, limit=64)
+            if not self._pending_settlements.identities():
+                self._close_error = None
+        # Resolving the original settlement obligation does not release a
+        # still-running collector's storage ownership.
+        if observation_pending and self._close_error is None:
+            self._close_error = _ObservationCleanupPendingError("runtime storage cleanup remains pending")
+        if self._close_error is not None:
+            raise self._close_error
+
+    def _retain_observation_workers(self, recorder: ActivityRecorder) -> None:
+        with self._lifecycle_condition:
+            self._retired_recorders = [item for item in self._retired_recorders if item._owned_workers_alive()]
+            if recorder._owned_workers_alive() and recorder not in self._retired_recorders:
+                self._retired_recorders.append(recorder)
+
+    @staticmethod
+    def _context_observation_pending(context: HandlerContext) -> bool:
+        return (not context._observation_start_done.is_set()
+                or (isinstance(context.activity, ActivityRecorder) and context.activity._owned_workers_alive()))
+
+    def _retain_observation_context(self, context: HandlerContext) -> None:
+        with self._lifecycle_condition:
+            self._retired_observation_contexts = [item for item in self._retired_observation_contexts
+                if self._context_observation_pending(item)]
+            if self._context_observation_pending(context) and context not in self._retired_observation_contexts:
+                self._retired_observation_contexts.append(context)
+
+    def _drain_observation_workers(self, deadline: float) -> bool:
+        with self._lifecycle_condition:
+            recorders = tuple(self._retired_recorders)
+            contexts = tuple(self._retired_observation_contexts)
+        reports = [recorder._join_owned_workers(deadline) for recorder in recorders]
+        for context in contexts:
+            context._observation_start_done.wait(max(0.0, deadline - time.monotonic()))
+            report = {"kind": "handler_observation_start", "execution_id": context.lease.execution_id,
+                      "initialization_pending": not context._observation_start_done.is_set()}
+            if isinstance(context.activity, ActivityRecorder):
+                report["recorder"] = context.activity._join_owned_workers(deadline)
+            report["state"] = "pending" if self._context_observation_pending(context) else "closed"
+            reports.append(report)
+        # These SDK threads can own journal connections. User delivery
+        # callbacks are not storage ownership and are never joined here.
+        sampler = None if self._stall_supervisor is None else self._stall_supervisor._sampler
+        service_workers = (("stall_sampler", sampler), ("settlement", self._settlement_thread))
+        for name, worker in service_workers:
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(max(0.0, deadline - time.monotonic()))
+            reports.append({"kind": "sdk_storage_service", "service": name,
+                "state": "pending" if worker is not None and worker.is_alive() else "closed"})
+        with self._lifecycle_condition:
+            self._retired_recorders = [recorder for recorder in self._retired_recorders if recorder._owned_workers_alive()]
+            self._retired_observation_contexts = [context for context in self._retired_observation_contexts
+                if self._context_observation_pending(context)]
+            self._observation_cleanup_report = reports
+            self._observation_cleanup_pending = (bool(self._retired_recorders or self._retired_observation_contexts)
+                or any(worker is not None and worker.is_alive() for _, worker in service_workers))
+            return self._observation_cleanup_pending
 
     def request_stop(self) -> None:
         """Revoke active handler authority without closing durable storage."""
@@ -315,7 +394,12 @@ class InProcessRuntime:
         if child_executor is not None:
             child_executor.shutdown(wait=False, cancel_futures=True)
         for context in contexts:
-            context.close()
+            try:
+                context.close()
+            finally:
+                self._retain_observation_context(context)
+                if isinstance(context.activity, ActivityRecorder):
+                    self._retain_observation_workers(context.activity)
 
     def _start_services(self) -> None:
         with self._lifecycle_lock:
@@ -1141,10 +1225,7 @@ class InProcessRuntime:
 
     @staticmethod
     def _storage_contention(error: Exception) -> bool:
-        code = getattr(error, "sqlite_errorcode", None)
-        return (isinstance(error, sqlite3.OperationalError)
-                and isinstance(code, int)
-                and code & 255 in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+        return is_sqlite_contention(error)
 
     def _prepare_handler_admission(self, lease: ExecutionLease):
         """Retry short control collisions within one original startup window."""
@@ -1459,6 +1540,9 @@ class InProcessRuntime:
                 try:
                     context.close()
                 finally:
+                    self._retain_observation_context(context)
+                    if isinstance(context.activity, ActivityRecorder):
+                        self._retain_observation_workers(context.activity)
                     with self._thread_lock:
                         self._thread_contexts.pop(generation, None)
 
@@ -1873,7 +1957,10 @@ class InProcessRuntime:
                 if 'running_lease' in locals() and running_lease is not None:
                     recorder = self._execution_recorders.pop((running_lease.execution_id, running_lease.attempt, running_lease.fence), None)
                     if recorder is not None:
-                        receipt = recorder.close()
+                        try:
+                            receipt = recorder.close()
+                        finally:
+                            self._retain_observation_workers(recorder)
                         local = recorder.snapshot()
                         self._diagnostic_note(running_lease, "driver_close", {
                             "receipt": receipt, "dropped_events": local["dropped_events"],

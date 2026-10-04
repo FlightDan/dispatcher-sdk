@@ -16,7 +16,7 @@ imports outside the checkout. Five public typing fixtures passed. The latest doc
 and six README examples with no skips.
 
 The Goal is not complete: native Windows and the existing 16-environment CI
-matrix have not run for this candidate. The 16 Linux skips do not count as
+matrix have not passed for the current implementation. The 16 Linux skips do not count as
 Windows acceptance. The user explicitly authorized the source/history push on
 2026-10-04; branch `work/execution-observability-20261003` was pushed successfully.
 The first [CI run](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37188996228)
@@ -74,6 +74,77 @@ that does not explain the historical failure. Worker expiry fixtures now use a
 caller-provided wall sample scoped to the actual handler, retaining real
 `context.budget` and original watchdog cutoffs; they no longer rely on deleting
 or replacing a shared Windows clock file or writing evidence after hard stop.
+
+Corrected implementation `21218650d0ff8f41cdc9b9f1fd9fc21854c071ff` was pushed and
+launched [run 37190938130](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37190938130).
+It is not yet matrix acceptance. A fresh Linux wheel built from that commit
+passed all five independent public scenarios and the original public example,
+outside the checkout with isolated imports. Evidence:
+`/tmp/sdk-ci-corrections-public-evidence/summary.json`,
+`/tmp/sdk-ci-corrections-public.log`, `/tmp/sdk-ci-corrections-example.log` and
+`/tmp/sdk-ci-corrections-import.json`. Import source is
+`/tmp/sdk-ci-corrections-installed/lib/python3.12/site-packages/dispatcher_sdk/__init__.py`.
+The first local wheel command failed only because pip attempted to write its
+cache outside the writable workspace; the no-cache build succeeded. Logs are
+`/tmp/sdk-ci-corrections-wheel.log` and `/tmp/sdk-ci-corrections-wheel-no-cache.log`.
+
+That matrix passed six Linux environments (Python 3.11–3.13 on x64 and ARM64),
+but failed native Windows and did not establish Python 3.10 acceptance. Four
+Python 3.10 jobs in the earlier run exhausted their original 45-minute limit
+after reporting hundreds of SQL authorization failures; the complete test
+summary followed by a stuck process is not a pass. A real Python 3.10.22
+reproduction confirmed `set_authorizer(None)` causes `DatabaseError: not authorized`;
+Python only supports disabling that callback with `None` from 3.11 onward.
+Control admission now temporarily allows only the internal `busy_timeout` pragma
+through a callable, preserving other authority restrictions and lock restoration.
+
+Additional current corrections address native busy-handler elapsed overshoot
+and observation-worker storage ownership. A genuine SQLite VFS sleep probe
+reproduced a 0.2-second cancellation admission taking 1.047 seconds, exceeding
+its original 0.6-second gate. Immediate SQLite admission plus Python retries
+stays inside the same original deadline; a delayed successful `BEGIN` is checked
+again before any clock or business writes. `/tmp/sdk-kernel-busy-baseline.log`,
+`/tmp/sdk-kernel-busy-revised.log` and independent review logs retain raw results.
+The Windows snapshot failures were fixture producer `PermissionError`s at
+`local.json` replacement, not proof of delayed telemetry. Dynamic fixture
+snapshots now publish independent immutable generations; original readiness,
+execution and stop bounds remain unchanged. `/tmp/sdk-pressure-producer-errors.json`
+retains the failed worker results. Native acceptance of these corrections remains
+required; earlier green jobs cannot establish the next candidate's acceptance.
+
+The current storage-lifetime correction retains stopped collectors, initializing
+handler observation contexts, the stall sampler and the settlement worker until
+they release SDK storage. All share one existing one-second cleanup window.
+An unfinished worker preserves temporary storage and reports pending cleanup;
+repeated close advances ownership cleanup without replaying business or changing
+the original flush receipt. Actual held-connection, startup, late-handler and
+concurrent-close probes and 17 independently reviewed focused tests passed.
+Evidence: `/tmp/sdk-observation-cleanup-final-review.log`,
+`/tmp/sdk-context-startup-fixed-review.log`,
+`/tmp/sdk-service-storage-fixed-review.log` and
+`/tmp/sdk-observation-concurrent-close-review.log`.
+
+Python 3.10 also lacks SQLite result-code attributes. One dependency-free shared
+classifier now recognizes only actual BUSY/LOCKED codes or, when codes are absent,
+the exact SQLite lock messages. Retry policies and deadlines remain with each
+caller. Real Python 3.10 focused control, persistence and child tests passed
+(35 tests), and independent seven-case classification plus isolated wheel imports
+passed. A fresh installed Python 3.10 wheel passed all five public scenarios and
+the original portable example. These are intermediate checks, not final matrix
+acceptance. Logs are `/tmp/sdk-shared-contention-policy-python310.log`,
+`/tmp/sdk-contention-classifier-independent310.log`,
+`/tmp/sdk-contention-classifier-isolated-wheel310.log` and
+`/tmp/sdk-platform-lifetime-public310.log`.
+
+The intermediate installed full regression ran 967 tests in 792.393 seconds
+and failed with two failures, one error and 17 native Windows skips. It exposed
+an obsolete test observer without stop events, an exact packaging allowlist
+missing the shared module, and a diagnostic fixture reading an absent Python
+3.10 SQLite code attribute before publishing its contention witness.
+All three fixtures were corrected; five focused checks passed with their original
+bounds unchanged (`/tmp/sdk-contention-packaging-fixture-python310.log`). The
+intermediate full log remains `/tmp/sdk-platform-lifetime-installed310-regression.log`.
+A freshly rebuilt candidate must still pass every required matrix environment.
 
 T01–T07 implementation and Linux evidence are present. T08 has local installation
 and regression evidence but still needs the native matrix; T09 independent review

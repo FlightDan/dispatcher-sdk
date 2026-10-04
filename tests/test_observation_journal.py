@@ -463,6 +463,11 @@ class ObservationJournalTests(unittest.TestCase):
         recorder = self.recorder(start=True)
         flusher = recorder._thread
         class SlowObserver:
+            def __init__(self):
+                self._stop = threading.Event()
+                self._wake = threading.Event()
+                self._thread = None
+
             def close(self, *, timeout):
                 time.sleep(timeout)
                 return {"unfinished_collector": True}

@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel.children import HandlerChildren
+from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope
 from dispatcher_sdk.execution_kernel.runtime import Runtime
 from dispatcher_sdk.observability import ObservationOptions
 
@@ -171,7 +172,13 @@ class ChildStorageContentionTests(unittest.TestCase):
         raw_result = runtime.kernel.get(row["child_execution_id"]).result.to_dict()
         self.assertEqual(raw_result, json.loads(settled["response_json"]))
         self.assertEqual(row["wait_id"], settled["wait_id"])
-        self.assertEqual(row["budget_json"], settled["budget_json"])
+        original_budget = BudgetEnvelope.from_dict(json.loads(row["budget_json"]))
+        settled_budget = BudgetEnvelope.from_dict(json.loads(settled["budget_json"]))
+        # Recovery may retain a stronger wall-clock sample. It must preserve
+        # every original deadline and must never restore spent authority.
+        self.assertEqual(original_budget.constraints, settled_budget.constraints)
+        self.assertLessEqual(settled_budget.view(sample=settled_budget.checkpoint).remaining_work_seconds,
+            original_budget.view(sample=settled_budget.checkpoint).remaining_work_seconds)
         self.assertEqual([row["child_execution_id"]], calls)
 
     def test_reservation_retry_expires_without_late_child_admission(self):

@@ -4,11 +4,12 @@ from __future__ import annotations
 from collections import deque
 from copy import deepcopy
 import math
-import sqlite3
 import threading
 import time
 from typing import Any, Callable, Mapping
 import uuid
+
+from .._sqlite_errors import is_sqlite_contention
 
 from .contracts import ObservationIdentity, ObservationOptions, identifier, positive
 from .journal import ObservationJournal, _bounded_json, _json
@@ -227,12 +228,14 @@ class ActivityRecorder:
 
     def observe_process(self, process: Any, *, role: str = "agent", process_id: str | None = None):
         """Observe an actual child handle independently of its stdout drain."""
-        if self._process_observer is None:
-            from .processes import ProcessObserver
-            with self._lock:
-                if self._process_observer is None:
-                    self._process_observer = ProcessObserver(self)
-        return self._process_observer.observe_process(process, role=role, process_id=process_id)
+        from .processes import ProcessObserver
+        with self._lock:
+            if self._process_observer is None:
+                self._process_observer = ProcessObserver(self, start=not self._closed)
+                if self._closed:
+                    self._process_observer._stop.set()
+            observer = self._process_observer
+        return observer.observe_process(process, role=role, process_id=process_id)
 
     def wait(self, reason: str, *, target: Any = None, deadline_at: float | None = None,
              resources: Mapping[str, Any] | None = None):
@@ -380,9 +383,7 @@ class ActivityRecorder:
 
     @staticmethod
     def _transient_storage_error(error: Exception) -> bool:
-        code = getattr(error, "sqlite_errorcode", None)
-        return isinstance(error, sqlite3.OperationalError) and code is not None and (code & 255) in (
-            sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+        return is_sqlite_contention(error)
 
     def flush(self) -> dict[str, Any]:
         """Persist one finite batch; failures keep bounded detail for replay."""
@@ -496,6 +497,11 @@ class ActivityRecorder:
         with self._lock:
             closing = self._closed
             self._closed = True
+            # A delayed flusher may spend the entire original close deadline
+            # in a journal operation. Collection must still stop immediately.
+            if self._process_observer is not None:
+                self._process_observer._stop.set()
+                self._process_observer._wake.set()
             if not closing:
                 self._close_deadline = deadline
                 self._stop.set()
@@ -507,6 +513,29 @@ class ActivityRecorder:
         return self._close_result or {"state": "pending", "reason": "close_in_progress",
                                       "timed_out": True, "final_flush_persisted": False,
                                       "source_closed": False}
+
+    def _owned_workers_alive(self) -> bool:
+        observer = self._process_observer
+        workers = (self._thread, None if observer is None else observer._thread)
+        return any(worker is not None and worker.is_alive() for worker in workers)
+
+    def _join_owned_workers(self, deadline: float) -> dict[str, Any]:
+        """Drain lifetime ownership without changing the telemetry receipt.
+
+        Runtime storage must outlive an operation which exceeded recorder
+        close's caller wait. Joining does not restart a flush or renew that
+        operation's original deadline, and cannot confirm lost telemetry.
+        """
+        observer = self._process_observer
+        workers = (self._thread, None if observer is None else observer._thread)
+        for worker in workers:
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(max(0.0, deadline - time.monotonic()))
+        flusher_alive = self._thread is not None and self._thread.is_alive()
+        observer_alive = observer is not None and observer._thread is not None and observer._thread.is_alive()
+        return {"identity": self.identity.to_dict(), "source_id": self.source_id,
+                "state": "pending" if flusher_alive or observer_alive else "closed",
+                "flusher_alive": flusher_alive, "process_observer_alive": observer_alive}
 
     def _finish_close(self, deadline: float) -> None:
         result: dict[str, Any] = {"state": "pending", "reason": "close_deadline",

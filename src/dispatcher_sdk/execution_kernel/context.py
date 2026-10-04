@@ -157,6 +157,10 @@ class HandlerContext:
         self._budget_envelope = budget_envelope
         self._service_spec = dict(service_spec or {})
         self._entry_lock = threading.Lock()
+        self._observation_lifecycle_lock = threading.Lock()
+        self._observation_closed = False
+        self._observation_start_done = threading.Event()
+        self._observation_start_done.set()
         self._budget_lock = threading.RLock()
         self._entered = False
         self.activity: Any = _UnavailableActivity("observation_unavailable")
@@ -216,6 +220,10 @@ class HandlerContext:
             self.activity.phase("handler_entered")
 
     def _start_observation(self) -> None:
+        with self._observation_lifecycle_lock:
+            if self._observation_closed:
+                return
+            self._observation_start_done.clear()
         try:
             from ..observability import ActivityRecorder, ObservationIdentity, ObservationJournal, ObservationOptions
             spec = self._service_spec
@@ -239,13 +247,28 @@ class HandlerContext:
                 receipt = self._kernel.confirm_progress(self.lease, key, timeout_seconds=timeout)
                 return {**receipt, "revision": receipt["progress_revision"], "advanced": receipt["new"]}
 
-            self.activity = ActivityRecorder(self._journal, identity, options=options,
-                progress_confirm=confirm, clock=self._kernel._wall_time, start=True, source_scope="handler")
+            with self._observation_lifecycle_lock:
+                if self._observation_closed:
+                    return
+            recorder = ActivityRecorder(self._journal, identity, options=options,
+                progress_confirm=confirm, clock=self._kernel._wall_time, start=False, source_scope="handler")
+            with self._observation_lifecycle_lock:
+                self.activity = recorder
+                closing = self._observation_closed
+                if not closing:
+                    recorder.start()
+            if closing:
+                recorder.close()
         except Exception as exc:
             self.activity = _UnavailableActivity(f"observation_unavailable:{type(exc).__name__}")
+        finally:
+            self._observation_start_done.set()
 
     def close(self) -> dict[str, Any]:
-        return self.activity.close()
+        with self._observation_lifecycle_lock:
+            self._observation_closed = True
+            activity = self.activity
+        return activity.close()
 
     def is_active(self) -> bool:
         """Expose cooperative cancellation without leaking Kernel internals."""

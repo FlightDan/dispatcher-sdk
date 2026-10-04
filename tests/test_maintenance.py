@@ -7,7 +7,10 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
+import dispatcher_sdk.maintenance as maintenance_module
 
 from dispatcher_sdk.maintenance import (
     InvalidLeaseError,
@@ -108,7 +111,15 @@ class MaintenanceTests(unittest.TestCase):
         self._create_database()
         context = multiprocessing.get_context("spawn")
         result = context.Queue()
-        with maintenance_lease(self.path, "owner", "slow operation", lease_seconds=0.1) as lease:
+        wall, elapsed = [time.time()], [time.monotonic()]
+        clock = SimpleNamespace(**{name: getattr(time, name) for name in dir(time)
+            if name not in {"time", "monotonic"}}, time=lambda: wall[0], monotonic=lambda: elapsed[0])
+        with patch.object(maintenance_module, "time", clock), \
+                maintenance_lease(self.path, "owner", "slow operation", lease_seconds=0.1) as lease:
+            # Expire only after durable acquisition. Slow metadata fsync must
+            # not spend this test's expiry interval before it owns the lease.
+            wall[0] += .2
+            elapsed[0] += .2
             process = context.Process(
                 target=_try_maintenance,
                 args=(str(self.path), 0.2, result),
@@ -158,10 +169,15 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_renew_extends_lifetime_and_publishes_observable_state(self):
         self._create_database()
-        with maintenance_lease(self.path, "owner", "upgrade", lease_seconds=0.2) as lease:
+        wall, elapsed = [time.time()], [time.monotonic()]
+        clock = SimpleNamespace(**{name: getattr(time, name) for name in dir(time)
+            if name not in {"time", "monotonic"}}, time=lambda: wall[0], monotonic=lambda: elapsed[0])
+        with patch.object(maintenance_module, "time", clock), \
+                maintenance_lease(self.path, "owner", "upgrade", lease_seconds=0.2) as lease:
             original_expiry = lease.expires_at
             original_id = lease.id
-            time.sleep(0.02)
+            wall[0] += .02
+            elapsed[0] += .02
             self.assertIs(lease.renew(2), lease)
             self.assertGreater(lease.expires_at, original_expiry)
             lease.check(self.path)

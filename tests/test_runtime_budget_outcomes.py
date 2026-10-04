@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import threading
 import time
+import traceback
 import unittest
 
 from tests._acceptance_evidence import retained_directory
@@ -151,6 +152,7 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
         runtime = reopened = writer = driver = None
         outcome_ready, writer_held = threading.Event(), threading.Event()
         originals, results, errors = [], [], []
+        driver_tracebacks = []
         try:
             runtime = Kernel.open_sqlite(root / 'kernel.sqlite3', {'work': observe_expired_then_roll_back},
                 isolation_mode='thread', now=HandlerClock(), lease_seconds=90)
@@ -174,6 +176,7 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
                     results.append(runtime.run_once(execution_id='original'))
                 except BaseException as error:
                     errors.append(error)
+                    driver_tracebacks.append(traceback.format_exc())
 
             driver = threading.Thread(target=drive)
             driver.start()
@@ -182,7 +185,8 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
             writer.execute('BEGIN IMMEDIATE')
             writer_held.set()
             driver.join(3)
-            evidence['driver_errors'] = [{'type': type(error).__name__, 'message': str(error)} for error in errors]
+            evidence['driver_errors'] = [{'type': type(error).__name__, 'message': str(error), 'traceback': trace}
+                for error, trace in zip(errors, driver_tracebacks)]
             evidence['returned'] = [result.to_dict() for result in results]
             evidence['originals'] = [original.to_dict() for original in originals]
             self.assertFalse(driver.is_alive(), evidence)

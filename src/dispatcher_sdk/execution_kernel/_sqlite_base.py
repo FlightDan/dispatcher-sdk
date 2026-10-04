@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import sqlite3
 from ..storage_connection import connect as storage_connect
+from .._sqlite_errors import is_sqlite_contention
 import threading
 import time
 from typing import Any, Iterator, Optional
@@ -189,6 +190,21 @@ class SQLiteBase:
         return timestamp
 
     @contextmanager
+    def _busy_timeout_access(self):
+        # Python 3.10 cannot disable an authorizer with None. Permit only the
+        # internal busy_timeout pragma while retaining all other restrictions.
+        def authorize(action, first, second, database, source):
+            if action == sqlite3.SQLITE_PRAGMA and first == "busy_timeout" and source is None:
+                return sqlite3.SQLITE_OK
+            return self._authorizer(action, first, second, database, source)
+
+        self._connection.set_authorizer(authorize)
+        try:
+            yield
+        finally:
+            self._connection.set_authorizer(self._authorizer)
+
+    @contextmanager
     def _control_lock(self, timeout_seconds: float | None):
         """Bound control admission without changing persistent SQLite settings."""
         if self._default_control_timeout is not None:
@@ -213,29 +229,47 @@ class SQLiteBase:
                 return
             if deadline <= time.monotonic():
                 raise TimeoutError("Kernel control admission budget elapsed")
-            self._connection.set_authorizer(None)
-            try:
+            with self._busy_timeout_access():
                 old_timeout = self._connection.execute("PRAGMA busy_timeout").fetchone()[0]
-                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
-                self._connection.execute(f"PRAGMA busy_timeout={remaining_ms}")
-            finally:
-                self._connection.set_authorizer(self._authorizer)
+                # SQLite's native busy handler counts requested sleep lengths,
+                # not elapsed wall time. Keep bounded admission in Python.
+                self._connection.execute("PRAGMA busy_timeout=0")
             yield
         finally:
-            if old_timeout is not None:
-                self._connection.set_authorizer(None)
-                try:
-                    self._connection.execute(f"PRAGMA busy_timeout={old_timeout}")
-                finally:
-                    self._connection.set_authorizer(self._authorizer)
-            self._control_deadline = previous_deadline
-            self._lock.release()
+            try:
+                if old_timeout is not None:
+                    with self._busy_timeout_access():
+                        self._connection.execute(f"PRAGMA busy_timeout={old_timeout}")
+            finally:
+                self._control_deadline = previous_deadline
+                self._lock.release()
 
     @contextmanager
     def _transaction(self, *, timeout_seconds: float | None = None) -> Iterator[tuple[sqlite3.Connection, float]]:
         with self._control_lock(timeout_seconds):
-            self._connection.execute("BEGIN IMMEDIATE")
+            deadline = self._control_deadline
+            busy_error = None
+            while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    if busy_error is not None:
+                        raise busy_error
+                    raise TimeoutError("Kernel control admission budget elapsed")
+                try:
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if deadline is None or not is_sqlite_contention(exc):
+                        raise
+                    busy_error = exc
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(.01, remaining))
             try:
+                if deadline is not None and time.monotonic() >= deadline:
+                    if busy_error is not None:
+                        raise busy_error
+                    raise TimeoutError("Kernel control admission budget elapsed")
                 timestamp = self._advance_clock(self._connection)
                 self._connection.execute("SAVEPOINT kernel_operation")
             except BaseException:

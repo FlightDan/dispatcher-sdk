@@ -61,7 +61,7 @@ class CurrentBindingRecoveryTests(unittest.TestCase):
                 return original_bind(identity)
             except sqlite3.OperationalError as error:
                 self.evidence["records"].append({"failed_bind_identity": identity.to_dict(),
-                    "error": str(error), "sqlite_errorcode": error.sqlite_errorcode, "at": time.time()})
+                    "error": str(error), "sqlite_errorcode": getattr(error, "sqlite_errorcode", None), "at": time.time()})
                 binding_failed.set()
                 raise
 

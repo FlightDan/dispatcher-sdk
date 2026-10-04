@@ -22,6 +22,7 @@ from typing import Any, Iterator, Mapping
 import uuid
 
 from .._inspection import InspectionBudgetExceeded
+from .._sqlite_errors import is_sqlite_contention
 from .budget import BudgetEnvelope, BudgetClockUnknownError, sample_clock
 from .contracts import ExecutionCommandV2, ExecutionLease, RetryPolicy
 from .errors import ExecutionNotFoundError, StaleFenceError, InvalidStateTransitionError
@@ -58,10 +59,8 @@ def _transient_control_error(error: Exception) -> bool:
     if isinstance(error, InspectionBudgetExceeded):
         # This expires one read attempt, not the original child wait window.
         return True
-    if isinstance(error, sqlite3.OperationalError):
-        code = getattr(error, "sqlite_errorcode", None)
-        return ((code is not None and code & 255 in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
-                or (code is None and str(error).lower() in ("database is locked", "database table is locked")))
+    if is_sqlite_contention(error):
+        return True
     return isinstance(error, TimeoutError) and str(error) in (
         "Kernel control lock admission timed out", "Kernel control admission budget elapsed",
         "child lifecycle admission timed out", "observation schema admission budget elapsed")

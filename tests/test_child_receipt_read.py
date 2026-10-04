@@ -34,7 +34,8 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
         narrowed = replace(original, checkpoint=replace(original.checkpoint,
             wall_at=original.checkpoint.wall_at + .3))
         self.facts.note({'execution_id': row['child_execution_id'], 'attempt': 0, 'fence': 0},
-            'child_budget_checkpoint', {'wait_id': row['wait_id'], 'budget_envelope': narrowed.to_dict()})
+            'child_budget_checkpoint', {'wait_id': row['wait_id'], 'budget_envelope': narrowed.to_dict()},
+            timeout_seconds=window.remaining())
         writer = self.exclusive_writer()
         def unlock():
             time.sleep(.25)

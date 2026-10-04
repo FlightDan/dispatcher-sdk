@@ -248,6 +248,15 @@ the original receipts without reopening business; a fresh Runtime restores
 them through the existing fenced settlement path.
 
 `observe` also returns bounded `diagnostics` pages from this independent store.
+Runtime storage also remains owned by observation workers which outlive a
+recorder's bounded close wait. Runtime `close()` drains those stopped workers;
+if they still hold storage, it raises `RuntimeError` and retains pending cleanup.
+Calling `close()` again advances that cleanup without restarting business or
+changing the original telemetry receipt. Temporary observation storage is removed
+only after its owned workers stop, including observation initialization, the stall
+sampler and the settlement worker. Their cleanup shares one absolute deadline. A late handler cannot register a new process
+collector after its recorder closes.
+
 Cancellation stages, the actual handler outcome and the driver close receipt
 remain visible when the activity writer is locked. Lost details or an
 unconfirmed final flush make the observation incomplete even after the execution

@@ -1,5 +1,6 @@
 """Portable native A12/A13 witnesses; preserve raw evidence outside fixtures."""
 import json
+from itertools import count
 import os
 from pathlib import Path
 import sqlite3
@@ -16,50 +17,29 @@ from dispatcher_sdk.execution_kernel import CASConflictError, Kernel
 from dispatcher_sdk.observability import inspect_execution
 
 
-if os.name == "nt":
-    import ctypes
-    from ctypes import wintypes
-    import msvcrt
-
-    _snapshot_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    _snapshot_create_file = _snapshot_kernel32.CreateFileW
-    _snapshot_create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-    _snapshot_create_file.restype = wintypes.HANDLE
-    _snapshot_close_handle = _snapshot_kernel32.CloseHandle
-    _snapshot_close_handle.argtypes = [wintypes.HANDLE]
-    _snapshot_close_handle.restype = wintypes.BOOL
-    _GENERIC_READ = 0x80000000
-    _FILE_SHARE_READ = 0x1
-    _FILE_SHARE_WRITE = 0x2
-    _FILE_SHARE_DELETE = 0x4
-    _OPEN_EXISTING = 3
-    _FILE_ATTRIBUTE_NORMAL = 0x80
-
-    def _open_shared_snapshot(path, flags):
-        # Atomic replacement must remain possible while this reader holds the
-        # previous snapshot. Ordinary Python file opens omit delete sharing.
-        handle = _snapshot_create_file(str(path), _GENERIC_READ,
-            _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
-            None, _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None)
-        if handle == ctypes.c_void_p(-1).value:
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            return msvcrt.open_osfhandle(handle, flags | os.O_BINARY)
-        except BaseException:
-            _snapshot_close_handle(handle)
-            raise
-
-
-class SnapshotReadUnavailable(RuntimeError):
-    def __init__(self, path, error):
-        super().__init__(f"snapshot read unavailable: {path}: {error}")
-        self.path, self.error = str(path), error
+_snapshot_sequence = count()
 
 
 def open_snapshot(path):
-    options = {"opener": _open_shared_snapshot} if os.name == "nt" else {}
-    return open(path, encoding="utf-8", **options)
+    path = Path(path)
+    generations = path.with_name(path.name + ".snapshots")
+    try:
+        latest = max((candidate for candidate in generations.iterdir()
+                      if candidate.suffix == ".json"), default=path)
+    except FileNotFoundError:
+        latest = path
+    return latest.open(encoding="utf-8")
+
+
+def publish_snapshot(path, value):
+    # Each path has one producer with its original 8-second execution window
+    # and a .01-second child output cadence. Retain their finite generations
+    # so readers never race deletion or replace an open Windows destination.
+    path = Path(path)
+    generations = path.with_name(path.name + ".snapshots")
+    generations.mkdir(exist_ok=True)
+    destination = generations / f"{next(_snapshot_sequence):020d}.json"
+    write_json(destination, value)
 
 
 def write_json(path, value):
@@ -116,6 +96,8 @@ def streaming_pressure_handler(payload, context):
         time.sleep(.01)
     source = """
 import json, os, pathlib, sys, time
+sys.path[:] = %r
+from %s import publish_snapshot
 root = pathlib.Path(sys.argv[1])
 count = 0
 while True:
@@ -123,11 +105,9 @@ while True:
         (root / 'escaped').write_text('descendant survived its owner')
     os.write(1, b'x' * 512)
     count += 512
-    pending = root / 'child.json.pending'
-    pending.write_text(json.dumps({'pid': os.getpid(), 'bytes': count, 'at': time.time()}))
-    pending.replace(root / 'child.json')
+    publish_snapshot(root / 'child.json', {'pid': os.getpid(), 'bytes': count, 'at': time.time()})
     time.sleep(.01)
-"""
+""" % (sys.path, __name__)
     child = subprocess.Popen([sys.executable, "-u", "-c", source, str(root)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     context.activity.observe_process(child, role="tool", process_id="native-output")
@@ -141,7 +121,7 @@ while True:
                 context.activity.phase("output-summary", details={"number": number})
             snapshot = context.activity.snapshot()
             snapshot.pop("tails", None)
-            write_json(root / "local.json", snapshot)
+            publish_snapshot(root / "local.json", snapshot)
     return {"unexpected_child_exit": child.wait()}
 
 
@@ -174,22 +154,12 @@ class ObservabilityPressureTests(unittest.TestCase):
     def wait_for(self, query, predicate=bool, *, seconds=15):
         deadline = time.monotonic() + seconds
         last = None
-        last_read_error = None
         while time.monotonic() < deadline:
-            try:
-                last = query()
-                last_read_error = None
-            except SnapshotReadUnavailable as error:
-                last_read_error = error.error
-                self.evidence.setdefault("snapshot_read_retries", []).append({
-                    "path": error.path, "at": time.time(),
-                    "winerror": error.error.winerror, "raw_error": repr(error.error)})
-                time.sleep(.02)
-                continue
+            last = query()
             if predicate(last):
                 return last
             time.sleep(.02)
-        raise self.failureException("stage deadline expired: " + repr(last)) from last_read_error
+        self.fail("stage deadline expired: " + repr(last))
 
     def read_json(self, path):
         try:
@@ -197,22 +167,19 @@ class ObservabilityPressureTests(unittest.TestCase):
                 return json.load(reader)
         except FileNotFoundError:
             return None
-        except PermissionError as error:
-            # A target being replaced can briefly be unavailable on Windows.
-            # Only the snapshot poll retries this; it retains the raw error and
-            # never turns a denied read into a readiness result.
-            if os.name == "nt" and error.winerror in (5, 32):
-                raise SnapshotReadUnavailable(path, error) from error
-            raise
 
     def encoded(self, report):
         return len(json.dumps(report, ensure_ascii=False, separators=(",", ":")).encode())
 
-    def test_atomic_snapshot_replace_preserves_open_reader(self):
+    def test_atomic_snapshot_publication_preserves_open_reader(self):
         path = self.root / "snapshot.json"
-        write_json(path, {"sequence": 1})
+        publish_snapshot(path, {"sequence": 1})
         with open_snapshot(path) as reader:
-            write_json(path, {"sequence": 2})
+            # An incomplete generation is never a readiness result.
+            pending = path.with_name(path.name + ".snapshots") / "99999999999999999999.json.pending"
+            pending.write_text('{"sequence":', encoding="utf-8")
+            self.assertEqual(self.read_json(path), {"sequence": 1})
+            publish_snapshot(path, {"sequence": 2})
             self.assertEqual(json.load(reader), {"sequence": 1})
             self.assertEqual(self.read_json(path), {"sequence": 2})
 
@@ -471,6 +438,8 @@ class ObservabilityPressureTests(unittest.TestCase):
                         self.assertLess(record["deadline_stop_lateness"], 2)
                     record["kernel_state"] = runtime.kernel.get(name).state
                     self.assertEqual(record["kernel_state"], "timed_out" if action == "deadline" else "cancelled")
+                    record["snapshot_generations"] = {kind: len(tuple(
+                        (root / f"{kind}.json.snapshots").glob("*.json"))) for kind in ("local", "child")}
                     record["locked_observation"] = runtime.observe(name, timeout=.5)
                     self.assertTrue(any(not item["receipt"]["final_flush_persisted"]
                         for item in record["driver_close_receipts"]), record["driver_close_receipts"])
