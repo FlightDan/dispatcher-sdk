@@ -2,8 +2,8 @@
 from pathlib import Path
 from typing import Any
 
-from dispatcher_sdk import Dispatcher, ObservationOptions, StallPolicy, Task, BudgetEnvelope, ExecutionBudget
-from dispatcher_sdk.execution_kernel import HandlerContext, SQLiteKernel
+from dispatcher_sdk import Dispatcher, ExecutionActivity, ObservationOptions, StallPolicy, Task, BudgetEnvelope, ExecutionBudget
+from dispatcher_sdk.execution_kernel import ChildCalls, HandlerContext, SQLiteKernel
 
 
 def work(payload: Any, context: HandlerContext) -> Any:
@@ -12,6 +12,12 @@ def work(payload: Any, context: HandlerContext) -> Any:
     context.activity.enable_stream("stdout")
     context.activity.report_bytes("stdout", b"raw", retain_tail=False)
     context.activity.progress("one-step")
+    activity: ExecutionActivity = context.activity
+    children: ChildCalls = context.children
+    activity.report_bytes("stdout", "not bytes")  # type: ignore[arg-type]
+    activity.progress("step", timeout="forever")  # type: ignore[arg-type]
+    children.run("child", {}, request_id="bounded", timeout_seconds="forever")  # type: ignore[arg-type]
+    children.wait_for("child", request_id=123)  # type: ignore[arg-type]
     return {"remaining": budget.remaining_work_seconds, "tool": tool.to_dict()}
 
 

@@ -7,7 +7,7 @@ the restart-safe global execution-event sequence.
 
 from .context import HandlerContext, HandlerEffects
 from .budget import BudgetEnvelope, BudgetClockUnknownError, ExecutionBudget, DeadlineConstraint, ClockCheckpoint
-from .children import HandlerChildren, ChildExecutionError
+from .children import ChildCalls, HandlerChildren, ChildExecutionError
 from .cancellation import (
     CancellationJournal, CancellationReceipt, CancellationJournalPage,
     CANCELLATION_SCHEMA_VERSION, inspect_cancellation_journal,
@@ -64,7 +64,7 @@ from .transitions import (
 
 __all__ = [
     "BudgetEnvelope", "BudgetClockUnknownError", "ExecutionBudget", "DeadlineConstraint", "ClockCheckpoint",
-    "HandlerChildren", "ChildExecutionError",
+    "ChildCalls", "HandlerChildren", "ChildExecutionError",
     "CancellationJournal", "CancellationReceipt", "CancellationJournalPage",
     "CANCELLATION_SCHEMA_VERSION", "inspect_cancellation_journal",
     "SandboxBackend", "SandboxBackendError", "SandboxHandler", "SandboxJournal",

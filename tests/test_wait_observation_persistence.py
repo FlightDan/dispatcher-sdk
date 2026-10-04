@@ -1,5 +1,6 @@
 """Wait projection against real SQLite contention and Kernel authority."""
 from contextlib import closing
+import json
 import sqlite3
 import threading
 import time
@@ -48,7 +49,11 @@ class WaitObservationTests(unittest.TestCase):
         self.journal = ObservationJournal(self.root / 'observations.sqlite3',
             kernel_path=self.kernel.db_path, source_id='store', clock=self.clock,
             options=ObservationOptions(write_timeout=.03))
-        self.journal.bind_current(self.identity)
+        encoded = json.dumps(self.identity.to_dict(), sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False)
+        with closing(sqlite3.connect(self.journal.path, timeout=0)) as connection, connection:
+            connection.execute("INSERT INTO obs_current VALUES(?,?,?,?,?)",
+                (self.identity.execution_id, self.identity.attempt, self.identity.fence, encoded, self.clock()))
 
     def recorder(self, **kwargs):
         return ActivityRecorder(self.journal, self.identity, clock=self.clock,

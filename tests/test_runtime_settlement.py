@@ -1,5 +1,6 @@
 """Original real handler outcomes survive bounded Kernel write contention."""
 from pathlib import Path
+from contextlib import closing
 from dataclasses import replace
 import json
 import sqlite3
@@ -233,6 +234,59 @@ class RuntimeSettlementTests(unittest.TestCase):
         self.assertIsNone(reopened.run_once())
         self.assertEqual(len(calls.read_text().splitlines()), 1)
         self.assert_retained(reopened, "restart", original, "recorded")
+
+    def test_copy_upgrade_keeps_external_pending_outcome_with_original_owner(self):
+        from dispatcher_sdk.maintenance import maintenance_lease
+        from dispatcher_sdk.storage_migration import upgrade_storage
+        from dispatcher_sdk.execution_kernel.settlement import SettlementJournal
+        from tests.test_storage_migration import StorageMigrationTests
+
+        name = "upgrade-original-owner"
+        runtime, writer, calls, original, obligation = self.run_with_result_writer_locked(name)
+        source = Path(runtime.kernel.db_path)
+        observation = dict(runtime.observation_storage)
+        journal_path = runtime._settlement_journal.path
+        source_id = runtime._settlement_journal.source_id
+        runtime.close()
+        writer.rollback()
+        before = StorageMigrationTests._stored_rows(source)
+        destination = self.root / "upgrade-copy.sqlite3"
+        with maintenance_lease(source, "tests", "pending-outcome-copy") as lease:
+            report = upgrade_storage(source, destination, lease=lease)
+        self.assertEqual(StorageMigrationTests._stored_rows(source), before)
+        self.assertEqual(StorageMigrationTests._stored_rows(destination), before)
+        for field in ("automatic_activation", "automatic_cutover",
+                      "external_stores_included", "observation_journal_included"):
+            self.assertFalse(report[field])
+        self.assertEqual((report["source_version"], report["target_version"]), (4, 4))
+        pending = SettlementJournal.open_readonly(journal_path, source_id=source_id,
+            kernel_path=source, timeout_seconds=.5).inspect(name, timeout_seconds=.5)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["result"], original)
+        self.assertIn(pending[0]["state"], {"pending", "error"})
+        with closing(sqlite3.connect(destination.resolve().as_uri() + "?mode=ro", uri=True)) as copied:
+            names = {row[0] for row in copied.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertFalse(any(table.startswith("obs_") or table.startswith("settlement_")
+                                 for table in names))
+        # Only the original deployment owns its unchanged external receipt.
+        # Recovery settles the retained result; it does not execute the handler.
+        reopened = self.open(name)
+        current, recovery = self.recover(reopened, name)
+        self.assertEqual(current.result.to_dict(), original)
+        self.assertIsNone(reopened.run_once())
+        self.assertEqual(calls.read_text().splitlines(), [name])
+        self.assert_retained(reopened, name, original, "recorded")
+        self.assertEqual(StorageMigrationTests._stored_rows(destination), before)
+        (self.root / "copy-upgrade-evidence.json").write_text(json.dumps({
+            "source": str(source), "destination": str(destination),
+            "observation_storage": observation, "original_obligation": obligation,
+            "pending_after_copy": pending,
+            "copy_report": report, "recovery_reports": recovery,
+            "original_result": original, "recovered_result": current.result.to_dict(),
+            "business_invocations": calls.read_text().splitlines(),
+            "destination_activated": False,
+        }, indent=2, default=str))
 
     def test_lifecycle_contention_preserves_actual_return_before_admission(self):
         runtime = Kernel.open_sqlite(self.root / "lifecycle.sqlite3",

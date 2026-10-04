@@ -562,8 +562,18 @@ class RuntimeHostTests(unittest.TestCase):
                 self.assertTrue(host.stop(timeout=2.0))
 
     def test_stop_drains_workers_and_closes_runtime(self) -> None:
+        from dataclasses import asdict
+        import traceback
+        from tests._acceptance_evidence import retained_directory
+        from tests._storage_evidence import StorageEvidence
+
         entered = threading.Event()
         release = threading.Event()
+        root = retained_directory("sdk-runtime-host-stop-")
+        evidence = StorageEvidence(root, self)
+        evidence.start(include_kernel=True)
+        self.addCleanup(evidence.stop)
+        self.addCleanup(evidence.save)
 
         def blocking_handler(_payload, _context):
             entered.set()
@@ -571,37 +581,78 @@ class RuntimeHostTests(unittest.TestCase):
             return {"done": True}
 
         blocking_handler.__execution_kernel_revision__ = "runtime-host-stop-v1"
-        with tempfile.TemporaryDirectory() as temp:
-            runtime = Kernel.open_sqlite(
-                Path(temp) / "kernel.sqlite3",
-                {("blocking", 1): blocking_handler},
-                isolation_mode="thread",
-                max_thread_workers=1,
-            )
-            command = make_command("host-stop", runtime.registry_revision)
-            command = replace(
-                command,
-                handler_id="blocking",
-                timeout_seconds=5.0,
-            )
-            runtime.submit(command)
-            host = RuntimeHost(
-                runtime,
-                RecordingBridge(),
-                worker_count=1,
-                sweep_interval=0.05,
-                pump_interval=0.01,
-            )
+        runtime = Kernel.open_sqlite(
+            root / "kernel.sqlite3", {("blocking", 1): blocking_handler},
+            isolation_mode="thread", max_thread_workers=1,
+        )
+        host = RuntimeHost(runtime, RecordingBridge(), worker_count=1,
+                           sweep_interval=0.05, pump_interval=0.01)
+
+        def facts():
+            report = host.stop_report
+            with runtime._lifecycle_condition:
+                recorders = tuple(runtime._retired_recorders)
+                contexts = tuple(runtime._retired_observation_contexts)
+            return {"health": asdict(host.health()),
+                    "stop_report": None if report is None else report.to_dict(),
+                    "shutdown_error": repr(host._shutdown_error),
+                    "owned_recorders": [{"identity": recorder.identity.to_dict(),
+                        "source_id": recorder.source_id,
+                        "workers_alive": recorder._owned_workers_alive(),
+                        "original_close_deadline": recorder._close_deadline,
+                        "receipt": recorder._close_result} for recorder in recorders],
+                    "owned_contexts": [{"execution_id": context.lease.execution_id,
+                        "initialization_done": context._observation_start_done.is_set(),
+                        "observation_closed": context._observation_closed} for context in contexts],
+                    "handler_entered": entered.is_set(), "release_set": release.is_set()}
+
+        def close_owned_runtime():
+            # Observe the existing coordinator after the original stop result;
+            # no second stop call or renewal of its deadline occurs.
             try:
-                host.start()
-                self.assertTrue(entered.wait(1.0))
-                self.assertTrue(host.stop(timeout=3.0))
-                self.assertTrue(host.join(0.1))
-                self.assertEqual(host.health().state, "stopped")
-                self.assertIsNone(runtime.run_once())
+                began = time.monotonic()
+                joined = host.join(3.0)
+                evidence.save(phase="lifetime-drain", checkpoint={
+                    "joined": joined, "elapsed": time.monotonic() - began, **facts()})
             finally:
-                release.set()
-                runtime.close()
+                try:
+                    runtime.close()
+                except BaseException as error:
+                    evidence.save(phase="cleanup-error", checkpoint={
+                        "error_chain": traceback.format_exception(type(error), error, error.__traceback__),
+                        **facts()})
+                    raise
+                finally:
+                    evidence.save(phase="after-runtime-close", checkpoint=facts())
+
+        # unittest keeps cleanup errors separate from the original failure.
+        # The retained root remains available while SDK storage is owned.
+        self.addCleanup(close_owned_runtime)
+        command = make_command("host-stop", runtime.registry_revision)
+        command = replace(command, handler_id="blocking", timeout_seconds=5.0)
+        runtime.submit(command)
+        stop_began = None
+        try:
+            host.start()
+            self.assertTrue(entered.wait(1.0))
+            stop_began = time.monotonic()
+            stopped = host.stop(timeout=3.0)
+            elapsed = time.monotonic() - stop_began
+            evidence.save(phase="original-stop-return", checkpoint={
+                "timeout": 3.0, "stopped": stopped, "elapsed": elapsed, **facts()})
+            self.assertTrue(stopped)
+            self.assertTrue(host.join(0.1))
+            self.assertEqual(host.health().state, "stopped")
+            self.assertIsNone(runtime.run_once())
+        except BaseException as error:
+            evidence.save(phase="original-failure", checkpoint={
+                "stop_timeout": 3.0,
+                "stop_elapsed": None if stop_began is None else time.monotonic() - stop_began,
+                "error_chain": traceback.format_exception(type(error), error, error.__traceback__),
+                **facts()})
+            raise
+        finally:
+            release.set()
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ same public Runtime API. A Linux pass does not constitute Windows acceptance.
 from __future__ import annotations
 
 import json
+import importlib
 import multiprocessing
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ import unittest
 
 import dispatcher_sdk
 from dispatcher_sdk import Dispatcher
-from dispatcher_sdk.execution_kernel import ExecutionNotFoundError, HandlerExecutionError, Kernel, RetryPolicy
+from dispatcher_sdk.execution_kernel import ChildExecutionError, ExecutionNotFoundError, HandlerExecutionError, Kernel, RetryPolicy
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, sample_clock
 from dispatcher_sdk.observability import ObservationOptions
 
@@ -69,6 +70,156 @@ class NativePhaseHandler:
         mark(self.root, "model-request")
         wait_file(Path(self.root) / "release-return", activity=context.activity)
         return {"model_request": True}
+
+
+class NativeImportHandler:
+    __execution_kernel_revision__ = "native-import-failure-acceptance-v1"
+
+    def __init__(self, root):
+        self.root = str(root)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        module = "sdk_acceptance_intentionally_absent_handler_module"
+        mark(self.root, "handler-import-started", module=module)
+        try:
+            importlib.import_module(module)
+        except ModuleNotFoundError as error:
+            mark(self.root, "handler-import-failed", module=module,
+                error_type=type(error).__name__, message=str(error), missing_name=error.name)
+            raise
+
+    def __call__(self, payload, context):
+        mark(self.root, "unexpected-import-handler-entry")
+        context.activity.model("request")
+        return {"unexpected": "handler import succeeded"}
+
+
+def resident_memory(pid):
+    """Measure native resident memory; inaccessible data remains unknown."""
+    facts = {"pid": pid, "wall": time.time(), "monotonic": time.monotonic(), "known": False}
+    try:
+        if sys.platform.startswith("linux"):
+            root = Path("/proc") / str(pid)
+            before = (root / "stat").read_text(encoding="ascii")
+            status = (root / "status").read_text(encoding="ascii")
+            after = (root / "stat").read_text(encoding="ascii")
+            first, last = before.rsplit(")", 1)[1].split(), after.rsplit(")", 1)[1].split()
+            if first[19] != last[19] or last[0] == "Z":
+                raise RuntimeError("process changed or became a zombie during resident measurement")
+            rss = next(line.split()[1] for line in status.splitlines() if line.startswith("VmRSS:"))
+            facts.update(known=True, source="linux_proc_status", resident_bytes=int(rss) * 1024,
+                birth_ticks=last[19], process_state=last[0], raw_status=status, raw_stat=after)
+        elif os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class Counters(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    *[(name, ctypes.c_size_t) for name in ("PeakWorkingSetSize", "WorkingSetSize",
+                        "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                        "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage", "PrivateUsage")]]
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel.CloseHandle.restype = wintypes.BOOL
+            kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            kernel.WaitForSingleObject.restype = wintypes.DWORD
+            kernel.GetProcessTimes.argtypes = (wintypes.HANDLE, *([ctypes.POINTER(wintypes.FILETIME)] * 4))
+            kernel.GetProcessTimes.restype = wintypes.BOOL
+            psapi.GetProcessMemoryInfo.argtypes = (wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD)
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            handle = kernel.OpenProcess(0x100410, False, pid)  # synchronize, query, VM read
+            if not handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                if kernel.WaitForSingleObject(handle, 0) != 258:
+                    raise RuntimeError("native process handle is not currently active")
+                created, exited, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
+                if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                        ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                counters = Counters()
+                counters.cb = ctypes.sizeof(counters)
+                if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                facts.update(known=True, source="windows_native_process_handle",
+                    resident_bytes=counters.WorkingSetSize, peak_resident_bytes=counters.PeakWorkingSetSize,
+                    private_commit_bytes=counters.PrivateUsage,
+                    birth_ticks=(created.dwHighDateTime << 32) | created.dwLowDateTime,
+                    native_wait_result=258)
+            finally:
+                if not kernel.CloseHandle(handle):
+                    raise ctypes.WinError(ctypes.get_last_error())
+        else:
+            facts["unknown_reason"] = "resident_measurement_platform_unsupported"
+    except Exception as error:
+        facts.update(known=False, unknown_reason="resident_measurement_unavailable",
+            error_type=type(error).__name__, message=str(error))
+    return facts
+
+
+def capacity_event(root, role, phase):
+    event = {"role": role, "phase": phase, "pid": os.getpid(), "wall": time.time(),
+        "monotonic": time.monotonic(), "interpreter": sys.executable, "sdk_import": dispatcher_sdk.__file__}
+    descriptor = os.open(Path(root) / "handler-events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(descriptor, (json.dumps(event) + "\n").encode("utf-8"))
+    finally:
+        os.close(descriptor)
+
+
+def native_capacity_parent(payload, context):
+    root = Path(payload["root"])
+    capacity_event(root, "parent", "entered")
+    before = resident_memory(os.getpid())
+    resident = bytearray(payload["buffer_bytes"])
+    for offset in range(0, len(resident), 4096):
+        resident[offset] = 91
+    resident[-1] = 91
+    allocated = resident_memory(os.getpid())
+    mark(root, "capacity-parent-entered", identity=context.lease.to_dict(), before=before,
+        allocated=allocated, buffer_bytes=len(resident), touched_pages=(len(resident) + 4095) // 4096,
+        budget=context.budget.to_dict())
+    try:
+        try:
+            result = context.children.run("child", payload, request_id="one-capacity-child", timeout_seconds=12)
+            returned = {"child": result}
+        except ChildExecutionError as error:
+            returned = {"child_error": error.result, "code": error.code, "message": str(error)}
+        mark(root, "capacity-parent-returned", retained_buffer_bytes=len(resident),
+            retained_first_byte=resident[0], retained_last_byte=resident[-1], memory=resident_memory(os.getpid()))
+        return returned
+    finally:
+        capacity_event(root, "parent", "returned")
+
+
+def native_capacity_child(payload, context):
+    root = Path(payload["root"])
+    capacity_event(root, "child", "entered")
+    mark(root, "capacity-child-entered", identity=context.lease.to_dict(), memory=resident_memory(os.getpid()))
+    try:
+        wait_file(root / "release-capacity-child", activity=context.activity, seconds=10)
+        if payload["fail"]:
+            mark(root, "capacity-child-error", error_type="HandlerExecutionError", code="native_child_denied",
+                message="original native child refusal", input=payload["input"])
+            raise HandlerExecutionError("native_child_denied", "original native child refusal",
+                details={"input": payload["input"]})
+        return {"input": payload["input"]}
+    finally:
+        capacity_event(root, "child", "returned")
+
+
+def native_capacity_successor(payload, context):
+    capacity_event(payload["root"], "successor", "entered")
+    try:
+        mark(payload["root"], "capacity-successor-entered", identity=context.lease.to_dict())
+        return {"continued": True}
+    finally:
+        capacity_event(payload["root"], "successor", "returned")
 
 
 def segmented_output(payload, context):
@@ -204,7 +355,8 @@ sys.exit(137)
 
 
 for handler in (segmented_output, blocked_native_tool, native_crash_gate, native_wait_gate,
-                native_registration_parent, native_registration_child, native_shared_oom_clue):
+                native_registration_parent, native_registration_child, native_shared_oom_clue,
+                native_capacity_parent, native_capacity_child, native_capacity_successor):
     handler.__execution_kernel_revision__ = "native-observability-acceptance-v1"
 
 
@@ -381,6 +533,123 @@ class NativeObservabilityAcceptanceTests(unittest.TestCase):
         self.assertNotIn("handler_entered", self.phases(observed))
         self.assertEqual(0, self.count(observed, "model_requests"))
         self.assertFalse((self.root / "entered.json").exists())
+
+    def test_native_handler_import_failure_retains_raw_error_without_false_ready_or_entry(self):
+        from tests._storage_evidence import StorageEvidence
+        evidence = StorageEvidence(self.root, self)
+        evidence.start(include_kernel=True)
+        self.addCleanup(evidence.stop)
+        self.addCleanup(evidence.save)
+        runtime = self.open(NativeImportHandler(self.root))
+        command = self.submit(runtime)
+        driver, results, errors = self.drive(runtime)
+        failure = self.await_marker("handler-import-failed")
+        result = self.finish(driver, results, errors)
+        observed = self.snapshot(runtime, command, "failed-handler-import")
+        evidence.save(phase="handler-import", checkpoint={"failure": failure,
+            "result": result.to_dict(), "observation": observed, "original_execution_timeout": 8})
+        self.assertEqual("ModuleNotFoundError", failure["error_type"])
+        self.assertEqual("sdk_acceptance_intentionally_absent_handler_module", failure["missing_name"])
+        self.assertEqual("failed", result.state)
+        self.assertIn(failure["message"], json.dumps(result.to_dict()))
+        self.assertEqual("ModuleNotFoundError", result.result.error.details["exception_type"])
+        self.assertEqual("worker_deserialization", result.result.error.details["stage"])
+        self.assertNotIn("worker_ready", self.phases(observed))
+        self.assertNotIn("handler_entered", self.phases(observed))
+        self.assertEqual(0, self.count(observed, "model_requests"))
+        self.assertFalse((self.root / "unexpected-import-handler-entry.json").exists())
+
+    def test_native_parent_resident_memory_and_child_results_keep_configured_capacity(self):
+        from tests._storage_evidence import StorageEvidence
+        evidence = StorageEvidence(self.root, self)
+        evidence.start(include_kernel=True)
+        self.addCleanup(evidence.stop)
+        self.addCleanup(evidence.save)
+        for fail in (False, True):
+            with self.subTest(child_failure=fail):
+                root = self.root / ("failure" if fail else "success")
+                root.mkdir()
+                payload = {"root": str(root), "fail": fail, "buffer_bytes": 16 * 1024 * 1024,
+                    "input": "original-native-capacity-input"}
+                mark(root, "configuration", business_workers=1, child_capacity=1, total_handler_capacity=2,
+                    parent_timeout=20, child_timeout=12, caller_timeout=25, child_barrier_timeout=10,
+                    entry_barrier_timeout=12, payload=payload)
+                app = Dispatcher(root / "application.sqlite3", {"parent": native_capacity_parent,
+                    "child": native_capacity_child, "successor": native_capacity_successor},
+                    isolation_mode="process", worker_count=1, child_capacity=1, max_child_depth=1,
+                    observation_options=self.options)
+                parent = app.submit("parent", payload, request_id="capacity-parent", timeout_seconds=20)
+                successor = app.submit("successor", {"root": str(root)}, request_id="capacity-successor",
+                    timeout_seconds=20)
+                try:
+                    app.start()
+                    wait_file(root / "capacity-parent-entered.json", seconds=12)
+                    wait_file(root / "capacity-child-entered.json", seconds=12)
+                    entered = json.loads((root / "capacity-parent-entered.json").read_text())
+                    child_entered = json.loads((root / "capacity-child-entered.json").read_text())
+                    deadline = time.monotonic() + 3
+                    while True:
+                        waiting = parent.observe(timeout=.5)
+                        if any(wait["state"] == "open" for wait in waiting.get("child_waits", [])):
+                            break
+                        if time.monotonic() >= deadline:
+                            self.fail(waiting)
+                        time.sleep(.02)
+                    memory = {"parent": resident_memory(entered["pid"]),
+                        "child": resident_memory(child_entered["pid"])}
+                    write_json(root / "during-child-wait.json", {"memory": memory, "observation": waiting,
+                        "successor_state": successor.snapshot["state"], "observed_handler_processes": 2})
+                    self.assertNotEqual(entered["pid"], child_entered["pid"])
+                    self.assertNotIn(os.getpid(), {entered["pid"], child_entered["pid"]})
+                    for measured in (entered["before"], entered["allocated"], *memory.values()):
+                        self.assertTrue(measured["known"], measured)
+                        self.assertGreaterEqual(measured["resident_bytes"], 0)
+                    self.assertEqual("queued", successor.snapshot["state"])
+                    self.assertFalse((root / "capacity-successor-entered.json").exists())
+                    requests = waiting["child_requests"]
+                    self.assertEqual(1, len(requests))
+                    self.assertEqual(child_entered["identity"]["execution_id"], requests[0]["child_execution_id"])
+                    (root / "release-capacity-child").touch()
+                    result = parent.wait(timeout=25)
+                    continued = successor.wait(timeout=25)
+                    returned = json.loads((root / "capacity-parent-returned.json").read_text())
+                    raw_events = (root / "handler-events.jsonl").read_text().splitlines()
+                    events = sorted((json.loads(line) for line in raw_events), key=lambda event: event["monotonic"])
+                    active, peak = set(), 0
+                    for event in events:
+                        if event["phase"] == "entered":
+                            self.assertNotIn(event["pid"], active, events)
+                            active.add(event["pid"])
+                            peak = max(peak, len(active))
+                        else:
+                            self.assertIn(event["pid"], active, events)
+                            active.remove(event["pid"])
+                    write_json(root / "capacity-result.json", {"result": result, "successor": continued,
+                        "parent_returned": returned, "raw_events": raw_events, "events": events,
+                        "actual_handler_peak": peak, "configured_handler_limit": 2})
+                    self.assertEqual("succeeded", result["status"])
+                    self.assertEqual("succeeded", continued["status"])
+                    self.assertTrue(continued["value"]["continued"])
+                    self.assertEqual(2, peak)
+                    self.assertEqual(set(), active)
+                    self.assertEqual(payload["buffer_bytes"], returned["retained_buffer_bytes"])
+                    self.assertEqual(91, returned["retained_first_byte"])
+                    self.assertEqual(91, returned["retained_last_byte"])
+                    self.assertTrue(returned["memory"]["known"], returned["memory"])
+                    if fail:
+                        raw_error = json.loads((root / "capacity-child-error.json").read_text())
+                        child_error = result["value"]["child_error"]["error"]
+                        self.assertEqual(raw_error["code"], child_error["code"])
+                        self.assertEqual(raw_error["message"], child_error["message"])
+                        self.assertEqual(payload["input"], child_error["details"]["input"])
+                    else:
+                        self.assertEqual(payload["input"], result["value"]["child"]["value"]["input"])
+                    evidence.save(phase="capacity-failure" if fail else "capacity-success",
+                        checkpoint={"waiting": waiting, "native_memory": memory, "events": events,
+                            "actual_handler_peak": peak, "result": result, "successor": continued})
+                finally:
+                    (root / "release-capacity-child").touch()
+                    app.close()
 
     def test_native_segmented_bytes_heartbeat_tool_response_and_progress_replay(self):
         runtime = self.open(segmented_output)

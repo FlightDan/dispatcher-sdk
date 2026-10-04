@@ -8,8 +8,9 @@ generation.
 ## Storage design
 
 The optional Runtime cancellation journal uses a separate SQLite file that the
-caller explicitly configures. Kernel schema 2, Orchestrator schema 3 and existing sandbox
-schema 1 remain unchanged. Enabling it creates a separate journal without migrating an existing active
+caller explicitly configures. Current Kernel and Orchestrator storage use schema
+4; existing sandbox storage uses schema 1. Enabling cancellation evidence creates
+a separate schema-1 journal without migrating an existing active
 database. Existing SDK APIs keep their default behavior.
 
 Journal schema 1 stores immutable cancellation requests and immutable phase

@@ -6,7 +6,82 @@ maintainability only. The user has activated the revised SDK-only Goal. ModPort 
 writes are outside the revised completion criteria. Historical integration evidence
 is retained below; it does not establish the new SDK-only A16.
 
-The last complete local Linux acceptance passed on implementation commit
+Latest completed candidate `12771d9ea00fcd58f4948d58f12c4aa903be8f12` failed all
+16 environments in [run 37200662333](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37200662333);
+history scanning passed. Every outer suite ran 975 cases and each installed suite
+970, retaining the original 900-second installed-suite deadline. A shared stale
+cancellation test expected a persisted failure receipt after raised control errors
+had deliberately moved to bounded local diagnostics. Its revised assertion checks
+the original CAS error, unchanged authority, durable original request and separate
+nonpersistent failure facts. No successful matrix is claimed for this candidate.
+
+Eight Windows environments retained 40 installed public scenarios, 32 actual
+post-close SQLite rename/delete probes, 16 actual launcher/worker final-flush and
+PID checks, and 16 `pythonw` cases. They do not override other failures. Raw inventory
+and retained native data are `/tmp/sdk-ci-audit-summary-37200662333.json` and
+`/tmp/sdk-ci-audit-evidence-37200662333`. Typing passed everywhere; docs/examples
+were skipped after test failures, so those steps are not fresh CI passes.
+
+Native ARM traces also retained unrelated fixture seeding writes spending .031s
+in `PRAGMA synchronous=2`, exhausting the original .03s admission window before
+BEGIN. Read-only aggregation fixtures now seed their known rows with test-owned
+SQLite, while actual SDK bind/write/contention validation retains its original
+budgets. Unattributed Host stop/notification and entry failures now retain their
+original checkpoints and cleanup errors. The receipt caller's original .3s window
+and .6s elapsed assertion remain; SQL, actual sleep and thread CPU timing were added
+to explain the retained native 1.839s return rather than widening its bound.
+
+Current local corrections passed 148 tests in 137.034s
+(`/tmp/sdk-goal-scope-corrections-integrated.log`). This covers public typed
+`ExecutionActivity`/`ChildCalls`, explicit unavailable-child errors, real missing
+module import, and public parent/child success/failure with a retained 16 MiB
+buffer, actual RSS readings and capacity two. These new mandatory witnesses still
+require the fresh native matrix. Explicit copy upgrade additionally preserved a
+real pending original result in its original external journal, then recovered it
+without invoking business again; the destination remained inactive and unchanged
+(`/tmp/sdk-copy-upgrade-preservation310-final.log`). Migration checks compare
+actual schema and rows instead of running the old SHA fixture. Independent
+read-only review found no blocker. The corrected wheel passed all five public
+scenarios and the original example with Python 3.10 isolated imports outside the
+checkout (`/tmp/sdk-scope-final-public310-evidence/summary.json`,
+`/tmp/sdk-scope-final-public310.log`, `/tmp/sdk-scope-final-example310.log`). Actual
+import is `/tmp/sdk-scope-final-installed310/lib/python3.10/site-packages/dispatcher_sdk/__init__.py`.
+Five public typing fixtures, 550 documentation links/six README examples and 26
+upgrade/settlement/packaging checks passed (`/tmp/sdk-scope-final-types.log`,
+`/tmp/sdk-scope-final-docs.log`, `/tmp/sdk-scope-final-upgrades312.log`).
+The corrected complete matrix remains pending.
+
+### Local observation cost measurement
+
+The fixed offline experiment in [benchmark_observability.py](../scripts/benchmark_observability.py)
+completed exactly three interleaved fresh-store trials of four tasks per arm,
+using process isolation, FULL durability, default observation settings and the
+same workload/original 30-second work and wait windows. All 36 tasks and their
+callbacks succeeded; no arm was retried. Installed Python 3.10 paths, commands,
+execution IDs, original errors and bounded per-process SQL counters are retained
+in `/tmp/sdk-observability-overhead-scope-final.json` and its adjacent directory.
+
+| Arm | Tasks/s | Median wait, s | Median handler, s | SQL mutation attempts | COMMIT attempts | Post-close database bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Historical dev0 | 0.915 | 2.754 | 0.105 | 3,890 | 572 | 1,896,448 |
+| Current automatic observation | 0.462 | 5.391 | 0.105 | 5,697 | 1,868 | 3,260,416 |
+| Current plus public reports | 0.332 | 8.052 | 0.336 | 6,495 | 2,213 | 3,883,008 |
+
+The historical comparison also includes other SDK changes; it does not isolate
+automatic observation overhead. Extra public reports reduced current throughput
+by about 28% in this small traced workload. SQL counts include attempts, retries
+and SQLite trigger callbacks, not successful physical writes or fsyncs; database
+bytes are totals across three stores. All actual handler PIDs had retained traces.
+Both current arms returned 12 complete observations, 12 persisted final flushes,
+zero collection gaps and zero dropped events. Public progress returned 45 confirmed
+and three unknown receipts retaining genuine SQLite contention; no report was
+resent to turn unknown into success. Nearest-rank p95 is only the maximum of 12
+task samples. This is local cost evidence, not native Windows acceptance or a
+production capacity prediction. The earlier partial-counter experiment remains
+retained at `/tmp/sdk-observability-overhead-12771d9.json`; it is not substituted
+for this corrected complete measurement.
+
+An earlier complete local Linux acceptance passed on implementation commit
 `969f0da7f2bdbcda9dc4235e0744e0176e0475b2` (Linux x86_64, Python 3.12).
 The complete regression ran 952 tests in 1629.062 seconds with zero failures or
 errors and 16 platform skips. Its freshly rebuilt and installed SDK also passed
@@ -400,12 +475,12 @@ Linux.
 
 | Scenario | Implementation and witness | Current evidence / remaining requirement |
 | --- | --- | --- |
-| A01 Startup phases | `test_observability_native_acceptance`: queue, real deserialization, ready, entry, model request, raw bootstrap failure | Linux source and installed candidate passed; readiness and entry facts survive an unavailable activity writer. Windows pending. |
+| A01 Startup phases | `test_observability_native_acceptance`: queue, real deserialization and module import, ready, entry, model request, raw bootstrap failure | Linux source and installed candidate passed; genuine missing-module import keeps the original ModuleNotFoundError and reports no false ready/entry/model event. Windows pending. |
 | A02 Raw output and progress | Same native suite: segmented bytes, heartbeat, tool response, new/replayed progress; `test_observation_processes` | Linux focused passed; original byte files and separate metric snapshots retained. Candidate matrix pending. |
 | A03 Unknown / old attempts | `test_observation_journal`, `test_observation_processes`, `test_stall_supervision` | Source and installed regressions cover inaccessible identity, collector replacement and old reports. No PID-only exit inference. Native matrix pending. |
 | A04 Effective deadlines | Native Run/tool cutoff witness; `test_runtime_deadline_envelopes`, `test_execution_budget` | Actual shortest cutoff, stopped process tree, inherited parent window and reserve semantics covered. Reported tool cause keeps its original message. Candidate matrix pending. |
 | A05 Restart and short waits | Native controller crash after confirmed entry; native short `Task.wait`; budget/recovery tests | Original cutoff survives rollback/restart; exhausted business is refused; caller wait does not cancel. Candidate matrix pending. |
-| A06 Parent waits / capacity | `test_managed_children_capacity`, `test_runtime_deadline_envelopes`, native saturation pressure witness | Actual children return success and original failure; dedicated capacity and successor work passed, including installed end-to-end witnesses. Native matrix pending. |
+| A06 Parent waits / capacity | `test_managed_children_capacity`, `test_runtime_deadline_envelopes`, public native parent/child witness | Actual children return success and original failure; parent retains a touched 16 MiB buffer and actual memory readings while waiting; peak capacity two and queued successor work passed locally. This is observed process memory, not a new global memory reservation API. Native matrix pending. |
 | A07 Rejection / partial registration | Child admission suite and native cross-store controller crash | Actual independent request reservation exists while Kernel child is absent; exit 73 and original-budget recovery close the wait without child business. Earlier stalled runs remain retained. Candidate matrix pending. |
 | A08 Cancellation / natural completion | Native pressure, Runtime lifecycle, Windows Job and sandbox tests | Linux descendant markers stop; Kernel winner and cleanup proof remain distinct. Current Windows Jobs pending. |
 | A09 Cleanup failure / exit cause | `test_sandbox_runtime` cleanup-failure restart with native worker business-call log; process exit classifiers; shared cgroup clue witness | Restart retries disposal only and keeps collected output; call count does not increase. Exit 137 remains status/unknown OOM even with readable shared cgroup counters. Provider is explicitly a persistent fake; native worker is real. Candidate matrix pending. |
@@ -413,7 +488,7 @@ Linux.
 | A11 Durable notification | Two real evaluator processes; abrupt exit after orchestration enqueue; repeated native crashes through delivery exhaustion and explicit retry | Same notice ID, one application notification, bounded attempts and explicit dead state passed. Native matrix pending. |
 | A12 Conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; separate capacity keeps local deadlines working. Candidate matrix pending. |
 | A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Linux regression passed; native matrix pending. |
-| A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; separately installed historical `v0.7.0.dev0` writer | Historical installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Full public API and pending-obligation upgrade regression passed on Linux. Native matrix pending. |
+| A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; historical `v0.7.0.dev0` writer; real pending outcome and original sidecar owner | Historical installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Core copy preserves history, remains inactive, and does not migrate external journals. Original owner recovers the exact pending result without business replay. Native matrix pending. |
 | A15 Installed entry | Isolated wheel consumer suite and portable public example | `969f0da` rebuilt-wheel consumer, complete source/installed suites and separately installed original portable example passed. Native matrix pending. |
 | A16 Independent SDK end-to-end | Installed public APIs, real handlers/processes, local byte/tool fixtures and persisted recovery; no ModPort or external model dependency | All five public-entry scenarios passed on the `969f0da` isolated rebuilt consumer: success/raw failure, output/silence, parent-child/tool budgets, cancellation and cleanup recovery without repeated business. Native matrix remains required. Historical ModPort checks are not a substitute. |
 | A17 Native Windows | `test_windows_runtime`, portable native observability/deadline/pressure suites | Linux mocks are not native acceptance. Windows x64/ARM64 jobs and raw Job evidence pending. Linux-only cgroup cases do not apply to Windows. |

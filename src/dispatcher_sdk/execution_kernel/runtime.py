@@ -548,7 +548,8 @@ class InProcessRuntime:
 
     def _service_spec(self, lease: ExecutionLease) -> dict[str, Any]:
         if self.observation_journal is None:
-            return {"entry_protocol": True}
+            return {"entry_protocol": True,
+                "child_service_error": self._observation_error or "observation journal unavailable"}
         spec = {"journal_path": self._observation_path, "kernel_path": self.kernel.db_path,
             "entry_protocol": True,
             "source_id": self._observation_source_id,

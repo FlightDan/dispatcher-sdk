@@ -1,5 +1,4 @@
 from contextlib import closing
-import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -151,8 +150,15 @@ class StorageMigrationTests(unittest.TestCase):
         self.destination = self.root / "upgraded.db"
 
     @staticmethod
-    def _digest(path: Path) -> str:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+    def _stored_rows(path: Path) -> dict:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            schema = connection.execute("SELECT name,type,sql FROM sqlite_master ORDER BY name").fetchall()
+            records = {}
+            for name, kind, _ in schema:
+                if kind == "table":
+                    quoted = '"' + name.replace('"', '""') + '"'
+                    records[name] = sorted(connection.execute("SELECT * FROM " + quoted).fetchall(), key=repr)
+            return {"schema": schema, "records": records}
 
     def _create_legacy(self) -> dict:
         blob = "stable-large-value:" + "x" * (70 * 1024)
@@ -216,11 +222,11 @@ class StorageMigrationTests(unittest.TestCase):
 
     def test_copy_upgrade_reopens_with_equal_history_events_and_receipt(self):
         expected = self._create_legacy()
-        before_hash = self._digest(self.source)
+        before_rows = self._stored_rows(self.source)
         with maintenance_lease(self.source, "test", "upgrade", lease_seconds=30) as lease:
             report = upgrade_storage(self.source, self.destination, lease=lease)
 
-        self.assertEqual(self._digest(self.source), before_hash)
+        self.assertEqual(self._stored_rows(self.source), before_rows)
         self.assertEqual((report["source_version"], report["target_version"]), (2, 4))
         self.assertTrue(report["source_unchanged"])
         self.assertFalse(report["automatic_cutover"])
@@ -272,13 +278,13 @@ class StorageMigrationTests(unittest.TestCase):
             connection.execute("INSERT INTO sdk_runs VALUES('run',2,'running')")
             connection.execute("INSERT INTO sdk_run_items VALUES('run','root','generation','0')")
             connection.commit()
-        before_hash = self._digest(self.source)
+        before_rows = self._stored_rows(self.source)
 
         with maintenance_lease(self.source, "test", "upgrade", lease_seconds=30) as lease:
             report = upgrade_storage(self.source, self.destination, lease=lease)
 
         self.assertEqual((report["source_version"], report["target_version"]), (3, 4))
-        self.assertEqual(self._digest(self.source), before_hash)
+        self.assertEqual(self._stored_rows(self.source), before_rows)
         with self.assertRaisesRegex(ValueError, "unsupported orchestration schema"):
             Orchestrator(self.source, object())
         sdk = Orchestrator(self.destination, object())
@@ -317,13 +323,13 @@ class StorageMigrationTests(unittest.TestCase):
                  command.registry_revision, canonical(command.to_dict())),
             )
             connection.commit()
-        before_hash = self._digest(self.source)
+        before_rows = self._stored_rows(self.source)
 
         with maintenance_lease(self.source, "test", "upgrade", lease_seconds=30) as lease:
             report = upgrade_storage(self.source, self.destination, lease=lease)
 
         self.assertEqual((report["source_version"], report["target_version"]), (3, 4))
-        self.assertEqual(self._digest(self.source), before_hash)
+        self.assertEqual(self._stored_rows(self.source), before_rows)
         with self.assertRaises(StorageIsolationError):
             SQLiteKernel(self.source)
         with SQLiteKernel(self.destination) as kernel:
@@ -391,10 +397,10 @@ class StorageMigrationTests(unittest.TestCase):
             connection.commit()
 
         compacted = self.root / "compacted.db"
-        before_hash = self._digest(self.destination)
+        before_rows = self._stored_rows(self.destination)
         with maintenance_lease(self.destination, "test", "compact", lease_seconds=30) as lease:
             report = compact_database(self.destination, compacted, lease)
-        self.assertEqual(self._digest(self.destination), before_hash)
+        self.assertEqual(self._stored_rows(self.destination), before_rows)
         self.assertEqual(report["operation"], "compact")
         self.assertFalse(report["automatic_activation"])
 

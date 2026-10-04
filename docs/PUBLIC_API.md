@@ -87,9 +87,9 @@ are separate identities:
 
 - Execution command/result contracts use `SCHEMA_VERSION = 2`. Unknown fields,
   invalid JSON values and conflicting identities are rejected.
-- Kernel SQLite storage remains schema 2 with its `kernel_schema_meta` marker.
-  The current development tree uses Orchestrator schema 3 and `sdk_*` tables;
-  earlier 0.6 builds used schema 2, which requires an explicit copy upgrade.
+- Kernel SQLite storage uses schema 4 with its `kernel_schema_meta` marker.
+  The current development tree uses Orchestrator schema 4 and `sdk_*` tables;
+  supported earlier schema 2/3 stores require an explicit copy upgrade.
   Older unversioned Orchestrator databases are incompatible and are not migrated
   automatically. Table layouts are implementation details, not a public SQL API.
 - Commands bind `handler_id`, `handler_contract_version` and `registry_revision`.

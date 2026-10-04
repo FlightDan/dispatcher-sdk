@@ -18,7 +18,7 @@ from pathlib import Path
 import sqlite3
 import threading
 import time
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Protocol
 import uuid
 
 from .._inspection import InspectionBudgetExceeded
@@ -131,6 +131,16 @@ def _retry(window: _RetryWindow, operation, *, kernel=None, store=None):
                 time.sleep(min(.01, remaining))
             else:
                 window.stop.wait(min(.01, remaining))
+
+
+class ChildCalls(Protocol):
+    """Public bounded child calls, including explicit service unavailability."""
+
+    def run(self, handler_id: str, payload: Any, *, request_id: str,
+            timeout_seconds: float = 300.0, handler_contract_version: int = 1) -> dict[str, Any]: ...
+
+    def wait_for(self, execution_id: str, *, request_id: str,
+                 timeout_seconds: float | None = None, reason: str = "child_result") -> dict[str, Any]: ...
 
 
 class ChildExecutionError(RuntimeError):

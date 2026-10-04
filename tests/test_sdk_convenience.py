@@ -33,15 +33,35 @@ class ConvenienceTests(unittest.TestCase):
         self.assertFalse(self.runtime._closed)
 
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
+        from tests._acceptance_evidence import retained_directory
+        from tests._storage_evidence import StorageEvidence
+
+        self.root = retained_directory("sdk-convenience-")
+        self.storage_evidence = StorageEvidence(self.root, self)
+        self.storage_evidence.start(include_kernel=True)
+        self.addCleanup(self.storage_evidence.stop)
+        self.addCleanup(self.storage_evidence.save)
         self.now = 100.0
         self.runtime = Kernel.open_sqlite(
             self.root / "kernel.db", {"echo": echo}, isolation_mode="thread", now=lambda: self.now)
-        self.addCleanup(self.runtime.close)
+
+        def close_owned_runtime():
+            import traceback
+            try:
+                self.runtime.close()
+            except BaseException as error:
+                self.storage_evidence.save(phase="cleanup-error", checkpoint={
+                    "error_chain": traceback.format_exception(type(error), error, error.__traceback__)})
+                raise
+            finally:
+                self.storage_evidence.save(phase="after-runtime-close")
+
+        self.addCleanup(close_owned_runtime)
         self.sdk = Orchestrator(self.root / "runs.db", self.runtime.kernel, runtime=self.runtime)
         self.sdk.create_run("run", command_id="create")
+
+    def tearDown(self):
+        self.storage_evidence.save(phase="before-cleanup")
 
     def command(self, execution_id):
         return ExecutionCommandV2(
@@ -108,18 +128,85 @@ class ConvenienceTests(unittest.TestCase):
         self.assertEqual(before, self.sdk.get_run("run"))
 
     def test_host_without_callback_executes_and_preserves_durable_notification(self):
+        from contextlib import closing
+        from dataclasses import asdict
+        import sqlite3
+        import traceback
+
+        def durable_facts():
+            facts = {}
+            for filename, tables in (
+                ("kernel.db", ("kernel_executions", "kernel_events", "kernel_result_outbox")),
+                ("runs.db", ("sdk_executions", "sdk_outbox", "sdk_notifications", "sdk_events")),
+            ):
+                began = time.monotonic()
+                store = {"tables": {}}
+                try:
+                    with closing(sqlite3.connect((self.root / filename).as_uri() + "?mode=ro",
+                                                 uri=True, timeout=0)) as connection:
+                        connection.row_factory = sqlite3.Row
+                        for table in tables:
+                            query_began = time.monotonic()
+                            store["tables"][table] = {"rows": [dict(row) for row in
+                                connection.execute('SELECT * FROM "' + table + '" LIMIT 20')],
+                                "elapsed": time.monotonic() - query_began}
+                except sqlite3.Error as error:
+                    store["read_error_chain"] = traceback.format_exception(
+                        type(error), error, error.__traceback__)
+                store["elapsed"] = time.monotonic() - began
+                facts[filename] = store
+            return facts
+
         self.apply(Operations.add_task("a", self.command("a")),
                    Operations.watch_task("a", watch_id="watch", target="application"),
                    Operations.dispatch("a"))
-        with OrchestratorHost(self.sdk, worker_count=1, pump_interval=0.01) as host:
-            deadline = time.monotonic() + 3
+        host = OrchestratorHost(self.sdk, worker_count=1, pump_interval=0.01)
+        stop_attempted = False
+
+        def stop_owned_host():
+            nonlocal stop_attempted
+            if stop_attempted:
+                return
+            stop_attempted = True
+            try:
+                host.stop()  # Preserve the original context manager's default.
+            except BaseException as error:
+                self.storage_evidence.save(phase="host-cleanup-error", checkpoint={
+                    "error_chain": traceback.format_exception(type(error), error, error.__traceback__),
+                    "stop_report": host.stop_report.to_dict(), "health": asdict(host.health())})
+                raise
+            finally:
+                self.storage_evidence.save(phase="after-host-stop", checkpoint={
+                    "health": asdict(host.health())})
+
+        self.addCleanup(stop_owned_host)
+        host.start()
+        try:
+            began = time.monotonic()
+            deadline = began + 3
             while not self.sdk.list_notifications() and time.monotonic() < deadline:
                 time.sleep(0.01)
-            notification, = self.sdk.list_notifications()
-            self.assertEqual(notification["state"], "pending")
-            self.assertEqual(notification["attempts"], 0)
-            self.assertEqual(self.sdk.get_run("run")["tasks"]["a"]["attempts"][-1]["state"], "succeeded")
-            self.assertFalse(host.health().notification_alive)
+            notifications = self.sdk.list_notifications()
+            elapsed = time.monotonic() - began
+            self.storage_evidence.save(phase="original-notice-boundary", checkpoint={
+                "deadline": deadline, "elapsed": elapsed, "timeout": 3,
+                "notifications": notifications, "health": asdict(host.health()),
+                "durable": durable_facts()})
+            try:
+                notification, = notifications
+                self.assertEqual(notification["state"], "pending")
+                self.assertEqual(notification["attempts"], 0)
+                self.assertEqual(self.sdk.get_run("run")["tasks"]["a"]["attempts"][-1]["state"], "succeeded")
+                self.assertFalse(host.health().notification_alive)
+            except BaseException as error:
+                self.storage_evidence.save(phase="original-notice-failure", checkpoint={
+                    "elapsed": elapsed, "error_chain": traceback.format_exception(
+                        type(error), error, error.__traceback__), "health": asdict(host.health())})
+                raise
+        finally:
+            self.storage_evidence.save(phase="notice-before-host-cleanup", checkpoint={
+                "health": asdict(host.health())})
+        stop_owned_host()
         received = []
         self.assertEqual(self.sdk.deliver_notifications(received.append, owner="consumer",
                          lease_seconds=30, retry_delay=1, limit=1), 1)

@@ -1,5 +1,4 @@
 from contextlib import closing
-import hashlib
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -32,7 +31,7 @@ class StorageUsageTests(unittest.TestCase):
             connection.execute("CREATE INDEX sdk_events_payload ON sdk_events(payload)")
             connection.execute("INSERT INTO sdk_events(payload) VALUES(?)", ('{"value":1}',))
         before_names = sorted(item.name for item in self.root.iterdir())
-        before_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        before_bytes = path.read_bytes()
         before_stat = path.stat()
 
         report = inspect_storage_usage(path)
@@ -42,7 +41,7 @@ class StorageUsageTests(unittest.TestCase):
                          report["sqlite"]["page_size_bytes"] * report["sqlite"]["page_count"])
         self.assertIsNone(report["sqlite"]["exact_reclaimable_bytes"])
         self.assertEqual(sorted(item.name for item in self.root.iterdir()), before_names)
-        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before_digest)
+        self.assertEqual(path.read_bytes(), before_bytes)
         self.assertEqual(path.stat().st_mtime_ns, before_stat.st_mtime_ns)
         if report["owned_objects"]["available"]:
             names = {item["name"] for item in report["owned_objects"]["objects"]}

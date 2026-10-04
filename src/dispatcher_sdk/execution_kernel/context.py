@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 from contextlib import nullcontext
 import threading
 
@@ -11,6 +11,10 @@ from .budget import BudgetEnvelope, ExecutionBudget, sample_clock
 from .contracts import ExecutionCommandV2, ExecutionLease
 from .errors import EffectRecoveryRequiredError, HandlerExecutionError, StaleFenceError
 from .sqlite import SQLiteKernel
+
+if TYPE_CHECKING:
+    from ..observability import ExecutionActivity
+    from .children import ChildCalls
 
 
 class HandlerEffects:
@@ -125,6 +129,9 @@ class _UnavailableActivity:
     def __init__(self, reason: str) -> None:
         self.reason = reason
 
+    def start(self) -> _UnavailableActivity:
+        return self
+
     def observe_process(self, process: Any, **kwargs: Any):
         class UnknownProcess:
             def snapshot(inner_self):
@@ -136,6 +143,21 @@ class _UnavailableActivity:
             receipt = {"state": "unknown", "reason": self.reason}
             return nullcontext(receipt) if name == "wait" else receipt
         return unavailable
+
+
+class _UnavailableChildren:
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def run(self, handler_id: str, payload: Any, *, request_id: str,
+            timeout_seconds: float = 300.0, handler_contract_version: int = 1) -> dict[str, Any]:
+        from .children import ChildExecutionError
+        raise ChildExecutionError("child_service_unavailable", self.reason)
+
+    def wait_for(self, execution_id: str, *, request_id: str,
+                 timeout_seconds: float | None = None, reason: str = "child_result") -> dict[str, Any]:
+        from .children import ChildExecutionError
+        raise ChildExecutionError("child_service_unavailable", self.reason, execution_id=execution_id)
 
 
 class HandlerContext:
@@ -163,8 +185,9 @@ class HandlerContext:
         self._observation_start_done.set()
         self._budget_lock = threading.RLock()
         self._entered = False
-        self.activity: Any = _UnavailableActivity("observation_unavailable")
-        self.children: Any = None
+        self.activity: ExecutionActivity = _UnavailableActivity("observation_unavailable")
+        self.children: ChildCalls = _UnavailableChildren(
+            self._service_spec.get("child_service_error", "child service not configured"))
         self._journal: Any = None
 
     def _sample(self):
@@ -201,10 +224,12 @@ class HandlerContext:
             if self._entered:
                 return
             self._start_observation()
+            handler_children = None
             if self._journal is not None:
                 from .children import HandlerChildren
-                self.children = HandlerChildren(self._kernel, self.command, self.lease,
+                handler_children = HandlerChildren(self._kernel, self.command, self.lease,
                     self.budget_envelope, self._service_spec, journal=self._journal)
+                self.children = handler_children
             envelope = self.budget_envelope.enter_handler(self.command.timeout_seconds,
                 origin_id="execution:" + self.command.execution_id, sample=self._sample())
             if not self._service_spec.get("entry_protocol"):
@@ -215,8 +240,8 @@ class HandlerContext:
                 raise HandlerExecutionError("execution_deadline_exhausted",
                     "execution has no trusted remaining work time", details=view.to_dict())
             self._entered = True
-            if self.children is not None:
-                self.children.budget_envelope = envelope
+            if handler_children is not None:
+                handler_children.budget_envelope = envelope
             self.activity.phase("handler_entered")
 
     def _start_observation(self) -> None:
@@ -261,6 +286,8 @@ class HandlerContext:
                 recorder.close()
         except Exception as exc:
             self.activity = _UnavailableActivity(f"observation_unavailable:{type(exc).__name__}")
+            if self._journal is None:
+                self.children = _UnavailableChildren(f"{type(exc).__name__}: {exc}")
         finally:
             self._observation_start_done.set()
 

@@ -230,14 +230,23 @@ class CancellationReportTests(unittest.TestCase):
         with runtime:
             self.setup_task(runtime, sdk)
             snapshot = runtime.kernel.get("x")
-            with self.assertRaises(CASConflictError):
+            with self.assertRaises(CASConflictError) as raised:
                 runtime.cancel("x", expected_revision=snapshot.revision + 1)
             self.assertEqual(runtime.kernel.get("x"), snapshot)
             page = inspect_cancellation_journal(self.root / "cancel.db", source_id="test-source",
                                                 kernel_path=self.root / "kernel.db", snapshot=snapshot)
-            self.assertEqual(page.receipts[0].phases["failure"]["phase"], "kernel_cancel")
+            self.assertEqual(len(page.receipts), 1)
+            self.assertNotIn("failure", page.receipts[0].phases)
             self.assertNotIn("process_cleanup", page.receipts[0].phases)
             self.assertEqual(self.report(sdk).execution_authority_revoked.status, "pending")
+            notes = runtime.observe("x")["local_cancellation_diagnostics"]["notes"]
+            failure = next(note for note in notes if note["phase"] == "cancellation_failure")
+            self.assertFalse(failure["persisted"])
+            self.assertEqual(failure["request_receipt_id"], page.receipts[0].receipt_id)
+            self.assertTrue(failure["request_persisted"])
+            self.assertEqual(failure["details"]["authority"], "unknown")
+            self.assertEqual(failure["details"]["type"], type(raised.exception).__name__)
+            self.assertEqual(failure["details"]["message"], str(raised.exception))
 
     def test_receipts_cannot_cross_command_attempt_fence_or_source(self):
         runtime, sdk = self.stack()

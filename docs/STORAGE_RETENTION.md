@@ -1,7 +1,8 @@
 # Storage retention and maintenance APIs
 
 These APIs describe the current development tree, not an already published
-release. New Orchestrator stores use schema 3. Kernel remains schema 2.
+release. New Orchestrator and Kernel stores use schema 4;
+Kernel commands/results remain protocol V2.
 The [full improvement plan](STORAGE_RETENTION_IMPROVEMENT_PLAN.md) is broader
 than the capabilities implemented here.
 
@@ -89,10 +90,14 @@ with maintenance_lease("upgraded.db", "operator", "compact", lease_seconds=600) 
 recovery tables. It copies committed WAL contents, converts values in bounded
 row batches, verifies logical equality and the target schema, then flushes and
 publishes a new file without overwriting any existing destination. Other
-components in that SQLite file are copied unchanged. Unknown legacy retention
+compatible components in that SQLite file are preserved; supported Kernel
+schemas 2/3 are explicitly upgraded to 4. Standalone Kernel schemas 2/3/4 are
+also supported. External observation, settlement and cleanup journals are not
+copied or rebound, and original bindings and unresolved work remain owned by the
+original deployment. Unknown legacy retention
 timestamps are not invented.
 
-`compact_database` accepts schema 3 and compacts a private copy. Sequence high
+`compact_database` accepts current Orchestrator schema 4 and compacts a private copy. Sequence high
 watermarks survive deletion of tail rows and compaction. Both functions require
 a real, active lease and perform a conservative free-space precheck. They leave
 the source in place and do not perform an application deployment cutover.

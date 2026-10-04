@@ -220,13 +220,18 @@ os._exit(0)
 
 class ThreadHandlerEntryGateTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
+        self.root = retained_directory("sdk-thread-entry-gate-")
+        self.storage_evidence = StorageEvidence(self.root, self)
+        self.storage_evidence.start(include_kernel=True)
+        self.addCleanup(self.storage_evidence.stop)
+        self.addCleanup(self.storage_evidence.save)
         self.called = threading.Event()
         self.confirming = threading.Event()
         self.release = threading.Event()
         self.worker_finished = threading.Event()
         self.results = []
+        self.driver_errors = []
+        self.driver_stage = "not_started"
         self.wall = None
 
         def handler(payload, context):
@@ -235,10 +240,10 @@ class ThreadHandlerEntryGateTests(unittest.TestCase):
             return context._kernel.get_execution_limits(context.command.execution_id)["entry_state"]
 
         handler.__execution_kernel_revision__ = "thread-entry-gate-v1"
-        self.runtime = Runtime(str(Path(temporary.name) / "thread-entry.sqlite3"),
+        self.runtime = Runtime(str(self.root / "thread-entry.sqlite3"),
                                {"handler": handler}, isolation_mode="thread", max_thread_workers=1,
                                now=lambda: time.time() if self.wall is None else self.wall)
-        self.addCleanup(self.runtime.close)
+        self.addCleanup(self.close_owned_runtime)
         self.addCleanup(self.release.set)
         self.confirm = self.runtime.kernel._checkpoint_handler_entry
         finished = self.runtime._thread_finished
@@ -251,13 +256,49 @@ class ThreadHandlerEntryGateTests(unittest.TestCase):
         self.finish_patch.start()
         self.addCleanup(self.finish_patch.stop)
 
+    def checkpoint(self, phase, **extra):
+        self.storage_evidence.save(phase=phase, checkpoint={
+            "driver_stage": self.driver_stage,
+            "driver_alive": hasattr(self, "driver") and self.driver.is_alive(),
+            "driver_errors": list(self.driver_errors),
+            "handler_called": self.called.is_set(),
+            "confirming": self.confirming.is_set(), "release": self.release.is_set(),
+            "worker_finished": self.worker_finished.is_set(),
+            "results": [result.to_dict() if result is not None else None for result in self.results],
+            **extra})
+
+    def tearDown(self):
+        self.checkpoint("before-cleanup")
+
+    def close_owned_runtime(self):
+        import traceback
+        # Release and observe the original driver separately from finish(2).
+        # Cleanup does not run another execution or alter its original cutoff.
+        try:
+            self.release.set()
+            if hasattr(self, "driver"):
+                began = time.monotonic()
+                self.driver.join(2)
+                self.checkpoint("lifetime-driver-drain", elapsed=time.monotonic() - began)
+        finally:
+            try:
+                self.runtime.close()
+            except BaseException as error:
+                self.checkpoint("cleanup-error", error_chain=traceback.format_exception(
+                    type(error), error, error.__traceback__))
+                raise
+            finally:
+                self.checkpoint("after-runtime-close")
+
     def start(self, *, timeout=2, fail=False):
         def held_confirmation(*args, **kwargs):
+            self.driver_stage = "entry_confirmation_held"
             self.confirming.set()
             if not self.release.wait(3):
                 raise RuntimeError("test did not release confirmation")
             if fail:
                 raise CASConflictError("injected entry acknowledgement failure")
+            self.driver_stage = "entry_confirmation_sql"
             return self.confirm(*args, **kwargs)
 
         self.confirm_patch = patch.object(self.runtime.kernel, "_checkpoint_handler_entry",
@@ -267,14 +308,40 @@ class ThreadHandlerEntryGateTests(unittest.TestCase):
         self.runtime.submit(self.runtime.command("handler", execution_id="thread-entry",
             idempotency_key="thread-entry", correlation_id="thread-entry",
             timeout_seconds=timeout, payload={}))
-        self.driver = threading.Thread(target=lambda: self.results.append(self.runtime.run_once()))
+        def drive():
+            import traceback
+            self.driver_stage = "run_once"
+            try:
+                self.results.append(self.runtime.run_once())
+                self.driver_stage = "returned"
+            except BaseException as error:
+                self.driver_stage = "raised"
+                self.driver_errors.append(traceback.format_exception(
+                    type(error), error, error.__traceback__))
+                raise
+
+        self.driver = threading.Thread(target=drive, name="entry-gate-driver")
         self.driver.start()
-        self.assertTrue(self.confirming.wait(2), "coordinator never received actual entry")
+        began = time.monotonic()
+        confirming = self.confirming.wait(2)
+        self.checkpoint("original-confirmation-wait", timeout=2,
+                        elapsed=time.monotonic() - began, confirming_return=confirming)
+        self.assertTrue(confirming, "coordinator never received actual entry")
 
     def finish(self):
         self.release.set()
+        began = time.monotonic()
         self.driver.join(2)
-        self.assertFalse(self.driver.is_alive(), "thread entry driver did not settle")
+        alive = self.driver.is_alive()
+        self.checkpoint("original-driver-join", timeout=2,
+                        elapsed=time.monotonic() - began, alive_at_return=alive)
+        try:
+            self.assertFalse(alive, "thread entry driver did not settle")
+        except AssertionError as error:
+            import traceback
+            self.checkpoint("original-driver-failure", error_chain=traceback.format_exception(
+                type(error), error, error.__traceback__))
+            raise
         return self.results[0]
 
     def test_user_code_waits_until_first_entry_ack_is_durable(self):
@@ -314,7 +381,18 @@ class ThreadHandlerEntryGateTests(unittest.TestCase):
     def test_expiry_releases_worker_waiting_for_entry_ack(self):
         self.start(timeout=.15)
         cutoff = self.runtime._thread_contexts[("thread-entry", 1, 1)].budget_envelope.constraints
-        self.assertTrue(self.worker_finished.wait(1), "entry wait ignored execution cutoff")
+        began = time.monotonic()
+        finished = self.worker_finished.wait(1)
+        self.checkpoint("original-expiry-worker-wait", timeout=1,
+                        elapsed=time.monotonic() - began, finished_return=finished,
+                        cutoff=[item.to_dict() for item in cutoff])
+        try:
+            self.assertTrue(finished, "entry wait ignored execution cutoff")
+        except AssertionError as error:
+            import traceback
+            self.checkpoint("original-expiry-failure", error_chain=traceback.format_exception(
+                type(error), error, error.__traceback__))
+            raise
         self.assertFalse(self.called.is_set())
         terminal = self.finish()
         self.assertEqual(terminal.state, "timed_out", terminal.result.error)

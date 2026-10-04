@@ -106,6 +106,12 @@ child_result = context.children.run(
 the child execution ID, error code and original result. `wait_for` can observe
 an existing execution; a queued execution may acquire inherited limits when
 ownership permits. It never reparents an already owned execution.
+`HandlerContext.activity` implements the public `ExecutionActivity` protocol;
+`HandlerContext.children` implements `ChildCalls`, exported by
+`dispatcher_sdk.execution_kernel`. Both expose checked method signatures.
+When the child journal/service is unavailable, child calls raise
+`ChildExecutionError(code="child_service_unavailable")` with the known original
+storage reason. They do not create a child or disable ordinary handler work.
 
 Configure `child_capacity` and `max_child_depth` on `Dispatcher` or
 `Kernel.open_sqlite`. Defaults are one reserved child slot and one level. A

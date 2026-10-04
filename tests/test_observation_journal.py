@@ -118,7 +118,13 @@ class ObservationJournalTests(unittest.TestCase):
         self.options = ObservationOptions(tail_bytes=16, write_timeout=.03)
         self.journal = self.open_journal()
         self.identity = ObservationIdentity("execution", 1, 1, run_id="run", task_id="task", task_attempt=0)
-        self.journal.bind_current(self.identity)
+        # Establish fixture data independently of each tested 30ms SDK write
+        # window. bind_current's ordering/identity rules have their own cases.
+        encoded = json.dumps(self.identity.to_dict(), sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False)
+        with closing(sqlite3.connect(self.journal.path, timeout=0)) as connection, connection:
+            connection.execute("INSERT INTO obs_current VALUES(?,?,?,?,?)",
+                (self.identity.execution_id, self.identity.attempt, self.identity.fence, encoded, self.clock()))
 
     def open_journal(self, **kwargs):
         return ObservationJournal(self.root / "observation.sqlite3", kernel_path=self.root / "kernel.sqlite3",
@@ -439,17 +445,26 @@ class ObservationJournalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.journal.write_batch(self.identity, source_id="invalid", sequence=1,
                 metrics={"x" * 100000: {"count": 0, "first_at": None, "last_at": None}}, captured_at=100)
+        # This is a read-aggregation fixture. Seed the same valid persisted
+        # dataset in one test-owned transaction rather than assuming 64 SDK
+        # writes each finish within the unrelated 30ms admission window.
+        # SDK admission expiry and batch validation have dedicated real-write
+        # tests; neither their budgets nor this read's .5/.6 bounds change.
+        rows = []
         for source in range(64):
             metrics = {f"metric_{source}_{number}_" + "x" * 100: {"count": 0, "first_at": None, "last_at": None}
                        for number in range(32)}
-            self.journal.write_batch(self.identity, source_id=f"source-{source:03}", sequence=1,
-                                     metrics=metrics, captured_at=100)
+            rows.append((self.identity.execution_id, self.identity.attempt, self.identity.fence,
+                f"source-{source:03}", 1, json.dumps(self.identity.to_dict()), json.dumps(metrics),
+                "{}", 100, self.clock(), 0, "active", None, None, "[]"))
+        with closing(sqlite3.connect(self.journal.path, timeout=0)) as connection, connection:
+            connection.executemany("INSERT INTO obs_sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM obs_sources").fetchone()[0], 64)
         started = time.monotonic()
         report = self.journal.inspect("execution", timeout=.5)
         self.assertLess(time.monotonic() - started, .6)
         self.assertFalse(report["complete"])
         self.assertTrue(report["truncated"])
-        import json
         self.assertLessEqual(len(json.dumps(report, ensure_ascii=False, separators=(",", ":")).encode()), self.options.query_bytes)
 
     def test_expired_query_returns_bounded_partial_and_keeps_event_cursor(self):

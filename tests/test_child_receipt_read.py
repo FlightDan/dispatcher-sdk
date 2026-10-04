@@ -1,9 +1,12 @@
 """Real receipt read admission retries keep original authority and clock floors."""
 import json
+from collections import deque
+from contextlib import ExitStack
 from pathlib import Path
 import sqlite3
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
 
@@ -13,6 +16,7 @@ from dispatcher_sdk.execution_kernel.children import _RetryWindow
 from dispatcher_sdk.execution_kernel.settlement import SettlementBusyError
 from tests import test_child_clock_checkpoint as checkpoint_fixture
 from tests import test_observability_runtime_integration as runtime_fixture
+from tests._storage_evidence import StorageEvidence
 
 
 class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
@@ -76,6 +80,31 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
         row, window = self.short_row(.3)
         original = BudgetEnvelope.from_dict(json.loads(row['budget_json']))
         writer = self.exclusive_writer()
+        sql_evidence = StorageEvidence(self.root, self)
+        sql_evidence.start(include_kernel=True)
+        self.addCleanup(sql_evidence.stop)
+        self.addCleanup(sql_evidence.save)
+        steps = deque(maxlen=256)
+
+        def traced(stage, operation):
+            def invoke(*args, **kwargs):
+                entry = {'stage': stage, 'began': time.monotonic(),
+                         'thread_cpu_began': time.thread_time()}
+                if stage == 'sleep':
+                    entry['requested_seconds'] = args[0]
+                steps.append(entry)
+                try:
+                    return operation(*args, **kwargs)
+                except BaseException as error:
+                    entry['error'] = {'type': type(error).__name__, 'message': str(error)}
+                    raise
+                finally:
+                    entry['elapsed'] = time.monotonic() - entry['began']
+                    entry['thread_cpu_seconds'] = time.thread_time() - entry['thread_cpu_began']
+            return invoke
+
+        import dispatcher_sdk._sqlite_admission as admission_module
+        timing = SimpleNamespace(**{**vars(time), 'sleep': traced('sleep', time.sleep)})
         before = time.monotonic()
         actual_windows = []
         actual_deadlines_at_call = []
@@ -88,8 +117,15 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
             return actual
 
         try:
-            with patch.object(self.children, '_completed_result') as rescue, \
-                    patch.object(children_module, '_RetryWindow', side_effect=observe_window):
+            with ExitStack() as diagnostics:
+                rescue = diagnostics.enter_context(patch.object(self.children, '_completed_result'))
+                diagnostics.enter_context(patch.object(children_module, '_RetryWindow', side_effect=observe_window))
+                diagnostics.enter_context(patch.object(self.children.store, '_facts',
+                    traced('receipt_open', self.children.store._facts)))
+                diagnostics.enter_context(patch.object(self.kernel, '_verify_active_lease_readonly',
+                    traced('parent_authority_read', self.kernel._verify_active_lease_readonly)))
+                diagnostics.enter_context(patch.object(children_module, 'time', timing))
+                diagnostics.enter_context(patch.object(admission_module, 'time', timing))
                 remaining_at_call = window.remaining()
                 window_at_call = window.envelope.to_dict()
                 deadline_at_call = window.deadline
@@ -120,7 +156,7 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
                     'original_budget': original.to_dict(), 'setup_window_at_call': window_at_call,
                     'setup_window_at_end': window.envelope.to_dict(),
                     'actual_window_at_end': None if actual_window is None else actual_window.envelope.to_dict(),
-                    'row_budget_at_end': row_budget_at_end.to_dict()})
+                    'row_budget_at_end': row_budget_at_end.to_dict(), 'actual_steps': list(steps)})
                 # Setup already spent part of the original .3-second window.
                 # Exhaustion, rather than a new minimum wait, is the contract.
                 self.assertIsInstance(caught, SettlementBusyError)

@@ -1,13 +1,20 @@
 # Storage, upgrades, and deployment preflight
 
-The current development tree uses Orchestrator schema 3, with content-addressed
+The current development tree uses Orchestrator schema 4, retaining content-addressed
 application state, history and decision-event payloads. Earlier 0.6 development
 builds used schema 2. Ordinary opening never converts either legacy schema 2 or
-older unversioned orchestration databases. See
+older unversioned orchestration databases; schema 3 also needs the explicit copy
+upgrade to schema 4. See
 [retention and maintenance APIs](STORAGE_RETENTION.md) for explicit copy upgrades.
 Opening an unsupported or damaged orchestration store raises an error instead
-of recreating missing tables. The Kernel's protocol and SQLite schema remain
-at version 2; the Orchestrator change does not introduce a Kernel schema 3.
+of recreating missing tables. Kernel commands and results remain protocol V2.
+The current Kernel SQLite schema is 4, including managed control and execution
+budget/supervision records; ordinary opening never upgrades older Kernel stores.
+`upgrade_storage` explicitly copies supported standalone Kernel schemas 2/3/4
+and shared stores into the current layout while preserving historical rows.
+The copy does not activate the destination or move/rebind external observation,
+settlement or cleanup journals. Preserve those files and their original source
+bindings; the original deployment remains responsible for unresolved work.
 
 The notification inbox has its own schema version 1, recorded in
 `notification_inbox_meta`. Existing inbox tables must match that schema,
@@ -39,7 +46,7 @@ changes, and Run history remains unchanged.
 `upgrade_schema()` accepts only a durable database with an Orchestrator schema 2
 marker. It does not convert an unversioned store, repair damaged tables, or
 upgrade the notification inbox. This helper deliberately leaves the source at
-schema 2; it does not enable the schema 3 reader. Back up the database and stop
+schema 2; it does not enable the current reader. Back up the database and stop
 its writers before running it, then use `upgrade_storage` to publish a new file.
 
 ## Moving from an older unversioned orchestration store
@@ -55,7 +62,7 @@ its writers before running it, then use `upgrade_storage` to publish a new file.
    input or state that the application explicitly chooses to carry forward.
 
 A backup or SQL dump preserves the source layout; restoring it does not convert
-an old Orchestrator schema into schema 3. There is no built-in in-place migration
+an old Orchestrator schema into schema 4. There is no built-in in-place migration
 for an unversioned store and no automatic replay into a new one. If Kernel and
 Orchestrator tables share one file, an unchanged Kernel schema does not make that
 file's old Orchestrator tables compatible with the new Orchestrator.
