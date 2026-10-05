@@ -16,7 +16,7 @@ from dispatcher_sdk.observability.journal import ObservationJournal
 from dispatcher_sdk.observability.activity import ActivityRecorder
 from dispatcher_sdk.observability.supervision import StallSupervisor
 from tests._acceptance_evidence import retained_directory
-from tests._storage_evidence import StorageEvidence
+from tests._storage_evidence import StorageEvidence, persist_retained_batch
 
 
 class Clock:
@@ -140,8 +140,19 @@ class WaitObservationTests(unittest.TestCase):
     def test_actual_lost_end_cannot_grant_stale_wait_exemption(self):
         options = ObservationOptions(queue_items=1, queue_bytes=4096)
         recorder = self.recorder(options=options)
+        # One maintenance window publishes the fixture's retained telemetry;
+        # each SQLite write still has the journal's original .03s allowance.
+        # Retry the same prepared batch, without recapturing wait/business facts
+        # or advancing the test clock or supervision deadline.
+        maintenance = {"began": time.monotonic(), "timeout_seconds": 1, "flushes": []}
+        self.addCleanup(self.storage_evidence.save, phase="wait_flush_maintenance", checkpoint=maintenance)
+
+        def persist_retained(stage):
+            return persist_retained_batch(self, recorder, stage=stage,
+                maintenance=maintenance, captured_at=lambda: self.clock.now)
+
         recorder.phase('handler_entered')
-        recorder.flush()
+        persist_retained('handler_baseline')
         service = StallSupervisor(self.journal, self.kernel, clock=self.clock,
                                   clock_sample=self.clock.sample)
         policy = StallPolicy('policy', sample_interval=2, consecutive_windows=1,
@@ -149,11 +160,11 @@ class WaitObservationTests(unittest.TestCase):
         service.watch(self.identity, policy, target={})
         service.tick()
         with recorder.wait('memory'):
-            recorder.flush()
+            persist_retained('wait_begin')
             self.clock.now = 101
         # Overflow the captured end after its begin has reached SQLite.
         recorder.phase('unrelated-phase')
-        recorder.flush()
+        persist_retained('lost_wait_end')
         report = self.journal.inspect('work')
         self.assertEqual(report['waits'][0]['state'], 'waiting')
         self.assertGreater(report['collection_gaps'], 0)
@@ -162,7 +173,7 @@ class WaitObservationTests(unittest.TestCase):
         observed = service._observed(row, policy, self.kernel.supervision_status('work'), report)
         self.assertEqual(observed, (None, 'collection_unknown', None))
         self.clock.now = 102
-        recorder.flush()
+        persist_retained('supervisor_sample')
         service.tick()
         self.assertEqual(service.outbox(), ())
         self.assertIn('bounded queue', recorder.snapshot()['error'])

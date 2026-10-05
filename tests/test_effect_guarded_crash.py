@@ -202,7 +202,10 @@ class EffectGuardedCrashTests(unittest.TestCase):
         representation_error = (math.ulp(armed["original_control_deadline"])
                                 + math.ulp(armed["monotonic"]))
         self.assertLessEqual(armed["original_timeout"] - .1, representation_error)
-        self.assertLess(armed["monotonic"], exited["monotonic"])
+        # The committed event is written before signalling the witnessed
+        # marker. Native monotonic observations may share one clock tick.
+        self.assertLess(crash_events.index(armed), crash_events.index(exited))
+        self.assertLessEqual(armed["monotonic"], exited["monotonic"])
         crashed = snapshot(self.path)
         self.evidence.update(crash_events=crash_events, crashed=crashed)
         guard = {"token": armed["token"], "execution_id": "execution", "reason": "sampling"}

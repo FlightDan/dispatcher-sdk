@@ -14,10 +14,104 @@ was pushed to the previously authorized work branch. CI run
 [37378483985](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37378483985)
 has finished: all eight Linux environments passed, all eight Windows environments
 failed, and history scanning passed. This is a failed acceptance run. Original
-Windows logs and retained artifacts are being used to separate fixture timing
-defects from SDK completion-clock recovery, native cutoff classification and
-callback diagnostic defects. The corrections are uncommitted and unverified;
-no replacement CI run has been started. The preceding run
+Windows logs and retained artifacts established fixture timing defects and SDK
+defects in completion-clock recovery, native cutoff classification, callback
+diagnostics and queued-policy promotion before confirmed handler entry.
+The reviewed corrections were committed as `a6b897c` and pushed to the authorized
+work branch. Replacement CI run
+[37385281478](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37385281478)
+has finished against that commit: all sixteen matrix jobs failed and history
+scanning passed. All eight Linux jobs failed: their original logs show
+an outdated Inbox readiness assertion waiting for `callback_errors` after SQL
+delivery errors were separated into `delivery_errors`. Two Linux environments
+also exposed a transient sampling guard in the final child-result authority
+check, after the sole child result read. The final check now retries only its
+authority transaction within the same proof deadline; the child result is not
+read again. The Windows ARM64 Python 3.13 public budget scenario retained a
+returned and contained tool timeout but lost its original completion sample
+after `OperationalError: interrupted`; its artifact does not retain the exact
+SQLite interruption attribution. Completion capture now preserves proof for
+positively attributed reader-window exhaustion and bounded transient admission,
+after successful physical close. Unrelated interruptions and permanent errors
+remain unproved. These source corrections passed independent review and targeted
+installed validation; complete installed and native matrix acceptance remain
+pending. The corrected Inbox assertion passed
+against the retained installed wheel outside the checkout in 1.373 seconds;
+the original command and output are in
+`/tmp/sdk-windows-corrections310/readiness-consumer/`.
+Original logs from all sixteen jobs were retained under
+`/tmp/sdk-windows-corrections310/`. Other confirmed Windows fixture defects were
+corrected without changing execution deadlines: event ordering uses causal
+ordinals, duration measurement uses the performance clock, deadline setup uses
+the supported caller clock, and collector cleanup confirms owned workers finish.
+Settlement-journal cold schema setup now explicitly allows one second, while its
+subsequent operation budgets remain unchanged. Two telemetry fixtures confirm
+prerequisite persistence by retrying the same prepared batch within one finite
+one-second maintenance window; each write retains its original 0.03-second
+allowance and captured clocks. The original runtime-overlap failure lacks raw
+ownership evidence; later local success does not establish its historical cause.
+This run cannot satisfy full acceptance. No replacement CI has been triggered.
+
+The current uncommitted SDK corrections were rebuilt from sdist and installed
+in a clean Python 3.10 virtualenv at `/tmp/sdk-final-authority-recovery310/`.
+Its recorded import is `venv/lib/python3.10/site-packages/dispatcher_sdk/__init__.py`.
+The first targeted command ran 73 cases in 70.282 seconds: 72 passed and one
+settlement expectation failed. The expectation was outdated because the now
+retained completion proof permits conservative resolution after lease expiry;
+the corrected assertion requires stale-lease rejection, the unchanged original
+outcome, and one business invocation. The affected follow-up ran 43 cases in
+22.221 seconds with no failures, including that assertion, both proofless legacy
+cases, settlement and cancellation regressions, and both telemetry fixtures.
+Independent review of these fixture changes found no blockers. The five public
+scenarios, managed example within its original 30-second limit, five type
+consumers, 627 links and four README examples also passed against this wheel.
+Compile and diff checks passed. Commands, stdout/stderr, import provenance and
+raw database evidence remain in that directory; these are local targeted checks,
+not a complete suite or native Windows acceptance.
+The same installed candidate subsequently passed four packaging/import-boundary
+checks and the existing Kernel and Orchestrator restart consumer in six separate
+processes. Each process recorded its `site-packages` import; Kernel states were
+queued/succeeded/succeeded and Orchestrator states were running/running/succeeded.
+The exact repository consumer script, six command receipts, stdout/stderr and
+summary are retained in `restart-evidence/` below that candidate directory.
+The two duplicate telemetry fixture loops were consolidated into
+`tests/_storage_evidence.py` without changing their assertions or caller-owned
+windows. Independent delta review found no blockers; both affected installed
+cases then passed in 0.940 seconds, with `helper-command.json` and raw evidence
+retained under the same candidate directory.
+
+The CI cost audit found that the outer discovery already imports the installed
+package and repeats nearly the whole suite inside the isolated rebuilt-wheel
+consumer. The failed sixteen-job run used 242.15 unweighted runner-minutes;
+104.42 minutes of nested installed suites are included in that total, not added
+to it. These are observed durations, not billed credits. The proposed correction
+keeps all sixteen environments and one complete installed suite in each, with
+outer packaging and isolation checks. Public/native scenarios, types, docs,
+examples, restart checks and artifacts remain required. No individual test
+definition has been removed. The one-line CI selection change is now present
+locally; it has not been pushed or used to trigger CI. At the user's request,
+deduplication was completed and checked before any new CI run. The next run
+will use one complete installed suite per environment, preserving the existing
+matrix and all unique tests.
+The proposed one-line workflow diff is retained at
+`/tmp/sdk-ci-single-full-suite-review/single-full-suite.patch`. Static inventory
+counts 1,159 test methods: five outer packaging/isolation checks plus 1,154 in
+the complete installed suite. This establishes selection coverage only, not
+execution or native acceptance; subtests are not counted as separate methods.
+An independent delta review found no omitted acceptance path. Actual unittest
+loading outside the checkout against the same clean installed SDK then found
+exactly 1,159 methods in both the original discovery and the partitioned
+selection: five outer and 1,154 inner, with no missing, extra, duplicate or
+failed imports. The loaded selections and result are retained in that review
+directory as `loaded-partition.json`, `full-selection.json`,
+`outer-selection.json` and `inner-selection.json`; no tests were executed by
+this coverage check. The initial loading attempt lacked the benchmark fixture
+script copied by the real consumer; that harness error is retained separately
+in `initial-load-missing-fixture/`. Loading passed after copying the same script
+as the real consumer. If packaging or an earlier public scenario fails, the
+installed suite will not be reached and the job remains failed; unexecuted
+checks cannot satisfy acceptance.
+The preceding run
 [37269716472](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37269716472)
 remains cancelled at the user's request.
 

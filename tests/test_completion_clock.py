@@ -454,7 +454,7 @@ class CompletionClockTests(unittest.TestCase):
             self.kernel._finish_budget_sample(token, "original", self.envelope)
 
     def test_actual_reader_unavailable_keeps_raw_busy_and_original_point_one_window(self):
-        self.rollback_journal_writer()
+        writer = self.rollback_journal_writer()
         calls_before = self.wall_calls
         began = time.monotonic()
         with self.assertRaises(sqlite3.OperationalError) as caught:
@@ -464,10 +464,153 @@ class CompletionClockTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed, .08)
         self.assertLess(elapsed, .3)
         self.assertEqual(1, self.wall_calls - calls_before)
+        proof = caught.exception._completion_clock_proof
+        writer.rollback()
+        context = HandlerContext(self.command, self.lease,
+            HandlerEffects(self.kernel, self.lease, lambda: True), budget_envelope=self.envelope)
+        self.addCleanup(context.close)
+        with patch.object(self.kernel, "_wall_time", side_effect=AssertionError("recovery sampled new wall time")):
+            completed_at, captured = resolve_completion_time(self.kernel, self.lease,
+                proof, context, deadline=time.monotonic() + .1)
+        self.assertGreaterEqual(completed_at, proof["sample"]["wall_at"])
+        self.assertEqual(proof["sample"]["elapsed_at"], captured.checkpoint.elapsed_at)
         self.evidence["records"].append({"actual_exclusive_writer": True,
             "original_capture_timeout": .1, "elapsed": elapsed,
             "error": type(caught.exception).__name__ + ": " + str(caught.exception),
             "wall_samples": self.wall_calls - calls_before})
+
+    def test_own_sqlite_interrupt_retains_original_sample_only_after_physical_close(self):
+        from dispatcher_sdk import storage_connection
+
+        factory = completion_clock_module._connect_readonly
+        physical_close = storage_connection._ParticipatingConnection.close
+        for fail_close in (False, True):
+            with self.subTest(fail_close=fail_close):
+                readers, interruptions = [], []
+
+                def opened(*args, **kwargs):
+                    reader = factory(*args, **kwargs)
+                    readers.append(reader)
+                    return reader
+
+                def close(reader):
+                    if fail_close and reader in readers:
+                        raise OSError("interrupted reader physical close failed")
+                    physical_close(reader)
+
+                def inspected(connection, lease, budget, **kwargs):
+                    try:
+                        connection.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL "
+                            "SELECT x+1 FROM n) SELECT sum(x) FROM n").fetchone()
+                    except sqlite3.OperationalError as error:
+                        interruptions.append((error, budget.stopped_reason))
+                        raise
+
+                before = self.wall_calls
+                try:
+                    with patch.object(completion_clock_module, "_connect_readonly", side_effect=opened), \
+                            patch.object(completion_clock_module, "_read_floor", side_effect=inspected), \
+                            patch.object(storage_connection._ParticipatingConnection, "close", close):
+                        with self.assertRaises(sqlite3.OperationalError) as caught:
+                            capture_completion_time(self.context)
+                    self.assertEqual(1, len(interruptions))
+                    self.assertIs(interruptions[0][0], caught.exception)
+                    self.assertEqual("interrupted", str(caught.exception))
+                    self.assertEqual("timeout", interruptions[0][1])
+                    self.assertEqual(1, self.wall_calls - before)
+                    if fail_close:
+                        self.assertIsInstance(caught.exception.__cause__, OSError)
+                        self.assertFalse(hasattr(caught.exception, "_completion_clock_proof"))
+                        self.assertEqual(1, readers[0].execute("SELECT 1").fetchone()[0])
+                    else:
+                        with self.assertRaises(sqlite3.ProgrammingError):
+                            readers[0].execute("SELECT 1")
+                        proof = caught.exception._completion_clock_proof
+                        context = HandlerContext(self.command, self.lease,
+                            HandlerEffects(self.kernel, self.lease, lambda: True),
+                            budget_envelope=self.envelope)
+                        self.addCleanup(context.close)
+                        with patch.object(self.kernel, "_wall_time",
+                                side_effect=AssertionError("recovery sampled new wall time")):
+                            completed_at, captured = resolve_completion_time(self.kernel, self.lease,
+                                proof, context, deadline=time.monotonic() + .1)
+                        self.assertGreaterEqual(completed_at, proof["sample"]["wall_at"])
+                        self.assertEqual(proof["sample"]["elapsed_at"], captured.checkpoint.elapsed_at)
+                    self.evidence["records"].append({"own_progress_interrupt": str(caught.exception),
+                        "sqlite_errorcode": getattr(caught.exception, "sqlite_errorcode", None),
+                        "progress_stop_reason": interruptions[0][1], "physical_close_failed": fail_close,
+                        "proof_retained": hasattr(caught.exception, "_completion_clock_proof")})
+                finally:
+                    for reader in readers:
+                        physical_close(reader)
+
+    def test_unrelated_sqlite_interrupt_does_not_publish_original_sample(self):
+        interruptions = []
+
+        def inspected(connection, lease, budget, **kwargs):
+            connection.set_progress_handler(lambda: 1, 1)
+            try:
+                connection.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL "
+                    "SELECT x+1 FROM n) SELECT sum(x) FROM n").fetchone()
+            except sqlite3.OperationalError as error:
+                interruptions.append((error, budget.stopped_reason))
+                raise
+
+        with patch.object(completion_clock_module, "_read_floor", side_effect=inspected):
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                capture_completion_time(self.context)
+        self.assertIs(interruptions[0][0], caught.exception)
+        self.assertEqual("interrupted", str(caught.exception))
+        self.assertIsNone(interruptions[0][1])
+        self.assertFalse(hasattr(caught.exception, "_completion_clock_proof"))
+        self.evidence["records"].append({"unrelated_interrupt": str(caught.exception),
+            "progress_stop_reason": interruptions[0][1], "proof_retained": False})
+
+    def test_own_expiry_before_open_and_after_close_retains_original_sample(self):
+        from dispatcher_sdk._inspection import InspectionBudgetExceeded
+        from dispatcher_sdk import storage_connection
+
+        original_read = completion_clock_module._read_completion_time
+        physical_close = storage_connection._ParticipatingConnection.close
+        for phase in ("before-open", "after-close"):
+            with self.subTest(phase=phase):
+                budgets, readers = [], []
+                factory = completion_clock_module._connect_readonly
+
+                def expire(budget):
+                    while not budget.expired():
+                        time.sleep(.001)
+
+                def read(kernel, lease, envelope, sample, budget, owner, **kwargs):
+                    budgets.append(budget)
+                    if phase == "before-open":
+                        expire(budget)
+                    return original_read(kernel, lease, envelope, sample, budget, owner, **kwargs)
+
+                def opened(*args, **kwargs):
+                    reader = factory(*args, **kwargs)
+                    readers.append(reader)
+                    return reader
+
+                def close(reader):
+                    physical_close(reader)
+                    if reader in readers and phase == "after-close":
+                        expire(budgets[0])
+
+                with patch.object(completion_clock_module, "_read_completion_time", side_effect=read), \
+                        patch.object(completion_clock_module, "_connect_readonly", side_effect=opened), \
+                        patch.object(storage_connection._ParticipatingConnection, "close", close):
+                    with self.assertRaises(InspectionBudgetExceeded) as caught:
+                        capture_completion_time(self.context)
+                proof = caught.exception._completion_clock_proof
+                self.assertEqual("timeout", budgets[0].stopped_reason)
+                self.assertEqual(0 if phase == "before-open" else 1, len(readers))
+                if readers:
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        readers[0].execute("SELECT 1")
+                self.assertEqual(self.lease.to_dict(), proof["lease"])
+                self.evidence["records"].append({"own_expiry_phase": phase,
+                    "original_error": str(caught.exception), "proof_retained": True})
 
     def test_actual_progress_timeout_preserves_original_guard_refusal(self):
         token = self.kernel._begin_budget_sample("original")
@@ -533,6 +676,7 @@ class CompletionClockTests(unittest.TestCase):
                     capture_completion_time(self.context)
             self.assertIs(permanent_errors[0], caught.exception)
             self.assertEqual("no such table: absent_completion_table", str(caught.exception))
+            self.assertFalse(hasattr(caught.exception, "_completion_clock_proof"))
         finally:
             self.kernel._finish_budget_sample(token, "original", self.envelope)
 

@@ -68,7 +68,7 @@ jobs:
       - name: Check typed SDK consumer compatibility
         run: python -m mypy --python-version 3.10 --follow-imports=silent --warn-unused-ignores tests/typing/orchestrator_consumer.py tests/typing/capability_consumer.py tests/typing/reliability_consumer.py tests/typing/application_consumer.py tests/typing/observability_consumer.py
       - name: Run SDK tests, source rebuild and isolated wheel consumers
-        run: python -m unittest discover -s tests -v
+        run: python -m unittest -v tests.test_packaging tests.test_execution_kernel_isolated_consumer
       - name: Check documentation and README examples
         run: python scripts/check_docs.py
       - name: Run portable examples

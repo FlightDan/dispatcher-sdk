@@ -492,26 +492,106 @@ class RuntimeHostTests(unittest.TestCase):
             self.assertTrue(runtime.closed)
 
     def test_same_run_tasks_have_overlapping_execution_intervals(self) -> None:
+        from dataclasses import asdict
+        import json
+        from queue import Empty
+        import traceback
+        from tests._acceptance_evidence import retained_directory
+        from tests._storage_evidence import StorageEvidence
+
         barrier = threading.Barrier(2)
         # Runtime observations belong in an external sink, not a mutable JSON
         # closure that forms part of the handler's implementation fingerprint.
         observations: SimpleQueue[tuple[str, float, float]] = SimpleQueue()
+        handler_events: SimpleQueue[dict] = SimpleQueue()
+        root = retained_directory("sdk-runtime-host-overlap-")
+        storage = StorageEvidence(root, self)
+        storage.start(include_kernel=True)
+        self.addCleanup(storage.stop)
+        record = {"test": self.id(), "worker_count": 2, "max_thread_workers": 2,
+                  "barrier_seconds": 5.0, "wait_seconds": 10.0,
+                  "handler_events": [], "checkpoints": [], "diagnostic_errors": []}
+        runtime = host = None
+
+        def error_record(error):
+            return {"type": type(error).__name__, "message": str(error),
+                    "traceback": traceback.format_exception(type(error), error, error.__traceback__)}
+
+        def attempt(name, operation):
+            try:
+                return operation()
+            except BaseException as error:
+                detail = {"operation": name, **error_record(error)}
+                record["diagnostic_errors"].append(detail)
+                return {"diagnostic_error": detail}
+
+        def save(phase, checkpoint=None):
+            while True:
+                try:
+                    record["handler_events"].append(handler_events.get_nowait())
+                except Empty:
+                    break
+            if checkpoint is not None:
+                record["checkpoints"].append({"phase": phase, **checkpoint})
+            attempt("storage evidence " + phase,
+                    lambda: storage.save(phase=phase, checkpoint=record))
+            attempt("write evidence " + phase, lambda: (root / "evidence.json").write_text(
+                json.dumps(record, indent=2), encoding="utf-8"))
+
+        self.addCleanup(lambda: save("cleanup"))
+
+        def facts():
+            checkpoint = {"at": time.monotonic()}
+            if host is not None:
+                checkpoint["health"] = attempt("host health", lambda: asdict(host.health()))
+                checkpoint["stop_report"] = attempt("host stop report", lambda:
+                    None if host.stop_report is None else host.stop_report.to_dict())
+            if runtime is not None:
+                checkpoint["runtime_closed"] = runtime._closed
+                checkpoint["executions"] = {}
+                for execution_id in ("same-run-1", "same-run-2"):
+                    def snapshot():
+                        with runtime.kernel._control_lock(.1):
+                            return runtime.kernel.get(execution_id).to_dict()
+                    checkpoint["executions"][execution_id] = {
+                        "snapshot": attempt(execution_id + " snapshot", snapshot),
+                        "limits": attempt(execution_id + " limits", lambda:
+                            runtime.kernel.get_execution_limits(execution_id, timeout_seconds=.1)),
+                        "observation": attempt(execution_id + " observation", lambda:
+                            runtime.observe(execution_id, timeout=.1)),
+                        "receipts": attempt(execution_id + " receipts", lambda:
+                            None if runtime._settlement_journal is None else
+                            runtime._settlement_journal.inspect(execution_id, timeout_seconds=.1)),
+                    }
+            return checkpoint
 
         def parallel_handler(payload, _context):
             started = time.monotonic()
+            handler_events.put({"execution_id": payload["execution_id"], "phase": "entered",
+                                "at": started, "thread": threading.current_thread().name})
             # The full 700-test gate can briefly deschedule either executor.
             # Keep the rendezvous bounded without making scheduler latency the
             # property under test; interval overlap remains the hard oracle.
-            barrier.wait(5.0)
-            time.sleep(0.05)
-            finished = time.monotonic()
+            try:
+                barrier.wait(5.0)
+                handler_events.put({"execution_id": payload["execution_id"],
+                                    "phase": "barrier_released", "at": time.monotonic()})
+                time.sleep(0.05)
+                finished = time.monotonic()
+            except BaseException as error:
+                handler_events.put({"execution_id": payload["execution_id"], "phase": "failed",
+                                    "at": time.monotonic(), **error_record(error)})
+                raise
+            handler_events.put({"execution_id": payload["execution_id"], "phase": "returned",
+                                "at": finished, "interval": [started, finished]})
             observations.put((payload["execution_id"], started, finished))
             return {"run_id": payload["run_id"]}
 
         parallel_handler.__execution_kernel_revision__ = "runtime-host-parallel-v1"
-        with tempfile.TemporaryDirectory() as temp:
+        original_error = None
+        try:
             runtime = Kernel.open_sqlite(
-                Path(temp) / "kernel.sqlite3",
+                root / "kernel.sqlite3",
                 {("parallel", 1): parallel_handler},
                 isolation_mode="thread",
                 max_thread_workers=2,
@@ -524,6 +604,7 @@ class RuntimeHostTests(unittest.TestCase):
                 )
                 for index in (1, 2)
             ]
+            submitted_commands = []
             for command in commands:
                 command = replace(
                     command,
@@ -535,6 +616,9 @@ class RuntimeHostTests(unittest.TestCase):
                     },
                 )
                 runtime.submit(command)
+                submitted_commands.append(command)
+            record["commands"] = attempt("submitted command snapshots", lambda:
+                [command.to_dict() for command in submitted_commands])
             host = RuntimeHost(
                 runtime,
                 RecordingBridge(),
@@ -542,24 +626,47 @@ class RuntimeHostTests(unittest.TestCase):
                 sweep_interval=0.05,
                 pump_interval=0.01,
             )
+            host.start()
+            record["wait_started"] = time.monotonic()
+            wait_until(
+                lambda: all(
+                    runtime.kernel.get(command.execution_id).state == "succeeded"
+                    for command in commands
+                ),
+                timeout=10.0,
+            )
+            intervals = {}
+            for _ in commands:
+                execution_id, started, finished = observations.get_nowait()
+                intervals[execution_id] = (started, finished)
+            record["intervals"] = intervals
+            self.assertEqual(set(intervals), {command.execution_id for command in commands})
+            first, second = (intervals[command.execution_id] for command in commands)
+            self.assertLess(max(first[0], second[0]), min(first[1], second[1]))
+        except BaseException as error:
+            original_error = error
+            record["original_error"] = error_record(error)
+            save("original-failure")
+            raise
+        finally:
+            save("before-stop", facts())
             try:
-                host.start()
-                wait_until(
-                    lambda: all(
-                        runtime.kernel.get(command.execution_id).state == "succeeded"
-                        for command in commands
-                    ),
-                    timeout=10.0,
-                )
-                intervals = {}
-                for _ in commands:
-                    execution_id, started, finished = observations.get_nowait()
-                    intervals[execution_id] = (started, finished)
-                self.assertEqual(set(intervals), {command.execution_id for command in commands})
-                first, second = (intervals[command.execution_id] for command in commands)
-                self.assertLess(max(first[0], second[0]), min(first[1], second[1]))
+                if host is not None:
+                    record["stop_started"] = time.monotonic()
+                    stopped = host.stop(timeout=2.0)
+                    record["stop_returned"] = time.monotonic()
+                    record["stopped"] = stopped
+                    self.assertTrue(stopped)
+                elif runtime is not None:
+                    runtime.close()
+            except BaseException as error:
+                record["stop_error"] = error_record(error)
+                if original_error is None:
+                    raise
             finally:
-                self.assertTrue(host.stop(timeout=2.0))
+                save("after-stop", facts())
+                attempt("print evidence path", lambda: print(
+                    "runtime_host_overlap_evidence=" + str(root / "evidence.json"), flush=True))
 
     def test_stop_drains_workers_and_closes_runtime(self) -> None:
         from dataclasses import asdict

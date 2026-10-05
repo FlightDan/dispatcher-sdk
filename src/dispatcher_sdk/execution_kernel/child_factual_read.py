@@ -67,7 +67,7 @@ def _borrow_owned(capability, window):
 def read_completed_result(capability, row: Mapping[str, Any], window) -> dict[str, Any] | None:
     """Read one result between fresh original parent/ancestry proofs.
 
-    Initial admission may retry within the caller's existing proof deadline.
+    Authority checks may retry within the caller's existing proof deadline.
     After the child is read, a failed final proof never replays that read.
     """
     from .children import ChildExecutionError
@@ -220,21 +220,45 @@ def read_completed_result(capability, row: Mapping[str, Any], window) -> dict[st
         # Start this fresh snapshot only AFTER the sole result read/encoding.
         # Its lease, identity, association and ancestry checks are consistent
         # without hiding cancellation committed while the result was read.
-        tokens = borrow()
-        connection.execute("BEGIN")
-        checking_parent = True
-        parent_proof(connection, tokens)
-        checking_parent = False
-        identity = connection.execute(
-            "SELECT execution_id,attempt,fence FROM kernel_executions WHERE execution_id=?",
-            (row["child_execution_id"],)).fetchone()
-        if identity is None or tuple(identity) != result_identity:
-            return None
-        if not child_proof(connection, tokens, result_identity):
-            return None
-        budget.check()
-        connection.rollback()
-        delivered = value
+        while True:
+            if budget.expired() and waiting is not None:
+                raise waiting
+            budget.check()
+            try:
+                tokens = borrow()
+                connection.execute("BEGIN")
+                checking_parent = True
+                parent_proof(connection, tokens)
+                checking_parent = False
+                identity = connection.execute(
+                    "SELECT execution_id,attempt,fence FROM kernel_executions WHERE execution_id=?",
+                    (row["child_execution_id"],)).fetchone()
+                if identity is None or tuple(identity) != result_identity:
+                    return None
+                if not child_proof(connection, tokens, result_identity):
+                    return None
+                budget.check()
+            except (sqlite3.OperationalError, BudgetClockUnknownError) as error:
+                if not (is_sqlite_contention(error) or type(error) is BudgetClockUnknownError
+                        and str(error) == "budget_clock_sample_unresolved:sampling"):
+                    raise
+                waiting = error
+                if connection.in_transaction:
+                    try:
+                        connection.rollback()
+                    except BaseException as rollback_error:
+                        raise error from rollback_error
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                # Retain the sole child read. Only fresh authority snapshots
+                # may observe a sampler's ACK within this original window.
+                checking_parent = True
+                time.sleep(min(.005, remaining))
+            else:
+                connection.rollback()
+                delivered = value
+                break
     except (StaleFenceError, InvalidStateTransitionError) as error:
         failure = ChildExecutionError("parent_authority_revoked", str(error),
                                       execution_id=lease.execution_id)

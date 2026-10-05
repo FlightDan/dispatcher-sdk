@@ -202,7 +202,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
             shutil.copy2(ROOT / "scripts" / "benchmark_sqlite_contention.py",
                          installed_suite / "scripts" / "benchmark_sqlite_contention.py")
             self._run([str(interpreter), "-m", "unittest", "discover", "-s", "tests", "-v"],
-                      # This runs the complete suite again, including SQLite
+                      # This runs the complete installed suite, including SQLite
                       # FULL durability fixtures; it needs its own suite budget.
                       cwd=installed_suite, timeout=900,
                       evidence_directory=evidence / "installed-suite")

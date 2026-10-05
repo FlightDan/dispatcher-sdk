@@ -10,7 +10,7 @@ from unittest.mock import patch
 from dispatcher_sdk.execution_kernel import child_factual_read as factual
 from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError, BudgetEnvelope, sample_clock
 from dispatcher_sdk.execution_kernel.budget_capture import _KernelBudgetCapture
-from dispatcher_sdk.execution_kernel.children import HandlerChildren
+from dispatcher_sdk.execution_kernel.children import ChildExecutionError, HandlerChildren
 from dispatcher_sdk.execution_kernel.context import HandlerContext, HandlerEffects
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
 from tests import test_child_completion_readonly as readonly_fixture
@@ -315,6 +315,73 @@ class ChildResultClockCleanupTests(unittest.TestCase):
 
     def test_foreign_owner_ack_after_original_proof_cannot_deliver_result(self):
         self.foreign_ack(after_proof=True)
+
+    def late_guard_retirement(self, *, revoke=False):
+        row, window, result = self.completed_child()
+        foreign = SQLiteKernel(self.kernel.db_path, durability='normal')
+        self.addCleanup(foreign.close)
+        owner = _KernelBudgetCapture(foreign, 'parent')
+        actual_read, actual_floor = factual._read_child_snapshot, factual._read_floor
+        record = {'scenario': 'final_guard_ack_then_revocation' if revoke else 'final_guard_ack',
+                  'proof_deadlines': [], 'refusals': [], 'child_read_finished': False}
+        self.evidence['records'].append(record)
+
+        def arm_after_child_read(*args):
+            snapshot = actual_read(*args)
+            token = foreign._begin_budget_sample('parent', _owner=owner)
+            captured = self.budget.recheckpoint(sample=sample_clock(wall_time=self.wall[0]))
+            owner._captured(token, captured)
+            record['token'] = token
+            record['child_read_finished'] = True
+            return snapshot
+
+        def observe_final_refusal(connection, lease, budget, **kwargs):
+            record['proof_deadlines'].append(budget.deadline)
+            try:
+                return actual_floor(connection, lease, budget, **kwargs)
+            except BudgetClockUnknownError as error:
+                if str(error) != 'budget_clock_sample_unresolved:sampling':
+                    raise
+                self.assertTrue(record['child_read_finished'])
+                self.assertTrue(connection.in_transaction)
+                record['refusals'].append(str(error))
+                remaining = budget.deadline - time.monotonic()
+                self.assertGreater(remaining, 0)
+                # Only the foreign producer retires its exact guard. The
+                # consumer must roll back before observing that real ACK.
+                owner.finish_pending(owner._pending[1], timeout_seconds=min(.1, remaining))
+                if revoke:
+                    foreign.cancel('parent', lease=self.lease, reason='revoked during final proof')
+                record['ack_returned'] = time.monotonic()
+                raise
+
+        with patch.object(factual, '_read_child_snapshot', side_effect=arm_after_child_read) as read, \
+                patch.object(factual, '_read_floor', side_effect=observe_final_refusal), \
+                patch.object(self.kernel, '_sample_budget', side_effect=AssertionError('new sample')), \
+                patch.object(self.kernel, '_finish_budget_sample', side_effect=AssertionError('consumer ACK')), \
+                patch.object(self.kernel, '_drain_budget_samples', side_effect=AssertionError('consumer drain')):
+            if revoke:
+                with self.assertRaises(ChildExecutionError) as caught:
+                    self.children._completed_result(row, window)
+                self.assertEqual(caught.exception.code, 'parent_authority_revoked')
+            else:
+                delivered = self.children._completed_result(row, window)
+                self.assertEqual(delivered, result.to_dict())
+                record['delivered'] = delivered
+            read.assert_called_once()
+        self.assertEqual(record['refusals'], ['budget_clock_sample_unresolved:sampling'])
+        self.assertEqual(len(set(record['proof_deadlines'])), 1)
+        self.assertLess(record['ack_returned'], record['proof_deadlines'][0])
+        self.assertIsNone(owner._pending)
+        self.assertFalse(self.kernel._connection.in_transaction)
+        self.assertEqual(window.envelope.constraints,
+            BudgetEnvelope.from_dict(json.loads(row['budget_json'])).constraints)
+
+    def test_guard_armed_after_sole_child_read_can_retire_inside_same_final_proof(self):
+        self.late_guard_retirement()
+
+    def test_parent_revocation_after_final_guard_ack_wins_without_second_child_read(self):
+        self.late_guard_retirement(revoke=True)
 
     def test_foreign_parent_guard_is_never_cleared_by_result_delivery(self):
         row, window, _ = self.completed_child()

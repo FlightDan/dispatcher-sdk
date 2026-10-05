@@ -583,7 +583,7 @@ class RuntimeSettlementTests(unittest.TestCase):
         self.assertEqual("superseded", receipts[0]["state"])
         self.assertEqual(1, len(calls.read_text().splitlines()))
 
-    def test_completion_clock_storage_timeout_retains_unknown_original_outcome(self):
+    def test_completion_clock_storage_timeout_cannot_revive_expired_lease(self):
         clock = Clock()
         captured, capture_done = [], threading.Event()
         original_capture = runtime_module._capture_completion_time
@@ -618,8 +618,9 @@ class RuntimeSettlementTests(unittest.TestCase):
                         writer.rollback()
                 self.assertFalse(captured[0][0]["completion_time_known"])
                 self.assertLess(captured[0][1], .25)
-                # Establish expiry only after the genuinely unreadable return
-                # point; later availability cannot recreate its original time.
+                # Establish expiry after the unreadable return point. The
+                # retained sample may be revalidated, but a later committed
+                # expiry floor cannot restore success or the original lease.
                 with context._budget_lock:
                     old_wall = clock.value
                     clock.value = lease.expires_at + 1
@@ -638,13 +639,23 @@ class RuntimeSettlementTests(unittest.TestCase):
         receipts = runtime._settlement_journal.inspect(command.execution_id, timeout_seconds=.5)
         self.assertEqual(1, len(receipts))
         self.assertIsNone(receipts[0]["result"])
-        self.assertIn(receipts[0]["state"], {"pending", "error"})
+        self.assertEqual(receipts[0]["state"], "superseded")
         raw = receipts[0]["deferred"]["outcome"]
         self.assertEqual("ok", raw["kind"])
         self.assertFalse(raw["completion_time_known"])
         self.assertNotIn("completed_at", raw)
         self.assertEqual({"message": "actual handler returned while lifecycle was held"}, raw["value"])
         self.assertEqual("OperationalError: database is locked", raw["completion_time_error"])
+        proof = raw["completion_clock_proof"]
+        self.assertEqual(lease.to_dict(), proof["lease"])
+        self.assertEqual(.1, proof["timeout_seconds"])
+        resolved = receipts[0]["evidence"]["resolved_result"]
+        self.assertEqual(resolved["status"], "timed_out")
+        self.assertGreater(resolved["completed_at"], lease.expires_at)
+        self.assertIn("StaleFenceError", receipts[0]["evidence"]["error"])
+        self.assertEqual(raw["value"], resolved["error"]["details"]["business_outcome"]["value"])
+        self.assertEqual(proof["budget_envelope"]["constraints"],
+            resolved["error"]["details"]["budget_envelope"]["constraints"])
         self.assertEqual(1, len(calls.read_text().splitlines()))
 
     def test_cancel_wins_and_archives_original_outcome(self):

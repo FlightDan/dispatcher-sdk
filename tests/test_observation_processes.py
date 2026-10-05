@@ -1,5 +1,6 @@
 """Real handles and byte chunks, including silent and unterminated output."""
 
+import json
 import multiprocessing
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +20,7 @@ from dispatcher_sdk.observability.contracts import ObservationIdentity, Observat
 from dispatcher_sdk.observability.journal import ObservationJournal
 from dispatcher_sdk.observability.processes import ProcessObserver
 from dispatcher_sdk.observability.streams import decoded_tail, observed_byte_chunks, observe_bytes
+from tests._acceptance_evidence import retained_directory
 
 
 def silent_child(gate):
@@ -26,18 +29,62 @@ def silent_child(gate):
 
 class ProcessObservationTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
+        retain_storage = self._testMethodName == "test_storage_failure_and_bounded_close_do_not_change_live_process"
+        if retain_storage:
+            root = retained_directory("sdk-process-observer-close-")
+            self._storage_close_evidence = {"test": self.id(), "cleanup_timeout_seconds": 1}
+        else:
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            root = Path(temporary.name)
+        self.root = root
         self.options = ObservationOptions(flush_interval=.05, process_freshness=.2)
         self.identity = ObservationIdentity("execution", 1, 1)
         self.journal = ObservationJournal(root / "observations.sqlite3", kernel_path=root / "kernel.sqlite3",
             source_id="test-source", options=self.options)
         self.journal.bind_current(self.identity)
         self.activity = ActivityRecorder(self.journal, self.identity, options=self.options)
-        self.addCleanup(self.activity.close)
+        if not retain_storage:
+            self.addCleanup(self.activity.close)
         self.observer = ProcessObserver(self.activity, poll_interval=.02)
-        self.addCleanup(self.observer.close)
+        self.addCleanup(self._close_retained_storage if retain_storage else self.observer.close)
+
+    def _close_retained_storage(self):
+        # Both collectors share the existing one-second cleanup allowance.
+        # Pending close never authorizes deleting their storage or rerunning
+        # the final flush under a renewed operation deadline.
+        deadline = time.monotonic() + 1
+        evidence = self._storage_close_evidence
+
+        def remaining():
+            value = deadline - time.monotonic()
+            self.assertGreater(value, 0, "collector cleanup window exhausted")
+            return value
+
+        try:
+            evidence["observer_close"] = self.observer.close(timeout=remaining())
+            evidence["activity_close"] = self.activity.close(timeout=remaining())
+            evidence["activity_drain"] = self.activity._join_owned_workers(deadline)
+            worker = self.observer._thread
+            if worker is not None:
+                worker.join(max(0., deadline - time.monotonic()))
+            evidence["observer_after_drain"] = self.observer.snapshot()
+            evidence["activity_workers_alive"] = self.activity._owned_workers_alive()
+            self.assertFalse(evidence["observer_after_drain"]["collector_alive"], evidence)
+            # The flusher leaves its readonly anchor only before thread exit.
+            self.assertFalse(evidence["activity_workers_alive"], evidence)
+        except BaseException as error:
+            evidence["cleanup_error"] = {"type": type(error).__name__, "message": str(error),
+                "traceback": traceback.format_exc()}
+            raise
+        finally:
+            evidence["observer_final"] = self.observer.snapshot()
+            evidence["activity_final"] = self.activity.snapshot()
+            evidence["activity_final_close"] = self.activity._close_result
+            evidence["activity_workers_alive_final"] = self.activity._owned_workers_alive()
+            path = self.root / "close-evidence.json"
+            path.write_text(json.dumps(evidence, default=str, indent=2), encoding="utf-8")
+            print("process_observer_close_evidence=" + str(path), flush=True)
 
     def launch(self, source):
         process = subprocess.Popen([sys.executable, "-u", "-c", source], stdout=subprocess.PIPE,
@@ -169,16 +216,32 @@ class ProcessObservationTests(unittest.TestCase):
             raise OSError("journal unavailable")
 
         with patch.object(self.journal, "register_process", blocked_registration):
-            observed = self.observer.observe_process(process, process_id="blocked-storage")
-            self.assertTrue(entered.wait(1))
-            started = time.monotonic()
-            report = self.observer.close(timeout=.05)
-            self.assertLess(time.monotonic() - started, .3)
-            self.assertTrue(report["unfinished_collector"])
-            self.assertIsNone(process.poll())
-            self.assertEqual("unknown", observed.snapshot()["state"])
-            release.set()
-        self.observer.close(timeout=1)
+            try:
+                observed = self.observer.observe_process(process, process_id="blocked-storage")
+                self.assertTrue(entered.wait(1))
+                started = time.monotonic()
+                report = self.observer.close(timeout=.05)
+                self._storage_close_evidence["bounded_close"] = report
+                self.assertLess(time.monotonic() - started, .3)
+                self.assertTrue(report["unfinished_collector"])
+                self.assertIsNone(process.poll())
+                self.assertEqual("unknown", observed.snapshot()["state"])
+            except BaseException as error:
+                self._storage_close_evidence["body_error"] = {
+                    "type": type(error).__name__, "message": str(error), "traceback": traceback.format_exc()}
+                raise
+            finally:
+                release.set()
+                # Keep failure injection installed through final collection:
+                # its second registration must not race a real SQLite write.
+                try:
+                    report = self.observer.close(timeout=1)
+                    self._storage_close_evidence["released_close"] = report
+                    self.assertFalse(report["unfinished_collector"], report)
+                except BaseException as error:
+                    self._storage_close_evidence["released_close_error"] = {
+                        "type": type(error).__name__, "message": str(error), "traceback": traceback.format_exc()}
+                    raise
 
     def test_stream_wrapper_does_not_prefetch_and_telemetry_error_does_not_drop_chunk(self):
         read = []

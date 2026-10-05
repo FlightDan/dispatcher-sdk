@@ -16,7 +16,7 @@ from dispatcher_sdk.observability import (
     ObservationOptions, StallPolicy,
 )
 from tests._acceptance_evidence import retained_directory
-from tests._storage_evidence import StorageEvidence
+from tests._storage_evidence import StorageEvidence, persist_retained_batch
 
 
 class _Clock:
@@ -351,16 +351,26 @@ class ObservationJournalTests(unittest.TestCase):
             StallPolicy("policy", metrics=())
 
     def test_explicit_collector_scope_replaces_crashed_incarnation_and_preserves_history(self):
+        # Publish each prerequisite before advancing the clock or replacing
+        # its collector. Keep one finite maintenance window and each original
+        # .03s write allowance, retrying only the exact retained batch.
+        maintenance = {"began": time.monotonic(), "timeout_seconds": 1, "flushes": []}
+        self.addCleanup(self.storage_evidence.save, phase="collector_flush_maintenance", checkpoint=maintenance)
+
+        def persist_retained(recorder, stage):
+            return persist_retained_batch(self, recorder, stage=stage,
+                maintenance=maintenance, captured_at=lambda: self.clock.now)
+
         old = self.recorder(source_id="old-handler", source_scope="handler")
         old.enable_stream("stdout")
         old.report_bytes("stdout", b"old")
         old.phase("handler_entered")
-        old.flush()
+        persist_retained(old, "old_collector")
         self.clock.now = 110
         self.assertFalse(self.journal.inspect("execution")["complete"])
         fresh = self.recorder(source_id="new-handler", source_scope="handler")
         fresh.enable_stream("stdout")
-        fresh.flush()
+        persist_retained(fresh, "replacement_collector")
         report = self.journal.inspect("execution")
         self.assertTrue(report["complete"])
         self.assertEqual([source["source_id"] for source in report["sources"]], ["new-handler"])
@@ -369,7 +379,7 @@ class ObservationJournalTests(unittest.TestCase):
         self.assertEqual(report["metrics"]["stdout_bytes"]["first_at"], 100)
         self.assertIn("collector_replaced", [event["kind"] for event in self.journal.events("execution")["events"]])
         old.report_bytes("stdout", b"late")
-        old.flush()
+        persist_retained(old, "late_old_collector")
         report = self.journal.inspect("execution")
         self.assertEqual(report["metrics"]["stdout_bytes"]["count"], 3)
         self.assertEqual(report["sources"][0]["source_id"], "new-handler")

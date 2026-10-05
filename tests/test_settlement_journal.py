@@ -46,8 +46,24 @@ class SettlementJournalTests(unittest.TestCase):
         self.addCleanup(self.storage_evidence.save)
         self.kernel_path = root / "kernel.db"
         self.path = Path(str(self.kernel_path) + ".settlements.sqlite3")
-        self.journal = SettlementJournal(self.path, source_id="store-original", kernel_path=self.kernel_path,
-            timeout_seconds=1 if self._testMethodName == 'test_committed_original_result_survives_process_exit_and_reopen' else .1)
+        # Cold schema/metadata setup creates no execution or business facts.
+        # WinARM311 CI 37385281478 correctly refused its former .1s setup
+        # after BEGIN IMMEDIATE took .359s, before yielding the connection.
+        # Keep record/inspect/note/settle budgets unchanged below.
+        setup = {"timeout_seconds": 1, "began": time.monotonic()}
+        self.addCleanup(self.storage_evidence.save, phase="fixture_setup", checkpoint=setup)
+        try:
+            self.journal = SettlementJournal(self.path, source_id="store-original", kernel_path=self.kernel_path,
+                timeout_seconds=1)
+            setup["state"] = "initialized"
+        except BaseException as error:
+            setup["error"] = {"type": type(error).__name__, "message": str(error),
+                "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                "traceback": traceback.format_exc()}
+            raise
+        finally:
+            setup["returned"] = time.monotonic()
+            setup["elapsed"] = setup["returned"] - setup["began"]
 
     def tearDown(self):
         self.storage_evidence.save(phase="before_cleanup")

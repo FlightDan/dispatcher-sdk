@@ -514,10 +514,12 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                     request.set()
                     self.assertTrue(held.wait(1))
                     state.phase[0] = "capture"
-                    began = time.monotonic()
+                    # Measure the native wait with the duration clock; the
+                    # original capture deadline still uses monotonic time.
+                    began = time.perf_counter()
                     with self.assertRaises((InspectionBudgetExceeded, TimeoutError)) as caught:
                         capture_completion_time(state.context)
-                    finished = time.monotonic()
+                    finished = time.perf_counter()
                     elapsed = finished - began
                     state.phase[0] = "cleanup"
                     bound = .1 if configured is None else configured
@@ -531,7 +533,8 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                     self.assertEqual(state.context._completion_readers, set())
                     self.assertFalse(state.context._completion_readers_pending())
                     self.evidence["records"].append({"phase": "admission_contention", "original_bound": bound,
-                        "elapsed": elapsed, "raw_error": self.raw(caught.exception), "wall_samples": 0, "opens": 0})
+                        "elapsed": elapsed, "elapsed_clock": "perf_counter",
+                        "raw_error": self.raw(caught.exception), "wall_samples": 0, "opens": 0})
                 state.context.close()
                 with patch.object(clock_module, "_connect_readonly", wraps=clock_module._connect_readonly) as opened:
                     state.phase[0] = "capture"
@@ -572,9 +575,11 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                             patch.object(state.context, "_release_completion_reader", side_effect=contended_release), \
                             patch.object(clock_module, "_connect_readonly", side_effect=opened):
                         state.phase[0] = "capture"
-                        began = time.monotonic()
+                        # Keep the budget's monotonic anchors intact while
+                        # measuring this native wait with the duration clock.
+                        began = time.perf_counter()
                         completed_at = capture_completion_time(state.context)
-                        finished = time.monotonic()
+                        finished = time.perf_counter()
                         elapsed = finished - began
                         state.phase[0] = "cleanup"
                         bound = .1 if configured is None else configured
@@ -591,7 +596,8 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                         self.assertTrue(state.context._completion_readers_pending())
                         self.assertIn(owners[0], state.context._completion_readers)
                         self.evidence["records"].append({"phase": "release_contention", "original_bound": bound,
-                            "elapsed": elapsed, "completed_at": completed_at, "capture_deadline": deadlines[0],
+                            "elapsed": elapsed, "elapsed_clock": "perf_counter",
+                            "completed_at": completed_at, "capture_deadline": deadlines[0],
                             "physical_reader_closed": True, "owner_retained": True})
                 with patch.object(clock_module, "_connect_readonly", side_effect=opened):
                     self.assertFalse(state.context._drain_completion_readers(time.monotonic() + 1))

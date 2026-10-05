@@ -119,11 +119,15 @@ class CancelAdmissionTests(unittest.TestCase):
 
     def test_persistent_writer_exhausts_original_bound_and_retains_last_busy(self):
         writer = self.writer()
-        before = time.monotonic()
         try:
             with patch.object(self.runtime.kernel, 'cancel', side_effect=self.observed_cancel):
                 with self.assertRaises(sqlite3.OperationalError) as caught:
+                    # Patch/context construction is fixture setup, outside
+                    # the same public .25s cancellation admission window.
+                    before = time.monotonic()
                     self.cancel(timeout=.25)
+            self.evidence['records'].append({'scenario': 'persistent_writer', 'original_timeout': .25,
+                'began': before, 'elapsed': time.monotonic()-before, 'error': str(caught.exception)})
             self.assertIs(caught.exception, self.raw_errors[-1])
             self.assertEqual(str(caught.exception), 'database is locked')
             if hasattr(caught.exception, 'sqlite_errorcode'):
@@ -131,8 +135,6 @@ class CancelAdmissionTests(unittest.TestCase):
             self.assertEqual(self.runtime.kernel.get('parent').state, 'running')
             self.assertTrue(all(call['at'] < before+.25 for call in self.calls))
             self.assertLessEqual(len(self.calls), 3)
-            self.evidence['records'].append({'scenario': 'persistent_writer', 'original_timeout': .25,
-                'elapsed': time.monotonic()-before, 'error': str(caught.exception)})
         finally:
             writer.rollback()
             writer.close()

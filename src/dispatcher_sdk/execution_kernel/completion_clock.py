@@ -317,11 +317,11 @@ def _capture_completion_time(context: Any, budget: InspectionBudget,
     try:
         return _read_completion_time(kernel, lease, envelope, sample, budget, owner,
             owned_token=None if owned is None else owned[0])
-    except BudgetClockUnknownError as error:
-        # Only a transient sampling refusal has a recoverable original fact.
-        # The reader must already be physically closed: a close failure keeps
-        # its lifetime charged and cannot publish this proof.
-        if (str(error) == "budget_clock_sample_unresolved:sampling"
+    except Exception as error:
+        # The read body attributes retryable admission or its own inspection
+        # exhaustion only after physical close. Keep the original return
+        # sample; recovery still has to validate every storage predicate.
+        if (getattr(error, "_completion_clock_retryable", False)
                 and error.__cause__ is None):
             configured = kernel._default_control_timeout
             error._completion_clock_proof = {
@@ -366,13 +366,13 @@ def _read_completion_time(kernel: Any, lease: ExecutionLease, envelope: BudgetEn
     deadline = budget.deadline
     assert deadline is not None
     retained_floor = envelope.recheckpoint(sample=sample).checkpoint.wall_at
-    budget.check()
     path = Path(kernel.db_path).expanduser().resolve()
     connection = None
     reader_ready = False
     failure: BaseException | None = None
     result = None
     admission_error: Exception | None = None
+    retryable_failure = False
     # The independent connection owns its maintenance participation until
     # actual close, including an unsuccessful close retained by its factory.
     try:
@@ -427,6 +427,11 @@ def _read_completion_time(kernel: Any, lease: ExecutionLease, envelope: BudgetEn
                 or code is None and str(error).lower() == "interrupted"))
         failure = (admission_error if (isinstance(error, InspectionBudgetExceeded) or timed_interrupt)
             and admission_error is not None else error)
+        retryable_failure = (timed_interrupt or
+            isinstance(error, InspectionBudgetExceeded) and budget.stopped_reason == "timeout" or
+            failure is admission_error and (is_sqlite_contention(failure) or
+                type(failure) is BudgetClockUnknownError and
+                str(failure) == "budget_clock_sample_unresolved:sampling"))
     finally:
         if connection is not None:
             try:
@@ -439,7 +444,15 @@ def _read_completion_time(kernel: Any, lease: ExecutionLease, envelope: BudgetEn
                     raise failure from error
                 raise
     if failure is not None:
+        if retryable_failure and failure.__cause__ is None:
+            failure._completion_clock_retryable = True
         raise failure
-    budget.check()
+    try:
+        budget.check()
+    except InspectionBudgetExceeded as error:
+        # This final check also follows successful physical close. It may
+        # retain the original sample without accepting the completed read.
+        error._completion_clock_retryable = True
+        raise
     assert result is not None
     return result

@@ -12,6 +12,33 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
+def persist_retained_batch(test, recorder, *, stage, maintenance, captured_at):
+    """Publish a fixture prerequisite within its caller's fixed maintenance window."""
+    deadline = maintenance["began"] + maintenance["timeout_seconds"]
+    batch = []
+    while deadline - time.monotonic() >= recorder.journal.options.write_timeout:
+        began = time.monotonic()
+        try:
+            receipt = recorder._flush(batch)
+        except BaseException as error:
+            maintenance["flushes"].append({"stage": stage, "began": began,
+                "returned": time.monotonic(), "captured_at": captured_at(),
+                "error": {"type": type(error).__name__, "message": str(error),
+                    "sqlite_errorcode": getattr(error, "sqlite_errorcode", None)}})
+            raise
+        maintenance["flushes"].append({"stage": stage, "began": began,
+            "returned": time.monotonic(), "captured_at": captured_at(),
+            "receipt": dict(receipt)})
+        test.assertLessEqual(maintenance["flushes"][-1]["returned"], deadline,
+            maintenance["flushes"])
+        if receipt.get("state") == "persisted":
+            return receipt
+        test.assertTrue(receipt.get("state") in ("degraded", "pending")
+            and receipt.get("retryable") is True, receipt)
+    test.fail("retained evidence did not persist within its original maintenance window: "
+        + repr(maintenance["flushes"]))
+
+
 class StorageEvidence:
     def __init__(self, root, test):
         self.root, self.test = root, test

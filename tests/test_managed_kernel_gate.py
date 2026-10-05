@@ -159,7 +159,15 @@ class ManagedKernelGateTests(unittest.TestCase):
             self.sdk._settle_managed_pause("one", expected_control_epoch=2)
 
     def test_deadline_after_start_allows_result_settlement_without_retry(self):
-        self.deadline = time.time() + 0.4
+        # This case controls the Run clock: registration and durable setup
+        # precede expiry, then the same deadline passes after the real start.
+        self.kernel.close()
+        wall = [time.time()]
+        clock = lambda: wall[0]
+        self.kernel = SQLiteKernel(self.path, now=clock)
+        self.addCleanup(self.kernel.close)
+        self.sdk = Orchestrator(self.path, self.kernel, clock=clock)
+        self.deadline = clock() + 0.4
         self._register("one")
         self.sdk._request_managed_control(
             "one", request_id="resume", kind="resume",
@@ -167,8 +175,12 @@ class ManagedKernelGateTests(unittest.TestCase):
         )
         self.sdk.flush()
         lease = self.kernel.claim_and_start("worker")
+        self.assertIsNotNone(lease)
         observed = self.kernel.get(lease.execution_id)
-        time.sleep(max(0, self.deadline - time.time()) + 0.03)
+        self.assertLess(observed.started_at, self.deadline)
+        wall[0] = self.deadline + 0.03
+        self.assertGreater(self.kernel.current_time(), self.deadline)
+        self.assertEqual(self.kernel.get_run_control("one")["deadline_at"], self.deadline)
         result = ExecutionResultV2(
             result_id="result:deadline", execution_id=lease.execution_id,
             status="failed", attempt=lease.attempt, fence=lease.fence,

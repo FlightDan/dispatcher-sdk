@@ -223,10 +223,14 @@ class InboxBackgroundReadinessTests(unittest.TestCase):
             connection.commit()
         app.start()
         try:
-            self.wait_for(lambda: app.health()["callback_errors"] > 0)
-            error = app.health()["last_callback_error"]
-            self.assertIn("OperationalError", error)
-            self.assertIn("notification_inbox_messages", error)
+            self.wait_for(lambda: app.health()["delivery_errors"] > 0)
+            health = app.health()
+            error = health["last_delivery_error"]
+            self.assertEqual(error["phase"], "readiness")
+            self.assertEqual(error["type"], "OperationalError")
+            self.assertIn("notification_inbox_messages", error["message"])
+            self.assertEqual(health["callback_errors"], 0)
+            self.assertIsNone(health["last_callback_error"])
         finally:
             with closing(sqlite3.connect(self.path)) as connection:
                 connection.execute("ALTER TABLE unavailable_inbox_messages RENAME TO notification_inbox_messages")
