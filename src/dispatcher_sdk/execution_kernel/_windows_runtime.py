@@ -30,7 +30,7 @@ from ._process_runtime import (
     invoke_handler, _serialize_handler_outcome,
     _budget_outcome, _confirmed_entry_packet, _close_context, _capture_completion_time,
     _bootstrap_diagnostic, _observe_phase, _budget_sample, _merge_budget_floor,
-    _BudgetTracker, _control_error_details, _finish_budget_capture,
+    _BudgetTracker, _NativeBudgetCutoff, _control_error_details, _finish_budget_capture,
 )
 from .budget import BudgetClockUnknownError, BudgetEnvelope
 from ._registry import Handler
@@ -704,6 +704,7 @@ def invoke_windows_handler(
         entry = None
         invocation_permitted = False
         work_expired = False
+        native_cutoff = None
         outcome = None
         contained_at = None
         returned = False
@@ -802,18 +803,42 @@ def invoke_windows_handler(
                         watchdog.retain_capture(budget_envelope)
                 time.sleep(_POLL_SECONDS)
         except BudgetClockUnknownError as exc:
+            established = getattr(exc, "budget_native_cutoff", None)
+            if (entry is not None and type(established) is _NativeBudgetCutoff
+                    and math.isfinite(established.deadline_monotonic)
+                    and math.isfinite(established.observed_monotonic)
+                    and established.observed_monotonic >= established.deadline_monotonic):
+                # Before entry a native bound may be only the startup cap.
+                # After entry the driver is observing the existing work or
+                # cleanup cutoff, even when its final clock ACK is pending.
+                native_cutoff = established
             # A ready factual result remains collectible even when a later
             # authority sample cannot be published. It does not admit new work.
             if outcome is None:
-                for name in ("outcome.json", "returned.json"):
+                # Recover the return timestamp before the final outcome. A
+                # ready outcome alone cannot prove a timely business return.
+                for name in ("returned.json", "outcome.json"):
                     path = root / name
                     if not path.exists() or path.stat().st_size > 256 * 1024:
                         continue
                     try:
                         available = json.loads(path.read_text(encoding="utf-8"))
-                        available = json.loads(available["outcome_json"]) if name == "returned.json" else available
+                        if type(available) is not dict:
+                            continue
+                        if name == "returned.json":
+                            completed = available.get("completed_monotonic")
+                            timely = (deadline is not None and type(completed) in {int, float}
+                                      and math.isfinite(completed) and completed < deadline)
+                            available = json.loads(available["outcome_json"])
                         if type(available) is dict:
                             outcome = available
+                            if name == "returned.json":
+                                returned = timely
+                                work_expired = not timely
+                                if returned:
+                                    watchdog.cleanup_deadline(hard_deadline if hard_deadline is not None else deadline)
+                                continue
+                            final_telemetry_receipt = outcome.get("telemetry_flush")
                             break
                     except (OSError, ValueError, KeyError, TypeError):
                         continue
@@ -824,6 +849,8 @@ def invoke_windows_handler(
             else:
                 outcome["budget_capture_error"] = {"state": "unknown", "error":
                     _control_error_details(exc.__cause__ or exc)}
+                if native_cutoff is not None:
+                    outcome["budget_capture_error"]["native_cutoff"] = native_cutoff.to_dict()
             if watchdog is not None:
                 watchdog.clock_error = exc
                 if tracker.envelope is not None:
@@ -857,7 +884,9 @@ def invoke_windows_handler(
             return publish({"kind": "authority_revoked", "reason": handle.revocation_reason, "effect_ids": []}, budget_envelope, entry)
         known_work_expired = (not returned and budget_envelope is not None and
             budget_envelope.view(sample=budget_envelope.checkpoint).remaining_work_seconds == 0)
-        if watchdog is not None and getattr(watchdog, "clock_error", None) is not None and not known_work_expired:
+        native_cutoff_expired = (native_cutoff is not None and (native_cutoff.hard or not returned))
+        if (watchdog is not None and getattr(watchdog, "clock_error", None) is not None
+                and not returned and not known_work_expired and native_cutoff is None):
             error = {"kind": "error", "code": "budget_clock_unknown",
                                    "message": str(watchdog.clock_error), "control_error": True,
                                    "retryable": False, "effect_ids": [],
@@ -866,8 +895,11 @@ def invoke_windows_handler(
                 error["details"]["business_outcome"] = outcome
                 error["effect_ids"] = outcome.get("effect_ids", [])
             return publish(error, budget_envelope, entry)
-        if (known_work_expired or work_expired or (entry is None and deadline is not None and time.monotonic() >= deadline)
-                or (watchdog is not None and watchdog.expired)
+        if (known_work_expired or work_expired or native_cutoff_expired
+                or (entry is None and deadline is not None and time.monotonic() >= deadline)
+                or (watchdog is not None and watchdog.expired and not returned)
+                or (returned and watchdog is not None and watchdog.cleanup
+                    and (contained_at is None or contained_at >= watchdog.deadline))
                 or (hard_deadline is not None and (contained_at is None or contained_at >= hard_deadline))):
             capture_unknown = None
             if outcome is None and (budget_envelope is not None or entry is not None or (root / "returned.json").exists()):
@@ -912,6 +944,8 @@ def invoke_windows_handler(
             if watchdog is not None and getattr(watchdog, "clock_error", None) is not None:
                 timeout["budget_capture_error"] = _control_error_details(
                     watchdog.clock_error.__cause__ or watchdog.clock_error)
+                if native_cutoff is not None:
+                    timeout["budget_capture_error"]["native_cutoff"] = native_cutoff.to_dict()
             return publish(timeout, budget_envelope, entry)
         # The worker can atomically publish between the loop's file check and
         # its exit check. After containment no writer remains, so recover that

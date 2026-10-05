@@ -15,7 +15,7 @@ from typing import Any
 from ._sqlite_base import encode_json
 from .budget import BudgetClockUnknownError, BudgetEnvelope, ClockCheckpoint, DeadlineConstraint, sample_clock
 from .contracts import ExecutionCommandV2, ExecutionLease
-from .errors import CASConflictError, StaleFenceError, StorageIsolationError
+from .errors import CASConflictError, ExecutionNotFoundError, StaleFenceError, StorageIsolationError
 
 
 class SupervisionMixin:
@@ -366,17 +366,29 @@ class SupervisionMixin:
     def supervision_status(self, execution_id: str, *, timeout_seconds: float = .1) -> dict[str, Any]:
         """Read current authority and progress without creating a control row."""
         with self._control_lock(timeout_seconds):
-            row = self._get_row(self._connection, execution_id)
-            current = self._connection.execute(
-                "SELECT * FROM kernel_supervision WHERE execution_id=?", (execution_id,)
+            # One scalar snapshot binds entry confirmation to the actual
+            # execution identity, including writes from a native worker.
+            row = self._connection.execute(
+                "SELECT e.execution_id,e.attempt,e.fence,e.state,e.revision,"
+                "l.entry_state,l.entry_attempt,l.entry_fence,"
+                "s.attempt AS supervision_attempt,s.fence AS supervision_fence,"
+                "s.progress_revision,s.progress_at,s.episode_id,s.policy_version,s.episode_progress_revision "
+                "FROM kernel_executions e LEFT JOIN kernel_supervision s ON s.execution_id=e.execution_id "
+                "LEFT JOIN kernel_execution_limits l ON l.execution_id=e.execution_id "
+                "WHERE e.execution_id=?", (execution_id,)
             ).fetchone()
-            value = dict(current) if current is not None else {}
-            if (value.get("attempt"), value.get("fence")) != (row["attempt"], row["fence"]):
-                value = {"execution_id": execution_id, "attempt": row["attempt"],
-                         "fence": row["fence"], "progress_revision": 0, "progress_at": None,
+            if row is None:
+                raise ExecutionNotFoundError(execution_id)
+            value = {name: row[name] for name in ("progress_revision", "progress_at", "episode_id",
+                                                "policy_version", "episode_progress_revision")}
+            if (row["supervision_attempt"], row["supervision_fence"]) != (row["attempt"], row["fence"]):
+                value = {"progress_revision": 0, "progress_at": None,
                          "episode_id": None, "policy_version": None,
                          "episode_progress_revision": None}
-            return {**value, "execution_state": row["state"], "execution_revision": row["revision"]}
+            return {"execution_id": execution_id, "attempt": row["attempt"], "fence": row["fence"],
+                    **value, "execution_state": row["state"], "execution_revision": row["revision"],
+                    "entry_state": row["entry_state"], "entry_attempt": row["entry_attempt"],
+                    "entry_fence": row["entry_fence"]}
 
     def confirm_progress(self, lease: ExecutionLease, event_id: str, *, timeout_seconds: float = .1) -> dict[str, Any]:
         """Confirm one application progress key under its live execution fence.

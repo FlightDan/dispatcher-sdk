@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel import HandlerExecutionError, Kernel, RetryPolicy
 from dispatcher_sdk.execution_kernel import runtime as runtime_module
+from dispatcher_sdk.execution_kernel import completion_clock as completion_clock_module
+from dispatcher_sdk.execution_kernel.context import HandlerContext, HandlerEffects
 from tests._acceptance_evidence import retained_directory
 from tests._storage_evidence import StorageEvidence
 
@@ -155,6 +157,171 @@ class RuntimeSettlementTests(unittest.TestCase):
         if runtime._settlement_thread is not None:
             runtime._settlement_thread.join(1)
             self.assertFalse(runtime._settlement_thread.is_alive())
+
+    def deferred_guarded_handler_outcome(self, name, *, failure=False):
+        """Run the actual invocation wrapper, then refuse its original clock read.
+
+        This boundary fixture owns no scheduler thread: only explicit recovery
+        can ACK the foreign guard or publish the actual retained handler result.
+        """
+        clock = Clock()
+        runtime = self.open(name, failure=failure, clock=clock)
+        calls = self.root / (name + "-calls.txt")
+        command = runtime.command("work", execution_id=name, idempotency_key=name,
+            correlation_id=name, timeout_seconds=5,
+            payload={"call_log": str(calls), "value": 17})
+        runtime.submit(command)
+        lease = runtime.kernel.claim_and_start("actual-handler-owner", execution_id=name)
+        envelope = runtime.kernel.prepare_execution_budget(lease)
+        context = HandlerContext(command, lease,
+            HandlerEffects(runtime.kernel, lease, lambda: True), budget_envelope=envelope)
+        self.addCleanup(context.close)
+        outcome = runtime_module.invoke_handler(
+            settlement_failure if failure else settlement_success, command, context)
+        self.assertEqual("error" if failure else "ok", outcome["kind"])
+        self.assertEqual([name], calls.read_text().splitlines())
+        token = runtime.kernel._begin_budget_sample(name)
+        runtime_module._capture_completion_time(outcome, context)
+        self.assertFalse(outcome["completion_time_known"])
+        self.assertIn("completion_clock_proof", outcome)
+        context._drain_completion_readers(time.monotonic() + 1)
+        record = runtime._settlement_journal.record(lease,
+            {"kind": "completion_time_unknown", "outcome": outcome},
+            evidence={"outcome_kind": outcome["kind"], "budget_envelope": outcome["budget_envelope"]})
+        return runtime, clock, command, lease, context.budget_envelope, token, calls, record, context
+
+    def test_later_watermark_resolves_original_sample_as_timeout_with_raw_business_error(self):
+        from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope
+
+        name = "guarded-return-past-work"
+        runtime, clock, command, lease, envelope, token, calls, record, _ = self.deferred_guarded_handler_outcome(
+            name, failure=True)
+        original = record["deferred"]["outcome"]
+        proof_before = json.loads(json.dumps(original["completion_clock_proof"]))
+        work_deadline = envelope.view(sample=envelope.checkpoint).effective_work_deadline_at
+        clock.value = work_deadline + 1
+        self.assertLess(clock.value, lease.expires_at)
+        runtime.kernel.submit(replace(command, execution_id="later-clock-witness",
+            idempotency_key="later-clock-witness"))
+        runtime.kernel._finish_budget_sample(token, name, envelope)
+        current, reports = self.recover(runtime, name)
+        self.assertEqual("timed_out", current.state)
+        self.assertGreaterEqual(current.result.completed_at, clock.value)
+        raw = current.result.error.details["business_outcome"]
+        self.assertEqual("original_real_failure", raw["code"])
+        self.assertEqual("original handler error", raw["message"])
+        self.assertEqual({"value": 17}, raw["details"])
+        self.assertEqual(proof_before, raw["completion_clock_proof"])
+        resolved = runtime._settlement_journal.pending(timeout_seconds=.5)
+        self.assertFalse(any(row["identity"]["execution_id"] == name for row in resolved))
+        self.assertEqual([name], calls.read_text().splitlines())
+        retained = runtime._settlement_journal.inspect(name, timeout_seconds=.5)[0]
+        self.assertEqual(proof_before, retained["deferred"]["outcome"]["completion_clock_proof"])
+        self.assertEqual(envelope.constraints,
+            BudgetEnvelope.from_dict(retained["evidence"]["budget_envelope"]).constraints)
+        (self.root / "guarded-return-timeout.json").write_text(json.dumps({
+            "original_receipt": record, "recovery_reports": reports,
+            "resolved_receipt": retained, "kernel_result": current.result.to_dict(),
+            "business_invocations": calls.read_text().splitlines()}, indent=2))
+
+    def test_resolved_result_survives_interruption_after_kernel_commit_and_exact_reopen_replay(self):
+        name = "guarded-return-commit-crash"
+        runtime, _, _, _, envelope, token, calls, original, _ = self.deferred_guarded_handler_outcome(name)
+        runtime.kernel._finish_budget_sample(token, name, envelope)
+        settle = runtime._settlement_journal.settle
+        committed_results = []
+
+        class AfterKernelCommit(BaseException):
+            pass
+
+        def interrupted(record, state, evidence, **kwargs):
+            if state == "recorded":
+                actual = runtime.kernel.get(name).result.to_dict()
+                self.assertEqual(record["evidence"]["resolved_result"], actual)
+                committed_results.append(actual)
+                raise AfterKernelCommit("interrupted before journal recording")
+            return settle(record, state, evidence, **kwargs)
+
+        with patch.object(runtime._settlement_journal, "settle", side_effect=interrupted):
+            with self.assertRaises(AfterKernelCommit):
+                runtime.recover_completions(timeout_seconds=.5)
+        self.assertEqual(1, len(committed_results))
+        pending = runtime._settlement_journal.pending(timeout_seconds=.5)[0]
+        self.assertEqual("pending", pending["state"])
+        self.assertEqual(committed_results[0], pending["evidence"]["resolved_result"])
+        self.assertEqual(original["deferred"], pending["deferred"])
+        runtime.close()
+        reopened = self.open(name)
+        with patch.object(reopened, "_outcome_result", side_effect=AssertionError("replay generated a new result")), \
+                patch.object(runtime_module, "resolve_completion_time",
+                             side_effect=AssertionError("replay reread the completion clock")):
+            current, reports = self.recover(reopened, name)
+        self.assertEqual(committed_results[0], current.result.to_dict())
+        self.assertEqual("succeeded", current.state)
+        final = reopened._settlement_journal.inspect(name, timeout_seconds=.5)[0]
+        self.assertEqual("recorded", final["state"])
+        self.assertEqual(pending["evidence"]["resolved_result"], final["evidence"]["resolved_result"])
+        self.assertEqual([name], calls.read_text().splitlines())
+        (self.root / "guarded-return-replay.json").write_text(json.dumps({
+            "before_reopen": pending, "after_reopen": final,
+            "recovery_reports": reports, "business_invocations": calls.read_text().splitlines()}, indent=2))
+
+    def test_failed_recovery_reader_close_retains_one_owner_until_runtime_close_retry(self):
+        from dispatcher_sdk import storage_connection
+
+        name = "guarded-return-reader-close"
+        runtime, _, _, _, envelope, token, calls, _, context = self.deferred_guarded_handler_outcome(name)
+        runtime.kernel._finish_budget_sample(token, name, envelope)
+        factory = completion_clock_module._connect_readonly
+        physical_close = storage_connection._ParticipatingConnection.close
+        readers, close_failures = [], []
+
+        def opened(*args, **kwargs):
+            reader = factory(*args, **kwargs)
+            readers.append(reader)
+            return reader
+
+        def failed_close(reader):
+            if reader in readers:
+                close_failures.append("recovery reader remains physically open")
+                raise OSError(close_failures[-1])
+            return physical_close(reader)
+
+        try:
+            with patch.object(completion_clock_module, "_connect_readonly", side_effect=opened), \
+                    patch.object(storage_connection._ParticipatingConnection, "close", failed_close):
+                runtime.recover_completions(timeout_seconds=.5)
+                self.assertEqual(1, len(readers))
+                self.assertEqual(1, len(runtime._recovery_completion_readers))
+                self.assertEqual(1, readers[0].execute("SELECT 1").fetchone()[0])
+                runtime.recover_completions(timeout_seconds=.5)
+                self.assertEqual(1, len(readers), "failed-close recovery opened another reader")
+                self.assertIsNone(runtime.kernel.get(name).result)
+                # A previously retired real Context may have finished before
+                # this close pass. Its successful drain must not erase the
+                # independent recovery reader's failed physical release.
+                context.close()
+                runtime._retired_observation_contexts.append(context)
+                with self.assertRaises(runtime_module._ObservationCleanupPendingError):
+                    runtime.close()
+                self.assertFalse(runtime.kernel._connection_closed)
+                self.assertEqual(1, len(runtime._recovery_completion_readers))
+            runtime.close()
+            self.assertEqual(set(), runtime._recovery_completion_readers)
+            self.assertTrue(runtime.kernel._connection_closed)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                readers[0].execute("SELECT 1")
+            reopened = self.open(name)
+            current, _ = self.recover(reopened, name)
+            self.assertEqual("succeeded", current.state)
+            self.assertEqual([name], calls.read_text().splitlines())
+            (self.root / "guarded-return-reader-close.json").write_text(json.dumps({
+                "reader_connections_before_close": len(readers), "close_errors": close_failures,
+                "recovered_result": current.result.to_dict(),
+                "business_invocations": calls.read_text().splitlines()}, indent=2))
+        finally:
+            for reader in readers:
+                physical_close(reader)
 
     def test_real_thread_success_and_error_recover_original_results(self):
         for failure in (False, True):

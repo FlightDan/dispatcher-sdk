@@ -212,19 +212,31 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                     tokens.append(token)
                     self.assertEqual(observer.execute('SELECT token FROM kernel_budget_samples').fetchone()[0], token)
                     wall[0] = baseline + 4
-                    time.sleep(.025)
+                    deadline = kernel._control_deadline
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        time.sleep(remaining)
+                    evidence['original_control_deadline'] = deadline
                     return token
 
                 kernel._begin_budget_sample = slow_committed_arm
                 try:
                     with self.assertRaises(TimeoutError) as caught:
-                        kernel.claim_and_start('child-owner', execution_id='child', timeout_seconds=.01)
+                        # Exercise the parent's guarded sampling directly. A
+                        # child claim's unrelated setup must not consume the
+                        # control window before this slow committed arm.
+                        kernel._sample_budget('parent', child, timeout_seconds=.01)
                     error = caught.exception
+                    evidence['error'] = {'type': type(error).__name__, 'message': str(error)}
                     retained = error.budget_sample_envelope
                     self.assertIsNotNone(retained)
+                    self.assertEqual(retained.constraints, child.constraints)
                     self.assertGreaterEqual(retained.checkpoint.wall_at, baseline + 4)
                     self.assertEqual(error.budget_sample_token, tokens[0])
-                    evidence['error'] = {'type': type(error).__name__, 'message': str(error)}
+                    self.assertIs(kernel._budget_sample_owners[tokens[0]], error.budget_sample_owner)
+                    self.assertIs(error.budget_sample_owner._pending[1], retained)
                 finally:
                     observer.close()
                     wall[0] = baseline

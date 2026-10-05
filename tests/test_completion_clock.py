@@ -13,6 +13,8 @@ from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError, samp
 from dispatcher_sdk.execution_kernel.budget_capture import _KernelBudgetCapture
 from dispatcher_sdk.execution_kernel import completion_clock as completion_clock_module
 from dispatcher_sdk.execution_kernel.completion_clock import capture_completion_time
+from dispatcher_sdk.execution_kernel.completion_clock import resolve_completion_time
+from dispatcher_sdk.execution_kernel.context import HandlerContext, HandlerEffects
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.errors import StorageIsolationError
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
@@ -142,6 +144,102 @@ class CompletionClockTests(unittest.TestCase):
             self.assertEqual(before, self.floor())
         finally:
             self.kernel._finish_budget_sample(token, "original", self.envelope)
+
+    def test_guard_refusal_retains_original_proof_only_after_physical_reader_close(self):
+        from dispatcher_sdk import storage_connection
+
+        token = self.kernel._begin_budget_sample("original")
+        factory = completion_clock_module._connect_readonly
+        physical_close = storage_connection._ParticipatingConnection.close
+        readers, closed = [], []
+        refuse_close = [False]
+
+        def opened(*args, **kwargs):
+            reader = factory(*args, **kwargs)
+            readers.append(reader)
+            return reader
+
+        def close(reader):
+            if reader in readers and refuse_close[0]:
+                raise OSError("original reader physical close failed")
+            physical_close(reader)
+            if reader in readers:
+                closed.append(reader)
+
+        try:
+            with patch.object(completion_clock_module, "_connect_readonly", side_effect=opened), \
+                    patch.object(storage_connection._ParticipatingConnection, "close", close):
+                before = self.wall_calls
+                with self.assertRaises(BudgetClockUnknownError) as successful_close:
+                    capture_completion_time(self.context)
+                proof = successful_close.exception._completion_clock_proof
+                self.assertEqual(self.lease.to_dict(), proof["lease"])
+                self.assertEqual(self.envelope.to_dict(), proof["budget_envelope"])
+                self.assertEqual(self.wall[0], proof["sample"]["wall_at"])
+                self.assertEqual(1, self.wall_calls - before)
+                self.assertEqual(readers, closed)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    readers[0].execute("SELECT 1")
+
+                refuse_close[0] = True
+                with self.assertRaises(BudgetClockUnknownError) as failed_close:
+                    capture_completion_time(self.context)
+                self.assertIsInstance(failed_close.exception.__cause__, OSError)
+                self.assertFalse(hasattr(failed_close.exception, "_completion_clock_proof"))
+                self.assertEqual(1, readers[-1].execute("SELECT 1").fetchone()[0])
+                self.evidence["records"].append({"retained_proof": proof,
+                    "failed_close_error": str(failed_close.exception.__cause__),
+                    "failed_close_published_proof": False})
+        finally:
+            for reader in readers:
+                physical_close(reader)
+            self.kernel._finish_budget_sample(token, "original", self.envelope)
+
+    def test_retained_proof_waits_for_real_foreign_ack_without_another_wall_sample(self):
+        token = self.kernel._begin_budget_sample("original")
+        original_token = token
+        context = HandlerContext(self.command, self.lease,
+            HandlerEffects(self.kernel, self.lease, lambda: True), budget_envelope=self.envelope)
+        self.addCleanup(context.close)
+        try:
+            with self.assertRaises(BudgetClockUnknownError) as original:
+                capture_completion_time(context)
+            proof = original.exception._completion_clock_proof
+            before = json.loads(json.dumps(proof))
+            context._drain_completion_readers(time.monotonic() + 1)
+            with patch.object(completion_clock_module, "_connect_readonly",
+                              side_effect=AssertionError("invalid proof opened storage")):
+                with self.assertRaises(StorageIsolationError):
+                    resolve_completion_time(self.kernel, replace(self.lease, lease_id="another-lease"),
+                        proof, context, deadline=time.monotonic() + .1)
+                incompatible = json.loads(json.dumps(proof))
+                incompatible["sample"]["domain_id"] = "another-original-domain"
+                with self.assertRaises(BudgetClockUnknownError):
+                    resolve_completion_time(self.kernel, self.lease, incompatible, context,
+                        deadline=time.monotonic() + .1)
+            with patch.object(self.kernel, "_wall_time", side_effect=AssertionError("recovery sampled new wall time")):
+                with self.assertRaisesRegex(BudgetClockUnknownError, "budget_clock_sample_unresolved:sampling"):
+                    resolve_completion_time(self.kernel, self.lease, proof, context,
+                        deadline=time.monotonic() + .1)
+            self.assertEqual(token, self.kernel._connection.execute(
+                "SELECT token FROM kernel_budget_samples").fetchone()[0])
+            self.assertEqual(before, proof)
+            self.kernel._finish_budget_sample(token, "original", self.envelope)
+            token = None
+            context._drain_completion_readers(time.monotonic() + 1)
+            with patch.object(self.kernel, "_wall_time", side_effect=AssertionError("recovery sampled new wall time")):
+                completed_at, captured = resolve_completion_time(self.kernel, self.lease, proof, context,
+                    deadline=time.monotonic() + .1)
+            self.assertGreaterEqual(completed_at, proof["sample"]["wall_at"])
+            self.assertEqual(proof["sample"]["elapsed_at"], captured.checkpoint.elapsed_at)
+            self.assertEqual(before, proof)
+            self.evidence["records"].append({"original_proof": proof,
+                "foreign_token": original_token, "resolved_at": completed_at,
+                "recovery_wall_samples": 0})
+        finally:
+            context._drain_completion_readers(time.monotonic() + 1)
+            if token is not None:
+                self.kernel._finish_budget_sample(token, "original", self.envelope)
 
     def test_actual_own_captured_failed_ack_has_factual_time_without_discharging_guard(self):
         owner, token, captured = self.owned_capture()

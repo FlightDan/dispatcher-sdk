@@ -42,6 +42,7 @@ from ..durability import Durability, validate_durability
 from .._sqlite_errors import is_sqlite_contention
 
 from .context import HandlerContext, HandlerEffects
+from .completion_clock import resolve_completion_time
 from .contracts import (
     ContractValidationError,
     ExecutionCommandV2,
@@ -70,13 +71,14 @@ from ._process_runtime import (
     _capture_completion_time,
     _confirm_handler_entry,
     _control_error_details,
+    _budget_outcome,
 )
 from .sqlite import SQLiteKernel
 from .sandbox import SandboxHandler, SandboxJournal
 from .sandbox_contracts import SandboxOutcomeUnknown
 from ._sandbox_registry import register_journals, journal_paths
 from .cancellation import CancellationJournal, _LocalCancellationDiagnostics
-from .settlement import SettlementJournal, merge_diagnostic_notes, merge_script_output
+from .settlement import SettlementConflictError, SettlementJournal, merge_diagnostic_notes, merge_script_output
 from .pending_settlements import PendingSettlements, SettlementAdmission
 from .script_output import ScriptOutputRecovery
 
@@ -181,6 +183,7 @@ class InProcessRuntime:
         self._execution_recorders: dict[tuple[str, int, int], ActivityRecorder] = {}
         self._retired_recorders: list[ActivityRecorder] = []
         self._retired_observation_contexts: list[HandlerContext] = []
+        self._recovery_completion_readers: set[Any] = set()
         self._observation_cleanup_report: list[dict[str, Any]] = []
         self._observation_cleanup_pending = False
         # Exists from the moment a claimed execution enters process
@@ -343,7 +346,8 @@ class InProcessRuntime:
 
     def _retry_close_cleanup(self) -> None:
         observation_pending = False
-        if (self._retired_recorders or self._retired_observation_contexts or self._observation_cleanup_pending
+        if (self._retired_recorders or self._retired_observation_contexts or self._recovery_completion_readers
+                or self._observation_cleanup_pending
                 or isinstance(self._close_error, _ObservationCleanupPendingError)):
             observation_pending = self._drain_observation_workers(time.monotonic() + 1.0)
             if not observation_pending:
@@ -369,6 +373,40 @@ class InProcessRuntime:
             if recorder._owned_workers_alive() and recorder not in self._retired_recorders:
                 self._retired_recorders.append(recorder)
 
+    def _reserve_completion_reader(self, owner: Any, budget: Any) -> None:
+        budget.check()
+        if not self._lifecycle_condition.acquire(timeout=max(0., budget.deadline-time.monotonic())):
+            raise TimeoutError("completion recovery reader admission timed out")
+        try:
+            budget.check()
+            if self._closed or self._recovery_completion_readers:
+                # A failed physical close must not permit another connection
+                # to accumulate on each maintenance pass.
+                raise TimeoutError("completion recovery reader release remains pending")
+            self._recovery_completion_readers.add(owner)
+        finally:
+            self._lifecycle_condition.release()
+
+    def _release_completion_reader(self, owner: Any, deadline: float) -> bool:
+        if not self._lifecycle_condition.acquire(timeout=max(0., deadline-time.monotonic())):
+            return False
+        try:
+            self._recovery_completion_readers.discard(owner)
+            return True
+        finally:
+            self._lifecycle_condition.release()
+
+    def _drain_recovery_completion_readers(self, deadline: float) -> bool:
+        if not self._lifecycle_condition.acquire(timeout=max(0., deadline-time.monotonic())):
+            return True
+        try:
+            readers = tuple(self._recovery_completion_readers)
+        finally:
+            self._lifecycle_condition.release()
+        for owner in readers:
+            owner.drain(deadline)
+        return bool(self._recovery_completion_readers)
+
     @staticmethod
     def _context_observation_pending(context: HandlerContext) -> bool:
         return ((context._budget_capture is not None and context._budget_capture._pending is not None)
@@ -385,10 +423,13 @@ class InProcessRuntime:
 
     def _drain_observation_workers(self, deadline: float) -> bool:
         self._recover_script_output(min(deadline, time.monotonic() + .1))
+        recovery_pending = self._drain_recovery_completion_readers(deadline)
         with self._lifecycle_condition:
             recorders = tuple(self._retired_recorders)
             contexts = tuple(self._retired_observation_contexts)
         reports = [recorder._join_owned_workers(deadline) for recorder in recorders]
+        reports.append({"kind": "completion_recovery_readers",
+            "state": "pending" if recovery_pending else "closed"})
         for context in contexts:
             context._observation_start_done.wait(max(0.0, deadline - time.monotonic()))
             completion_pending = context._drain_completion_readers(deadline)
@@ -431,7 +472,7 @@ class InProcessRuntime:
                 if self._context_observation_pending(context)]
             self._observation_cleanup_report = reports
             self._observation_cleanup_pending = (bool(self._retired_recorders or self._retired_observation_contexts)
-                or budget_pending or child_pending or script_pending
+                or budget_pending or child_pending or script_pending or recovery_pending
                 or any(worker is not None and worker.is_alive() for _, worker in service_workers))
             return self._observation_cleanup_pending
 
@@ -561,6 +602,7 @@ class InProcessRuntime:
         reports = []
         try:
             reports.extend(self._persist_pending_settlements(deadline, limit=limit))
+            self._drain_recovery_completion_readers(deadline)
             self._recover_script_output(min(deadline, time.monotonic() + .025))
             if time.monotonic() >= deadline:
                 return tuple(reports)
@@ -602,26 +644,54 @@ class InProcessRuntime:
                             if (completed.attempt, completed.fence) != (lease.attempt, lease.fence):
                                 raise StaleFenceError("deferred recovery belongs to an old attempt")
                             if original["kind"] == "completion_time_unknown":
-                                # A later clock read cannot establish the
-                                # original return time. Retain the outcome,
-                                # without granting pre-expiry settlement.
-                                if completed.state != "running":
-                                    self._settlement_journal.settle(record, "superseded",
+                                resolved = record["evidence"].get("resolved_result")
+                                proof = original["outcome"].get("completion_clock_proof")
+                                if resolved is None and (proof is None or completed.state != "running"):
+                                    # Historical unknown outcomes without an
+                                    # original sample remain unknowable.
+                                    state = "superseded" if completed.state != "running" else "error"
+                                    self._settlement_journal.settle(record, state,
                                         {**record["evidence"], "execution_state": completed.state,
-                                         "error": "original completion time remains unknown"}, timeout_seconds=.1)
-                                    reports.append({**identity, "state": "superseded"})
-                                else:
-                                    self._settlement_journal.settle(record, "error",
-                                        {**record["evidence"], "error": "original completion time remains unknown"}, timeout_seconds=.1)
-                                    reports.append({**identity, "state": "unknown"})
-                                continue
-                            if original["kind"] != "recovery_required":
+                                         "error": "original completion time remains unknown"},
+                                        timeout_seconds=operation_timeout())
+                                    reports.append({**identity, "state": "superseded" if state == "superseded" else "unknown"})
+                                    continue
+                                if resolved is None:
+                                    completed_at, captured = resolve_completion_time(
+                                        self.kernel, lease, proof, self, deadline=operation_deadline)
+                                    completion_budget = replace(captured,
+                                        checkpoint=replace(captured.checkpoint, wall_at=completed_at))
+                                    original_outcome = original["outcome"]
+                                    retained = original_outcome.get("budget_envelope")
+                                    outcome = _budget_outcome({**original_outcome,
+                                        "completed_at": completed_at, "completion_time_known": True,
+                                        "budget_envelope": completion_budget.to_dict()},
+                                        None if retained is None else BudgetEnvelope.from_dict(retained),
+                                        {"started_at": completed.started_at,
+                                         "budget_envelope": proof["budget_envelope"]})
+                                    result = self._outcome_result(completed.command, lease,
+                                        completed.started_at, outcome)
+                                    # Persist the exact result before Kernel
+                                    # publication. A CAS loser publishes none;
+                                    # a crash retries this durable result ID.
+                                    record = self._settlement_journal.settle(record, "pending",
+                                        {**record["evidence"], "resolved_result": result.to_dict(),
+                                         "budget_envelope": outcome["budget_envelope"]},
+                                        timeout_seconds=operation_timeout())
+                                    resolved = record["evidence"]["resolved_result"]
+                                result = ExecutionResultV2.from_dict(resolved)
+                                retained = record["evidence"].get("budget_envelope")
+                                completed = self.kernel._complete_sdk_result(lease, result,
+                                    budget_envelope=None if retained is None else BudgetEnvelope.from_dict(retained),
+                                    timeout_seconds=operation_timeout(), settlement=True)
+                            elif original["kind"] != "recovery_required":
                                 raise ValueError("unknown deferred completion kind")
-                            if completed.state != "recovery_required":
-                                completed = self.kernel._require_effect_recovery(lease,
-                                    original["outcome"]["effect_id"], timeout_seconds=operation_timeout(),
-                                    settlement=True)
-                            result = None
+                            else:
+                                if completed.state != "recovery_required":
+                                    completed = self.kernel._require_effect_recovery(lease,
+                                        original["outcome"]["effect_id"], timeout_seconds=operation_timeout(),
+                                        settlement=True)
+                                result = None
                         else:
                             result = ExecutionResultV2.from_dict(record["result"])
                             retained_budget = record["evidence"].get("budget_envelope")
@@ -634,10 +704,15 @@ class InProcessRuntime:
                         "execution_revision": completed.revision}
                     if result is not None:
                         evidence["result_id"] = result.result_id
-                    self._settlement_journal.settle(record, state, evidence, timeout_seconds=.1)
+                    self._settlement_journal.settle(record, state, evidence, timeout_seconds=operation_timeout())
                     reports.append({**identity, "state": state, **evidence})
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
+                    if isinstance(exc, SettlementConflictError):
+                        # Another maintainer owns the newer durable revision.
+                        # Do not overwrite it or publish our uncommitted result.
+                        reports.append({**identity, "state": "pending", "error": error})
+                        continue
                     if self._storage_contention(exc) or isinstance(exc, TimeoutError):
                         reports.append({**identity, "state": "pending", "error": error})
                         break
@@ -2245,6 +2320,11 @@ class InProcessRuntime:
             recorders = tuple(self._retired_recorders)
             contexts = tuple(self._retired_observation_contexts)
             active = self._execution_recorders.get(generation)
+            readers = tuple(self._recovery_completion_readers)
+        if any(owner.lease is not None and
+               (owner.lease.execution_id, owner.lease.attempt, owner.lease.fence) == generation
+               for owner in readers):
+            return True
         if active is not None:
             # The driver still owns final close/pop, even if the recorder's
             # workers have already exited. Keep its resource reservation.

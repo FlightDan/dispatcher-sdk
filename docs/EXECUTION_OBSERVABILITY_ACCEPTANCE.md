@@ -8,10 +8,35 @@ revised SDK-only A16.
 
 ## Current status, 2026-10-06
 
-The candidate declares `0.7.0.dev2`. It is not fully accepted. CI run
+The candidate declares `0.7.0.dev2`. It is not fully accepted. After the known
+fixture defects were corrected and reviewed, implementation commit `d5d9741`
+was pushed to the previously authorized work branch. CI run
+[37378483985](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37378483985)
+has finished: all eight Linux environments passed, all eight Windows environments
+failed, and history scanning passed. This is a failed acceptance run. Original
+Windows logs and retained artifacts are being used to separate fixture timing
+defects from SDK completion-clock recovery, native cutoff classification and
+callback diagnostic defects. The corrections are uncommitted and unverified;
+no replacement CI run has been started. The preceding run
 [37269716472](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37269716472)
-was cancelled at the user's request. CI and any push that triggers it remain
-paused until known failures are fixed.
+remains cancelled at the user's request.
+
+The Windows corrections now have independent source review and installed
+verification in `/tmp/sdk-windows-corrections310/`. The candidate was rebuilt
+from an sdist and installed into a clean Python 3.10 virtualenv; its actual
+import is that virtualenv's `site-packages/dispatcher_sdk/__init__.py`.
+The 115-case targeted run completed in 95.781 seconds with 114 passes and one
+fixture error: an external FULL-sync ACK returned after its unchanged 0.1-second
+proof window. The fixture's in-window visibility publisher now explicitly uses
+NORMAL; its consumer and late-ACK case retain FULL. Four affected/integration
+cases then passed, and the late-ACK case passed separately in 0.905 seconds.
+A mistyped late-ACK selector in that integration command is retained as a
+harness error, followed by the correct single-case command; it is not a SDK pass.
+No complete local suite was rerun. The five public end-to-end scenarios,
+managed supervisor example within 30 seconds, five typing fixtures, 627 links
+and four remaining README examples passed against the same installed wheel.
+Raw commands, import provenance, stdout/stderr and scenario evidence remain
+under that directory. These checks do not replace the required native matrix.
 
 | Check | Current evidence |
 | --- | --- |
@@ -32,6 +57,7 @@ paused until known failures are fixed.
 | Received positive sampling facts | The unchanged older wheel reproduced the missing ACK after actual producer capture, SQLite contention, durable receipt and recovery. The correction passed independent review and 48 source integration cases. All 11 corrected regression cases passed against its rebuilt installed wheel in 7.954 seconds; complete matrix acceptance remains pending |
 | Latest received-fact installed candidate | Five public scenarios and the managed example passed. The installed suite hit its original 900-second limit after a managed-capacity cleanup error and seven producer-fixture failures; final restart did not run. `/tmp/sdk-received-current-independent310.log` |
 | Final installed types, README and restart checks | The same retained wheel passed five public type consumers outside the checkout, 626 documentation links, all four remaining README examples with zero skips, and Kernel/Orchestrator restart consumers in six separate processes; `/tmp/sdk-received-final-types310.log`, `/tmp/sdk-received-final-docs310.log`, `/tmp/sdk-received-final-restart310/` |
+| Final requirement coverage review | An independent read-only audit of committed `d5d9741` mapped T01–T09 and A01–A18 to the concrete current tests, public consumers and CI obligations. No additional mandatory coverage blocker or incorrect mandatory-platform skip was found. This establishes coverage wiring only; terminal jobs, native/installed artifacts and per-platform skips still require reconciliation |
 | Current registration and cleanup tests | All nine cases passed against the same installed wheel in 26.463 seconds, including actual registration-connection ownership and close before recorder publication; `/tmp/sdk-runtime-registration-current310.log` |
 | Child result to parent completion | Exact captured-fact handoff passed independent review and 65 source cases in 56.343 seconds; five cases against its sdist-rebuilt installed wheel passed in 16.057 seconds, including the unchanged native success and raw-failure scenario. Complete installed validation remains pending |
 | Interrupted native sampling receipt | A real alarm exposed a stored control-flow exception that suppressed both supervisor terminal sends. The correction passed independent review, the actual supervisor-to-parent path and 45 source integration cases in 22.707 seconds; `/tmp/sdk-uncaptured-alarm-integration310.log`. The latest installed run passed both terminal receipts, then errored in the recovery refusal assertion; see below |
@@ -1835,7 +1861,8 @@ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 
 The last command includes the isolated rebuilt-wheel consumer suite. A focused
 pass does not replace it. Five public typing fixtures and `scripts/check_docs.py`
-are also required. The latter runs all six README examples on Linux.
+are also required. The latter now runs all four remaining README examples on
+Linux; the standalone script-notification example remains a separate CI step.
 
 ## Scenario mapping and historical baseline
 

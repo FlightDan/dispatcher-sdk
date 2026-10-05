@@ -467,6 +467,22 @@ class RuntimeTests(unittest.TestCase):
                 cmd = make_command("open", stack.registry_revision)
                 stack.submit(cmd)
                 result = stack.run_once()
+                # A bounded result publication can remain pending after the
+                # business has returned. Recover its receipt, never invoke it
+                # again, before checking the durable restart state.
+                deadline = time.monotonic() + cmd.timeout_seconds
+                while result.state == "running" and time.monotonic() < deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    stack.recover_completions(timeout_seconds=min(.1, remaining))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    with stack.kernel._control_lock(remaining):
+                        result = stack.kernel.get(cmd.execution_id)
+                    if result.state == "running":
+                        time.sleep(min(.01, max(0., deadline-time.monotonic())))
                 self.assertEqual(result.state, "succeeded")
                 self.assertEqual(result.result.value, {"echo": 7, "version": 1})
             finally:

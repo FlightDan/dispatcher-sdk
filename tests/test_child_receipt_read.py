@@ -200,7 +200,14 @@ class ChildReceiptReadTests(unittest.TestCase):
             try:
                 return original_facts(*args, **kwargs)
             except SettlementBusyError as error:
-                time.sleep(max(0., window.deadline - time.monotonic()))
+                deadline = window.deadline
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(remaining)
+                with window.project():
+                    self.assertEqual(window.remaining(), 0)
                 terminal.append(error)
                 raise
 

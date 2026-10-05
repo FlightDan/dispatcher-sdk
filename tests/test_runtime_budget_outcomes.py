@@ -1,9 +1,9 @@
-"""Actual worker clock observations survive completion and denied retries."""
+"""Captured terminal budget floors survive completion and denied retries."""
 from __future__ import annotations
 
 import json
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import sqlite3
 import sys
@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import unittest
+from unittest.mock import patch
 
 from tests._acceptance_evidence import retained_directory
 
@@ -21,7 +22,7 @@ from dispatcher_sdk.execution_kernel.contracts import ExecutionResultV2, RetryPo
 
 
 class HandlerClock:
-    """A caller-provided clock with forward samples scoped to the handler.
+    """A caller-provided clock with forward samples scoped to its calling thread.
 
     The instance is pickleable; each process/thread initializes its own local
     sample. Host deadline observers continue sampling the original real clock.
@@ -54,19 +55,20 @@ def observe_expired_then_roll_back(payload, context):
     with (root / 'calls.jsonl').open('a', encoding='utf-8') as stream:
         stream.write(json.dumps({'attempt': context.lease.attempt, 'pid': os.getpid()}) + '\n')
     if context.lease.attempt == 1:
-        forward = context.budget.effective_work_deadline_at + 1
-        with HandlerClock.sample_wall(forward):
-            observed = context.budget.to_dict()
-            (root / 'observed.json').write_text(json.dumps(observed), encoding='utf-8')
-        # The real context must retain its expired floor after the fixture
-        # restores normal sampling; no host-visible file triggers an early kill.
-        restored = context.budget.to_dict()
-        (root / 'observed-after-rollback.json').write_text(json.dumps(restored), encoding='utf-8')
-        (root / 'clock-sampling.json').write_text(json.dumps({'pid': os.getpid(),
-            'thread_id': threading.get_ident(), 'forward_wall': forward, 'restored_real_wall': time.time(),
-            'interpreter': sys.executable, 'sdk_import': dispatcher_sdk.__file__,
-            'source': 'caller-provided HandlerClock',
-            'scope': 'handler calling thread; host deadline clock unchanged'}), encoding='utf-8')
+        if not payload.get('expire_at_native_normalization'):
+            forward = context.budget.effective_work_deadline_at + 1
+            with HandlerClock.sample_wall(forward):
+                observed = context.budget.to_dict()
+                (root / 'observed.json').write_text(json.dumps(observed), encoding='utf-8')
+            # The real context must retain its expired floor after the fixture
+            # restores normal sampling; no host-visible file triggers an early kill.
+            restored = context.budget.to_dict()
+            (root / 'observed-after-rollback.json').write_text(json.dumps(restored), encoding='utf-8')
+            (root / 'clock-sampling.json').write_text(json.dumps({'pid': os.getpid(),
+                'thread_id': threading.get_ident(), 'forward_wall': forward, 'restored_real_wall': time.time(),
+                'interpreter': sys.executable, 'sdk_import': dispatcher_sdk.__file__,
+                'source': 'caller-provided HandlerClock',
+                'scope': 'handler calling thread; host deadline clock unchanged'}), encoding='utf-8')
         if payload['failure']:
             (root / 'handler-outcome.json').write_text(json.dumps({'kind': 'error',
                 'code': 'original_failure', 'message': 'raw original failure', 'retryable': True}), encoding='utf-8')
@@ -80,6 +82,50 @@ observe_expired_then_roll_back.__execution_kernel_revision__ = 'observed-termina
 
 
 class RuntimeBudgetOutcomeTests(unittest.TestCase):
+    @contextmanager
+    def native_terminal_expiration(self, runtime, root, evidence):
+        if os.name == 'nt':
+            from dispatcher_sdk.execution_kernel import _windows_runtime as native_runtime
+        else:
+            from dispatcher_sdk.execution_kernel import _process_runtime as native_runtime
+        normalize = native_runtime._budget_outcome
+
+        def expire_received_outcome(outcome, envelope, entry=None):
+            # This host boundary receives the SDK's decoded native packet
+            # after containment. A handler file is not a return-packet proof.
+            self.assertIsNotNone(entry, outcome)
+            self.assertEqual('error' if evidence['failure'] else 'ok', outcome.get('kind'), outcome)
+            self.assertFalse(outcome.get('control_error'), outcome)
+            self.assertNotIn('received_native_outcome', evidence)
+            evidence['received_native_outcome'] = json.loads(json.dumps(outcome))
+            raw = json.loads((root / 'handler-outcome.json').read_text())
+            for key, value in raw.items():
+                self.assertEqual(outcome[key], value, outcome)
+            returned = BudgetEnvelope.from_dict(outcome['budget_envelope'])
+            forward = returned.view(sample=returned.checkpoint).effective_work_deadline_at + 1
+            with HandlerClock.sample_wall(forward):
+                captured = runtime.kernel._sample_budget('original', returned, timeout_seconds=.1)
+            restored = runtime.kernel._sample_budget('original', captured, timeout_seconds=.1)
+            self.assertEqual(returned.constraints, captured.constraints)
+            self.assertEqual(returned.started_at, captured.started_at)
+            observed = captured.view(sample=captured.checkpoint).to_dict()
+            after_rollback = restored.view(sample=restored.checkpoint).to_dict()
+            (root / 'observed.json').write_text(json.dumps(observed), encoding='utf-8')
+            (root / 'observed-after-rollback.json').write_text(json.dumps(after_rollback), encoding='utf-8')
+            (root / 'clock-sampling.json').write_text(json.dumps({'pid': os.getpid(),
+                'thread_id': threading.get_ident(), 'forward_wall': forward, 'restored_real_wall': time.time(),
+                'interpreter': sys.executable, 'sdk_import': dispatcher_sdk.__file__,
+                'source': 'caller-provided HandlerClock through actual Kernel budget capture',
+                'scope': 'host terminal normalization after decoded native outcome handoff'}), encoding='utf-8')
+            # Inject the captured expiration at terminal normalization, keeping
+            # the real entry packet and raw business fields. This does not
+            # claim that the worker returned late or that cleanup expiry alone
+            # should relabel a timely business return.
+            return normalize({**outcome, 'budget_envelope': captured.to_dict()}, restored, entry)
+
+        with patch.object(native_runtime, '_budget_outcome', expire_received_outcome):
+            yield
+
     def run_expired_completion(self, isolation, failure):
         root = retained_directory('sdk-terminal-budget-outcome-')
         evidence = {'isolation': isolation, 'failure': failure, 'timeout_seconds': 10, 'lease_seconds': 90,
@@ -88,11 +134,17 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
             with Kernel.open_sqlite(root / 'kernel.sqlite3', {'work': observe_expired_then_roll_back},
                                    isolation_mode=isolation, now=HandlerClock(),
                                    lease_seconds=90) as runtime:
+                payload = {'root': str(root), 'failure': failure}
+                if isolation == 'process':
+                    payload['expire_at_native_normalization'] = True
+                    evidence['clock_sampling'] = 'actual host terminal-normalization capture after native handoff'
                 runtime.submit(runtime.command('work', execution_id='original', idempotency_key='original',
                     correlation_id='original', timeout_seconds=10,
                     retry_policy=RetryPolicy(max_attempts=2, retry_timeouts=True),
-                    payload={'root': str(root), 'failure': failure}))
-                first = runtime.run_once(execution_id='original')
+                    payload=payload))
+                with (self.native_terminal_expiration(runtime, root, evidence)
+                      if isolation == 'process' else nullcontext()):
+                    first = runtime.run_once(execution_id='original')
                 evidence['first'] = first.to_dict()
                 evidence['first_limits'] = runtime.kernel.get_execution_limits('original')
                 evidence['first_receipts'] = runtime._settlement_journal.inspect('original', timeout_seconds=.5)

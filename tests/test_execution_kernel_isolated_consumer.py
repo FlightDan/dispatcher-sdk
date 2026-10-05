@@ -216,6 +216,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                     import multiprocessing
                     from pathlib import Path
                     import sys
+                    import time
 
                     import importlib.util
                     import dispatcher_sdk
@@ -320,6 +321,19 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                                 snapshot = runtime.submit(command)
                             elif mode == "resume":
                                 snapshot = runtime.run_once()
+                                deadline = time.monotonic() + snapshot.command.timeout_seconds
+                                while snapshot.state == "running" and time.monotonic() < deadline:
+                                    remaining = deadline-time.monotonic()
+                                    if remaining <= 0:
+                                        break
+                                    runtime.recover_completions(timeout_seconds=min(.1, remaining))
+                                    remaining = deadline-time.monotonic()
+                                    if remaining <= 0:
+                                        break
+                                    with runtime.kernel._control_lock(remaining):
+                                        snapshot = runtime.kernel.get("isolated-execution")
+                                    if snapshot.state == "running":
+                                        time.sleep(min(.01, max(0., deadline-time.monotonic())))
                             elif mode == "verify":
                                 snapshot = runtime.kernel.get("isolated-execution")
                             else:

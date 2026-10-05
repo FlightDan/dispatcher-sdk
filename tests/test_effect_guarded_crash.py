@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -198,7 +199,9 @@ class EffectGuardedCrashTests(unittest.TestCase):
         armed = next(item for item in crash_events if item["phase"] == "sample_marker_committed")
         exited = next(item for item in crash_events if item["phase"] == "real_exit")
         self.assertTrue(exited["marker_witnessed"])
-        self.assertLessEqual(armed["original_timeout"], .1)
+        representation_error = (math.ulp(armed["original_control_deadline"])
+                                + math.ulp(armed["monotonic"]))
+        self.assertLessEqual(armed["original_timeout"] - .1, representation_error)
         self.assertLess(armed["monotonic"], exited["monotonic"])
         crashed = snapshot(self.path)
         self.evidence.update(crash_events=crash_events, crashed=crashed)

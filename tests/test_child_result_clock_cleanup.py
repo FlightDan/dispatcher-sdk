@@ -149,7 +149,12 @@ class ChildResultClockCleanupTests(unittest.TestCase):
         actual_read = factual._read_child_snapshot
         def read_then_spend_remaining(*args):
             snapshot = actual_read(*args)
-            time.sleep(max(0., window._delivery_deadline-time.monotonic())+.005)
+            deadline = window._delivery_deadline
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(remaining)
             return snapshot
         with patch.object(factual, '_read_child_snapshot', side_effect=read_then_spend_remaining) as read:
             started = time.monotonic()
@@ -226,7 +231,11 @@ class ChildResultClockCleanupTests(unittest.TestCase):
         self.assertFalse(self.kernel._budget_samples_pending())
 
     def foreign_ack(self, *, after_proof=False):
-        foreign = SQLiteKernel(self.kernel.db_path)
+        # This case tests live commit visibility within a short proof window.
+        # Full synchronization can finish after that window; power-loss
+        # durability is exercised separately. The consumer remains FULL.
+        foreign = SQLiteKernel(self.kernel.db_path,
+            durability='full' if after_proof else 'normal')
         self.addCleanup(foreign.close)
         row, window, result, writer, original, token = self.captured_wait(
             different_owner=True, foreign_kernel=foreign)
@@ -235,7 +244,8 @@ class ChildResultClockCleanupTests(unittest.TestCase):
         writer.rollback()
         refused, proof_finished = threading.Event(), threading.Event()
         errors, record = [], {'scenario': 'foreign_ack_after_proof' if after_proof else 'foreign_ack_in_proof',
-            'token': token, 'original_proof_seconds': .1, 'refusals': [], 'proof_deadlines': []}
+            'token': token, 'original_proof_seconds': .1, 'refusals': [], 'proof_deadlines': [],
+            'publisher_durability': foreign.durability, 'consumer_durability': self.kernel.durability}
         actual_floor = factual._read_floor
         def observe_refusal(connection, lease, budget, **kwargs):
             try:

@@ -113,9 +113,13 @@ class ExpiredChildClockGuardTests(unittest.TestCase):
             self.wall[0] = baseline
             writer.rollback()
             writer.close()
-        view = original.view(sample=sample_clock(wall_time=original.checkpoint.wall_at))
-        time.sleep(max(0, view.remaining_work_seconds) + .01)
-        expired = original.view(sample=sample_clock(wall_time=original.checkpoint.wall_at))
+        while True:
+            expired = original.view(sample=sample_clock(wall_time=original.checkpoint.wall_at))
+            if expired.remaining_work_seconds <= 0:
+                break
+            # Project this same retained floor until its elapsed clock proves
+            # expiry; one sleep need not cross a coarse Windows clock tick.
+            time.sleep(expired.remaining_work_seconds)
         self.assertEqual(0, expired.remaining_work_seconds)
         with SQLiteKernel(self.kernel.db_path, now=lambda: self.wall[0]) as fresh:
             statements = []

@@ -15,7 +15,7 @@ from typing import Any
 from .._inspection import InspectionBudget, InspectionBudgetExceeded
 from .._sqlite_errors import is_sqlite_contention
 from ..storage_connection import _connect_readonly
-from .budget import BudgetClockUnknownError, BudgetEnvelope, sample_clock
+from .budget import BudgetClockUnknownError, BudgetEnvelope, ClockCheckpoint, sample_clock
 from .budget_capture import _KernelBudgetCapture
 from .contracts import ExecutionLease
 from .errors import StorageIsolationError
@@ -191,15 +191,16 @@ def _read_floor(connection: sqlite3.Connection, lease: ExecutionLease,
 
 
 class _CompletionReaderLifetime:
-    """One Context reservation; retries own the same physically live reader.
+    """One storage reservation; retries own the same physically live reader.
 
     The capture stays on its original invocation thread. Cross-thread cleanup
     is allowed only after the full capture body has left; it never overlaps a
     statement, takes another wall sample, or opens another connection.
     """
 
-    def __init__(self, context: Any) -> None:
+    def __init__(self, context: Any, lease: ExecutionLease | None = None) -> None:
         self.context = context
+        self.lease = lease
         self._body_done = threading.Event()
         self._close_lock = threading.Lock()
         self._connection: sqlite3.Connection | None = None
@@ -313,6 +314,57 @@ def _capture_completion_time(context: Any, budget: InspectionBudget,
         # unchanged even if a captured observer used a different envelope.
         envelope = envelope.with_clock_floor(owned[1].checkpoint)
     sample = sample_clock(wall_time=kernel._wall_time())
+    try:
+        return _read_completion_time(kernel, lease, envelope, sample, budget, owner,
+            owned_token=None if owned is None else owned[0])
+    except BudgetClockUnknownError as error:
+        # Only a transient sampling refusal has a recoverable original fact.
+        # The reader must already be physically closed: a close failure keeps
+        # its lifetime charged and cannot publish this proof.
+        if (str(error) == "budget_clock_sample_unresolved:sampling"
+                and error.__cause__ is None):
+            configured = kernel._default_control_timeout
+            error._completion_clock_proof = {
+                "lease": lease.to_dict(), "budget_envelope": envelope.to_dict(),
+                "sample": sample.to_dict(),
+                "timeout_seconds": min(budget.timeout_seconds,
+                    .1 if configured is None else configured)}
+        raise
+
+
+def resolve_completion_time(kernel: Any, lease: ExecutionLease, proof: Any,
+                            context: Any, *, deadline: float) -> tuple[float, BudgetEnvelope]:
+    """Retry the original sample under the current unrenewed control window."""
+    if type(proof) is not dict or set(proof) != {
+            "lease", "budget_envelope", "sample", "timeout_seconds"}:
+        raise StorageIsolationError("completion clock proof is malformed")
+    if ExecutionLease.from_dict(proof["lease"]) != lease:
+        raise StorageIsolationError("completion clock proof belongs to another lease")
+    timeout = proof["timeout_seconds"]
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= .1:
+        raise StorageIsolationError("completion clock proof control bound is malformed")
+    envelope = BudgetEnvelope.from_dict(proof["budget_envelope"])
+    sample = ClockCheckpoint.from_dict(proof["sample"])
+    # Validate continuity against the original checkpoint, never a later one.
+    captured = envelope.recheckpoint(sample=sample)
+    budget = InspectionBudget(timeout, None)
+    assert budget.deadline is not None
+    budget.deadline = min(budget.deadline, deadline)
+    owner = _CompletionReaderLifetime(context, lease)
+    context._reserve_completion_reader(owner, budget)
+    try:
+        completed_at = _read_completion_time(kernel, lease, envelope, sample, budget, owner)
+        return completed_at, captured
+    finally:
+        owner.body_finished(budget.deadline)
+
+
+def _read_completion_time(kernel: Any, lease: ExecutionLease, envelope: BudgetEnvelope,
+                          sample: ClockCheckpoint, budget: InspectionBudget,
+                          owner: _CompletionReaderLifetime | None, *,
+                          owned_token: str | None = None) -> float:
+    deadline = budget.deadline
+    assert deadline is not None
     retained_floor = envelope.recheckpoint(sample=sample).checkpoint.wall_at
     budget.check()
     path = Path(kernel.db_path).expanduser().resolve()
@@ -344,7 +396,7 @@ def _capture_completion_time(context: Any, budget: InspectionBudget,
                     reader_ready = True
                 connection.execute("BEGIN")
                 floor = _read_floor(connection, lease, budget,
-                    owned_token=None if owned is None else owned[0])
+                    owned_token=owned_token)
                 result = max(sample.wall_at, retained_floor, floor)
                 break
             except (sqlite3.OperationalError, BudgetClockUnknownError) as error:

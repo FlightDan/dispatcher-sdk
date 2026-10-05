@@ -78,8 +78,12 @@ or incomplete inspection also fails closed. This uses `check="bindings"`, not a
 full integrity scan. `preflight_timeout` defaults to 30 seconds. Historical
 pending commands need their original deployment or an explicit recovery decision.
 
-`health()` reports host health, callback errors and consumer liveness without a
-storage scan. `diagnostics(timeout_seconds=5)` performs bounded read-only storage
+`health()` reports host health and consumer liveness without a storage scan.
+`callback_errors` counts callback invocation and synchronous-return validation
+failures. Inbox readiness, claim, acknowledgment and retry-settlement failures
+appear separately in `delivery_errors` and `last_delivery_error`, which retains
+the source, phase, exception type and message.
+`diagnostics(timeout_seconds=5)` performs bounded read-only storage
 observations; see [SQLite operations](SQLITE_OPERATIONS.md) for cost and limits.
 
 `close(timeout=...)` stops accepting new work, drains result consumers, then stops

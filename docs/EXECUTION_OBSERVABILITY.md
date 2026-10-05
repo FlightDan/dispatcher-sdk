@@ -127,6 +127,13 @@ lost observation. Factual completion can use the exact live owner’s already
 captured token without acknowledging or clearing it. A foreign or uncaptured
 guard remains unknown. `Task.observe` remains read-only; `context.budget` establishes
 an authoritative budget sample and can encounter this bounded control admission.
+A completion read refused by a transient sampling guard can retain its exact
+original sample after successful physical reader close. Recovery retries that
+sample under one bounded control window, after all guards permit the snapshot;
+it takes no new wall sample and never repeats business. A later committed floor
+past the original work cutoff produces a timeout. The exact resolved result is
+saved in the existing settlement receipt before Kernel completion, so a crash
+replays the same result. Outcomes without the original sample remain unknown.
 Resolving an uncertain Effect does not acknowledge a clock sample or clear its
 guard. The original response remains saved, but a recovered execution stays
 fenced while its clock fact is unknown, even if its Effect recovery target is queued.
@@ -217,6 +224,10 @@ fresh windows count. Sampling gaps, collector replacement and unknown metrics
 break the consecutive streak and preserve the historical windows. Wait exemptions
 pause counting without extending any deadline. Confirmed new progress ends the
 current episode; later stagnation creates a new episode.
+A subscription registered while its execution is queued stays pending through
+native startup. It becomes active when durable handler-entry confirmation
+matches the current attempt and fence. Explicit registration on an already
+running execution retains its existing behavior.
 An active collector with retained coverage gaps remains unknown. A successful
 counter flush does not prove that missing wait facts were recovered; a new
 declared collector starts fresh continuity while preserving retired history.

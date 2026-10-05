@@ -292,6 +292,8 @@ class Dispatcher:
         self._callback = on_result
         self._callback_errors = 0
         self._last_callback_error: str | None = None
+        self._delivery_errors = 0
+        self._last_delivery_error: dict[str, str] | None = None
         self.orchestrator = Orchestrator.open_sqlite(
             self.path, handlers, isolation_mode=isolation_mode, durability=durability,
             observation_options=observation_options, child_capacity=child_capacity, max_child_depth=max_child_depth)
@@ -473,29 +475,36 @@ class Dispatcher:
     def _deliver_stalls(self) -> None:
         while not self._stop.is_set():
             lease = None
+            phase = "readiness"
             try:
                 if self.inbox._delivery_ready(_STALL_SOURCE):
+                    phase = "claim"
                     lease = self.inbox.claim(self._owner+":stalls", source_id=_STALL_SOURCE,
                         lease_seconds=self.callback_lease_seconds)
                 if lease is not None:
                     assert self._stall_callback is not None
+                    phase = "callback"
                     returned = self._stall_callback(lease.payload)
                     if inspect.isawaitable(returned):
                         if inspect.iscoroutine(returned):
                             returned.close()
                         raise TypeError("stall callback must be synchronous")
+                    phase = "ack"
                     self.inbox.consume(lease)
                     continue
             except Exception as error:
-                with self._lock:
-                    self._callback_errors += 1
-                    self._last_callback_error = f"{type(error).__name__}: {error}"
+                if phase == "callback":
+                    with self._lock:
+                        self._callback_errors += 1
+                        self._last_callback_error = f"{type(error).__name__}: {error}"
+                else:
+                    self._record_delivery_error(_STALL_SOURCE, phase, error)
                 if lease is not None:
                     try:
                         self.inbox.fail(lease, error={"type": type(error).__name__, "message": str(error)},
                             retry_delay=self.callback_retry_delay)
-                    except Exception:
-                        pass
+                    except Exception as settlement_error:
+                        self._record_delivery_error(_STALL_SOURCE, "fail", settlement_error)
             self._stop.wait(.05)
 
     def stall_notifications(self, *, state=None, limit: int = 100):
@@ -652,34 +661,46 @@ class Dispatcher:
             count += 1
         return count
 
+    def _record_delivery_error(self, source: str, phase: str, error: Exception) -> None:
+        with self._lock:
+            self._delivery_errors += 1
+            self._last_delivery_error = {"source": source, "phase": phase,
+                "type": type(error).__name__, "message": str(error)}
+
     def _deliver(self) -> None:
         while not self._stop.is_set():
             lease = None
+            phase = "readiness"
             try:
                 if self.inbox._delivery_ready(_SOURCE):
+                    phase = "claim"
                     lease = self.inbox.claim(
                         self._owner, source_id=_SOURCE, lease_seconds=self.callback_lease_seconds)
                 if lease is not None:
                     assert self._callback is not None
+                    phase = "callback"
                     returned = self._callback(lease.payload)
                     if inspect.isawaitable(returned):
                         if inspect.iscoroutine(returned):
                             returned.close()
                         raise TypeError("on_result must be synchronous")
+                    phase = "ack"
                     self.inbox.consume(lease)
                     continue
             except Exception as error:
-                with self._lock:
-                    self._callback_errors += 1
-                    self._last_callback_error = f"{type(error).__name__}: {error}"
+                if phase == "callback":
+                    with self._lock:
+                        self._callback_errors += 1
+                        self._last_callback_error = f"{type(error).__name__}: {error}"
+                else:
+                    self._record_delivery_error(_SOURCE, phase, error)
                 if lease is not None:
                     try:
                         self.inbox.fail(
                             lease, error={"type": type(error).__name__, "message": str(error)},
                             retry_delay=self.callback_retry_delay)
                     except Exception as settlement_error:
-                        with self._lock:
-                            self._last_callback_error += f"; settlement: {settlement_error}"
+                        self._record_delivery_error(_SOURCE, "fail", settlement_error)
             self._stop.wait(0.05)
 
     def health(self) -> dict[str, Any]:
@@ -693,6 +714,9 @@ class Dispatcher:
                 "callback_errors": self._callback_errors,
                 "active_consumers": self._active_consumers,
                 "last_callback_error": self._last_callback_error,
+                "delivery_errors": self._delivery_errors,
+                "last_delivery_error": None if self._last_delivery_error is None
+                    else dict(self._last_delivery_error),
                 "secondary_close_error": self._secondary_close_error,
             }
 

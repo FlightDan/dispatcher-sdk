@@ -149,6 +149,12 @@ class StallSupervisor:
                 if status["execution_state"] != "running":
                     connection.execute("UPDATE obs_policies SET state='closed',revision=revision+1 WHERE policy_id=? AND version=? AND execution_id=? AND attempt=? AND fence=?", key)
                     continue
+                if current["state"] == "pending_execution" and (
+                        status["entry_state"] != "confirmed" or
+                        (status["entry_attempt"], status["entry_fence"]) != (status["attempt"], status["fence"])):
+                    # Running includes native startup. A queued subscription
+                    # begins observing business only at its durable entry ACK.
+                    continue
                 # Migration uses the actual current Kernel identity, not an
                 # inferred increment, after a persisted queued subscription.
                 attempt, fence = status["attempt"], status["fence"]

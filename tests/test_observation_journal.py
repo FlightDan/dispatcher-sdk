@@ -222,15 +222,18 @@ class ObservationJournalTests(unittest.TestCase):
 
     def test_cumulative_batch_replay_and_old_sequences_do_not_double_count(self):
         metrics = {"stdout_bytes": {"count": 3, "first_at": 100, "last_at": 100}}
-        self.assertTrue(self.journal.write_batch(self.identity, source_id="worker", sequence=2, metrics=metrics, captured_at=100))
-        self.assertFalse(self.journal.write_batch(self.identity, source_id="worker", sequence=2, metrics=metrics, captured_at=100))
-        self.assertFalse(self.journal.write_batch(self.identity, source_id="worker", sequence=1, metrics=metrics, captured_at=100))
-        metrics["stdout_bytes"]["count"] = 7
-        self.journal.write_batch(self.identity, source_id="worker", sequence=3, metrics=metrics, captured_at=102)
-        self.assertEqual(self.journal.inspect("execution")["metrics"]["stdout_bytes"]["count"], 7)
-        metrics["stdout_bytes"]["count"] = 1
-        with self.assertRaises(ObservationError):
-            self.journal.write_batch(self.identity, source_id="worker", sequence=4, metrics=metrics, captured_at=103)
+        # Match a real flusher's live WAL lifetime. Each batch still opens its
+        # own connection and consumes its unchanged short write allowance.
+        with self.journal._flush_anchor():
+            self.assertTrue(self.journal.write_batch(self.identity, source_id="worker", sequence=2, metrics=metrics, captured_at=100))
+            self.assertFalse(self.journal.write_batch(self.identity, source_id="worker", sequence=2, metrics=metrics, captured_at=100))
+            self.assertFalse(self.journal.write_batch(self.identity, source_id="worker", sequence=1, metrics=metrics, captured_at=100))
+            metrics["stdout_bytes"]["count"] = 7
+            self.journal.write_batch(self.identity, source_id="worker", sequence=3, metrics=metrics, captured_at=102)
+            self.assertEqual(self.journal.inspect("execution")["metrics"]["stdout_bytes"]["count"], 7)
+            metrics["stdout_bytes"]["count"] = 1
+            with self.assertRaises(ObservationError):
+                self.journal.write_batch(self.identity, source_id="worker", sequence=4, metrics=metrics, captured_at=103)
 
     def test_late_old_attempt_is_history_without_changing_current(self):
         old = self.recorder(source_id="old")

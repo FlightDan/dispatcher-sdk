@@ -47,7 +47,12 @@ class SamplingRefusalTests(unittest.TestCase):
                         if admissions == expire_admission:
                             # Consume this admission's existing deadline. The
                             # SQL guard remains real and no exception is faked.
-                            time.sleep(max(0., recovered._control_deadline - time.monotonic()))
+                            deadline = recovered._control_deadline
+                            while True:
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    break
+                                time.sleep(remaining)
 
                 recovered._assert_budget_clock = record_refusal
                 recovered._connection.set_trace_callback(expire_original_window)

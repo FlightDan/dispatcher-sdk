@@ -183,7 +183,13 @@ class WorkerEntryConfirmationTests(unittest.TestCase):
                         time.sleep(.01)
                     self.assertTrue((root / "confirming").exists())
                     self.assertFalse((root / "business").exists())
-                    self.assertEqual("pending", runtime.kernel.get_execution_limits("probe")["entry_state"])
+                    # Observe the durable entry barrier without contending for
+                    # the parent's native-preparation control lock.
+                    with closing(sqlite3.connect((root / "kernel.db").as_uri() + "?mode=ro",
+                                                 uri=True, timeout=.1)) as reader:
+                        entry = reader.execute("SELECT entry_state FROM kernel_execution_limits "
+                            "WHERE execution_id = ?", ("probe",)).fetchone()
+                    self.assertEqual(("pending",), entry)
                     if mode == "lock":
                         with closing(sqlite3.connect(root / "kernel.db", timeout=.1)) as writer:
                             with writer:

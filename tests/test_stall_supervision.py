@@ -12,7 +12,7 @@ import time
 import unittest
 
 from dispatcher_sdk.execution_kernel import CASConflictError, ExecutionCommandV2, RetryPolicy, SQLiteKernel
-from dispatcher_sdk.execution_kernel.budget import ClockCheckpoint
+from dispatcher_sdk.execution_kernel.budget import ClockCheckpoint, sample_clock
 from dispatcher_sdk.observability import ActivityRecorder, ObservationIdentity, ObservationJournal, ObservationOptions, StallPolicy
 from dispatcher_sdk.observability.supervision import StallSupervisor
 from tests._acceptance_evidence import retained_directory
@@ -242,6 +242,16 @@ class StallSupervisionTests(unittest.TestCase):
         actual = ObservationIdentity("queued", lease.attempt, lease.fence, run_id="run", task_id="task")
         self.journal.bind_current(actual)
         recorder = ActivityRecorder(self.journal, actual, clock=self.clock)
+        restarted.tick()
+        self.assertEqual(restarted._watch_state("queued"), "pending_execution")
+        self.assertEqual(restarted.outbox(), ())
+        prepared = self.kernel._prepare_handler_entry(lease)
+        restarted.tick()
+        self.assertEqual(restarted._watch_state("queued"), "pending_execution")
+        self.assertEqual(restarted.outbox(), ())
+        entered = prepared.enter_handler(command.timeout_seconds, origin_id="execution:queued",
+                                         sample=sample_clock(wall_time=self.clock()))
+        self.kernel.confirm_handler_entry(lease, entered)
         recorder.phase("handler_entered")
         recorder.flush()
         restarted.tick()

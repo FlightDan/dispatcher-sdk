@@ -1,6 +1,7 @@
 """Completion readers follow real Context close and physical SQLite release."""
 from contextlib import contextmanager
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -161,15 +162,26 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
             self.assertEqual(reader.get("original").to_dict(), state.original.to_dict())
             self.assertEqual(reader.get("queued").state, "queued")
 
-    def assert_reader_retry_has_no_sql(self, connection, began, sample_calls, samples_before):
+    def reader_retry_boundary(self):
         with self.storage._lock:
-            events = [dict(event) for event in self.storage.events
-                      if event["connection"] == connection.evidence_id and event["began"] >= began]
+            return self.storage.operations
+
+    def assert_reader_retry_has_no_sql(self, connection, boundary, sample_calls, samples_before):
+        with self.storage._lock:
+            operations = self.storage.operations
+            retained = tuple(self.storage.events)
+        appended = operations - boundary
+        self.assertLessEqual(appended, len(retained), "retry operation evidence was truncated")
+        # Adjacent stages may share a Windows clock tick. Append order proves
+        # which operations belong to this retry without including its body.
+        events = [dict(event) for event in (retained[-appended:] if appended else ())
+                  if event["connection"] == connection.evidence_id]
         self.assertEqual([event for event in events if event["operation"] != "close"], [],
                          "physical-release retry executed work on the retained reader")
         self.assertEqual(len(sample_calls), samples_before, "physical-release retry took another completion sample")
         self.evidence["records"].append({"phase": "reader_physical_release_retry",
             "exact_reader_connection": connection.evidence_id, "operations": events,
+            "operation_boundary": boundary, "operations_after_retry": operations,
             "completion_samples_before": samples_before, "completion_samples_after": len(sample_calls)})
         return events
 
@@ -326,10 +338,10 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                     self.assertIsNotNone(connections[0]._participation)
                     self.assertFalse(state.runtime._thread_slots.acquire(blocking=False))
                     samples_before = len(sample_calls)
-                    retry_began = time.monotonic()
+                    retry_boundary = self.reader_retry_boundary()
                     with self.assertRaises(_ObservationCleanupPendingError):
                         state.runtime.close()
-                    self.assert_reader_retry_has_no_sql(connections[0], retry_began, sample_calls, samples_before)
+                    self.assert_reader_retry_has_no_sql(connections[0], retry_boundary, sample_calls, samples_before)
                     self.assertFalse(state.runtime.kernel._connection_closed)
                     self.assertIn(state.context, state.runtime._retired_observation_contexts)
                     self.assertIs(owner._connection, connections[0])
@@ -340,10 +352,10 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                     self.assertTrue(all(item["body_done"] for item in close_calls[1:]))
                     allow_close.set()
                     samples_before = len(sample_calls)
-                    retry_began = time.monotonic()
+                    retry_boundary = self.reader_retry_boundary()
                     state.runtime.close()
                     retry_events = self.assert_reader_retry_has_no_sql(
-                        connections[0], retry_began, sample_calls, samples_before)
+                        connections[0], retry_boundary, sample_calls, samples_before)
                     self.assertTrue(any(event["operation"] == "close" for event in retry_events),
                                     "successful retry lacked physical close evidence for the exact reader")
                     self.assertIsNone(owner._connection)
@@ -450,9 +462,12 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                  and event["timeout"] is not None]
         self.assertEqual(len(calls), count)
         self.assertEqual(budget["deadline"], budget["started"] + bound)
+        # Subtracting large clock anchors can round just above the nominal
+        # duration. This is assertion precision, not extra capture authority.
+        representation_error = math.ulp(budget["started"]) + math.ulp(budget["deadline"])
         for event in calls:
             self.assertGreaterEqual(event["timeout"], 0)
-            self.assertLessEqual(event["timeout"], bound,
+            self.assertLessEqual(event["timeout"] - bound, representation_error,
                                  "real lock acquire ignored the tighter configured capture bound")
             remaining = max(0., budget["deadline"] - event["called_at"])
             # Allow interception/scheduler delay between calculating remaining
@@ -502,10 +517,12 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                     began = time.monotonic()
                     with self.assertRaises((InspectionBudgetExceeded, TimeoutError)) as caught:
                         capture_completion_time(state.context)
-                    elapsed = time.monotonic() - began
+                    finished = time.monotonic()
+                    elapsed = finished - began
                     state.phase[0] = "cleanup"
                     bound = .1 if configured is None else configured
-                    self.assertGreaterEqual(elapsed, bound * .8)
+                    representation_error = math.ulp(began) + math.ulp(finished)
+                    self.assertGreaterEqual(elapsed - bound * .8, -representation_error)
                     self.assertLess(elapsed, .3)
                     self.assertEqual(len(budgets), 1)
                     self.assert_lifecycle_acquires_use_deadline(acquires, budgets[0], bound, count=1)
@@ -557,10 +574,12 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                         state.phase[0] = "capture"
                         began = time.monotonic()
                         completed_at = capture_completion_time(state.context)
-                        elapsed = time.monotonic() - began
+                        finished = time.monotonic()
+                        elapsed = finished - began
                         state.phase[0] = "cleanup"
                         bound = .1 if configured is None else configured
-                        self.assertGreaterEqual(elapsed, bound * .8)
+                        representation_error = math.ulp(began) + math.ulp(finished)
+                        self.assertGreaterEqual(elapsed - bound * .8, -representation_error)
                         self.assertLess(elapsed, .3)
                         self.assertEqual(deadlines[0]["deadline"], deadlines[0]["started"] + bound)
                         self.assert_lifecycle_acquires_use_deadline(acquires, deadlines[0], bound, count=2)

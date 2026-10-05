@@ -9,7 +9,7 @@ cancel or replace the supervisor's timer.
 from __future__ import annotations
 
 import ctypes
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 import math
 import multiprocessing
@@ -235,6 +235,9 @@ def _capture_completion_time(outcome: dict[str, Any], context: HandlerContext) -
     except Exception as exc:
         outcome["completion_time_known"] = False
         outcome["completion_time_error"] = f"{type(exc).__name__}: {exc}"
+        proof = getattr(exc, "_completion_clock_proof", None)
+        if type(proof) is dict:
+            outcome["completion_clock_proof"] = proof
 
 
 def _budget_sample(now: Any):
@@ -293,6 +296,21 @@ def _transient_capture_error(error: BaseException) -> bool:
         or str(error) == "budget_clock_sample_unresolved:sampling")
 
 
+@dataclass(frozen=True)
+class _NativeBudgetCutoff:
+    """An observed local cutoff, separate from an unpublished clock sample."""
+
+    deadline_monotonic: float
+    observed_monotonic: float
+    hard: bool
+    envelope: BudgetEnvelope
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"deadline_monotonic": self.deadline_monotonic,
+                "observed_monotonic": self.observed_monotonic, "hard": self.hard,
+                "budget_envelope": self.envelope.to_dict()}
+
+
 def _capture_budget_until(envelope: BudgetEnvelope, capture: Any, deadline: float,
                           *, hard: bool = False, on_capture: Any = None,
                           stop_retry: Any = None) -> BudgetEnvelope:
@@ -302,10 +320,14 @@ def _capture_budget_until(envelope: BudgetEnvelope, capture: Any, deadline: floa
         projected = envelope.recheckpoint(sample=_elapsed_budget_sample(envelope))
         bound = projected.deadline_monotonic(hard=hard, sample=projected.checkpoint)
         deadline = min(deadline, math.inf if bound is None else bound)
-        remaining = deadline - time.monotonic()
+        observed = time.monotonic()
+        remaining = deadline - observed
         if remaining <= 0:
             if last_error is not None:
-                last_error.budget_sample_envelope = envelope
+                # Preserve the original token/envelope and ACK uncertainty.
+                # The trusted projection and this local comparison establish
+                # expiry independently of the capture error's classification.
+                last_error.budget_native_cutoff = _NativeBudgetCutoff(deadline, observed, hard, projected)
                 raise last_error
             return projected
         try:
@@ -330,9 +352,10 @@ def _capture_budget_until(envelope: BudgetEnvelope, capture: Any, deadline: floa
             projected = envelope.recheckpoint(sample=_elapsed_budget_sample(envelope))
             bound = projected.deadline_monotonic(hard=hard, sample=projected.checkpoint)
             deadline = min(deadline, math.inf if bound is None else bound)
-            remaining = deadline - time.monotonic()
+            observed = time.monotonic()
+            remaining = deadline - observed
             if remaining <= 0:
-                exc.budget_sample_envelope = envelope
+                exc.budget_native_cutoff = _NativeBudgetCutoff(deadline, observed, hard, projected)
                 raise
             time.sleep(min(.005, remaining))
 

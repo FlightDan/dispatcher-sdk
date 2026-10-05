@@ -152,7 +152,7 @@ class SavedScriptOutputObservationTests(unittest.TestCase):
         root = retained_directory("sdk-script-long-identity-")
         execution_id = "original-" + "x" * 1500
         with Kernel.open_sqlite(root / "kernel.db", script_handlers(), isolation_mode="process") as runtime:
-            command = ScriptSpec("print('finished')", (sys.executable, "-u"), root, root / "logs").command(
+            command = ScriptSpec("import os; os.write(1, b'finished\\n')", (sys.executable, "-u"), root, root / "logs").command(
                 execution_id=execution_id, idempotency_key="long-identity",
                 registry_revision=runtime.registry_revision, correlation_id="long-identity", timeout_seconds=2)
             runtime.submit(command)
