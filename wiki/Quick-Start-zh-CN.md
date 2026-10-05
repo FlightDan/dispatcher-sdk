@@ -2,7 +2,7 @@
 
 [English](Quick-Start.md) | [简体中文](Quick-Start-zh-CN.md) | [首页](Home-zh-CN.md)
 
-使用 0.7 开发版代码，并确保 Python 版本为 3.10+。
+使用 0.7.0.dev2 开发版代码，并确保 Python 版本为 3.10 或更高。
 在仓库根目录运行：
 
 ```sh
@@ -42,9 +42,9 @@ Wake conversation-42: succeeded
 report ready
 ```
 
-[脚本示例](../examples/sdk_script_wakeup.py) 会提交任务并在后台执行。回调会持久化
-收到的通知，示例随后读取 stdout。示例只打印消息；实际应用需要让收件箱消费者读取
-这些通知，并据此继续 Agent 流程。后台执行期间必须保持宿主运行。原生 Windows
+[脚本示例](../examples/sdk_script_wakeup.py) 会提交任务并在后台执行。回调会先持久化
+通知，示例再读取 stdout。它只打印结果；实际应用还需要由收件箱消费者读取通知并继续
+Agent 流程。后台任务运行期间要保持 Host 存活。原生 Windows
 的运行要求和已记录的验证范围详见[平台状态](../docs/WINDOWS_RUNTIME.md)。
 
 ## 接入自己的任务

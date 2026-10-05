@@ -1,6 +1,6 @@
 # Security policy
 
-Security fixes target the latest developer preview and the default branch.
+We apply security fixes to the latest developer preview and the default branch.
 
 Report suspected vulnerabilities privately through
 [GitHub private vulnerability reporting](https://github.com/FlightDan/dispatcher-sdk/security/advisories/new).

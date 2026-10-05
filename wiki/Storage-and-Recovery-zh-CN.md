@@ -2,9 +2,9 @@
 
 [English](Storage-and-Recovery.md) | [简体中文](Storage-and-Recovery-zh-CN.md) | [首页](Home-zh-CN.md)
 
-0.7 的单文件部署默认使用 SQLite WAL 和 `synchronous=FULL`。Kernel schema 仍为 2，
-Orchestrator schema 为 3，通知收件箱使用独立的 schema 1。产品版本与存储 schema
-不是同一个概念。
+0.7 的单文件部署默认使用 SQLite WAL 和 `synchronous=FULL`。Kernel SQLite 布局为
+schema 5，Orchestrator 存储为 schema 4，通知收件箱使用独立的 schema 1。公开的
+Kernel 执行记录契约仍为 v2；契约版本与存储布局是两回事。
 
 通过 `app.diagnostics()` 或 `dispatcher_sdk.diagnostics.inspect_diagnostics()` 可以查看
 执行状态、`recovery_required`、投递与收件箱积压，以及数据库和 WAL 大小。所有组件共用

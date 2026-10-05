@@ -2,7 +2,7 @@
 
 [English](Quick-Start.md) | [简体中文](Quick-Start-zh-CN.md) | [Home](Home.md)
 
-Use Python 3.10+ and the 0.7 development checkout. From its root:
+Use the 0.7.0.dev2 checkout with Python 3.10 or later. From its root:
 
 ```sh
 python -m venv .venv
@@ -42,10 +42,11 @@ Wake conversation-42: succeeded
 report ready
 ```
 
-The [script example](../examples/sdk_script_wakeup.py) submits a task, runs it in
-the background, uses a callback to durably accept the notification, and reads stdout. It prints a
-message; connect your application's inbox consumer to the logic that continues
-the Agent workflow. Keep the host alive for background work. For native Windows
+The [script example](../examples/sdk_script_wakeup.py) submits a task and runs it
+in the background. Its callback durably accepts the notification, and the
+example reads stdout. Connect your application's inbox consumer to the logic
+that continues the Agent workflow, and keep the host alive while work is pending.
+For native Windows
 requirements and recorded validation scope, see
 [platform status](../docs/WINDOWS_RUNTIME.md).
 

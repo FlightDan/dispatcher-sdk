@@ -18,6 +18,7 @@ handles execution and delivery.
 7. [Troubleshooting](Troubleshooting.md): diagnose pending work, duplicates and recovery.
 8. [Integration engineering principles](Engineering-Principles.md): prepare durable deployments and evidence that can be reviewed.
 9. [Diagnostics and projections](Diagnostics-and-Projections.md): inspect deployment identity, persist events, and check work availability or cancellation.
+10. [Execution activity and supervision](../docs/EXECUTION_OBSERVABILITY.md): read persisted activity, deadlines, child work and optional stall notifications.
 
 Coding agents should start with [DocsforAgents](../DocsforAgents/README.md).
 Detailed API contracts are maintained in [docs/SDK.md](../docs/SDK.md) and the
@@ -28,7 +29,7 @@ discovery, see the [integration engineering principles](Engineering-Principles.m
 
 ## Version and scope
 
-These pages describe the 0.7 development checkout (`0.7.0.dev0`), which requires Python 3.10+.
+These pages describe the 0.7 development checkout (`0.7.0.dev2`), which requires Python 3.10 or later.
 Read documentation from the same revision as your code. Older releases may lack
 these entry points. Before opening an existing database, read
 [storage and upgrades](../docs/STORAGE_AND_UPGRADES.md).

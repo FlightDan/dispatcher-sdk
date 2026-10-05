@@ -1,14 +1,16 @@
 # 0.7 development design and migration
 
-Status: implemented and verified on `release/0.7.0` (`0.7.0.dev0`). The user approved
-breaking changes and explicit local recovery activation. This document records
-the implementation contract, migration impact and validation evidence.
+This document records the `0.7.0.dev0` implementation and its Linux validation
+on `release/0.7.0`. The user approved breaking changes and explicit local
+recovery activation. The measurements below belong to that candidate.
+Current `0.7.0.dev2` contracts and outstanding acceptance checks are described in
+[execution observability](EXECUTION_OBSERVABILITY.md) and
+[its acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md).
 
-The proposed next increment is recorded in the
-[0.7.0.dev1 improvement plan](DEV_0_7_0_DEV1_IMPROVEMENT_PLAN.md).
-It covers managed Runs, execution authorization, pause/revision/resume, lifecycle
-settlement, continuous budgets and bounded diagnostics. It is a proposal, not an
-implemented capability or validation report.
+The [0.7.0.dev1 improvement plan](DEV_0_7_0_DEV1_IMPROVEMENT_PLAN.md) records
+managed Run, authorization and pause/revision/resume design. Parts were
+implemented; the complete managed lifecycle remains unfinished. Its dated
+progress table distinguishes implementation from acceptance.
 
 ## Goals and scope
 
@@ -101,7 +103,9 @@ no silent conversion from application-owned inbox schemas or arbitrary old Run
 IDs. Existing applications may keep their lower-level integration while moving
 new standalone tasks to `Dispatcher`.
 
-Orchestrator storage is schema 3, Kernel schema/protocol 2, inbox schema 1.
+The dev0 candidate used Orchestrator schema 3, Kernel storage/protocol 2 and
+inbox schema 1. The current layouts are listed in
+[storage and upgrades](STORAGE_AND_UPGRADES.md).
 Older Orchestrator stores require the existing explicit copy upgrade. Product
 version 0.7 does not imply a schema 7. Restore retirement is an intentional
 behavioral change: participating writers must refuse a retired source path.
@@ -170,7 +174,8 @@ deliberately remove `PYTHONPATH` and still import the package.
 The existing CI matrix also runs the new tests, typing consumer, managed example
 and recovery example. This session did not execute that matrix remotely; its
 Windows and alternate-Python entries remain CI verification, not measured local
-results. `0.7.0.dev0` is a development candidate, not a published release.
+results. At the time of these checks, `0.7.0.dev0` was an unpublished
+development candidate; this record does not describe its later release status.
 
 ## Measured SQLite workload
 

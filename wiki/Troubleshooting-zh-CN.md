@@ -6,6 +6,7 @@
 | --- | --- |
 | 提交成功但任务不执行 | 保持 Host 运行，或手动依次调用 `flush()`、`runtime.run_once()` 和 `sync()`；检查命令投递错误与处理器兼容性。 |
 | `Dispatcher` 拒绝启动 | 查看 `DeploymentMismatchError.report`；未完成任务仍需要原 handler 部署。 |
+| `task.wait(timeout=...)` 超时 | 结束的是调用方等待。先用 `task.observe()` 查看执行状态和时限，再决定任务是否应继续。 |
 | `run_once()` 没取到任务 | 检查任务租约、`next_attempt_at`、是否有可执行任务，以及处理器是否可用。一次 `run_once()` 没取到任务，不能据此认定系统停滞。 |
 | `flush()` 返回零 | 查看待投递记录和最后一条错误；返回零不等于队列为空。 |
 | 任务成功但 Run 仍在运行 | 先校验业务结果，释放相应的 `wait` 条件，再显式结束 Run。 |
@@ -23,7 +24,8 @@
 具体规则和恢复流程见[任务提交](../docs/TASK_SUBMISSION.md)、
 [恢复](../docs/SDK_RECOVERY.md)、[收件箱](../docs/NOTIFICATION_INBOX.md)、
 [存储](../docs/STORAGE_AND_UPGRADES.md)、[本地恢复](../docs/LOCAL_RECOVERY.md)
-和[沙箱运行时](../docs/SANDBOX_RUNTIME.md)。
+和[沙箱运行时](../docs/SANDBOX_RUNTIME.md)。观测缺口和停滞通知的说明见
+[执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md)。
 
 反馈问题时，请提供 SDK 版本或 commit、Python 版本、平台、隔离模式、相关身份和状态，
 以及最小复现（能重现问题的最小示例）。请先移除凭据和私有数据。

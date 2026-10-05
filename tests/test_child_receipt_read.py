@@ -19,7 +19,12 @@ from tests import test_observability_runtime_integration as runtime_fixture
 from tests._storage_evidence import StorageEvidence
 
 
-class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
+class ChildReceiptReadTests(unittest.TestCase):
+    # Reuse the real stores without rerunning every independent clock case.
+    setUp = checkpoint_fixture.ChildClockCheckpointTests.setUp
+    tearDown = checkpoint_fixture.ChildClockCheckpointTests.tearDown
+    command = staticmethod(checkpoint_fixture.ChildClockCheckpointTests.command)
+
     def short_row(self, seconds):
         envelope = self.parent_budget.derive(source='tool', origin_id='receipt-read', timeout_seconds=seconds)
         window = _RetryWindow(envelope, self.kernel)
@@ -126,7 +131,8 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
                     traced('parent_authority_read', self.kernel._verify_active_lease_readonly)))
                 diagnostics.enter_context(patch.object(children_module, 'time', timing))
                 diagnostics.enter_context(patch.object(admission_module, 'time', timing))
-                remaining_at_call = window.remaining()
+                with window.project():
+                    remaining_at_call = window.remaining()
                 window_at_call = window.envelope.to_dict()
                 deadline_at_call = window.deadline
                 caught, returned, raw_traceback = None, None, None
@@ -139,8 +145,12 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
                 # persisted envelope; the helper returned by short_row is a
                 # separate local timer and can differ by a coarse host tick.
                 actual_window = actual_windows[0] if len(actual_windows) == 1 else None
-                remaining_at_end = None if actual_window is None else actual_window.remaining()
-                setup_window_remaining_at_end = window.remaining()
+                remaining_at_end = None
+                if actual_window is not None:
+                    with actual_window.project():
+                        remaining_at_end = actual_window.remaining()
+                with window.project():
+                    setup_window_remaining_at_end = window.remaining()
                 row_budget_at_end = BudgetEnvelope.from_dict(json.loads(row['budget_json']))
                 self.evidence['records'].append({'scenario': 'persistent_receipt_contention',
                     'elapsed': elapsed, 'began': before,
@@ -150,6 +160,12 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
                     'actual_deadlines_at_call': actual_deadlines_at_call,
                     'error_type': None if caught is None else type(caught).__name__,
                     'error': None if caught is None else str(caught), 'traceback': raw_traceback,
+                    'control_cause': None if caught is None or caught.__cause__ is None else {
+                        'type': type(caught.__cause__).__name__, 'message': str(caught.__cause__)},
+                    'original_receipt_cause': None if getattr(caught, 'original_receipt_cause', None) is None else {
+                        'type': type(caught.original_receipt_cause).__name__,
+                        'message': str(caught.original_receipt_cause),
+                        'sqlite_errorcode': getattr(caught.original_receipt_cause, 'sqlite_errorcode', None)},
                     'sqlite_errorcode': getattr(caught, 'sqlite_errorcode', None), 'returned': returned,
                     'completed_result_rescue_calls': rescue.call_count,
                     'writer_in_transaction': writer.in_transaction,
@@ -168,6 +184,44 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
                 self.assertEqual(row_budget_at_end.constraints, original.constraints)
                 self.assertTrue(writer.in_transaction)
                 self.assertLess(elapsed, .6)
+        finally:
+            writer.rollback()
+            writer.close()
+
+    def test_terminal_receipt_busy_keeps_original_error_without_resampling(self):
+        row, window = self.short_row(.3)
+        writer = self.exclusive_writer()
+        original_facts = self.children.store._facts
+        original_remaining = window.remaining
+        terminal = []
+        proof_error = TimeoutError('Kernel control lock admission timed out')
+
+        def exhaust_receipt_read(*args, **kwargs):
+            try:
+                return original_facts(*args, **kwargs)
+            except SettlementBusyError as error:
+                time.sleep(max(0., window.deadline - time.monotonic()))
+                terminal.append(error)
+                raise
+
+        def remaining_without_new_terminal_sample():
+            if terminal and not window._projecting:
+                raise TimeoutError('terminal receipt attempted another authoritative sample')
+            return original_remaining()
+
+        try:
+            with patch.object(self.children.store, '_facts', side_effect=exhaust_receipt_read), \
+                    patch.object(window, 'remaining', side_effect=remaining_without_new_terminal_sample), \
+                    patch.object(self.kernel, '_verify_active_lease_readonly', side_effect=proof_error):
+                with self.assertRaises(SettlementBusyError) as caught:
+                    self.children.store.attach(row, window)
+                self.assertTrue(terminal, "original cutoff elapsed before the actual receipt read")
+                self.assertIs(caught.exception, terminal[0])
+                self.assertIs(caught.exception.__cause__, proof_error)
+                self.assertIsInstance(caught.exception.original_receipt_cause, sqlite3.OperationalError)
+                with window.project():
+                    self.assertEqual(window.remaining(), 0)
+                self.assertTrue(writer.in_transaction)
         finally:
             writer.rollback()
             writer.close()
@@ -238,37 +292,124 @@ class ChildReceiptReadTests(checkpoint_fixture.ChildClockCheckpointTests):
             rescue.assert_not_called()
 
     def test_actual_parent_cancellation_interrupts_receipt_retry_before_original_cutoff(self):
+        import traceback
+        from copy import deepcopy
         from dispatcher_sdk.execution_kernel.children import ChildExecutionError
         row, window = self.short_row(1)
         writer = self.exclusive_writer()
         errors = []
+        timings, sql = {}, deque(maxlen=256)
+        sql_operations = [0]
+        evidence_lock = threading.RLock()
+        record = {'scenario': 'cancel_during_receipt_exclusive_lock',
+            'original_row_seconds': 1, 'original_sleep_seconds': .15,
+            'original_join_seconds': .5, 'original_elapsed_assertion_seconds': .7,
+            'original_budget': json.loads(row['budget_json']),
+            'setup_native_deadline': window.deadline, 'actual_windows': [],
+            'thread_timings': timings}
+        self.evidence['records'].append(record)
+        storage = StorageEvidence(self.root, self)
+        storage.start(include_kernel=True)
+        self.addCleanup(storage.stop)
+        self.addCleanup(storage.save)
+        original_window = children_module._RetryWindow
+
+        def observe_window(*args, **kwargs):
+            actual = original_window(*args, **kwargs)
+            with evidence_lock:
+                record['actual_windows'].append({'initial_native_deadline': actual.deadline,
+                    'budget': actual.envelope.to_dict(), 'execution_id': actual.execution_id})
+            return actual
+
+        def trace(statement):
+            with evidence_lock:
+                sql_operations[0] += 1
+                sql.append({'at': time.monotonic(), 'thread': threading.current_thread().name,
+                            'sql': statement[:2048], 'sql_truncated': len(statement) > 2048})
+
+        def error_facts(error):
+            envelope = getattr(error, 'budget_sample_envelope', None)
+            cause = error.__cause__
+            return {'type': type(error).__name__, 'message': str(error),
+                'code': getattr(error, 'code', None),
+                'cause': None if cause is None else {'type': type(cause).__name__, 'message': str(cause)},
+                'pending_token': getattr(error, 'budget_sample_token', None),
+                'captured_envelope': None if envelope is None else envelope.to_dict()}
+
         def await_child():
+            with evidence_lock:
+                timings['reader_start'] = time.monotonic()
+                timings['reader_cpu_start'] = time.thread_time()
             try:
                 self.children._await(row)
             except BaseException as error:
+                returned_at, returned_cpu = time.monotonic(), time.thread_time()
                 errors.append(error)
+                with evidence_lock:
+                    timings['reader_return'] = returned_at
+                    timings['reader_cpu_return'] = returned_cpu
+                    record['reader_error'] = {**error_facts(error),
+                        'traceback': traceback.format_exc(limit=16)[-16384:]}
+            else:
+                with evidence_lock:
+                    timings['reader_return'] = time.monotonic()
+                    timings['reader_cpu_return'] = time.thread_time()
+            finally:
+                with evidence_lock:
+                    timings['reader_thread_done'] = time.monotonic()
         reader = threading.Thread(target=await_child)
         before = time.monotonic()
-        with patch.object(self.children, '_completed_result') as rescue:
+        record['began'] = before
+        self.kernel._connection.set_trace_callback(trace)
+        with patch.object(self.children, '_completed_result') as rescue, \
+                patch.object(children_module, '_RetryWindow', side_effect=observe_window):
             try:
                 reader.start()
                 time.sleep(.15)
-                self.kernel.cancel(self.parent.execution_id, lease=self.lease, reason='real parent cancellation')
+                timings['cancel_start'] = time.monotonic()
+                timings['cancel_cpu_start'] = time.thread_time()
+                try:
+                    self.kernel.cancel(self.parent.execution_id, lease=self.lease, reason='real parent cancellation')
+                    record['cancel_committed'] = True
+                except BaseException as error:
+                    record['cancel_error'] = {**error_facts(error),
+                        'traceback': traceback.format_exc(limit=16)[-16384:]}
+                    raise
+                finally:
+                    timings['cancel_return'] = time.monotonic()
+                    timings['cancel_cpu_return'] = time.thread_time()
                 reader.join(.5)
                 elapsed = time.monotonic() - before
+                # Retain real phase facts even when the original timing
+                # assertion fails; do not obtain another budget observation.
+                with evidence_lock:
+                    record.update(elapsed=elapsed, reader_alive_at_join=reader.is_alive(),
+                        reader_error_count=len(errors), rescue_calls=rescue.call_count,
+                        sql=list(sql), parent_lease=self.lease.to_dict())
                 self.assertFalse(reader.is_alive())
                 self.assertEqual(len(errors), 1)
                 self.assertIsInstance(errors[0], ChildExecutionError)
                 self.assertEqual(errors[0].code, 'parent_authority_revoked')
                 self.assertLess(elapsed, .7)
                 rescue.assert_not_called()
-                self.evidence['records'].append({'scenario': 'cancel_during_receipt_exclusive_lock',
-                    'elapsed': elapsed, 'error_type': type(errors[0]).__name__,
-                    'code': errors[0].code, 'error': str(errors[0]), 'original_budget': json.loads(row['budget_json'])})
             finally:
+                with evidence_lock:
+                    record['before_cleanup_at'] = time.monotonic()
+                    record['elapsed_before_cleanup'] = record['before_cleanup_at'] - before
+                    timings['writer_release_start'] = time.monotonic()
                 writer.rollback()
                 writer.close()
+                with evidence_lock:
+                    timings['writer_release_return'] = time.monotonic()
                 reader.join(1)
+                self.kernel._connection.set_trace_callback(None)
+                with evidence_lock:
+                    record.update(terminal_at=time.monotonic(),
+                        reader_alive_after_cleanup=reader.is_alive(), sql=list(sql),
+                        sql_operations=sql_operations[0],
+                        sql_events_dropped=max(0, sql_operations[0]-len(sql)))
+                    checkpoint = deepcopy(record)
+                storage.save(phase='cancel-receipt-terminal', checkpoint=checkpoint)
 
     def test_original_public_parent_process_child_fixture(self):
         runtime_fixture.RuntimeObservationIntegrationTests().execute('process')

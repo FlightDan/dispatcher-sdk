@@ -3,8 +3,10 @@ from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
+import sys
 import threading
 import time
+import traceback
 import unittest
 from unittest.mock import patch
 
@@ -86,6 +88,10 @@ class ChildStorageContentionTests(unittest.TestCase):
             **{key: list(value) if isinstance(value, list) else value for key, value in facts.items()}}
         self.evidence["records"].append(record)
         if not reached:
+            frames = sys._current_frames()
+            record["workers"] = [{"name": thread.name,
+                "stack": traceback.format_stack(frames[thread.ident])[-10:]}
+                for thread in threading.enumerate() if thread.ident in frames][:24]
             for name, operation in (("parent", lambda: runtime.kernel.get("parent").to_dict()),
                                     ("requests", lambda: self.requests(runtime))):
                 try:
@@ -173,15 +179,20 @@ class ChildStorageContentionTests(unittest.TestCase):
         self.addCleanup(return_child.set)
         def child(payload, context):
             calls.append(context.lease.execution_id)
+            self.evidence["records"].append({"stage": "actual_child_entry",
+                "monotonic": time.monotonic(), "envelope": context.budget_envelope.to_dict()})
             entered.set()
             if not return_child.wait(2):
                 raise TimeoutError("child fixture was not released")
             return {"raw_fact": "original successful child"}
         def parent(payload, context):
+            self.evidence["records"].append({"stage": "original_child_call",
+                "monotonic": time.monotonic(), "envelope": context.budget_envelope.to_dict()})
             return context.children.run("child", {}, request_id="one", timeout_seconds=3)
         runtime = self.runtime(parent, child)
         driver, outcomes, errors = self.drive(runtime, timeout=4)
-        self.assertTrue(entered.wait(2))
+        self.witness_readiness(entered, 2, runtime, driver, outcomes, errors,
+            parent_timeout=4, child_timeout=3, calls=calls)
         row = self.requests(runtime)[0]
         with self.writer(runtime.observation_journal.path):
             return_child.set()

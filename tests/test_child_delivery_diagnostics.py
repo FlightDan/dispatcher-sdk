@@ -1,4 +1,5 @@
 """A failed bounded proof retains its raw cause behind the original wait error."""
+from dataclasses import replace
 import json
 from pathlib import Path
 import sqlite3
@@ -11,8 +12,11 @@ from unittest.mock import patch
 from tests._acceptance_evidence import retained_directory
 
 from dispatcher_sdk.execution_kernel import Kernel
+from dispatcher_sdk.execution_kernel import child_factual_read as factual
+from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope
 from dispatcher_sdk.execution_kernel.children import ChildExecutionError, HandlerChildren
-from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, RetryPolicy
+from dispatcher_sdk.execution_kernel.children import _RetryWindow
+from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, ExecutionResultV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
 from dispatcher_sdk.observability import ObservationJournal
 
@@ -54,7 +58,30 @@ class ChildDeliveryDiagnosticsTests(unittest.TestCase):
     def await_after_attachment(self):
         return self.children._await(self.row)
 
+    def admit_actual_child(self):
+        child_id = self.row['child_execution_id']
+        command = replace(self.command, execution_id=child_id, idempotency_key=child_id,
+                          causation_id='parent')
+        budget = self.budget.derive(source='tool', origin_id='actual-diagnostic-child', timeout_seconds=1)
+        self.kernel.submit_child(command, self.lease, budget)
+        lease = self.kernel.claim_and_start('child-owner', execution_id=child_id, child_pool=True)
+        snapshot = self.kernel.get(child_id)
+        result = ExecutionResultV2('diagnostic-child-result', child_id, 'succeeded', lease.attempt,
+            lease.fence, [], snapshot.started_at, self.kernel.current_time(), 'root', 'parent', 42, None)
+        self.kernel.complete(lease, result)
+
     def test_real_kernel_lock_timeout_is_cause_of_the_identical_original_wait_error(self):
+        # A custom Kernel deliberately retains the shared-connection fallback.
+        # Standard file-backed factual reads have independent-lock coverage.
+        class CustomSQLiteKernel(SQLiteKernel):
+            pass
+        self.kernel = CustomSQLiteKernel(self.kernel.db_path)
+        self.addCleanup(self.kernel.close)
+        self.children.kernel = self.kernel
+        # This case starts after initial clock reconstruction and attachment.
+        # Hold the lock only during the original wait's factual delivery proof.
+        window = _RetryWindow(BudgetEnvelope.from_dict(json.loads(self.row['budget_json'])),
+                              self.kernel, execution_id=self.row['parent_execution_id'])
         acquired, release = threading.Event(), threading.Event()
         def hold_control():
             with self.kernel._lock:
@@ -66,7 +93,8 @@ class ChildDeliveryDiagnosticsTests(unittest.TestCase):
         original_budget = self.row['budget_json']
         actual_proof = self.children._completed_result
         try:
-            with patch.object(self.children.store, 'attach'), \
+            with patch('dispatcher_sdk.execution_kernel.children._RetryWindow', return_value=window), \
+                    patch.object(self.children.store, 'attach'), \
                     patch.object(self.children, '_await_window', side_effect=self.original), \
                     patch.object(self.children, '_completed_result', wraps=actual_proof) as proof:
                 before = time.monotonic()
@@ -117,11 +145,12 @@ class ChildDeliveryDiagnosticsTests(unittest.TestCase):
             writer.close()
 
     def test_real_sqlite_busy_code_and_object_are_retained_without_proof_retry(self):
+        self.admit_actual_child()
         raw = self.actual_sqlite_busy()
         actual_proof = self.children._completed_result
         with patch.object(self.children.store, 'attach'), \
                 patch.object(self.children, '_await_window', side_effect=self.original), \
-                patch.object(self.kernel, 'get', side_effect=raw) as read, \
+                patch.object(factual, '_read_child_snapshot', side_effect=raw) as read, \
                 patch.object(self.children, '_completed_result', wraps=actual_proof) as proof:
             with self.assertRaises(ChildExecutionError) as caught:
                 self.await_after_attachment()
@@ -149,10 +178,11 @@ class ChildDeliveryDiagnosticsTests(unittest.TestCase):
         self.assertIsNone(caught.exception.__cause__)
 
     def test_permanent_proof_error_propagates_instead_of_becoming_wait_error(self):
+        self.admit_actual_child()
         permanent = sqlite3.OperationalError('no such table: required_authority')
         with patch.object(self.children.store, 'attach'), \
                 patch.object(self.children, '_await_window', side_effect=self.original), \
-                patch.object(self.kernel, 'get', side_effect=permanent):
+                patch.object(factual, '_read_child_snapshot', side_effect=permanent):
             with self.assertRaises(sqlite3.OperationalError) as caught:
                 self.await_after_attachment()
         self.assertIs(caught.exception, permanent)
@@ -162,7 +192,7 @@ class ChildDeliveryDiagnosticsTests(unittest.TestCase):
         self.kernel.cancel('parent', lease=self.lease, reason='actual parent revoked')
         with patch.object(self.children.store, 'attach'), \
                 patch.object(self.children, '_await_window', side_effect=self.original), \
-                patch.object(self.kernel, 'get', wraps=self.kernel.get) as read:
+                patch.object(factual, '_read_child_snapshot', wraps=factual._read_child_snapshot) as read:
             with self.assertRaises(ChildExecutionError) as caught:
                 self.await_after_attachment()
         self.assertEqual(caught.exception.code, 'parent_authority_revoked')

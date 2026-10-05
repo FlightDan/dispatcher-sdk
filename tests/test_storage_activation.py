@@ -84,7 +84,7 @@ class IdentityRegistryActivationTests(unittest.TestCase):
         # Isolate activation's sandbox boundary from deployment fingerprinting
         # and authenticated snapshot creation. The registry itself is real SQL.
         self.inspection = {
-            "complete": True, "kernel_schema": 4, "orchestrator_schema": "absent",
+            "complete": True, "kernel_schema": 5, "orchestrator_schema": "absent",
             "inbox_schema": "absent", "sandbox_schema": "absent",
             "sandbox_registry_schema": 1, "issues": [],
             "checks": {"integrity": "ok", "bindings": "checked"},

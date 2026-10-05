@@ -18,6 +18,7 @@ from dispatcher_sdk.execution_kernel.contracts import ExecutionLease, ExecutionR
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
 from dispatcher_sdk.execution_kernel.settlement import (
     SettlementBindingError, SettlementBusyError, SettlementConflictError, SettlementJournal,
+    merge_diagnostic_notes,
 )
 from tests._acceptance_evidence import retained_directory
 from tests._storage_evidence import StorageEvidence
@@ -317,6 +318,45 @@ except BaseException as error:
         terminal = self.journal.settle(receipt, "recorded", {"kernel_revision": 4})
         self.journal.note(lease(), "late_diagnostic", {"raw": "late fact"})
         self.assertEqual(self.journal.inspect("execution"), [terminal])
+
+    def test_delayed_cancellation_notes_keep_capture_order_after_reopen(self):
+        captured = time.time() - 20
+        requested = self.journal.note(lease(), "cancellation_requested",
+            {"captured_at": captured, "observed_at": captured + 5})
+        authority = self.journal.note(lease(), "cancellation_authority_revoked",
+            {"captured_at": captured + 1})
+        cleanup = self.journal.note(lease(), "process_cleanup",
+            {"state": "confirmed", "captured_at": captured + 2})
+        legacy = self.journal.note(lease(), "legacy_phase", {"state": "confirmed"})
+        reopened = SettlementJournal.open_readonly(self.path,
+            source_id="store-original", kernel_path=self.kernel_path)
+        report = {"identity": {"attempt": 1, "fence": 1}, "complete": True,
+            "processes": [{"process_id": "worker", "state": "alive"}]}
+        merge_diagnostic_notes(report, reopened.inspect_notes("execution"), process_freshness=3)
+        phases = {item["phase"]: item for item in report["phases"]}
+        for phase, receipt, expected in (
+            ("cancellation_requested", requested, captured),
+            ("cancellation_authority_revoked", authority, captured + 1),
+            ("process_cleanup", cleanup, captured + 2),
+            ("legacy_phase", legacy, legacy["created_at"]),
+        ):
+            self.assertEqual(expected, phases[phase]["captured_at"])
+            self.assertEqual(receipt["created_at"], phases[phase]["persisted_at"])
+            self.assertGreater(phases[phase]["persisted_at"], captured + 2)
+        self.assertEqual("exited", report["processes"][0]["state"])
+        self.assertEqual(captured + 2, report["processes"][0]["observed_at"])
+
+    def test_delayed_entry_note_does_not_make_old_process_observation_fresh(self):
+        captured = time.time() - 20
+        receipt = self.journal.note(lease(), "handler_entered",
+            {"worker_pid": os.getpid(), "observed_at": captured})
+        report = {"identity": {"attempt": 1, "fence": 1}, "complete": True}
+        merge_diagnostic_notes(report, self.journal.inspect_notes("execution"), process_freshness=3)
+        process = report["processes"][0]
+        self.assertEqual("unknown", process["state"])
+        self.assertEqual("process_observation_stale", process["unknown_reason"])
+        self.assertEqual(captured, process["observed_at"])
+        self.assertEqual(receipt["created_at"], process["persisted_at"])
 
     def test_notes_read_only_missing_store_and_unshipped_version_one_are_not_repaired(self):
         self.journal.note(lease(), "phase", {"raw": "fact"})

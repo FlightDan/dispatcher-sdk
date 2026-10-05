@@ -10,7 +10,7 @@ from typing import Optional
 from .errors import StorageIsolationError
 
 
-KERNEL_STORAGE_SCHEMA_VERSION = 4
+KERNEL_STORAGE_SCHEMA_VERSION = 5
 
 
 KERNEL_TABLES = frozenset(
@@ -27,6 +27,7 @@ KERNEL_TABLES = frozenset(
         "kernel_execution_limits",
         "kernel_supervision",
         "kernel_progress_keys",
+        "kernel_budget_samples",
     }
 )
 
@@ -337,6 +338,22 @@ SCHEMA_SQL = (KERNEL_SCHEMA_V3
               .replace("schema_version = 3", "schema_version = 4", 1)
               .replace("VALUES ('execution_kernel', 3)", "VALUES ('execution_kernel', 4)", 1)
               .replace("COMMIT;", SUPERVISION_SCHEMA_SQL + "COMMIT;", 1))
+KERNEL_SCHEMA_V4 = SCHEMA_SQL
+BUDGET_SAMPLE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS kernel_budget_samples (
+    token TEXT NOT NULL PRIMARY KEY CHECK (length(token) > 0),
+    execution_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (reason IN ('sampling','legacy_unprotected')),
+    FOREIGN KEY (execution_id) REFERENCES kernel_executions(execution_id)
+);
+CREATE INDEX IF NOT EXISTS kernel_budget_samples_execution
+    ON kernel_budget_samples(execution_id, token);
+"""
+KERNEL_INDEXES = KERNEL_INDEXES | {"kernel_budget_samples_execution"}
+SCHEMA_SQL = (KERNEL_SCHEMA_V4
+              .replace("schema_version = 4", "schema_version = 5", 1)
+              .replace("VALUES ('execution_kernel', 4)", "VALUES ('execution_kernel', 5)", 1)
+              .replace("COMMIT;", BUDGET_SAMPLE_SCHEMA_SQL + "COMMIT;", 1))
 
 
 def _schema_v2_from_v3() -> str:
@@ -380,6 +397,10 @@ KERNEL_SCHEMA_V2 = _schema_v2_from_v3()
 
 
 EXPECTED_COLUMNS = {
+    "kernel_budget_samples": (
+        ("token", "TEXT", 1, 1), ("execution_id", "TEXT", 1, 0),
+        ("reason", "TEXT", 1, 0),
+    ),
     "kernel_execution_limits": (
         ("execution_id", "TEXT", 1, 1), ("envelope_json", "TEXT", 1, 0),
         ("parent_execution_id", "TEXT", 0, 0), ("parent_attempt", "INTEGER", 0, 0),
@@ -468,7 +489,7 @@ EXPECTED_COLUMNS = {
 SQL_REQUIREMENTS = {
     "kernel_schema_meta": (
         "check(component='execution_kernel')",
-        "typeof(schema_version)='integer'andschema_version=4",
+        "typeof(schema_version)='integer'andschema_version=5",
     ),
     "kernel_clock": (
         "check(singleton=1)",
@@ -549,6 +570,7 @@ SQL_REQUIREMENTS = {
 
 
 EXPECTED_INDEX_SQL = {
+    "kernel_budget_samples_execution": "createindexkernel_budget_samples_executiononkernel_budget_samples(execution_id,token)",
     "kernel_executions_idempotency": "createuniqueindexkernel_executions_idempotencyonkernel_executions(idempotency_key)",
     "kernel_executions_claim": "createindexkernel_executions_claimonkernel_executions(state,registry_revision,next_attempt_at,created_at)",
     "kernel_managed_executions_run": "createindexkernel_managed_executions_runonkernel_managed_executions(run_id,generation,drain_allowed,execution_id)",
@@ -590,6 +612,7 @@ def validate_kernel_schema_v2(connection: sqlite3.Connection) -> None:
         "kernel_execution_limits",
         "kernel_supervision",
         "kernel_progress_keys",
+        "kernel_budget_samples",
     }
     actual_tables = {
         name
@@ -744,13 +767,75 @@ def upgrade_kernel_schema_v3_to_v4(connection: sqlite3.Connection) -> None:
         try:
             validate_kernel_schema_v3(connection)
             connection.execute("DROP TABLE kernel_schema_meta")
-            connection.execute(_schema_statement_for("kernel_schema_meta"))
+            connection.execute(_schema_statement_for("kernel_schema_meta", KERNEL_SCHEMA_V4))
             connection.execute(
                 "INSERT INTO kernel_schema_meta(component,schema_version) VALUES(?,?)",
-                ("execution_kernel", KERNEL_STORAGE_SCHEMA_VERSION),
+                ("execution_kernel", 4),
             )
             for name in ("kernel_execution_limits", "kernel_supervision", "kernel_progress_keys"):
-                connection.execute(_schema_statement_for(name))
+                connection.execute(_schema_statement_for(name, KERNEL_SCHEMA_V4))
+            validate_kernel_schema_v4(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        connection.row_factory = previous_row_factory
+
+
+def validate_kernel_schema_v4(connection: sqlite3.Connection) -> None:
+    """Accept the former exact layout only for an explicit private-copy upgrade."""
+    reference = sqlite3.connect(":memory:")
+    try:
+        reference.executescript(KERNEL_SCHEMA_V4)
+        query = "SELECT name,type,sql FROM sqlite_master WHERE name LIKE 'kernel_%'"
+        expected = {row[0]: (row[1], _normalize_sql(row[2] or "")) for row in reference.execute(query)}
+        actual = {row[0]: (row[1], _normalize_sql(row[2] or "")) for row in connection.execute(query)}
+        if actual != expected:
+            raise StorageIsolationError("Kernel v4 schema differs from its exact layout")
+        marker = connection.execute(
+            "SELECT component,schema_version,typeof(schema_version) FROM kernel_schema_meta").fetchall()
+        if len(marker) != 1 or tuple(marker[0]) != ("execution_kernel", 4, "integer"):
+            raise StorageIsolationError("invalid Kernel v4 schema marker")
+        clock = connection.execute(
+            "SELECT singleton,watermark,event_sequence FROM kernel_clock").fetchall()
+        if (len(clock) != 1 or clock[0][0] != 1
+                or type(clock[0][2]) is not int or clock[0][2] < 0
+                or not math.isfinite(float(clock[0][1])) or clock[0][1] < 0):
+            raise StorageIsolationError("invalid Kernel v4 clock")
+        maximum = connection.execute(
+            "SELECT COALESCE(MAX(sequence),0) FROM kernel_events").fetchone()[0]
+        if maximum != clock[0][2]:
+            raise StorageIsolationError("inconsistent Kernel v4 event sequence")
+    finally:
+        reference.close()
+
+
+def upgrade_kernel_schema_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """Add write-ahead clock guards; never infer missing historical samples.
+
+    Open historical budgets have no proof that a failed sampling write did not
+    lose a stronger floor. They remain inspectable and cleanable, but cannot
+    acquire a fresh business allowance in the upgraded copy.
+    """
+    if connection.in_transaction:
+        raise RuntimeError("Kernel schema upgrade requires an idle connection")
+    previous_row_factory = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            validate_kernel_schema_v4(connection)
+            connection.execute("DROP TABLE kernel_schema_meta")
+            connection.execute(_schema_statement_for("kernel_schema_meta"))
+            connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',5)")
+            connection.execute(_schema_statement_for("kernel_budget_samples"))
+            connection.execute(_schema_statement_for("kernel_budget_samples_execution"))
+            connection.execute(
+                "INSERT INTO kernel_budget_samples(token,execution_id,reason) "
+                "SELECT 'legacy:' || l.execution_id,l.execution_id,'legacy_unprotected' "
+                "FROM kernel_execution_limits l JOIN kernel_executions e ON e.execution_id=l.execution_id "
+                "WHERE e.state IN ('queued','leased','running','recovery_required')")
             validate_schema(connection, KERNEL_TABLES)
             connection.commit()
         except BaseException:
@@ -795,6 +880,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
 
 def _table_columns(connection: sqlite3.Connection, table: str) -> tuple[tuple, ...]:
     statements = {
+        "kernel_budget_samples": "PRAGMA table_info(kernel_budget_samples)",
         "kernel_schema_meta": "PRAGMA table_info(kernel_schema_meta)",
         "kernel_clock": "PRAGMA table_info(kernel_clock)",
         "kernel_run_controls": "PRAGMA table_info(kernel_run_controls)",
@@ -887,6 +973,7 @@ def validate_schema(
 def install_authorizer(connection: sqlite3.Connection):
     read_tables = KERNEL_TABLES | {"sqlite_master", "sqlite_schema"}
     insert_tables = {
+        "kernel_budget_samples",
         "kernel_run_controls",
         "kernel_managed_executions",
         "kernel_executions",
@@ -981,7 +1068,7 @@ def install_authorizer(connection: sqlite3.Connection):
             elif action == sqlite3.SQLITE_UPDATE:
                 allowed = second in update_columns.get(first or "", set())
             else:
-                allowed = False
+                allowed = first == "kernel_budget_samples"
             return sqlite3.SQLITE_OK if allowed else sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 

@@ -51,6 +51,14 @@ Use `ScriptSpec` to select source, interpreter, working directory, and log paths
 Read [script contracts](../docs/SDK_SCRIPT_WAKEUPS.md) before interpreting logs
 or handling an interrupted script.
 
+For persisted output, tool activity, waits or application progress, report through
+`HandlerContext.activity`. Read `Task.observe()` and `Task.events()` to inspect
+saved facts; those reads do not claim work or change its deadline. The
+[execution activity guide](../docs/EXECUTION_OBSERVABILITY.md) describes inherited
+budgets, bounded child calls and the opt-in stall workflow. Apply a derived budget
+at the actual provider request and its blocking wait; deriving it alone does not
+supervise an external call.
+
 ## 4. Accept notifications durably
 
 Register the application's conversation or task identity as the watch target.
@@ -73,4 +81,3 @@ Submit the next dispatch, bounded repair attempt, wait release, or Run finish
 explicitly. On a revision conflict, reload state and recompute the decision.
 See [output validation and rework](../docs/SDK_OUTPUT_CONTRACTS.md) and
 [contracts](CONTRACTS.md) before adding retries or recovery.
-

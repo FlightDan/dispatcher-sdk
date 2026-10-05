@@ -10,6 +10,7 @@ Use these APIs to inspect the deployment, consume events, and investigate work a
 | Persist-before-ACK event consumption | `ProjectionConsumer(...).drain(...)` |
 | Why a Run has no currently claimable work | `sdk.inspect_work_availability(run_id)` |
 | Cancellation phases, cleanup and recovery identities | `sdk.inspect_cancellation(run_id)` |
+| Persisted activity and event pages for a managed task | `task.observe()` and `task.events()` |
 
 Projection callbacks must commit idempotent destination writes before returning
 `persisted` or `already_present`. A failed page replays, poison events are not
@@ -20,6 +21,11 @@ Diagnostic queries do not synchronize or mutate the Run. They distinguish
 missing evidence from confirmed facts and report cross-store snapshot limitations.
 Work diagnostics bound their Effect scan; an exceeded budget yields an unknown
 count, not zero.
+
+Execution observations follow the same read-only rule. They report recorded facts
+without claiming work, renewing a lease or cleaning up a process. See [execution
+activity and supervision](../docs/EXECUTION_OBSERVABILITY.md) for deadlines,
+child calls and optional stall notifications.
 
 Runtime cancellation evidence can be persisted with explicit
 `cancellation_journal_path` and `source_id` options. Receipts use a separate SQLite

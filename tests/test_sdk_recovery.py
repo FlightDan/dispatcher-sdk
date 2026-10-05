@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import multiprocessing
 import os
 from pathlib import Path
@@ -35,12 +36,26 @@ def mutate_file(payload, context):
             os._exit(37)
         return {"receipt": payload["operation_id"], "content": "mutation\n"}
 
-    response = context.effects.execute_once(
-        payload["effect_id"], "append-file", payload, perform
-    )
-    if payload["crash_window"] == "after_commit" and context.lease.attempt == 1:
-        os._exit(38)
-    return response
+    # These cases witness an Effect crash with a confirmed clock. Exclude a
+    # concurrent monitor arm during that phase; a crash after an unconfirmed
+    # sampling marker must instead keep recovery fenced (covered separately).
+    gate = context._budget_lock if context.lease.attempt == 1 else nullcontext()
+    with gate:
+        if context.lease.attempt == 1:
+            capture = context._budget_capture
+            assert context._entry_confirmed, "fixture crashed before confirmed handler entry"
+            assert capture is None or capture._pending is None, "fixture has a pending clock fact"
+            with context._kernel._control_lock(.1):
+                guard = context._kernel._connection.execute(
+                    "SELECT token FROM kernel_budget_samples WHERE execution_id=? LIMIT 1",
+                    (context.lease.execution_id,)).fetchone()
+                assert guard is None, "fixture has an unresolved durable sampling guard"
+        response = context.effects.execute_once(
+            payload["effect_id"], "append-file", payload, perform
+        )
+        if payload["crash_window"] == "after_commit" and context.lease.attempt == 1:
+            os._exit(38)
+        return response
 
 
 # The same deployment and handler code is used before and after every restart.

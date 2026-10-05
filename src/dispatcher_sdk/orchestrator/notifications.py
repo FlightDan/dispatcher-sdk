@@ -82,6 +82,43 @@ class NotificationsMixin:
              attempt['command']['execution_id'], len(task['attempts']) - 1,
              generation, target, maximum))
 
+    def _notification_collection_ready(self):
+        """Advise the Host without writing an empty watch's delivery clock.
+
+        A false result only defers collection to the next existing poll. Events,
+        planned cancellations and live delivery rows still use the ordinary
+        collector's atomic cursor, notification and clock transaction.
+        """
+        connection = self._connect(configure=False)
+        try:
+            connection.execute('BEGIN')
+            watches = connection.execute(
+                'SELECT run_id,task_id,attempt,cursor FROM sdk_watches WHERE completed=0').fetchall()
+            if not watches:
+                return False
+            if self._notification_delivery_pending(connection):
+                return True
+            for watch in watches:
+                row = connection.execute(
+                    "SELECT value FROM sdk_run_items WHERE run_id=? AND section='attempt' AND item_key=?",
+                    (watch['run_id'], canonical([watch['task_id'], watch['attempt']]))).fetchone()
+                if row is None:
+                    return True
+                try:
+                    attempt = json.loads(row[0])
+                    if type(attempt['dispatched']) is not bool or type(attempt['state']) is not str:
+                        return True
+                    if not attempt['dispatched'] and attempt['state'] == 'cancelled':
+                        return True
+                except (ValueError, TypeError, KeyError):
+                    # An encoded or malformed legacy item belongs to the
+                    # ordinary decoder and its existing error path.
+                    return True
+        finally:
+            connection.close()
+        # Unrelated events matter too: collection advances the global cursor.
+        return bool(self.kernel.events_since(min(watch['cursor'] for watch in watches), 1))
+
     def collect_notifications(self, *, limit=100):
         """Read at most limit Kernel events per open watch; atomically queue/cursor.
 
@@ -273,6 +310,26 @@ class NotificationsMixin:
                 (now, notification_id))
             return self._notification_record(connection.execute(
                 'SELECT * FROM sdk_notifications WHERE notification_id=?', (notification_id,)).fetchone())
+
+    @staticmethod
+    def _notification_delivery_pending(connection):
+        return connection.execute(
+            "SELECT 1 FROM sdk_notifications WHERE state IN ('pending','delivering') "
+            "UNION ALL SELECT 1 FROM sdk_results WHERE state IN ('pending','delivering') "
+            "LIMIT 1").fetchone() is not None
+
+    def _notification_delivery_ready(self):
+        """Advise the Host whether polling needs the shared delivery clock.
+
+        Any pending or leased notification/result retains the original atomic
+        claim, including its rollback protection. A racing enqueue is observed
+        by the next existing Host wake/poll; this read never grants a lease.
+        """
+        connection = self._connect(configure=False)
+        try:
+            return self._notification_delivery_pending(connection)
+        finally:
+            connection.close()
 
     def deliver_notifications(self, callback, *, owner, lease_seconds=30, retry_delay=1, limit=1):
         """Invoke a synchronous application enqueue callback outside transactions.

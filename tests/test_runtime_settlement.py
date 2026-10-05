@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import threading
 import time
+import traceback
 import unittest
 from unittest.mock import patch
 
@@ -258,7 +259,7 @@ class RuntimeSettlementTests(unittest.TestCase):
         for field in ("automatic_activation", "automatic_cutover",
                       "external_stores_included", "observation_journal_included"):
             self.assertFalse(report[field])
-        self.assertEqual((report["source_version"], report["target_version"]), (4, 4))
+        self.assertEqual((report["source_version"], report["target_version"]), (5, 5))
         pending = SettlementJournal.open_readonly(journal_path, source_id=source_id,
             kernel_path=source, timeout_seconds=.5).inspect(name, timeout_seconds=.5)
         self.assertEqual(len(pending), 1)
@@ -326,6 +327,14 @@ class RuntimeSettlementTests(unittest.TestCase):
             self.assertEqual(receipts[0]["result"]["value"], {
                 "message": "actual handler returned while lifecycle was held"})
             driver.join(1)
+            frame = sys._current_frames().get(driver.ident)
+            (self.root / "lifecycle-caller.json").write_text(json.dumps({
+                "original_execution_timeout_seconds": command.timeout_seconds,
+                "original_receipt": receipts[0], "driver_alive": driver.is_alive(),
+                "driver_stack": [] if frame is None else traceback.format_stack(frame)[-12:],
+                "errors": [repr(error) for error in errors],
+                "returned_states": [result.state for result in results],
+            }, indent=2), encoding="utf-8")
             self.assertFalse(driver.is_alive(), "lifecycle contention still blocked the public caller")
             self.assertEqual(errors, [])
             self.assertEqual(results[0].state, "running")
@@ -407,7 +416,7 @@ class RuntimeSettlementTests(unittest.TestCase):
         self.assertEqual("superseded", receipts[0]["state"])
         self.assertEqual(1, len(calls.read_text().splitlines()))
 
-    def test_completion_clock_control_lock_timeout_retains_unknown_original_outcome(self):
+    def test_completion_clock_storage_timeout_retains_unknown_original_outcome(self):
         clock = Clock()
         captured, capture_done = [], threading.Event()
         original_capture = runtime_module._capture_completion_time
@@ -423,13 +432,27 @@ class RuntimeSettlementTests(unittest.TestCase):
             lease = runtime.kernel.get(command.execution_id).lease
             context = next(iter(runtime._thread_contexts.values()))
             with runtime.kernel._lock:
+                # The writer lock alone no longer blocks factual snapshots.
+                # Make clock storage genuinely unreadable during the original
+                # return capture, using a real rollback-journal writer.
+                connection = runtime.kernel._connection
+                connection.set_authorizer(lambda *args: sqlite3.SQLITE_OK)
+                try:
+                    self.assertEqual("delete", connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0])
+                finally:
+                    connection.set_authorizer(runtime.kernel._authorizer)
                 began = time.monotonic()
-                release.touch()
-                self.assertTrue(capture_done.wait(.25), "return-time capture waited on unbounded Kernel admission")
+                with closing(sqlite3.connect(runtime.kernel.db_path, timeout=0)) as writer:
+                    writer.execute("BEGIN EXCLUSIVE")
+                    try:
+                        release.touch()
+                        self.assertTrue(capture_done.wait(.25), "return-time capture exceeded its original admission bound")
+                    finally:
+                        writer.rollback()
                 self.assertFalse(captured[0][0]["completion_time_known"])
                 self.assertLess(captured[0][1], .25)
-                # Establish expired logical authority while the worker cannot
-                # read this connection, then roll wall time back before retry.
+                # Establish expiry only after the genuinely unreadable return
+                # point; later availability cannot recreate its original time.
                 with context._budget_lock:
                     old_wall = clock.value
                     clock.value = lease.expires_at + 1
@@ -454,7 +477,7 @@ class RuntimeSettlementTests(unittest.TestCase):
         self.assertFalse(raw["completion_time_known"])
         self.assertNotIn("completed_at", raw)
         self.assertEqual({"message": "actual handler returned while lifecycle was held"}, raw["value"])
-        self.assertIn("TimeoutError", raw["completion_time_error"])
+        self.assertEqual("OperationalError: database is locked", raw["completion_time_error"])
         self.assertEqual(1, len(calls.read_text().splitlines()))
 
     def test_cancel_wins_and_archives_original_outcome(self):

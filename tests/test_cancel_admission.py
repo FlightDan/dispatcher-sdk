@@ -372,6 +372,47 @@ class CancelAdmissionTests(unittest.TestCase):
             self.assertEqual(runtime.kernel.get('bounded').revision, queued.revision)
             self.evidence['records'].append({'scenario': 'bounded_local_failure_no_storage', 'report': report})
 
+    def test_successful_cancel_keeps_local_facts_when_optional_writers_exhaust_its_allowance(self):
+        writers = []
+        try:
+            for path in (self.runtime._settlement_journal.path, self.runtime.observation_journal.path):
+                writer = sqlite3.connect(path, timeout=.1)
+                writers.append(writer)
+                writer.execute('BEGIN IMMEDIATE')
+            before = time.monotonic()
+            with patch.object(self.runtime.kernel, 'cancel', side_effect=self.observed_cancel):
+                result = self.cancel(timeout=.3)
+            elapsed = time.monotonic() - before
+            self.assertEqual('cancelled', result.state)
+            self.assertEqual(1, len(self.calls))
+            # Two independently held writers must share the original allowance;
+            # each cancellation phase cannot start another pair of .1s waits.
+            self.assertLess(elapsed, .6)
+        finally:
+            for writer in writers:
+                try:
+                    writer.rollback()
+                finally:
+                    writer.close()
+        report = self.runtime.observe('parent')
+        local = report['local_cancellation_diagnostics']
+        self.assertFalse(report['complete'])
+        self.assertFalse(local['persisted'])
+        notes = {item['phase']: item for item in local['notes']}
+        self.assertEqual({'cancellation_requested', 'cancellation_authority_revoked',
+            'cancellation_process_cleanup', 'cancellation_remote_cleanup'}, set(notes))
+        for note in notes.values():
+            self.assertFalse(note['persisted'])
+            self.assertNotIn('persisted_at', note)
+            self.assertEqual({'execution_id': 'parent', 'attempt': self.lease.attempt,
+                'fence': self.lease.fence}, note['identity'])
+        self.assertLessEqual(notes['cancellation_requested']['captured_at'],
+                             notes['cancellation_authority_revoked']['captured_at'])
+        self.assertEqual([], self.runtime._settlement_journal.inspect_notes('parent')['notes'])
+        self.assertEqual('cancelled', self.runtime.kernel.get('parent').state)
+        self.evidence['records'].append({'scenario': 'successful_cancel_optional_writers_held',
+            'original_timeout': .3, 'elapsed': elapsed, 'report': report})
+
     def test_failed_cancel_historical_filters_and_restart_do_not_claim_durability(self):
         path = self.root/'historical.sqlite3'
         with Kernel.open_sqlite(path, {'unused': unused}, isolation_mode='thread') as runtime:

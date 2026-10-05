@@ -1,6 +1,7 @@
 """On-time Kernel results survive delayed child response publication."""
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import math
 import os
@@ -17,9 +18,10 @@ from unittest.mock import patch
 from tests._acceptance_evidence import retained_directory
 
 from dispatcher_sdk.execution_kernel import Kernel, HandlerExecutionError
+from dispatcher_sdk.execution_kernel import child_factual_read as factual
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, DeadlineConstraint, sample_clock
 from dispatcher_sdk.execution_kernel.children import HandlerChildren, ChildExecutionError, _RetryWindow, _Store
-from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, RetryPolicy
+from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, ExecutionResultV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.context import HandlerContext, HandlerEffects
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
 from dispatcher_sdk.observability import ObservationJournal
@@ -41,7 +43,23 @@ def parent(payload, context):
                                      request_id='delivery', timeout_seconds=payload.get('child_timeout', 2))
         return {'child': value}
     except ChildExecutionError as error:
+        if payload.get('parent_diagnostic_path'):
+            Path(payload['parent_diagnostic_path']).write_text(json.dumps({
+                'type': type(error).__module__ + '.' + type(error).__qualname__,
+                'message': str(error), 'code': error.code,
+                'traceback': traceback.format_exc(limit=16)[-16384:],
+            }, indent=2), encoding='utf-8')
         return {'code': error.code, 'message': str(error), 'child_error': error.result}
+    except Exception as error:
+        if payload.get('parent_diagnostic_path'):
+            Path(payload['parent_diagnostic_path']).write_text(json.dumps({
+                'type': type(error).__module__ + '.' + type(error).__qualname__,
+                'message': str(error), 'traceback': traceback.format_exc(),
+                'budget_sample_token': getattr(error, 'budget_sample_token', None),
+                'budget_sample_envelope': (None if getattr(error, 'budget_sample_envelope', None) is None
+                    else error.budget_sample_envelope.to_dict()),
+            }, indent=2), encoding='utf-8')
+        raise
 
 
 for handler in (parent, child):
@@ -54,14 +72,14 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
         from dispatcher_sdk.execution_kernel.errors import ExecutionNotFoundError
         root = retained_directory('sdk-child-delivery-writer-cutoff-')
         witness = SimpleNamespace(waiting=threading.Event(), resume=threading.Event(), row=None,
-                                  calls=[], outcomes=[], errors=[], rescues=[])
+                                  calls=[], outcomes=[], errors=[], rescues=[], writer={})
 
         def retain_observations():
             # Also runs when setup or a timing assertion fails before the
             # normal completed-result report can be assembled.
             path = root / 'observations.json'
             path.write_text(json.dumps({'row': witness.row, 'calls': witness.calls,
-                'errors': witness.errors, 'rescues': witness.rescues,
+                'errors': witness.errors, 'rescues': witness.rescues, 'writer': witness.writer,
                 'outcomes': [item.to_dict() for item in witness.outcomes]}, indent=2), encoding='utf-8')
             print('child_writer_cutoff_observations=' + str(path), flush=True)
 
@@ -87,9 +105,25 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
 
         def observe_rescue(capability, row, window):
             error = sys.exc_info()[1]
-            witness.rescues.append({'exception_type': type(error).__name__, 'message': str(error),
-                                   'code': getattr(error, 'code', None)})
-            return original_completed(capability, row, window)
+            owner = window._pending_sample_owner or window._capture
+            entry = {'exception_type': type(error).__name__, 'message': str(error),
+                'code': getattr(error, 'code', None), 'began': time.monotonic(),
+                'proof_deadline': window._delivery_deadline,
+                'window_budget': window.envelope.to_dict(),
+                'owner_pending': (None if owner is None or owner._pending is None else
+                    {'token': owner._pending[0], 'captured': None if owner._pending[1] is None
+                        else owner._pending[1].to_dict()})}
+            witness.rescues.append(entry)
+            try:
+                delivered = original_completed(capability, row, window)
+                entry['delivered'] = delivered
+                return delivered
+            except BaseException as proof_error:
+                entry['proof_error'] = {'type': type(proof_error).__name__,
+                    'message': str(proof_error), 'traceback': traceback.format_exc(limit=16)[-16384:]}
+                raise
+            finally:
+                entry['returned'] = time.monotonic()
 
         with Kernel.open_sqlite(root/'kernel.sqlite3', {'parent': actual_parent, 'child': actual_child},
                                isolation_mode='thread') as runtime:
@@ -125,13 +159,16 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                         BudgetEnvelope.from_dict(json.loads(witness.row['budget_json'])).constraints)
                     writer = sqlite3.connect(runtime.kernel.db_path, timeout=.1)
                     writer.execute('BEGIN IMMEDIATE')
+                    witness.writer['held_at'] = time.monotonic()
                     witness.resume.set()
                     time.sleep(max(0, cutoff - time.time() + .03))
                 finally:
                     witness.resume.set()
                     if writer is not None:
+                        witness.writer['release_started'] = time.monotonic()
                         writer.rollback()
                         writer.close()
+                        witness.writer['release_returned'] = time.monotonic()
                     driver.join(3)
             import dispatcher_sdk
             report = {'sdk_import': dispatcher_sdk.__file__, 'python': sys.executable,
@@ -140,7 +177,7 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                            'test_public_child_result_survives_kernel_writer_held_until_wait_cutoff -v',
                 'parent_timeout_seconds': 12, 'child_timeout_seconds': 5,
                 'cutoff': cutoff, 'child_result': child_result, 'calls': witness.calls,
-                'errors': witness.errors, 'rescue_original_errors': witness.rescues,
+                'errors': witness.errors, 'rescue_original_errors': witness.rescues, 'writer': witness.writer,
                 'parent': witness.outcomes[0].to_dict() if witness.outcomes else None}
             evidence = root/'evidence.json'
             evidence.write_text(json.dumps(report, indent=2), encoding='utf-8')
@@ -152,6 +189,8 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
             rescue = witness.rescues[0]
             if rescue['exception_type'] == 'ChildExecutionError':
                 self.assertEqual(rescue['code'], 'child_wait_timeout')
+            elif rescue['exception_type'] == 'BudgetClockUnknownError':
+                self.assertEqual(rescue['message'], 'budget_clock_sample_unresolved:sampling')
             else:
                 self.assertIn(rescue['exception_type'], ('OperationalError', 'TimeoutError'))
             self.assertEqual(witness.outcomes[0].state, 'succeeded', report)
@@ -210,7 +249,8 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                         root/'kernel.sqlite3', {'parent': parent, 'child': child},
                         isolation_mode='process', child_capacity=1) as runtime:
                     runtime.submit(runtime.command('parent', execution_id='parent', idempotency_key='parent',
-                        correlation_id='root', timeout_seconds=12, payload={'fail': fail, 'child_timeout': 5}))
+                        correlation_id='root', timeout_seconds=12, payload={'fail': fail, 'child_timeout': 5,
+                            'parent_diagnostic_path': str(root/'parent-exception.json')}))
                     import dispatcher_sdk
                     report = {'sdk_import': dispatcher_sdk.__file__, 'python': sys.executable,
                         'runtime_type': type(runtime).__module__ + '.' + type(runtime).__qualname__,
@@ -332,6 +372,21 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
             journal=journal)
         return kernel, context, capability
 
+    def complete_direct_child(self, kernel, context, *, not_before=None):
+        command = replace(context.command, execution_id='child', idempotency_key='child',
+                          causation_id='parent', timeout_seconds=2)
+        budget = context.budget_envelope.derive(source='tool', origin_id='actual-child', timeout_seconds=2)
+        kernel.submit_child(command, context.lease, budget)
+        lease = kernel.claim_and_start('child-owner', execution_id='child', child_pool=True)
+        snapshot = kernel.get('child')
+        if not_before is not None:
+            time.sleep(max(0., not_before-time.time()))
+        result = ExecutionResultV2('actual-child-result', 'child', 'succeeded', lease.attempt,
+            lease.fence, [], snapshot.started_at, kernel.current_time(),
+            command.correlation_id, command.causation_id, {'original': 42}, None)
+        kernel.complete(lease, result)
+        return result
+
     def test_parent_revocation_wins_without_reading_child(self):
         with tempfile.TemporaryDirectory() as directory:
             kernel, context, capability = self.direct(Path(directory))
@@ -342,7 +397,7 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                        'child_execution_id': 'unread-child', 'action': 'run'}
                 window = _RetryWindow(envelope, kernel)
                 kernel.cancel('parent', lease=context.lease, reason='test cancellation')
-                with patch.object(kernel, 'get', wraps=kernel.get) as read:
+                with patch.object(factual, '_read_child_snapshot', wraps=factual._read_child_snapshot) as read:
                     with self.assertRaises(ChildExecutionError) as caught:
                         capability._completed_result(row, window)
                     self.assertEqual(caught.exception.code, 'parent_authority_revoked')
@@ -353,13 +408,14 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
 
     def test_late_child_and_unknown_clock_are_not_delivered(self):
         from dispatcher_sdk.execution_kernel.budget import ClockCheckpoint, BudgetClockUnknownError
-        from types import SimpleNamespace
         for unknown in (False, True):
             with self.subTest(unknown=unknown), tempfile.TemporaryDirectory() as directory:
                 kernel, context, capability = self.direct(Path(directory))
                 try:
                     native = sample_clock()
                     envelope = BudgetEnvelope((DeadlineConstraint('tool', 'tool', native.wall_at + .1),), native)
+                    result = self.complete_direct_child(kernel, context, not_before=native.wall_at + .2)
+                    self.assertGreater(result.completed_at, envelope.constraints[0].work_deadline_at)
                     window = _RetryWindow(envelope, kernel)
                     if unknown:
                         envelope = BudgetEnvelope(envelope.constraints, ClockCheckpoint(
@@ -368,40 +424,38 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                     row = {'budget_json': json.dumps(envelope.to_dict()), 'parent_execution_id': 'parent',
                            'parent_attempt': context.lease.attempt, 'parent_fence': context.lease.fence,
                            'child_execution_id': 'child', 'action': 'observe'}
-                    result = SimpleNamespace(execution_id='child', attempt=1, fence=1,
-                        completed_at=native.wall_at + .2, to_dict=lambda: {})
-                    snapshot = SimpleNamespace(state='succeeded', result=result, attempt=1, fence=1)
-                    with patch.object(kernel, 'get', return_value=snapshot) as read:
+                    with patch.object(factual, '_read_child_snapshot', wraps=factual._read_child_snapshot) as read:
                         if unknown:
                             with self.assertRaises(BudgetClockUnknownError):
                                 capability._completed_result(row, window)
                             read.assert_not_called()
                         else:
                             self.assertIsNone(capability._completed_result(row, window))
-                            read.assert_called_once_with('child')
+                            read.assert_called_once()
                 finally:
                     context.close()
                     kernel.close()
 
     def test_parent_revoked_during_result_read_wins_within_the_same_control_budget(self):
-        from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as directory:
             kernel, context, capability = self.direct(Path(directory))
             try:
                 envelope = context.budget_envelope.derive(source='tool', origin_id='test-tool', timeout_seconds=1)
+                self.complete_direct_child(kernel, context)
                 row = {'budget_json': json.dumps(envelope.to_dict()), 'parent_execution_id': 'parent',
                        'parent_attempt': context.lease.attempt, 'parent_fence': context.lease.fence,
                        'child_execution_id': 'child', 'action': 'observe'}
                 window = _RetryWindow(envelope, kernel)
-                result = SimpleNamespace(execution_id='child', attempt=1, fence=1,
-                    completed_at=time.time(), to_dict=lambda: {'should_not_be_delivered': True})
-                def concurrent_cancel(execution_id):
+                actual_read = factual._read_child_snapshot
+                def concurrent_cancel(*args):
+                    result = actual_read(*args)
                     kernel.cancel('parent', lease=context.lease, reason='concurrent cancellation')
-                    return SimpleNamespace(state='succeeded', result=result, attempt=1, fence=1)
-                with patch.object(kernel, 'get', side_effect=concurrent_cancel):
+                    return result
+                with patch.object(factual, '_read_child_snapshot', side_effect=concurrent_cancel) as read:
                     with self.assertRaises(ChildExecutionError) as caught:
                         capability._completed_result(row, window)
                     self.assertEqual(caught.exception.code, 'parent_authority_revoked')
+                    read.assert_called_once()
             finally:
                 context.close()
                 kernel.close()
@@ -433,7 +487,10 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                 kernel, context, capability = self.direct(Path(directory))
                 try:
                     envelope = context.budget_envelope.derive(source='tool', origin_id='live', timeout_seconds=1)
-                    row = {'budget_json': json.dumps(envelope.to_dict())}
+                    row = {'budget_json': json.dumps(envelope.to_dict()),
+                           'parent_execution_id': context.command.execution_id,
+                           'parent_attempt': context.lease.attempt,
+                           'parent_fence': context.lease.fence}
                     with patch.object(capability.store, 'attach'), patch.object(capability, '_await_window',
                             side_effect=error), patch.object(capability, '_completed_result') as rescue:
                         with self.assertRaises(type(error)) as caught:

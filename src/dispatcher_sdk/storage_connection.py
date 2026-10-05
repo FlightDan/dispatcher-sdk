@@ -62,3 +62,28 @@ def connect(
     except BaseException:
         participation.__exit__(None, None, None)
         raise
+
+
+def _connect_readonly(database: str | os.PathLike[str], *, timeout: float = 0,
+                      check_same_thread: bool = True) -> sqlite3.Connection:
+    """Own a file reader's maintenance receipt until SQLite actually closes.
+
+    Readonly URI admission cannot create a missing store. Failed close retains
+    the same connection-owned receipt, as it does for SDK writer connections.
+    Opting out of thread affinity requires serialized use and positive proof
+    that the reader body has left before another thread retries close.
+    """
+    path = Path(database).expanduser().resolve(strict=False)
+    _assert_not_retired(path)
+    participation = storage_participant(path, timeout=0)
+    participation.__enter__()
+    try:
+        _assert_not_retired(path)
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True,
+            factory=_ParticipatingConnection, timeout=timeout, isolation_level=None,
+            check_same_thread=check_same_thread)
+        connection._participation = participation
+        return connection
+    except BaseException:
+        participation.__exit__(None, None, None)
+        raise

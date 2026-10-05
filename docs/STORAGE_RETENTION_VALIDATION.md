@@ -1,5 +1,10 @@
 # Storage retention implementation validation
 
+The results below belong to the 2026-09-18 candidate. Current schema versions
+and supported copy upgrades are documented in
+[storage and upgrades](STORAGE_AND_UPGRADES.md); the current observability
+candidate has [separate acceptance evidence](EXECUTION_OBSERVABILITY_ACCEPTANCE.md).
+
 Date: 2026-09-18. Scope: the local development tree, not a released SDK or a
 production migration. The [implementation guide](STORAGE_RETENTION.md) separates
 available APIs from the [remaining roadmap](STORAGE_RETENTION_IMPROVEMENT_PLAN.md).

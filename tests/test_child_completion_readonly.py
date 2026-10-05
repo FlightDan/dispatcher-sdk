@@ -4,13 +4,16 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from tests._acceptance_evidence import retained_directory
 import unittest
 from unittest.mock import patch
 
+from dispatcher_sdk._inspection import InspectionBudgetExceeded
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope
+from dispatcher_sdk.execution_kernel import child_factual_read as factual
 from dispatcher_sdk.execution_kernel.children import ChildExecutionError, HandlerChildren, _RetryWindow
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, ExecutionResultV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.errors import StaleFenceError, StorageIsolationError
@@ -43,15 +46,24 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         path.write_text(json.dumps(self.evidence, indent=2), encoding='utf-8')
         print('child_completion_readonly_evidence=' + str(path), flush=True)
 
-    def completed_child(self):
+    def completed_child(self, *, failure=None):
         envelope = self.budget.derive(source='tool', origin_id='original-child-call', timeout_seconds=.5)
         command = replace(self.command, execution_id='child', idempotency_key='child', causation_id='parent')
         self.kernel.submit_child(command, self.lease, envelope)
         lease = self.kernel.claim_and_start('child-owner', execution_id='child', child_pool=True)
         snapshot = self.kernel.get('child')
-        result = ExecutionResultV2('original-child-result', 'child', 'succeeded',
-            lease.attempt, lease.fence, [], snapshot.started_at, self.wall[0],
-            'root', 'parent', {'original': 42}, None)
+        # Guard ACKs promote elapsed floors into the durable logical clock;
+        # a frozen raw wall sample can precede this actual claimed snapshot.
+        completed_at = self.kernel.current_time()
+        record = {'scenario': 'original_child_setup', 'frozen_wall': self.wall[0],
+            'claimed_snapshot': snapshot.to_dict(), 'logical_completed_at': completed_at,
+            'completion_clock_source': 'SQLiteKernel.current_time',
+            'original_budget': envelope.to_dict()}
+        self.evidence['records'].append(record)
+        result = ExecutionResultV2('original-child-result', 'child', 'succeeded' if failure is None else 'failed',
+            lease.attempt, lease.fence, [], snapshot.started_at, completed_at,
+            'root', 'parent', {'original': 42} if failure is None else None, failure)
+        record['original_result'] = result.to_dict()
         self.kernel.complete(lease, result)
         row = {'budget_json': json.dumps(envelope.to_dict()), 'parent_execution_id': 'parent',
             'parent_attempt': self.lease.attempt, 'parent_fence': self.lease.fence,
@@ -68,17 +80,29 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         before = self.watermark()
         writer = sqlite3.connect(self.kernel.db_path, timeout=.1)
         writer.execute('BEGIN IMMEDIATE')
-        statements, calls = [], []
+        statements, reader_statements, calls = [], [], []
         self.kernel._connection.set_trace_callback(statements.append)
-        readonly = self.kernel._verify_active_lease_readonly
-        def observe(lease):
-            calls.append(self.kernel._control_deadline)
-            return readonly(lease)
+        connect, read_floor = factual._connect_readonly, factual._read_floor
+        def observe_connection(*args, **kwargs):
+            connection = connect(*args, **kwargs)
+            connection.set_trace_callback(reader_statements.append)
+            return connection
+        def observe_floor(connection, lease, budget, **kwargs):
+            calls.append(budget.deadline)
+            return read_floor(connection, lease, budget, **kwargs)
         try:
             # Actual contention remains held throughout the expired original
             # child-call window and both fresh parent observations.
-            time.sleep(window.remaining() + .01)
-            with patch.object(self.kernel, '_verify_active_lease_readonly', side_effect=observe), \
+            original_deadline = window.deadline
+            time.sleep(max(0., original_deadline - time.monotonic()) + .01)
+            before_delivery = time.monotonic()
+            self.evidence['records'].append({'scenario': 'held_writer_original_cutoff_aging',
+                'original_native_deadline': original_deadline,
+                'before_completed_result': before_delivery,
+                'cutoff_has_passed': before_delivery >= original_deadline})
+            with patch.object(factual, '_connect_readonly', side_effect=observe_connection), \
+                    patch.object(factual, '_read_floor', side_effect=observe_floor), \
+                    patch.object(factual, '_read_child_snapshot', wraps=factual._read_child_snapshot) as child_read, \
                     patch.object(self.kernel, 'verify', side_effect=AssertionError('business verify invoked')):
                 started = time.monotonic()
                 delivered = self.children._completed_result(row, window)
@@ -86,15 +110,19 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
             after = self.watermark()
             self.assertEqual(delivered, result.to_dict())
             self.assertEqual(before, after)
-            self.assertEqual(len(calls), 2)
-            self.assertEqual(calls[0], calls[1])
+            child_read.assert_called_once()
+            self.assertGreaterEqual(len(calls), 4)
+            self.assertEqual(len(set(calls)), 1)
             self.assertLess(elapsed, .1)
             self.assertFalse(self.kernel._connection.in_transaction)
             self.assertFalse(any(sql.lstrip().upper().startswith(('BEGIN', 'UPDATE', 'INSERT', 'DELETE'))
                                  for sql in statements), statements)
+            self.assertFalse(any(sql.lstrip().upper().startswith(('UPDATE', 'INSERT', 'DELETE'))
+                                 for sql in reader_statements), reader_statements)
             self.evidence['records'].append({'scenario': 'writer_held_after_original_cutoff',
                 'elapsed': elapsed, 'watermark_before': before, 'watermark_after': after,
                 'parent_read_deadlines': calls, 'statements': statements,
+                'readonly_statements': reader_statements,
                 'original_budget': original.to_dict(), 'delivered': delivered})
         finally:
             self.kernel._connection.set_trace_callback(None)
@@ -103,16 +131,117 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
 
     def test_fresh_final_parent_read_observes_actual_cancel_committed_during_child_read(self):
         row, window, _ = self.completed_child()
-        original_get = self.kernel.get
-        def cancel_between_reads(execution_id):
-            result = original_get(execution_id)
+        original_read = factual._read_child_snapshot
+        def cancel_between_reads(*args):
+            result = original_read(*args)
             with SQLiteKernel(self.kernel.db_path) as other:
                 other.cancel('parent', lease=self.lease, reason='concurrent parent cancellation')
             return result
-        with patch.object(self.kernel, 'get', side_effect=cancel_between_reads):
+        with patch.object(factual, '_read_child_snapshot', side_effect=cancel_between_reads) as child_read:
             with self.assertRaises(ChildExecutionError) as caught:
                 self.children._completed_result(row, window)
+            child_read.assert_called_once()
         self.assertEqual(caught.exception.code, 'parent_authority_revoked')
+
+    def test_shared_kernel_lock_cannot_block_independent_factual_result(self):
+        row, window, result = self.completed_child()
+        acquired, release = threading.Event(), threading.Event()
+        def hold_control():
+            with self.kernel._lock:
+                acquired.set()
+                release.wait(1)
+        holder = threading.Thread(target=hold_control)
+        holder.start()
+        try:
+            self.assertTrue(acquired.wait(.5))
+            window._delivery_deadline = time.monotonic() + .1
+            with patch.object(factual, '_read_child_snapshot', wraps=factual._read_child_snapshot) as read:
+                delivered = self.children._completed_result(row, window)
+                read.assert_called_once()
+            self.assertEqual(delivered, result.to_dict())
+            self.assertLess(time.monotonic(), window._delivery_deadline)
+        finally:
+            release.set()
+            holder.join(1)
+            self.assertFalse(holder.is_alive())
+
+    def final_sql_failure(self, *, exhaust_progress):
+        row, window, _ = self.completed_child()
+        time.sleep(max(0., window.deadline-time.monotonic())+.01)
+        original = ChildExecutionError('child_wait_timeout',
+            'child wait exhausted its inherited work window', execution_id='child')
+        actual_read, actual_floor = factual._read_child_snapshot, factual._read_floor
+        returned = False
+        raw_errors = []
+        record = {'scenario': 'actual_final_progress_timeout' if exhaust_progress else 'actual_final_permanent_sql',
+            'original_proof_seconds': .1, 'original_budget': json.loads(row['budget_json'])}
+        def read_once(*args):
+            nonlocal returned
+            snapshot = actual_read(*args)
+            returned = True
+            return snapshot
+        def final_sql(connection, lease, budget, **kwargs):
+            if not returned:
+                return actual_floor(connection, lease, budget, **kwargs)
+            # The actual reader's final BEGIN starts only after its sole child
+            # result read. Its installed progress handler owns this deadline.
+            self.assertTrue(connection.in_transaction)
+            record['proof_deadline'] = budget.deadline
+            try:
+                if exhaust_progress:
+                    connection.execute('WITH RECURSIVE work(value) AS '
+                        '(VALUES(0) UNION ALL SELECT value+1 FROM work) '
+                        'SELECT sum(value) FROM work').fetchone()
+                else:
+                    connection.execute('SELECT value FROM missing_required_authority').fetchone()
+            except sqlite3.OperationalError as error:
+                raw_errors.append(error)
+                record['raw_type'] = type(error).__name__
+                record['raw_message'] = str(error)
+                record['sqlite_errorcode'] = getattr(error, 'sqlite_errorcode', None)
+                record['stopped_reason'] = budget.stopped_reason
+                raise
+            self.fail('actual proof SQL unexpectedly completed')
+        try:
+            with patch('dispatcher_sdk.execution_kernel.children._RetryWindow', return_value=window), \
+                    patch.object(self.children.store, 'attach'), \
+                    patch.object(self.children, '_await_window', side_effect=original), \
+                    patch.object(factual, '_read_child_snapshot', side_effect=read_once) as read, \
+                    patch.object(factual, '_read_floor', side_effect=final_sql):
+                started = time.monotonic()
+                expected = ChildExecutionError if exhaust_progress else sqlite3.OperationalError
+                with self.assertRaises(expected) as caught:
+                    self.children._await(row)
+                record['elapsed'] = time.monotonic()-started
+                record['read_calls'] = read.call_count
+                read.assert_called_once()
+            self.assertEqual(len(raw_errors), 1)
+            if exhaust_progress:
+                self.assertIs(caught.exception, original)
+                self.assertIsInstance(caught.exception.__cause__, InspectionBudgetExceeded)
+                self.assertIs(caught.exception.__cause__.__cause__, raw_errors[0])
+                self.assertEqual(record['stopped_reason'], 'timeout')
+                self.assertGreaterEqual(time.monotonic(), record['proof_deadline'])
+                code = getattr(raw_errors[0], 'sqlite_errorcode', None)
+                if code is not None:
+                    self.assertEqual(code & 255, sqlite3.SQLITE_INTERRUPT)
+                else:
+                    self.assertEqual(str(raw_errors[0]), 'interrupted')
+            else:
+                self.assertIs(caught.exception, raw_errors[0])
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertIsNone(record['stopped_reason'])
+                self.assertIn('no such table', str(caught.exception))
+            self.assertLess(record['elapsed'], .2)
+            self.assertIsNone(window._delivery_deadline)
+        finally:
+            self.evidence['records'].append(record)
+
+    def test_real_final_progress_timeout_keeps_original_wait_and_interrupt_after_one_child_read(self):
+        self.final_sql_failure(exhaust_progress=True)
+
+    def test_real_final_permanent_sql_error_remains_raw_after_one_child_read(self):
+        self.final_sql_failure(exhaust_progress=False)
 
     def test_cancelled_and_revoked_parent_are_excluded_before_child_read(self):
         row, window, _ = self.completed_child()
@@ -122,7 +251,7 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
                     replace(self.lease, lease_id='revoked-lease'))
                 if cancelled:
                     self.kernel.cancel('parent', lease=self.lease, reason='parent cancelled')
-                with patch.object(self.kernel, 'get', wraps=self.kernel.get) as child_read:
+                with patch.object(factual, '_read_child_snapshot', wraps=factual._read_child_snapshot) as child_read:
                     with self.assertRaises(ChildExecutionError) as caught:
                         self.children._completed_result(row, window)
                     self.assertEqual(caught.exception.code, 'parent_authority_revoked')
@@ -135,7 +264,7 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
             self.kernel.verify(self.lease)
         advanced = self.watermark()
         self.wall[0] = self.budget.checkpoint.wall_at
-        with patch.object(self.kernel, 'get', wraps=self.kernel.get) as child_read:
+        with patch.object(factual, '_read_child_snapshot', wraps=factual._read_child_snapshot) as child_read:
             with self.assertRaises(ChildExecutionError) as caught:
                 self.children._completed_result(row, window)
             self.assertEqual(caught.exception.code, 'parent_authority_revoked')

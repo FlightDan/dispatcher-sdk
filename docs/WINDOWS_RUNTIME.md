@@ -11,6 +11,11 @@ console Python executable, and a file-backed SQLite database. The backend
 uses standard-library `ctypes` and Win32 Job Objects; it adds no Python runtime
 dependency.
 
+The native results in this guide are historical. The current `0.7.0.dev2`
+observability and managed-supervisor candidate still needs native Windows
+acceptance; [the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md) tracks
+that matrix separately.
+
 ## Containment and startup
 
 `CreateProcessW` receives `CREATE_SUSPENDED` and the extended
@@ -41,8 +46,9 @@ unpickling remain bounded by the startup timeout.
 Revocation, termination, process waits, and handle closure share a lock.
 Termination uses `TerminateJobObject`, polls Job accounting until the active
 process count reaches zero, and waits for worker process exit. A successful
-outcome is accepted only after this containment completes within the execution
-deadline. Even successful handlers have leftover child processes terminated.
+outcome requires confirmed containment. The current inherited
+work and hard deadlines, including reserved cleanup time, are described in
+[execution budgets](EXECUTION_OBSERVABILITY.md#use-the-execution-budget). Even successful handlers have leftover child processes terminated.
 Cleanup failures raise an error and prevent publication of a successful
 execution result.
 

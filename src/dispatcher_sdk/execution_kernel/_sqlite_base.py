@@ -85,6 +85,8 @@ class SQLiteBase:
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._budget_sample_owners: dict[str, Any] = {}
+        self._connection_closed = False
         self._connection = storage_connect(
             self.db_path,
             timeout=SQLITE_OPEN_TIMEOUT_SECONDS if self._default_control_timeout is None else self._default_control_timeout,
@@ -116,8 +118,22 @@ class SQLiteBase:
             raise
 
     def close(self) -> None:
-        with self._lock:
+        if self._connection_closed:
+            return
+        deadline = time.monotonic() + .1
+        drain = getattr(self, "_drain_budget_samples", None)
+        if drain is not None:
+            drain(deadline)
+        if not self._lock.acquire(timeout=max(0., deadline - time.monotonic())):
+            raise TimeoutError("Kernel close admission timed out")
+        try:
+            if self._budget_sample_owners:
+                from .budget import BudgetClockUnknownError
+                raise BudgetClockUnknownError("budget_clock_cleanup_pending")
             self._connection.close()
+            self._connection_closed = True
+        finally:
+            self._lock.release()
 
     def __enter__(self):
         return self
@@ -229,11 +245,15 @@ class SQLiteBase:
                 return
             if deadline <= time.monotonic():
                 raise TimeoutError("Kernel control admission budget elapsed")
-            with self._busy_timeout_access():
-                old_timeout = self._connection.execute("PRAGMA busy_timeout").fetchone()[0]
-                # SQLite's native busy handler counts requested sleep lengths,
-                # not elapsed wall time. Keep bounded admission in Python.
-                self._connection.execute("PRAGMA busy_timeout=0")
+            if previous_deadline is None:
+                # A bounded outer section already owns timeout zero. Nested
+                # sections only tighten the deadline, retaining SQL authority
+                # and avoiding redundant authorizer/cache resets.
+                with self._busy_timeout_access():
+                    old_timeout = self._connection.execute("PRAGMA busy_timeout").fetchone()[0]
+                    # SQLite's native busy handler counts requested sleep lengths,
+                    # not elapsed wall time. Keep bounded admission in Python.
+                    self._connection.execute("PRAGMA busy_timeout=0")
             yield
         finally:
             try:
@@ -245,7 +265,8 @@ class SQLiteBase:
                 self._lock.release()
 
     @contextmanager
-    def _transaction(self, *, timeout_seconds: float | None = None) -> Iterator[tuple[sqlite3.Connection, float]]:
+    def _transaction(self, *, timeout_seconds: float | None = None,
+                     _observe_clock: bool = True) -> Iterator[tuple[sqlite3.Connection, float]]:
         with self._control_lock(timeout_seconds):
             deadline = self._control_deadline
             busy_error = None
@@ -270,7 +291,14 @@ class SQLiteBase:
                     if busy_error is not None:
                         raise busy_error
                     raise TimeoutError("Kernel control admission budget elapsed")
-                timestamp = self._advance_clock(self._connection)
+                if _observe_clock:
+                    timestamp = self._advance_clock(self._connection)
+                else:
+                    row = self._connection.execute(
+                        "SELECT watermark FROM kernel_clock WHERE singleton=1").fetchone()
+                    if row is None:
+                        raise RuntimeError("kernel logical clock row is missing")
+                    timestamp = self._number(row[0], "clock watermark", minimum=0.0)
                 self._connection.execute("SAVEPOINT kernel_operation")
             except BaseException:
                 self._connection.rollback()
@@ -286,8 +314,19 @@ class SQLiteBase:
                     self._connection.rollback()
                 raise
             else:
-                self._connection.execute("RELEASE kernel_operation")
-                self._connection.commit()
+                try:
+                    self._connection.execute("RELEASE kernel_operation")
+                    self._connection.commit()
+                except BaseException:
+                    # A failed/interrupted COMMIT may leave the write
+                    # transaction active. Preserve the original failure while
+                    # releasing only a transaction that did not commit.
+                    if self._connection.in_transaction:
+                        try:
+                            self._connection.rollback()
+                        except BaseException:
+                            pass
+                    raise
 
     @staticmethod
     def _cas(cursor: sqlite3.Cursor, operation: str) -> None:
@@ -375,6 +414,14 @@ class SQLiteBase:
         if type(lease) is not ExecutionLease:
             raise TypeError("operation requires ExecutionLease")
         row = self._get_row(connection, lease.execution_id)
+        return self._assert_lease_row(row, lease, timestamp=timestamp,
+            states=states, settlement=settlement)
+
+    def _assert_lease_row(self, row, lease: ExecutionLease, *, timestamp: float,
+                          states: Optional[set[str]] = None, settlement: bool = False):
+        """Apply the same lease authority checks to an already read row."""
+        if type(lease) is not ExecutionLease:
+            raise TypeError("operation requires ExecutionLease")
         context = {
             "execution_id": lease.execution_id,
             "lease_id": lease.lease_id,

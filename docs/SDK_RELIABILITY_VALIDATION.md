@@ -1,5 +1,11 @@
 # Reliability repair validation
 
+This is a historical validation record for the 2026-09-19 candidate. Its suite
+limits and schema numbers describe that run, not the current development tree.
+See [the current API guide](SDK_RELIABILITY.md) and
+[observability acceptance](EXECUTION_OBSERVABILITY_ACCEPTANCE.md) for current
+contracts and outstanding checks.
+
 Date: 2026-09-19. Source: current 0.6.0 development tree, including existing
 schema 3 storage work. No release, production migration or ModPort database
 operation was performed. The [plan](SDK_RELIABILITY_REPAIR_PLAN.md) and
@@ -36,18 +42,18 @@ Actionable findings were reproduced and fixed:
   last two budget-boundary regressions are covered by the focused runs below.
 - Isolated packaging/installation rerun:
   `PYTHONPATH=src python3 -m unittest tests.test_execution_kernel_isolated_consumer -v`
-  — **2 tests passed in 353.898 seconds**. This rebuilds from the source archive,
+  **2 tests passed in 353.898 seconds**. This rebuilds from the source archive,
   installs the wheel into a fresh virtualenv, runs the final tree's installed
   full sub-suite (537 cases, excluding the 3 source-packaging and 2 isolation
   wrapper cases), and verifies durable Kernel/SDK consumer restart. The raw
   rerun log is `/tmp/dispatcher-reliability-isolated-rerun.log` for this session.
 - Final inspection regression:
   `PYTHONPATH=src python3 -m unittest tests.test_storage_preflight tests.test_runtime_identity tests.test_storage_usage -q`
-  — **51 tests passed**, including real SQLite interruption of `quick_check` and
+  **51 tests passed**, including real SQLite interruption of `quick_check` and
   `dbstat`, a 5,000-row no-history-scan trace, and final-row/fingerprint overruns.
 - Final identity/codec/origin regression:
   `PYTHONPATH=src python3 -m unittest tests.test_runtime_identity tests.test_content tests.test_execution_origins -q`
-  — **49 tests passed**. This includes aggregate referenced-object budgets,
+  **49 tests passed**. This includes aggregate referenced-object budgets,
   rejection before object-body fetch, invalid evidence and scoped cross-segment reads.
 - Shutdown regressions: **32 tests passed** across report/runtime/orchestrator
   suites; after adding the cleanup-failure/live-callback case, all **9 report

@@ -14,10 +14,15 @@ def double(payload, context):
     return payload * 2
 
 
-with Dispatcher("tasks.sqlite3", {"double": double}) as app:
-    task = app.submit("double", 21, request_id="message-42")
-    result = task.wait(timeout=10)
-    print(result["value"])
+def main():
+    with Dispatcher("tasks.sqlite3", {"double": double}) as app:
+        task = app.submit("double", 21, request_id="message-42")
+        result = task.wait(timeout=10)
+        print(result["value"])
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 `request_id` 应来自应用已有的持久身份。相同 ID 和内容会返回原任务；内容变化时抛出
@@ -26,6 +31,10 @@ with Dispatcher("tasks.sqlite3", {"double": double}) as app:
 
 默认使用进程隔离。它能终止受监督的可信代码，但不会限制文件和网络权限。
 线程模式需要显式开启，而且无法强制停止阻塞调用。
+
+`task.observe()` 和 `task.events()` 只读取已保存的执行事实，不会领取任务或修改时限。
+Handler 可以通过 `context.activity` 报告输出、等待状态和进度；停滞策略默认关闭，需显式配置。
+报告与恢复规则（包括预留容量的托管处理器）见[执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md)。
 
 ## 处理结果
 

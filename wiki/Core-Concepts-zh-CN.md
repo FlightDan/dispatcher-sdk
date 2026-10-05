@@ -11,11 +11,13 @@
 | Run / task | Run 组织一组应用工作；task 记录依赖关系和业务尝试。 |
 | Host | 在宿主进程保持运行时，驱动任务执行和结果投递。 |
 | Effect | 保存外部操作的意图和回执，供应用显式恢复。 |
-| Recovery / generation | Recovery 重新打开已结束的 Run；generation 用来区分恢复前后的工作。 |
+| Recovery / generation | Recovery 只重新打开符合条件的失败或取消 Run；generation 用来区分恢复前后的工作。 |
 | 通知 / 收件箱 | 通知把结果投递给应用；持久化收件箱负责接收通知并去重。 |
+| 观测 / 预算 | 观测报告已保存的执行事实；预算记录约束工作的时限。 |
 
-普通本地任务可以直接调用 `Dispatcher.submit()`。它会创建 Run 和 task，启动后台
-Host，并返回持久化的 `Task` 句柄。应用可以等待结果，也可以消费已保存的结果通知。
+启动 `Dispatcher` 后，调用 `Dispatcher.submit()` 会创建 Run 和 task、唤醒后台 Host，
+并返回持久化的 `Task` 句柄。可用 `app.start()` 或 `with` 语句启动 Dispatcher。
+应用可以等待结果，也可以消费已保存的结果通知。
 用法见[托管任务](Managed-Tasks-zh-CN.md)。
 
 需要任务依赖、等待条件、显式恢复或控制 Run 决策时，再使用底层流程：创建 Run，记录
@@ -36,9 +38,13 @@ Host，并返回持久化的 `Task` 句柄。应用可以等待结果，也可�
 结果不确定的外部操作，应先根据证据核对，再决定是否重试。
 
 Effect 恢复和 Run 恢复处理的问题不同。Effect 恢复用于核定一次结果不确定的外部操作。
-Run 恢复保留原有身份和历史，再以新的 generation 重新打开失败或取消的 Run。
+Run 恢复保留原有身份和历史，再以新的 generation 重新打开符合条件的失败或取消的 Run。
 事件、尝试、结果和通知都会记录产生它们的 generation，因此迟到的第 0 代数据不会
 与恢复后的新工作混在一起。
+
+`Task.observe()` 和 `Task.events()` 只读取已保存的执行事实，不会领取任务或修改时限。
+Handler 通过 `HandlerContext.activity` 报告执行活动。观测的边界和可选停滞处理流程见
+[执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md)。
 
 详细规则见 [SDK 契约](../docs/SDK.md)、[恢复指南](../docs/SDK_RECOVERY.md)
 和[输出校验](../docs/SDK_OUTPUT_CONTRACTS.md)。

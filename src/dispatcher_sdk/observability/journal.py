@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import base64
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import json
 import math
 from pathlib import Path
@@ -316,6 +316,63 @@ class ObservationJournal:
             connection.close()
 
     @contextmanager
+    def _flush_anchor(self):
+        """Keep WAL admission warm only while its owning flusher is alive.
+
+        This idle readonly connection has no transaction or retained cursor.
+        Writes still use their original independent connections and durability.
+        Admission is best effort; failed physical close retains this worker's
+        ownership until the same connection actually closes.
+        """
+        connection = None
+        try:
+            budget = InspectionBudget(min(self.options.write_timeout,
+                                          self.options.query_timeout), None)
+            budget.check()
+            connection = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0)
+            budget.install(connection)
+            for statement in ("PRAGMA query_only=ON", "PRAGMA trusted_schema=OFF"):
+                with closing(connection.execute(statement)):
+                    budget.check()
+            with closing(connection.execute("PRAGMA journal_mode")) as cursor:
+                if cursor.fetchone() != ("wal",):
+                    raise ObservationError("observation flush anchor requires WAL mode")
+            with closing(connection.execute(
+                    "SELECT singleton=1 AND version=? AND kernel_path=? AND source_id=? "
+                    "FROM obs_meta LIMIT 2", (SCHEMA_VERSION, self.kernel_path, self.source_id))) as cursor:
+                if cursor.fetchall() != [(1,)]:
+                    raise ObservationError("observation flush anchor binding differs")
+            budget.check()
+            if connection.in_transaction:
+                raise ObservationError("observation flush anchor retained a transaction")
+            InspectionBudget.clear(connection)
+        except Exception:
+            # An optimization cannot prevent the ordinary independently
+            # bounded flusher from attempting its original telemetry work.
+            # Failed setup may still own an unfinished statement/snapshot;
+            # discard it before ordinary work, retaining the worker if that
+            # physical release itself is unresolved.
+            if connection is not None:
+                self._close_flush_anchor(connection)
+                connection = None
+        try:
+            yield
+        finally:
+            if connection is not None:
+                self._close_flush_anchor(connection)
+
+    @staticmethod
+    def _close_flush_anchor(connection) -> None:
+        while True:
+            try:
+                connection.close()
+                return
+            except Exception:
+                # No flush replay or new business allowance. Runtime keeps
+                # this live worker/storage/capacity charged until release.
+                time.sleep(.05)
+
+    @contextmanager
     def _read_connection(self, timeout: float, budget: InspectionBudget | None = None):
         budget = budget or InspectionBudget(positive(timeout, "timeout"), None)
         budget.check()
@@ -404,9 +461,10 @@ class ObservationJournal:
                                    (ended, ended, now, *_key(identity), wait_id))
 
     def phase(self, identity: ObservationIdentity, phase: str, *, captured_at: float | None = None,
-              details: Mapping[str, Any] | None = None, source_id: str = "runtime") -> None:
+              details: Mapping[str, Any] | None = None, source_id: str = "runtime",
+              timeout_seconds: float | None = None) -> None:
         identifier(phase, "phase")
-        with self._transaction() as (connection, now):
+        with self._transaction(timeout_seconds=timeout_seconds) as (connection, now):
             self._event(connection, identity, source_id, "phase", now if captured_at is None else captured_at,
                         {"phase": phase, "details": dict(details or {})}, now)
 
@@ -795,7 +853,8 @@ class ObservationJournal:
     def _bound_report(self, report: dict[str, Any], budget: InspectionBudget | None = None) -> dict[str, Any]:
         budget = budget or InspectionBudget(self.options.query_timeout, None)
         sections = ("metrics", "sources", "waits", "child_waits", "child_requests", "processes", "phases", "retired_sources", "tails",
-                    "diagnostics", "local_cancellation_diagnostics", "settlement_obligations", "result", "budget", "settlement", "supervision")
+                    "diagnostics", "local_cancellation_diagnostics", "settlement_obligations", "result", "budget", "settlement", "supervision",
+                    "output", "script_output_fact")
         original = {name: report[name] for name in sections if isinstance(report.get(name), (dict, list))}
         for name in original:
             report[name] = {} if isinstance(original[name], dict) else []

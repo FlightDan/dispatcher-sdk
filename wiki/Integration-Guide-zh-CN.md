@@ -11,6 +11,7 @@
 | 目标 | 先读 | 可运行示例 |
 | --- | --- | --- |
 | 运行一个托管本地任务 | [统一应用接口](../docs/MANAGED_APPLICATION.md) | [托管任务](../examples/managed_task.py) |
+| 查看执行活动并监督长时间任务 | [执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md) | [父子任务示例](../examples/execution_observability.py) |
 | 持久化执行函数 | [SDK](../docs/SDK.md) 与[公共 API](../docs/PUBLIC_API.md) | [重开后执行排队任务](../examples/kernel_task.py) |
 | 使用可重放身份提交任务 | [原子任务提交](../docs/TASK_SUBMISSION.md) | 该指南中的完整示例 |
 | 执行脚本并通知 Agent | [脚本与唤醒](../docs/SDK_SCRIPT_WAKEUPS.md)、[持久化收件箱](../docs/NOTIFICATION_INBOX.md) | [脚本回调](../examples/sdk_script_wakeup.py) |
@@ -45,8 +46,8 @@
 不能重新打开。
 
 恢复进度会持久化。进程重启后，Host 可以继续处理 prepared 或 committed 记录。
-当前 Orchestrator 使用 schema 3。旧 schema 2 数据库需要显式准备并复制升级，
-不能直接当作当前写库打开。具体步骤以存储指南为准。
+当前 Orchestrator 使用 schema 4。旧存储需要按存储指南支持的步骤预检并复制升级，
+不能直接当作当前写库打开。
 
 复用旧存储前先看[存储与升级](../docs/STORAGE_AND_UPGRADES.md)：
 0.7 不会自动迁移旧 Orchestrator 数据库。

@@ -3,8 +3,10 @@
 [English](Storage-and-Recovery.md) | [简体中文](Storage-and-Recovery-zh-CN.md) | [Home](Home.md)
 
 The 0.7 single-file deployment uses SQLite WAL with `synchronous=FULL` by
-default. Kernel schema remains 2, Orchestrator schema is 3, and the notification
-inbox has its own schema 1. Product version and storage schema are separate.
+default. The Kernel SQLite layout is schema 5, the Orchestrator store is schema
+4, and the notification inbox has its own schema 1. The public Kernel execution
+record contract is still version 2; contract versions and storage layouts are
+separate.
 
 Use `app.diagnostics()` or `dispatcher_sdk.diagnostics.inspect_diagnostics()`
 to inspect execution states, `recovery_required`, delivery and inbox backlog,

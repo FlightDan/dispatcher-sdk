@@ -35,12 +35,15 @@ and rerun the final checks when the candidate changes.
 | `python examples/dependent_tasks.py` | The application explicitly dispatches dependent work and finishes the Run; output is `Invoice total: 60`. |
 | `python examples/effect_recovery.py` | A real worker crash leaves an uncertain effect; evidence-based recovery succeeds without writing the receipt again. |
 | `python examples/sdk_script_wakeup.py` | A durable callback wakes `conversation-42` with state `succeeded` and script output `report ready`. Follow the script guide's platform requirements. |
+| `python examples/execution_observability.py` | A managed parent and child report persisted activity, process state and the execution budget through the public API. |
 | `python examples/durable_audit.py` | Assertions cover durable audit consumption, replay, and application-owned dependency approval. |
 | `python examples/isolation_timeout.py` | On Linux, the timed-out handler and child exit, then another task succeeds. |
 
 These examples validate their demonstrated paths using temporary data. They do
 not establish that your application's callbacks, external services, recovery
 policy, or deployment platform satisfy the same guarantees.
+The [execution observability acceptance index](../docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md)
+records current candidate evidence and remaining platform gates.
 
 ## Check the application's own boundaries
 

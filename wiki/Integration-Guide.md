@@ -2,7 +2,7 @@
 
 [English](Integration-Guide.md) | [简体中文](Integration-Guide-zh-CN.md) | [Home](Home.md)
 
-Choose the fewest integration steps that meet your application's needs.
+Choose the shortest integration path that meets your application's needs.
 
 Before connecting real work, review the [integration engineering principles](Engineering-Principles.md).
 They cover version identity, supervised lifetime, evidence levels, candidate
@@ -11,6 +11,7 @@ freezing and safe discovery without moving business policy into the SDK.
 | Goal | Start with | Working example |
 | --- | --- | --- |
 | Run one managed local task | [Managed application API](../docs/MANAGED_APPLICATION.md) | [Managed task](../examples/managed_task.py) |
+| Inspect activity and supervise long-running work | [Execution activity and supervision](../docs/EXECUTION_OBSERVABILITY.md) | [Parent/child example](../examples/execution_observability.py) |
 | Execute a function with persisted state | [SDK](../docs/SDK.md) and [public API](../docs/PUBLIC_API.md) | [Queued work after reopen](../examples/kernel_task.py) |
 | Submit a task with replayable identity | [Atomic task submission](../docs/TASK_SUBMISSION.md) | Complete example in that guide |
 | Execute a script and notify an Agent | [Scripts and wakeups](../docs/SDK_SCRIPT_WAKEUPS.md), [durable inbox](../docs/NOTIFICATION_INBOX.md) | [Script callback](../examples/sdk_script_wakeup.py) |
@@ -49,9 +50,9 @@ needs an authorization record. Successful Runs and Runs with a continuation
 cannot be reopened.
 
 Recovery progress is durable. The host can finish a prepared or committed
-record after a restart. Current Orchestrator stores use schema 3. A legacy
-schema 2 store needs explicit preparation and a copy upgrade; follow the storage
-guide instead of opening it as a current writer.
+record after a restart. Current Orchestrator stores use schema 4. Older stores
+need the preparation and copy-upgrade steps supported by the storage guide;
+never open an incompatible store as a current writer.
 
 Check [storage and upgrades](../docs/STORAGE_AND_UPGRADES.md) before reusing old
 stores; 0.7 does not automatically migrate old Orchestrator databases.

@@ -10,6 +10,7 @@ and parameter definitions.
 | Dispatch and completion | Explicitly dispatch successors and finish Runs. Settled dependencies can include failures; the application must check business acceptance. Open waits prevent finish but do not automatically prevent dispatch. | [SDK operations](../docs/SDK.md) |
 | LLM output | Validate exact enums in structured fields and the full application contract. Natural-language success claims and type annotations do not establish business acceptance. | [Output contracts](../docs/SDK_OUTPUT_CONTRACTS.md) |
 | Execution retry | `max_attempts` includes the first claim. Lease-expiry redelivery and ordinary retryable failures share this budget. Reopening the database does not replenish it. | [Recovery](../docs/SDK_RECOVERY.md) |
+| Observation and deadlines | Use persisted observations to inspect activity. They do not claim work or renew leases; derive and apply an execution budget at the actual provider call and blocking wait. | [Execution activity and supervision](../docs/EXECUTION_OBSERVABILITY.md) |
 | Business repair | Persist a separate repair budget. Use explicit `new_attempt` and `dispatch` with new execution/idempotency identities, after the previous attempt settles and while the Run is running. Revalidate repaired output. | [Output contracts](../docs/SDK_OUTPUT_CONTRACTS.md) |
 | External effects | Record recoverable operations through the Effect interface. Investigate uncertain outcomes with external evidence before resolving them. Arbitrary file writes and API calls are not guaranteed exactly once. | [Recovery](../docs/SDK_RECOVERY.md) |
 | Notifications | Durably deduplicate by stable source and notification identity before acknowledging delivery. Keep callback acceptance separate from processing. | [Notification inbox](../docs/NOTIFICATION_INBOX.md) |
@@ -28,6 +29,11 @@ delivery errors. A zero `flush()` count does not prove there are no pending
 messages. `sync()` observes execution facts; it does not reap leases or make
 business decisions. Use the inspection and recovery interfaces described in
 [SDK operations](../docs/SDK.md) and [recovery](../docs/SDK_RECOVERY.md).
+
+Activity, output, tool use and progress are separate signals. Logs and heartbeats
+do not renew a work deadline or count as application progress. Read the
+[execution activity guide](../docs/EXECUTION_OBSERVABILITY.md) before using them
+for supervision decisions.
 
 Interrupted scripts can enter `recovery_required` because script execution
 records an Effect. Verify external state before assuming a timeout or cancellation

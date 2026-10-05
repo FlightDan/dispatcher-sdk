@@ -8,6 +8,7 @@ These records intentionally do not change the public V2 execution contracts.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from fractions import Fraction
 import math
 import os
 from pathlib import Path
@@ -71,7 +72,10 @@ class ClockCheckpoint:
                 or self.domain_scope != sample.domain_scope
                 or sample.elapsed_at < self.elapsed_at):
             return None
-        result = max(sample.wall_at, self.wall_at + (sample.elapsed_at - self.elapsed_at))
+        try:
+            result = max(sample.wall_at, math.fsum((sample.elapsed_at, -self.elapsed_at, self.wall_at)))
+        except OverflowError:
+            return None
         return result if math.isfinite(result) else None
 
     def to_dict(self) -> dict[str, Any]:
@@ -291,7 +295,22 @@ class BudgetEnvelope:
         effective = self.checkpoint.effective_time(current)
         if effective is None:
             raise BudgetClockUnknownError("clock domain continuity cannot be established")
+        # Changing elapsed anchors must not round a protected floor downward.
+        # Keep exact anchors unchanged; round only an inexact lower result up.
+        exact = max(Fraction(current.wall_at), Fraction(self.checkpoint.wall_at)
+                    + Fraction(current.elapsed_at) - Fraction(self.checkpoint.elapsed_at))
+        effective = float(exact)
+        if Fraction(effective) < exact:
+            effective = math.nextafter(effective, math.inf)
+            if not math.isfinite(effective):
+                raise BudgetClockUnknownError("clock floor cannot be represented conservatively")
         return replace(self, checkpoint=replace(current, wall_at=effective))
+
+    def with_clock_floor(self, checkpoint: ClockCheckpoint) -> BudgetEnvelope:
+        """Merge clock evidence without inheriting another owner's constraints."""
+        if checkpoint.elapsed_at >= self.checkpoint.elapsed_at:
+            return self.recheckpoint(sample=checkpoint)
+        return replace(self, checkpoint=checkpoint).recheckpoint(sample=self.checkpoint)
 
     def enter_handler(self, timeout_seconds: float, *, origin_id: str,
                       reserve_seconds: float = 0.0,

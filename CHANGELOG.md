@@ -1,6 +1,27 @@
 # Changelog
 
-## 0.7.0.dev0 (in development)
+## 0.7.0.dev2 (in development)
+
+- Kernel storage uses layout schema 5 and Orchestrator storage uses schema 4.
+  Kernel execution records retain their public v2 contract.
+- Execution activity records handler entry, output, waits, tool and model use,
+  progress, and bounded script-output facts. Read APIs remain separate from
+  execution control. Durable sampling guards keep recovery from restoring time
+  after an interrupted or unacknowledged clock sample.
+- Bounded child-result recovery uses a read-only final check of the parent,
+  child and ancestry after its one result read. It can return a result completed
+  within the original window without rerunning business work or extending its
+  budget; publication acknowledgement remains a separate obligation.
+- Optional managed stall supervision reserves independent capacity and enforces
+  native memory limits. It preserves the original notice and business budgets
+  and reports capacity shortages and pending cleanup. Linux limits worker address
+  space; Windows uses Job committed-memory limits. Native Windows acceptance is
+  still pending.
+- See [execution activity and supervision](docs/EXECUTION_OBSERVABILITY.md) and
+  the [acceptance index](docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md) for behavior,
+  validation evidence and remaining gates.
+
+## 0.7.0.dev0
 
 - `Dispatcher` is the primary managed application entry point: stable request
   submission, startup binding checks, owned Host lifecycle and durable inbox.

@@ -108,7 +108,8 @@ adjacent continuation IDs. It does not construct an Orchestrator writer, load a
 whole Run or traverse filesystem catalogs. Same-store continuation keeps execution
 identity queryable without copying descriptors into each new segment.
 
-The reader targets the current schema 3 layout. Payload bytes, SQL work and elapsed
+The reader targets the current Orchestrator schema 4 layout; older stores need
+the documented explicit copy upgrade. Payload bytes, SQL work and elapsed
 time have explicit limits; content-object decoding participates in payload limits.
 The encoded-byte allowance is cumulative across roots and referenced objects,
 as is the separate logical-payload allowance. The content codec exposes

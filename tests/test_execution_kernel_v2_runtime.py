@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import multiprocessing
 from multiprocessing.connection import Connection
@@ -338,6 +339,77 @@ def make_command(
 
 
 class RuntimeTests(unittest.TestCase):
+    @contextmanager
+    def runtime_case_evidence(self, prefix):
+        from collections import deque
+        from copy import deepcopy
+        import traceback
+        from dispatcher_sdk.execution_kernel import runtime as runtime_module
+        from tests._storage_evidence import StorageEvidence
+
+        root = retained_directory(prefix)
+        evidence = {"test": self.id(), "interpreter": sys.executable,
+                    "runtime_import": runtime_module.__file__, "root": str(root)}
+        storage = StorageEvidence(root, self)
+        storage.start(include_kernel=True)
+        self.addCleanup(storage.stop)
+        self.addCleanup(lambda: storage.save(checkpoint=evidence))
+        native = deque(maxlen=16)
+        lock = threading.Lock()
+        original = runtime_module.invoke_process_handler
+
+        def invoke(**kwargs):
+            callbacks = deque(maxlen=128)
+            item = {"command": kwargs["command"].to_dict(), "lease": kwargs["lease"].to_dict(),
+                    "began": time.monotonic(), "callbacks": callbacks}
+            with lock:
+                native.append(item)
+            for name in ("on_entered", "on_phase", "on_cleanup_confirmed"):
+                callback = kwargs.get(name)
+                if callback is not None:
+                    def forward(*args, _callback=callback, _name=name, **options):
+                        with lock:
+                            callbacks.append({"callback": _name, "at": time.monotonic(),
+                                              "arguments": deepcopy(args)})
+                        return _callback(*args, **options)
+                    kwargs[name] = forward
+            try:
+                result = original(**kwargs)
+                with lock:
+                    item["outcome"] = deepcopy(result)
+                return result
+            except BaseException as error:
+                with lock:
+                    item["error"] = {"type": type(error).__name__, "message": str(error),
+                                     "traceback": traceback.format_exc()}
+                raise
+            finally:
+                with lock:
+                    item["elapsed"] = time.monotonic() - item["began"]
+
+        with patch.object(runtime_module, "invoke_process_handler", invoke):
+            try:
+                yield root, evidence
+            except BaseException as error:
+                evidence["original_error"] = {"type": type(error).__name__, "message": str(error),
+                                              "traceback": traceback.format_exc()}
+                raise
+            finally:
+                with lock:
+                    evidence["native_invocations"] = deepcopy(list(native))
+                for invocation in evidence["native_invocations"]:
+                    invocation["callbacks"] = list(invocation["callbacks"])
+                try:
+                    storage.save(phase="before-cleanup", checkpoint=evidence)
+                    (root / "evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+                except BaseException as error:
+                    evidence["capture_error"] = {"type": type(error).__name__, "message": str(error),
+                                                 "traceback": traceback.format_exc()}
+                    if "original_error" not in evidence:
+                        raise
+                    print("runtime_case_capture_error=" + repr(error), flush=True)
+                print("runtime_case_evidence=" + str(root / "evidence.json"), flush=True)
+
     def test_runtime_exposes_revision_cas_cancellation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stack = Kernel.open_sqlite(
@@ -417,39 +489,39 @@ class RuntimeTests(unittest.TestCase):
                 stack.close()
 
     def test_exact_registry_selection_and_bad_binding_do_not_block_later_item(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        with self.runtime_case_evidence("sdk-exact-registry-selection-") as (temp, evidence):
             stack = Kernel.open_sqlite(
                 Path(temp) / "kernel.sqlite3",
                 {("echo", 1): version_one, ("echo", 2): version_two},
                 isolation_mode="thread",
             )
-            try:
-                stack.kernel.submit(make_command("00-wrong-registry", "other"))
-                stack.kernel.submit(
-                    make_command(
-                        "01-bad-version",
-                        stack.registry_revision,
-                        handler_id="echo",
-                        version=3,
-                    )
+            self.addCleanup(stack.close)
+            stack.kernel.submit(make_command("00-wrong-registry", "other"))
+            stack.kernel.submit(
+                make_command(
+                    "01-bad-version",
+                    stack.registry_revision,
+                    handler_id="echo",
+                    version=3,
                 )
-                stack.submit(
-                    make_command(
-                        "02-valid",
-                        stack.registry_revision,
-                        handler_id="echo",
-                        version=2,
-                    )
+            )
+            stack.submit(
+                make_command(
+                    "02-valid",
+                    stack.registry_revision,
+                    handler_id="echo",
+                    version=2,
                 )
-                result = stack.run_once()
-                self.assertEqual(result.execution_id, "02-valid")
-                self.assertEqual(result.result.value, {"version": 2})
-                rejected = stack.kernel.get("01-bad-version")
-                self.assertEqual(rejected.state, "dead")
-                self.assertEqual(rejected.result.error.code, "handler_contract_mismatch")
-                self.assertEqual(stack.kernel.get("00-wrong-registry").state, "queued")
-            finally:
-                stack.close()
+            )
+            result = stack.run_once()
+            evidence["result"] = result.to_dict()
+            evidence["observation"] = stack.observe(result.execution_id)
+            self.assertEqual(result.execution_id, "02-valid")
+            self.assertEqual(result.result.value, {"version": 2})
+            rejected = stack.kernel.get("01-bad-version")
+            self.assertEqual(rejected.state, "dead")
+            self.assertEqual(rejected.result.error.code, "handler_contract_mismatch")
+            self.assertEqual(stack.kernel.get("00-wrong-registry").state, "queued")
 
     def test_registry_revision_binds_handler_implementation_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1090,26 +1162,26 @@ class RuntimeTests(unittest.TestCase):
         "requires POSIX fork isolation",
     )
     def test_early_supervisor_alarm_does_not_shorten_monotonic_deadline(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        with self.runtime_case_evidence("sdk-early-supervisor-alarm-") as (temp, evidence):
             stack = Kernel.open_sqlite(
                 Path(temp) / "kernel.sqlite3",
                 {("early-alarm", 1): inject_early_supervisor_alarm},
                 isolation_mode="process",
             )
-            try:
-                stack.submit(
-                    make_command(
-                        "early-alarm",
-                        stack.registry_revision,
-                        handler_id="early-alarm",
-                        timeout=1.0,
-                    )
+            self.addCleanup(stack.close)
+            stack.submit(
+                make_command(
+                    "early-alarm",
+                    stack.registry_revision,
+                    handler_id="early-alarm",
+                    timeout=1.0,
                 )
-                result = stack.run_once()
-                self.assertEqual(result.state, "succeeded")
-                self.assertEqual(result.result.value, {"completed": True})
-            finally:
-                stack.close()
+            )
+            result = stack.run_once()
+            evidence["result"] = result.to_dict()
+            evidence["observation"] = stack.observe(result.execution_id)
+            self.assertEqual(result.state, "succeeded")
+            self.assertEqual(result.result.value, {"completed": True})
 
     @unittest.skipUnless(
         os.name == "posix" and "fork" in multiprocessing.get_all_start_methods(),
@@ -1171,6 +1243,7 @@ class RuntimeTests(unittest.TestCase):
         import json
         import traceback
         from tests._acceptance_evidence import retained_directory
+        from dispatcher_sdk.execution_kernel import runtime as runtime_module
 
         root = retained_directory("sdk-native-active-cancel-")
         started, pid_file, late, release = (root / name for name in
@@ -1186,6 +1259,32 @@ class RuntimeTests(unittest.TestCase):
             timeout=2.0, payload={"started": str(started), "pid": str(pid_file),
                 "late": str(late), "release": str(release)})
         evidence["command"] = command.to_dict()
+        cleanup = evidence["actual_cleanup_callbacks"] = []
+        original_invoke = runtime_module.invoke_process_handler
+
+        def invoke(**kwargs):
+            original_cleanup = kwargs["on_cleanup_confirmed"]
+
+            def confirmed():
+                item = {"confirmed_at": time.time(), "monotonic": time.monotonic()}
+                cleanup.append(item)
+                try:
+                    result = original_cleanup()
+                    item["returned"] = True
+                    return result
+                except BaseException as error:
+                    item["error"] = {"type": type(error).__name__, "message": str(error),
+                                     "traceback": traceback.format_exc()}
+                    raise
+                finally:
+                    item["elapsed"] = time.monotonic() - item["monotonic"]
+
+            kwargs["on_cleanup_confirmed"] = confirmed
+            return original_invoke(**kwargs)
+
+        invocation_patch = patch.object(runtime_module, "invoke_process_handler", invoke)
+        invocation_patch.start()
+        self.addCleanup(invocation_patch.stop)
 
         def capture(phase):
             item = {"phase": phase, "at": time.time(), "monotonic": time.monotonic(),
@@ -1233,10 +1332,12 @@ class RuntimeTests(unittest.TestCase):
             release.touch()
             driver.join(1.0)
             capture("after_cancel")
-            # Natural budget expiry must not substitute for stopping an active
-            # handler. Cancellation and synchronous cleanup precede its cutoff.
+            # Actual cancellation and containment precede the work cutoff.
+            # Trailing diagnostic persistence may delay cancel's return.
             self.assertLess(cancelled.result.completed_at, work_cutoff)
-            self.assertLess(evidence["cancel_returned_at"], work_cutoff)
+            self.assertEqual(1, len(cleanup))
+            self.assertTrue(cleanup[0].get("returned"), cleanup)
+            self.assertLess(cleanup[0]["confirmed_at"], work_cutoff)
             self.assertFalse(driver.is_alive())
             self.assertEqual(errors, [])
             self.assertEqual(cancelled.state, "cancelled")
@@ -1521,12 +1622,80 @@ class RuntimeTests(unittest.TestCase):
                     driver.join(2)
                 stack.close()
 
+    def test_thread_business_result_survives_real_observation_writer_during_final_close(self) -> None:
+        from contextlib import closing
+        import sqlite3
+        import traceback
+        from dispatcher_sdk.execution_kernel.context import HandlerContext
+
+        with self.runtime_case_evidence("sdk-thread-business-final-close-") as (root, evidence):
+            entered, release = threading.Event(), threading.Event()
+            calls, outcomes, errors, close_events = [], [], [], []
+
+            def business(_payload, context):
+                entered.set()
+                if not release.wait(.5):
+                    raise RuntimeError("fixture writer did not enter within the original work window")
+                calls.append(context.budget.to_dict())
+                return {"business_count": len(calls)}
+
+            business.__execution_kernel_revision__ = "real-thread-final-close-v1"
+            runtime = Kernel.open_sqlite(root / "kernel.sqlite3", {"business": business},
+                                        isolation_mode="thread", max_thread_workers=1)
+            self.addCleanup(runtime.close)
+            runtime.submit(make_command("final-close", runtime.registry_revision,
+                                        handler_id="business", timeout=1))
+            original_close = HandlerContext.close
+
+            def close(context, *args, **kwargs):
+                close_events.append({"phase": "started", "at": time.monotonic()})
+                try:
+                    return original_close(context, *args, **kwargs)
+                finally:
+                    close_events.append({"phase": "finished", "at": time.monotonic()})
+
+            def drive():
+                try:
+                    outcomes.append(runtime.run_once())
+                except BaseException as error:
+                    errors.append({"type": type(error).__name__, "message": str(error),
+                                   "traceback": traceback.format_exc()})
+
+            driver = threading.Thread(target=drive)
+            try:
+                with patch.object(HandlerContext, "close", close):
+                    driver.start()
+                    self.assertTrue(entered.wait(3))
+                    with closing(sqlite3.connect(runtime.observation_journal.path, timeout=1)) as writer:
+                        writer.execute("BEGIN IMMEDIATE")
+                        release.set()
+                        driver.join(3)
+                        evidence.update(calls=calls, outcomes=[result.to_dict() for result in outcomes],
+                                        errors=errors, close_events=close_events,
+                                        driver_alive=driver.is_alive())
+                        self.assertFalse(driver.is_alive())
+                        self.assertEqual([], errors)
+                        self.assertEqual(1, len(calls))
+                        self.assertEqual(1, len(outcomes))
+                        self.assertEqual("succeeded", outcomes[0].state)
+                        self.assertEqual({"business_count": 1}, outcomes[0].result.value)
+                        self.assertGreater(calls[0]["remaining_work_seconds"], 0)
+                        self.assertLess(outcomes[0].result.completed_at,
+                                        calls[0]["effective_work_deadline_at"])
+                        self.assertTrue(any(item["phase"] == "started" for item in close_events))
+                        writer.rollback()
+            finally:
+                release.set()
+                if driver.ident is not None:
+                    driver.join(3)
+
     def test_thread_timeout_slots_are_bounded_and_close_is_reentrant(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             clock = Clock(time.time())
             entered = threading.Event()
             release = threading.Event()
             finished = threading.Event()
+            wrapper_finished = threading.Event()
 
             def blocked(_payload, _context):
                 entered.set()
@@ -1544,6 +1713,16 @@ class RuntimeTests(unittest.TestCase):
             )
             outcomes = []
             errors = []
+            thread_finished = stack._thread_finished
+
+            def observed_thread_finished(authority, generation, **options):
+                try:
+                    return thread_finished(authority, generation, **options)
+                finally:
+                    if generation[0] == "blocked-1":
+                        wrapper_finished.set()
+
+            stack._thread_finished = observed_thread_finished
 
             def drive():
                 try:
@@ -1591,7 +1770,8 @@ class RuntimeTests(unittest.TestCase):
                 release.set()
                 if driver.ident is not None:
                     driver.join(2)
-                self.assertTrue(finished.wait(1))
+                self.assertTrue(wrapper_finished.wait(1))
+                self.assertTrue(finished.is_set())
                 stack.close()
 
     def test_thread_timeout_releases_slot_after_underlying_call_exits(self) -> None:

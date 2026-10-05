@@ -1,10 +1,13 @@
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import sqlite3
+import threading
 import unittest
+from unittest.mock import patch
 
-from dispatcher_sdk.execution_kernel import Kernel, RetryPolicy
+from dispatcher_sdk.execution_kernel import HandlerContext, Kernel, RetryPolicy
 from dispatcher_sdk.orchestrator import CommandConflict, OrchestrationError, Orchestrator, RevisionConflict
 
 
@@ -186,6 +189,123 @@ class ReopenRunTests(unittest.TestCase):
             dispatch=True)
         self.assertEqual(replay["revision"], submitted["revision"])
         self.assertEqual(replay["generation"], 0)
+
+    def _deliver_and_finish_failed(self):
+        self.sdk.sync()
+        self.sdk.pump_results()
+        claim = self.sdk.claim_results(owner="test", lease_seconds=5, limit=1)[0]
+        self.sdk.acknowledge_result(
+            claim["result"]["result_id"], lease_id=claim["lease_id"], fence=claim["fence"])
+        return self.sdk.apply_operations(
+            "run", command_id="finish", expected_revision=self.sdk.get_run("run")["revision"],
+            operations=[{"kind": "finish", "state": "failed"}])
+
+    def test_completed_thread_releases_after_driver_close_before_immediate_reopen(self):
+        runtime = self.sdk.runtime
+        callback_done = threading.Event()
+        futures = []
+        generations = []
+        submit = ThreadPoolExecutor.submit
+        finished = runtime._thread_finished
+        settle = runtime._settle_outcome
+
+        def observed_submit(executor, function, *args, **options):
+            future = submit(executor, function, *args, **options)
+            if getattr(function, "__name__", None) == "invoke_started":
+                futures.append(future)
+            return future
+
+        def observed_finished(authority, generation, **options):
+            result = finished(authority, generation, **options)
+            generations.append(generation)
+            callback_done.set()
+            return result
+
+        def settle_before_driver_close(*args, **options):
+            terminal = settle(*args, **options)
+            self.assertTrue(callback_done.wait(5), "real handler future did not finish")
+            generation = generations[0]
+            self.assertTrue(futures[0].done())
+            self.assertIn(generation, runtime._thread_done)
+            self.assertIn(generation, runtime._thread_authority_by_execution)
+            self.assertIn(generation, runtime._execution_recorders)
+            context = runtime._thread_contexts[generation]
+            self.assertTrue(context._observation_closed)
+            self.assertFalse(runtime._context_observation_pending(context))
+            return terminal
+
+        # Keep maintenance idle so it cannot hide a missing release in the
+        # real run_once driver teardown. Close still stops this service.
+        with patch.object(runtime, "_settlement_loop", runtime._stop_event.wait), \
+                patch.object(runtime, "_thread_finished", observed_finished), \
+                patch.object(runtime, "_settle_outcome", settle_before_driver_close), \
+                patch.object(ThreadPoolExecutor, "submit", observed_submit):
+            self.sdk.submit_task(
+                "run", "submitted", request_id="request-0", expected_revision=0,
+                handler_id="echo", payload={"execution": "submitted"}, timeout_seconds=5,
+                dispatch=True)
+            self.sdk.flush()
+            terminal = runtime.run_once()
+            self.assertEqual(terminal.state, "succeeded")
+            generation = generations[0]
+            self.assertNotIn(generation, runtime._thread_done)
+            self.assertNotIn(generation, runtime._thread_authority_by_execution)
+            self.assertNotIn(generation, runtime._thread_contexts)
+            self.assertNotIn(generation, runtime._execution_recorders)
+            failed = self._deliver_and_finish_failed()
+            reopened = self.sdk.reopen_run(
+                "run", command_id="reopen", **self.reopen_args(failed["revision"]))
+            self.assertEqual(reopened["status"], "activated")
+
+    def test_immediate_reopen_keeps_real_handler_cleanup_ownership(self):
+        runtime = self.sdk.runtime
+        cleanup_entered = threading.Event()
+        release_cleanup = threading.Event()
+        callback_done = threading.Event()
+        self.addCleanup(release_cleanup.set)
+        close = HandlerContext.close
+        finished = runtime._thread_finished
+
+        def held_close(context):
+            cleanup_entered.set()
+            if not release_cleanup.wait(5):
+                raise RuntimeError("test did not release handler cleanup")
+            return close(context)
+
+        def observed_finished(authority, generation, **options):
+            result = finished(authority, generation, **options)
+            callback_done.set()
+            return result
+
+        with patch.object(runtime, "_settlement_loop", runtime._stop_event.wait), \
+                patch.object(runtime, "_thread_finished", observed_finished), \
+                patch.object(HandlerContext, "close", held_close):
+            try:
+                self.sdk.submit_task(
+                    "run", "submitted", request_id="request-0", expected_revision=0,
+                    handler_id="echo", payload={"execution": "submitted"}, timeout_seconds=5,
+                    dispatch=True)
+                self.sdk.flush()
+                terminal = runtime.run_once()
+                self.assertEqual(terminal.state, "succeeded")
+                self.assertTrue(cleanup_entered.wait(5))
+                generation = (terminal.execution_id, terminal.attempt, terminal.fence)
+                self.assertIn(generation, runtime._thread_authority_by_execution)
+                self.assertNotIn(generation, runtime._thread_done)
+                self.assertFalse(runtime._thread_contexts[generation]._observation_closed)
+                failed = self._deliver_and_finish_failed()
+                with self.assertRaisesRegex(OrchestrationError, "process_cleanup_in_flight"):
+                    self.sdk.reopen_run(
+                        "run", command_id="reopen", **self.reopen_args(failed["revision"]))
+                self.assertIn(generation, runtime._thread_authority_by_execution)
+                release_cleanup.set()
+                self.assertTrue(callback_done.wait(5), "real cleanup callback did not finish")
+                self.assertNotIn(generation, runtime._thread_authority_by_execution)
+                reopened = self.sdk.reopen_run(
+                    "run", command_id="reopen", **self.reopen_args(failed["revision"]))
+                self.assertEqual(reopened["status"], "activated")
+            finally:
+                release_cleanup.set()
 
     def test_reopened_result_delivery_keeps_generation(self):
         failed = self.finish_failed()

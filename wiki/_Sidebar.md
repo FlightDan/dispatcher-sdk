@@ -11,6 +11,7 @@
 - [Storage and local recovery](Storage-and-Recovery.md)
 - [Engineering principles](Engineering-Principles.md)
 - [Diagnostics and projections](Diagnostics-and-Projections.md)
+- [Execution activity and supervision](../docs/EXECUTION_OBSERVABILITY.md)
 - [Troubleshooting](Troubleshooting.md)
 
 **简体中文**
@@ -24,6 +25,7 @@
 - [存储与本地恢复](Storage-and-Recovery-zh-CN.md)
 - [接入工程原则](Engineering-Principles-zh-CN.md)
 - [诊断与事件投影](Diagnostics-and-Projections-zh-CN.md)
+- [执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md)
 - [常见问题](Troubleshooting-zh-CN.md)
 
 [DocsforAgents (English)](../DocsforAgents/README.md)

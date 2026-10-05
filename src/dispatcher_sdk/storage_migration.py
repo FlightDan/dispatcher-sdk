@@ -25,8 +25,10 @@ from .execution_kernel._sqlite_schema import (
     existing_table_names,
     upgrade_kernel_schema_v2_to_v3,
     upgrade_kernel_schema_v3_to_v4,
+    upgrade_kernel_schema_v4_to_v5,
     validate_kernel_schema_v2,
     validate_kernel_schema_v3,
+    validate_kernel_schema_v4,
     validate_schema as validate_kernel_schema,
 )
 from .execution_kernel.errors import StorageIsolationError
@@ -195,6 +197,8 @@ def _kernel_source_version(connection: sqlite3.Connection) -> int | None:
             validate_kernel_schema_v2(connection)
         elif version == 3:
             validate_kernel_schema_v3(connection)
+        elif version == 4:
+            validate_kernel_schema_v4(connection)
         elif version == KERNEL_STORAGE_SCHEMA_VERSION:
             validate_kernel_schema(connection, names)
         else:
@@ -455,6 +459,8 @@ def upgrade_storage(
                 upgrade_kernel_schema_v2_to_v3(target)
             if kernel_source_version in {2, 3}:
                 upgrade_kernel_schema_v3_to_v4(target)
+            if kernel_source_version in {2, 3, 4}:
+                upgrade_kernel_schema_v4_to_v5(target)
             _hit(failpoint, "after_schema")
             if not kernel_only and source_version == 2:
                 converted = _convert_legacy_values(

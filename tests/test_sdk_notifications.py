@@ -1,11 +1,16 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
+import sqlite3
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel import (
     ExecutionCommandV2, Kernel, RetryPolicy, HandlerExecutionError, StaleFenceError)
 from dispatcher_sdk.orchestrator import Orchestrator, OrchestrationError
+from dispatcher_sdk.orchestrator.host import OrchestratorHost
 
 
 def echo(payload, context):
@@ -55,6 +60,73 @@ class NotificationsTests(unittest.TestCase):
         self.runtime.run_once()
         self.sdk.collect_notifications()
         return self.sdk.list_notifications()[0]
+
+    def test_empty_host_poll_reads_through_actual_writer_without_clock_mutation(self):
+        with closing(self.sdk._connect(configure=False)) as reader:
+            before = reader.execute('SELECT value FROM sdk_result_clock WHERE id=1').fetchone()[0]
+        host = OrchestratorHost(self.sdk, lambda notice: self.fail('empty queue invoked callback'))
+        checked = threading.Event()
+        errors = []
+        readiness = []
+        original_ready = self.sdk._notification_delivery_ready
+
+        def ready():
+            try:
+                value = original_ready()
+                readiness.append(value)
+                return value
+            finally:
+                checked.set()
+                host._stop_event.set()
+
+        def deliver():
+            try:
+                host._deliver()
+            except BaseException as error:
+                errors.append(error)
+
+        writer = sqlite3.connect(self.path, timeout=0)
+        try:
+            writer.execute('BEGIN IMMEDIATE')
+            with patch.object(self.sdk, '_notification_delivery_ready', side_effect=ready), \
+                    patch.object(self.sdk, 'deliver_notifications', wraps=self.sdk.deliver_notifications) as claim:
+                worker = threading.Thread(target=deliver)
+                worker.start()
+                try:
+                    self.assertTrue(checked.wait(1), 'empty poll competed with actual writer')
+                finally:
+                    writer.rollback()
+                    worker.join(1)
+                self.assertFalse(worker.is_alive())
+                claim.assert_not_called()
+        finally:
+            writer.close()
+        self.assertEqual([], errors)
+        self.assertEqual([False], readiness)
+        self.assertEqual(0, host._error_count)
+        with closing(self.sdk._connect(configure=False)) as reader:
+            self.assertEqual(before, reader.execute('SELECT value FROM sdk_result_clock WHERE id=1').fetchone()[0])
+
+    def test_host_keeps_shared_clock_observation_for_original_result_lease(self):
+        self.finish()
+        self.assertEqual(1, self.sdk.deliver_notifications(lambda notice: None, owner='app'))
+        self.assertEqual(1, self.sdk.pump_results())
+        result = self.sdk.claim_results(owner='result-reader', lease_seconds=1, limit=1)[0]
+        self.assertTrue(self.sdk._notification_delivery_ready())
+        self.now = result['lease_until'] + 1
+        host = OrchestratorHost(self.sdk, lambda notice: self.fail('delivered notice invoked again'))
+        original_ready = self.sdk._notification_delivery_ready
+
+        def ready():
+            host._stop_event.set()
+            return original_ready()
+
+        with patch.object(self.sdk, '_notification_delivery_ready', side_effect=ready):
+            host._deliver()
+        self.now = 100
+        with self.assertRaises(StaleFenceError):
+            self.sdk.acknowledge_result(result['result']['result_id'],
+                lease_id=result['lease_id'], fence=result['fence'])
 
     def test_atomic_registration_rollback(self):
         self.add(dispatch=False)

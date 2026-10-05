@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 
 import dispatcher_sdk
@@ -370,11 +371,84 @@ class NativeWallClock:
 
 def crash_controller(database, root):
     runtime = Kernel.open_sqlite(database, {"work": native_crash_gate}, isolation_mode="process")
-    driver = threading.Thread(target=runtime.run_once)
+    invoke = runtime._invoke_process
+    driver_failed = threading.Event()
+    errors = []
+
+    def crash_after_receipt(handler, command, lease):
+        # The real native call owns the original timeout, containment and
+        # finish-only clock publication. _run_once_active cannot persist its
+        # outcome until this instance method returns to it.
+        outcome = invoke(handler, command, lease)
+        generation = (lease.execution_id, lease.attempt, lease.fence)
+        with runtime._lifecycle_lock:
+            registration = runtime._process_registration_events.get(generation)
+            cleanup_confirmed = registration is not None and registration.cleanup_confirmed
+            supervisor_registered = generation in runtime._process_supervisors
+        with runtime.kernel._lock:
+            owned_tokens = list(runtime.kernel._budget_sample_owners)
+            guards = [dict(token=row[0], execution_id=row[1], reason=row[2]) for row in
+                runtime.kernel._connection.execute(
+                    "SELECT token,execution_id,reason FROM kernel_budget_samples ORDER BY token")]
+            row = runtime.kernel._connection.execute(
+                "SELECT state,attempt,fence,result_json FROM kernel_executions WHERE execution_id=?",
+                (lease.execution_id,)).fetchone()
+        receipt = {"stage": "native_return_before_result_persistence", "outcome": outcome,
+            "lease": lease.to_dict(), "cleanup_confirmed": cleanup_confirmed,
+            "supervisor_registered": supervisor_registered, "owned_guard_tokens": owned_tokens,
+            "durable_guards": guards, "execution": None if row is None else {
+                "state": row[0], "attempt": row[1], "fence": row[2], "result_json": row[3]}}
+        write_json(Path(root) / "controller-native-receipt.json", receipt)
+        if not cleanup_confirmed or supervisor_registered:
+            raise AssertionError("native receipt did not confirm containment before controller crash")
+        if owned_tokens or guards:
+            raise AssertionError("native receipt still owns an unresolved sampling guard")
+        if row is None or tuple(row[:3]) != ("running", lease.attempt, lease.fence) or row[3] is not None:
+            raise AssertionError("native receipt crash stage is not before result persistence")
+        if outcome.get("kind") != "timeout":
+            raise AssertionError("original native handler did not reach its execution cutoff")
+        checkpoint = outcome.get("budget_checkpoint")
+        if checkpoint is not None:
+            if not isinstance(checkpoint, dict):
+                raise AssertionError("native receipt has an invalid budget checkpoint")
+            # Windows reports one flat checkpoint; POSIX reports available
+            # parent/supervisor checkpoints. Absent fields imply no receipt,
+            # rather than an invented confirmation; zero guards is required.
+            if "state" in checkpoint:
+                checkpoints = [checkpoint]
+            elif set(checkpoint) <= {"parent", "supervisor"}:
+                checkpoints = [value for value in checkpoint.values() if value is not None]
+            else:
+                raise AssertionError("native receipt has an unknown budget checkpoint shape")
+            if any(not isinstance(value, dict) or value.get("state") != "confirmed"
+                   for value in checkpoints):
+                raise AssertionError("native receipt did not confirm its available budget checkpoints")
+        # This positive recovery fixture crashes only after its samplers have
+        # settled and the worker tree is reaped. Separate armed-crash fixtures
+        # retain the required unknown-clock refusal path.
+        mark(root, "controller-crashing", stage="confirmed_native_receipt_before_result_persistence",
+             receipt="controller-native-receipt.json")
+        os._exit(73)
+
+    runtime._invoke_process = crash_after_receipt
+
+    def drive():
+        try:
+            result = runtime.run_once()
+            raise AssertionError("native receipt crash stage was not reached; driver returned " + repr(result))
+        except BaseException as error:
+            evidence = {"stage": "native_receipt_crash_stage_failed", "type": type(error).__name__,
+                "message": str(error), "traceback": traceback.format_exc()}
+            errors.append(evidence)
+            write_json(Path(root) / "controller-stage-error.json", evidence)
+        finally:
+            driver_failed.set()
+
+    driver = threading.Thread(target=drive)
     driver.start()
-    wait_file(Path(root) / "entered.json")
-    mark(root, "controller-crashing")
-    os._exit(73)
+    if not driver_failed.wait(12):
+        raise TimeoutError("native receipt crash stage exceeded the original fixture barrier")
+    raise AssertionError("native receipt crash stage failed: " + repr(errors))
 
 
 def registration_crash_controller(database, root):
@@ -749,6 +823,8 @@ class NativeObservabilityAcceptanceTests(unittest.TestCase):
                 controller.join(3)
             controller.close()
         entered = self.await_marker("entered")
+        crash = json.loads((self.root / "controller-crashing.json").read_text())
+        self.assertEqual("confirmed_native_receipt_before_result_persistence", crash["stage"])
         original = BudgetEnvelope.from_dict(entered["envelope"])
         time.sleep(1.1)
         clock = NativeWallClock(entered["identity"]["expires_at"] + 1)

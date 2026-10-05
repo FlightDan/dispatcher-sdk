@@ -1,5 +1,10 @@
 # SDK 停机、检查与结果追踪修复计划
 
+本文记录 2026-09-19 的修复范围；其中 schema 3 是当时的布局。
+当前来源查询使用 Orchestrator schema 4，实际 API 见
+[使用说明](SDK_RELIABILITY.md)。当前开发候选的验收见
+[执行观测记录](EXECUTION_OBSERVABILITY_ACCEPTANCE.md)。
+
 日期：2026-09-19。状态：已完成实现、独立审查、修复及验证。
 
 交付 API 见[使用说明](SDK_RELIABILITY.md)，测试结果、原始超时和复跑记录见
@@ -7,7 +12,7 @@
 
 ## 依据与边界
 
-9 月 16–18 日下游记录显示：已提交 checkpoint 后停机超时；身份预检读取大历史库；
+9 月 16-18 日下游记录显示：已提交 checkpoint 后停机超时；身份预检读取大历史库；
 跨段结果缺少原任务描述；调用方结束后出现迟到结果。停机具体卡点未复现，不能定性为死锁。
 约 51 GiB 临时备份是下游探测脚本事件，不归因为身份检查。
 
@@ -45,4 +50,4 @@ SDK 提供事实与持久化原语；返工资格、业务验收、模型是否�
 
 主代理负责接口衔接、接收确认、文档和最终验证；独立模块并行实现，审查使用新上下文。
 已有 [存储生命周期计划](STORAGE_RETENTION_IMPROVEMENT_PLAN.md) 与
-[A01–A04 策略](SDK_CAPABILITY_INCREMENT_STRATEGY.md) 保留原进度；本文件记录其补充增量。
+[A01-A04 策略](SDK_CAPABILITY_INCREMENT_STRATEGY.md) 保留原进度；本文件记录其补充增量。

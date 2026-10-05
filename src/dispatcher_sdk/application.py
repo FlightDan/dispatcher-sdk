@@ -16,7 +16,7 @@ import uuid
 
 from .durability import Durability
 from .execution_kernel import RetryPolicy
-from .observability import ObservationOptions, StallPolicy
+from .observability import ManagedStallOptions, ObservationOptions, StallPolicy
 from .orchestrator import NotificationInbox, Orchestrator, OrchestratorHost
 from .orchestrator.contracts import CommandConflict, canonical, digest, identifier
 from .storage import inspect_storage
@@ -238,6 +238,8 @@ class Dispatcher:
     def __init__(
         self, path: str | Path, handlers: Mapping[Any, Any], *,
         on_result: Callable[[dict[str, Any]], Any] | None = None,
+        stall_handler: Callable[..., Any] | None = None,
+        stall_options: ManagedStallOptions | None = None,
         isolation_mode: str = "process", worker_count: int = 1,
         durability: Durability = "full", shutdown_timeout: float = 5,
         callback_retry_delay: float = 1, callback_lease_seconds: float = 30,
@@ -253,12 +255,24 @@ class Dispatcher:
             raise TypeError("on_result must be synchronous")
         if type(worker_count) is not int or worker_count < 1:
             raise ValueError("worker_count must be a positive integer")
+        if (stall_handler is None) != (stall_options is None):
+            raise TypeError("stall_handler and stall_options must be configured together")
+        bindings = dict(handlers)
+        if stall_handler is not None:
+            from .observability.managed_supervisor import _HANDLER
+            if not callable(stall_handler) or inspect.iscoroutinefunction(stall_handler):
+                raise TypeError("managed stall handler must be synchronous")
+            if type(stall_options) is not ManagedStallOptions:
+                raise TypeError("stall_options must be ManagedStallOptions")
+            if any((key[0] if isinstance(key, tuple) else key) == _HANDLER for key in bindings):
+                raise ValueError("reserved stall handler ID cannot be a business handler")
+            bindings[_HANDLER] = stall_handler
         self.shutdown_timeout = _seconds(shutdown_timeout, "shutdown_timeout")
         self.callback_retry_delay = _seconds(callback_retry_delay, "callback_retry_delay")
         self.callback_lease_seconds = _seconds(callback_lease_seconds, "callback_lease_seconds")
         self.path = Path(path).resolve()
         self.preflight = inspect_storage(
-            self.path, handlers=handlers, check="bindings",
+            self.path, handlers=bindings, check="bindings",
             timeout_seconds=_seconds(preflight_timeout, "preflight_timeout"))
         if (self.preflight["issues"] or not self.preflight["complete"]
                 or self.preflight["checks"]["bindings"] not in {"checked", "not_applicable"}):
@@ -271,6 +285,8 @@ class Dispatcher:
         self._consumer: threading.Thread | None = None
         self._stall_consumer: threading.Thread | None = None
         self._stall_callback: Callable[[dict[str, Any]], Any] | None = None
+        self._managed_stall_supervisor: Any = None
+        self._secondary_close_error: dict[str, Any] | None = None
         self._state = "open"
         self._owner = "dispatcher-consumer-" + uuid.uuid4().hex
         self._callback = on_result
@@ -285,6 +301,8 @@ class Dispatcher:
             self.host = OrchestratorHost(
                 self.orchestrator, self._accept, worker_count=worker_count)
             self.runtime.set_stall_notification_bridge(self.orchestrator.enqueue_stall_notification)
+            if stall_handler is not None:
+                self.subscribe_stalls(handler=stall_handler, options=stall_options)
         except BaseException:
             self.orchestrator.close()
             raise
@@ -300,18 +318,18 @@ class Dispatcher:
                 return self
             self.host.start()
             self._state = "running"
-            self._start_stall_consumer()
-            if self._callback is not None:
-                self._consumer = threading.Thread(
-                    target=self._deliver, name="dispatcher-result-consumer", daemon=True)
-                try:
+            try:
+                self._start_stall_consumer()
+                if self._callback is not None:
+                    self._consumer = threading.Thread(
+                        target=self._deliver, name="dispatcher-result-consumer", daemon=True)
                     self._consumer.start()
-                except BaseException:
-                    self._consumer = None
-                    self._state = "stopping"
-                    self._stop.set()
-                    self.host.stop(timeout=self.shutdown_timeout)
-                    raise
+            except BaseException:
+                self._consumer = None
+                self._state = "stopping"
+                self._stop.set()
+                self.host.stop(timeout=self.shutdown_timeout)
+                raise
             return self
 
     def submit(
@@ -392,31 +410,73 @@ class Dispatcher:
         source = _STALL_SOURCE if notification.get("kind") == "stalled" else _SOURCE
         self.inbox.accept(source, notification, max_attempts=notification.get("max_deliveries", 5))
 
-    def subscribe_stalls(self, callback: Callable[[dict[str, Any]], Any]) -> None:
-        """Start one bounded at-least-once consumer for stall episodes only."""
-        if not callable(callback) or inspect.iscoroutinefunction(callback):
+    def subscribe_stalls(self, callback: Callable[[dict[str, Any]], Any] | None = None, *,
+                         handler: Callable[..., Any] | None = None,
+                         options: ManagedStallOptions | None = None) -> None:
+        """Subscribe a callback or a reserved, process-isolated SDK handler.
+
+        A managed handler receives ``(notification, HandlerContext)``. Its
+        original receipt, command, result and deadline survive replay. Successful
+        execution consumes the notice; it never implicitly cancels its task.
+        ``options`` explicitly reserves capacity and native memory limits.
+        Shortages are visible in ``stall_supervisor_status``.
+        """
+        if (callback is None) == (handler is None):
+            raise TypeError("choose exactly one stall callback or managed handler")
+        if callback is not None and (not callable(callback) or inspect.iscoroutinefunction(callback)):
             raise TypeError("stall callback must be synchronous")
+        if handler is None and options is not None:
+            raise TypeError("options require a managed stall handler")
         with self._lock:
             self._ensure_open()
-            if self._stall_callback is not None and self._stall_callback is not callback:
+            if self._managed_stall_supervisor is not None:
+                raise RuntimeError("a managed stall consumer is already registered")
+            if self._stall_callback is not None and (handler is not None or self._stall_callback is not callback):
                 raise RuntimeError("a stall consumer is already registered")
-            self._stall_callback = callback
+            if handler is not None:
+                from .observability.managed_supervisor import ManagedStallSupervisor
+                if options is None:
+                    raise TypeError("managed stall handler requires ManagedStallOptions")
+                self._managed_stall_supervisor = ManagedStallSupervisor(self, handler, options)
+            else:
+                self._stall_callback = callback
             if self._state == "running":
                 self._start_stall_consumer()
 
     def _start_stall_consumer(self) -> None:
+        if self._managed_stall_supervisor is not None:
+            self._managed_stall_supervisor.start()
+            return
         if self._stall_callback is None or self._stall_consumer is not None:
             return
         self._stall_consumer = threading.Thread(target=self._deliver_stalls,
             name="dispatcher-stall-consumer", daemon=True)
         self._stall_consumer.start()
 
+    def stall_supervisor_status(self, notification_id: str | None = None) -> dict[str, Any]:
+        """Read reserved admission/cleanup and an original managed execution."""
+        from ._inspection import InspectionBudget
+        budget = InspectionBudget(self.runtime.observation_options.query_timeout, None)
+        if not self._lock.acquire(timeout=budget.sqlite_timeout_seconds):
+            raise TimeoutError("managed status admission timed out")
+        try:
+            budget.check()
+            if self._state == "closed":
+                raise RuntimeError("Dispatcher is closed")
+            if self._managed_stall_supervisor is None:
+                return {"mode": "callback" if self._stall_callback is not None else "unconfigured",
+                        "capacity": 1 if self._stall_callback is not None else 0}
+            return self._managed_stall_supervisor.status(notification_id, budget=budget)
+        finally:
+            self._lock.release()
+
     def _deliver_stalls(self) -> None:
         while not self._stop.is_set():
             lease = None
             try:
-                lease = self.inbox.claim(self._owner+":stalls", source_id=_STALL_SOURCE,
-                    lease_seconds=self.callback_lease_seconds)
+                if self.inbox._delivery_ready(_STALL_SOURCE):
+                    lease = self.inbox.claim(self._owner+":stalls", source_id=_STALL_SOURCE,
+                        lease_seconds=self.callback_lease_seconds)
                 if lease is not None:
                     assert self._stall_callback is not None
                     returned = self._stall_callback(lease.payload)
@@ -596,8 +656,9 @@ class Dispatcher:
         while not self._stop.is_set():
             lease = None
             try:
-                lease = self.inbox.claim(
-                    self._owner, source_id=_SOURCE, lease_seconds=self.callback_lease_seconds)
+                if self.inbox._delivery_ready(_SOURCE):
+                    lease = self.inbox.claim(
+                        self._owner, source_id=_SOURCE, lease_seconds=self.callback_lease_seconds)
                 if lease is not None:
                     assert self._callback is not None
                     returned = self._callback(lease.payload)
@@ -627,9 +688,12 @@ class Dispatcher:
                 "state": self._state, "host": asdict(self.host.health()),
                 "consumer_alive": self._consumer is not None and self._consumer.is_alive(),
                 "stall_consumer_alive": self._stall_consumer is not None and self._stall_consumer.is_alive(),
+                "managed_stall_supervisor": None if self._managed_stall_supervisor is None
+                    else self._managed_stall_supervisor.status(),
                 "callback_errors": self._callback_errors,
                 "active_consumers": self._active_consumers,
                 "last_callback_error": self._last_callback_error,
+                "secondary_close_error": self._secondary_close_error,
             }
 
     def diagnostics(self, *, timeout_seconds: float = 5) -> dict[str, Any]:
@@ -651,6 +715,24 @@ class Dispatcher:
                     return
                 self._state = "stopping"
                 self._stop.set()
+            if self._managed_stall_supervisor is not None:
+                try:
+                    self._managed_stall_supervisor.close(timeout=max(0., deadline-time.monotonic()))
+                except BaseException:
+                    # Stop independent business admission even when reserved
+                    # cleanup is unknown. Keep storage/receipts open, and keep
+                    # the original supervisor error as the caller's outcome.
+                    try:
+                        self.host.stop(timeout=max(0., deadline-time.monotonic()))
+                    except BaseException as secondary:
+                        from .observability.managed_supervisor import _error
+                        with self._lock:
+                            self._secondary_close_error = _error(secondary)
+                    else:
+                        with self._lock:
+                            self._secondary_close_error = None
+                    raise
+                self._secondary_close_error = None
             if self._consumer is not None:
                 self._consumer.join(max(0, deadline - time.monotonic()))
                 if self._consumer.is_alive():

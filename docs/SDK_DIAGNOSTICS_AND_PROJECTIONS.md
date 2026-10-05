@@ -1,9 +1,9 @@
 # Runtime diagnostics and durable projections
 
 Use these APIs to check deployment identity, persist event projections, inspect
-work availability, and read cancellation evidence. Existing execution and
-Orchestrator schemas and public operations remain unchanged. Diagnostic reports
-do not authorize execution, change application policy, or migrate an old store.
+work availability, and read cancellation evidence. These diagnostic APIs retain the existing public operation semantics. The
+current storage layouts are documented in
+[storage and upgrades](STORAGE_AND_UPGRADES.md). Diagnostic reports do not authorize execution, change application policy, or migrate an old store.
 
 ## Deployment identity (A01)
 

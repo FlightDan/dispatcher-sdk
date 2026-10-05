@@ -83,10 +83,10 @@ class CancellationTelemetryOrderTests(unittest.TestCase):
                 finally:
                     mark("kernel_cancel_end")
 
-            def note(identity, phase, details):
+            def note(identity, phase, details, **options):
                 mark("diagnostic_note_begin", phase=phase)
                 try:
-                    return original_note(identity, phase, details)
+                    return original_note(identity, phase, details, **options)
                 finally:
                     mark("diagnostic_note_end", phase=phase)
 
@@ -140,6 +140,12 @@ class CancellationTelemetryOrderTests(unittest.TestCase):
             self.assertLess(revoked["monotonic"], requested_note["monotonic"])
             report = stack.observe(command.execution_id)
             phases = {item["phase"]: item for item in report["phases"]}
+            local = report.get("local_cancellation_diagnostics", {})
+            for item in local.get("notes", []):
+                self.assertFalse(item["persisted"])
+                self.assertEqual(item["identity"], {"execution_id": running.execution_id,
+                    "attempt": running.attempt, "fence": running.fence})
+                phases.setdefault(item["phase"], item)
             requested = phases["cancellation_requested"]
             authority = phases["cancellation_authority_revoked"]
             cleanup = phases["process_cleanup"]
@@ -147,9 +153,14 @@ class CancellationTelemetryOrderTests(unittest.TestCase):
             evidence["cancellation_phases"] = [requested, authority, cleanup, cancellation_cleanup]
             self.assertLess(requested["captured_at"], authority["captured_at"])
             self.assertLess(authority["captured_at"], cleanup["captured_at"])
-            self.assertLess(cleanup["captured_at"], requested["persisted_at"])
-            self.assertGreaterEqual(requested["persisted_at"], revoked["wall"])
-            self.assertGreaterEqual(authority["persisted_at"], revoked["wall"])
+            for phase in (requested, authority):
+                if "persisted_at" in phase:
+                    self.assertGreaterEqual(phase["persisted_at"], revoked["wall"])
+                else:
+                    self.assertFalse(phase["persisted"])
+                    self.assertFalse(report["complete"])
+            if "persisted_at" in requested:
+                self.assertLess(cleanup["captured_at"], requested["persisted_at"])
         finally:
             try:
                 if writer_thread is not None:

@@ -28,6 +28,13 @@ with `status`, `value` and `error`. It does not acknowledge a notification. Wait
 timeout does not cancel execution. A `recovery_required` observation raises
 `RecoveryRequiredError` with the request ID and snapshot for investigation.
 
+`Task.observe()`, `events()` and `stall_windows()` provide bounded activity and
+wait evidence. Handlers report activity and progress through `HandlerContext`;
+child calls inherit their original deadlines and reserved capacity. Optional
+stall callbacks or a separately limited native supervisor handler are described
+in [execution activity and supervision](EXECUTION_OBSERVABILITY.md). A stall
+notice reports an observation; the application chooses its response.
+
 Use `app.runtime` and `app.orchestrator` for cancellation, effect inspection,
 evidence-based resolution or advanced dependencies. These are escape hatches;
 the managed request identity must not be rewritten. Recovery which reopens a Run
@@ -38,7 +45,10 @@ with a new generation requires the explicit advanced API.
 Every managed task is watched. The Host writes each notification to the built-in
 `NotificationInbox` before acknowledging upstream transport. With no callback,
 notifications remain pending across restarts. The inbox shares the execution
-database, so a consistent single-file backup includes receipt state.
+database, so a consistent single-file backup includes those notification
+receipts. Observation, settlement and optional cancellation journals are separate
+components; preserve their original bindings when backing up unfinished work.
+See [storage and upgrades](STORAGE_AND_UPGRADES.md).
 
 `on_result(notification)` runs on a separate daemon consumer thread. A failure
 schedules another delivery (default delay one second, inbox maximum five attempts).

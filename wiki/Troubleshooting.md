@@ -6,6 +6,7 @@
 | --- | --- |
 | Submission succeeded but no work runs | Keep a host alive, or explicitly flush, execute and sync. Inspect command delivery errors and handler compatibility. |
 | `Dispatcher` rejects startup | Read `DeploymentMismatchError.report`; keep the historical handler deployment available for unfinished work. |
+| `task.wait(timeout=...)` times out | The caller's wait ended; inspect `task.observe()` and the execution deadline before deciding whether work should continue. |
 | `run_once()` returns no work | Check leases, `next_attempt_at`, eligible work and handler availability. An empty result does not prove a stall. |
 | `flush()` returns zero | Inspect pending delivery records and their last errors; zero does not prove an empty queue. |
 | Task succeeded but Run is still running | Validate the business result, release applicable waits and explicitly finish. |
@@ -23,7 +24,8 @@
 See [submission](../docs/TASK_SUBMISSION.md), [recovery](../docs/SDK_RECOVERY.md),
 [inbox](../docs/NOTIFICATION_INBOX.md), [storage](../docs/STORAGE_AND_UPGRADES.md),
 [local recovery](../docs/LOCAL_RECOVERY.md) and [sandbox runtime](../docs/SANDBOX_RUNTIME.md)
-for exact contracts and recovery procedures.
+for exact contracts and recovery procedures. For observation gaps or stall notices,
+see [execution activity and supervision](../docs/EXECUTION_OBSERVABILITY.md).
 
 When reporting a problem, include the SDK version or commit, Python version,
 platform, isolation mode, relevant IDs and states, and a minimal reproduction.

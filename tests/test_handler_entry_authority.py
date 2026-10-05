@@ -248,9 +248,12 @@ class ThreadHandlerEntryGateTests(unittest.TestCase):
         self.confirm = self.runtime.kernel._checkpoint_handler_entry
         finished = self.runtime._thread_finished
 
-        def record_finished(*args):
-            finished(*args)
-            self.worker_finished.set()
+        def record_finished(*args, **kwargs):
+            finished(*args, **kwargs)
+            if "deadline" not in kwargs:
+                # The actual Future callback reports worker exit. A bounded
+                # maintenance revisit must not fabricate that callback's end.
+                self.worker_finished.set()
 
         self.finish_patch = patch.object(self.runtime, "_thread_finished", side_effect=record_finished)
         self.finish_patch.start()
@@ -697,25 +700,31 @@ class AdmissionContentionTests(unittest.TestCase):
         identifier = self.submit(runtime, "clock", managed=True)
         ready, held, busy, _ = self.contend(runtime)
         jumped = threading.Event()
-        original_prepare = runtime.kernel._prepare_handler_entry
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+        captured = []
+        original_sample = runtime.kernel._sample_budget
 
-        def after_helper_checkpoint(lease, **kwargs):
-            # This call follows the helper's resample/recheckpoint, so the
-            # barrier proves the forward jump was incorporated before rollback.
-            if wall[0] == base + 6:
+        def after_guarded_sample(*args, **kwargs):
+            envelope = original_sample(*args, **kwargs)
+            if envelope.checkpoint.wall_at >= base + 6:
+                captured.append(envelope.to_dict())
                 jumped.set()
-            return original_prepare(lease, **kwargs)
+                if not resume.wait(1):
+                    raise AssertionError("guarded sample was not released before original startup expiry")
+            return envelope
 
-        runtime.kernel._prepare_handler_entry = after_helper_checkpoint
+        runtime.kernel._sample_budget = after_guarded_sample
         driver, results, errors = self.drive(runtime, identifier)
         self.assertTrue(ready.wait(2))
         writer = self.writer(runtime.kernel.db_path)
         held.set()
         self.assertTrue(busy.wait(1))
         wall[0] = base + 6
+        writer.rollback()
         self.assertTrue(jumped.wait(1))
         wall[0] = base
-        writer.rollback()
+        resume.set()
         driver.join(2)
         self.assertFalse(driver.is_alive())
         self.assertEqual(errors, [])
@@ -723,6 +732,7 @@ class AdmissionContentionTests(unittest.TestCase):
         view = results[0].result.value
         self.assertLessEqual(view["remaining_work_seconds"], 4)
         self.assertEqual(view["limiting_source"], "run")
+        self.assertGreaterEqual(captured[0]["checkpoint"]["wall_at"], base + 6)
 
     def test_expired_run_during_writer_contention_never_invokes_business(self):
         base = time.time()
@@ -744,7 +754,35 @@ class AdmissionContentionTests(unittest.TestCase):
         self.assertFalse(driver.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(results[0].state, "timed_out")
+        error = results[0].result.error
+        self.assertEqual(error.code, "execution_deadline_exhausted")
+        self.assertEqual(error.message, "managed Run deadline has elapsed")
+        self.assertEqual(error.details["limiting_source"], "run")
+        self.assertEqual(error.details["phase"], "entry_authority")
+        self.assertEqual(error.details["cause"], "CASConflictError")
+        self.assertEqual(error.details["deadline"], {
+            "source": "run", "deadline_at": base + 10, "observed_at": base + 11})
         self.assertFalse(marker.exists())
+
+    def test_unmarked_or_invalid_deadline_facts_do_not_relabel_cas_conflicts(self):
+        markers = (None, {"source": "tool", "deadline_at": 1, "observed_at": 2},
+            {"source": "run", "deadline_at": True, "observed_at": 2},
+            {"source": "run", "deadline_at": 1, "observed_at": float("inf")},
+            {"source": "run", "deadline_at": 2, "observed_at": 1})
+        for index, marker in enumerate(markers):
+            with self.subTest(marker=marker):
+                runtime, business = self.runtime()
+                identifier = self.submit(runtime, "unmarked-deadline-" + str(index))
+                raw = CASConflictError("managed Run deadline has elapsed")
+                raw._budget_deadline = marker
+                with patch.object(runtime.kernel, "_prepare_handler_entry", side_effect=raw):
+                    result = runtime.run_once(execution_id=identifier)
+                self.assertEqual(result.state, "failed")
+                self.assertEqual(result.result.error.code, "entry_admission_failed")
+                self.assertEqual(result.result.error.message, str(raw))
+                self.assertEqual(result.result.error.details["cause"], "CASConflictError")
+                self.assertFalse(business.exists())
+                runtime.close()
 
     @unittest.skipUnless(sys.platform == "linux", "requires POSIX process containment")
     def test_process_restore_uses_remaining_original_startup_window(self):

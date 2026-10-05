@@ -25,6 +25,7 @@ class RequestJournal:
 
     def __init__(self, path):
         self.path, self.source_id = Path(path), "test-store"
+        self.clock = time.time
         self.options = SimpleNamespace(query_timeout=.5, write_timeout=.2)
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.executescript(CHILD_SCHEMA)

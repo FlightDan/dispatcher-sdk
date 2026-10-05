@@ -2,7 +2,7 @@
 from pathlib import Path
 from typing import Any
 
-from dispatcher_sdk import Dispatcher, ExecutionActivity, ObservationOptions, StallPolicy, Task, BudgetEnvelope, ExecutionBudget
+from dispatcher_sdk import Dispatcher, ExecutionActivity, ObservationOptions, StallPolicy, Task, BudgetEnvelope, ExecutionBudget, ManagedStallOptions
 from dispatcher_sdk.execution_kernel import ChildCalls, HandlerContext, SQLiteKernel
 
 
@@ -40,3 +40,22 @@ def consume(path: Path) -> None:
         print(observation, app.runtime.observation_storage)
         reports: tuple[dict[str, Any], ...] = app.runtime.recover_completions(timeout_seconds=.5)
         print(reports)
+
+
+def supervise(notification: dict[str, Any], context: HandlerContext) -> dict[str, Any]:
+    context.activity.progress("reviewed-notice")
+    budget: ExecutionBudget = context.budget
+    return {"notification_id": notification["notification_id"],
+            "remaining": budget.remaining_work_seconds}
+
+
+def consume_managed(path: Path) -> None:
+    options = ManagedStallOptions(memory_limit_bytes=512 * 1024 * 1024, capacity=1,
+                                  memory_budget_bytes=512 * 1024 * 1024, budget_seconds=10)
+    with Dispatcher(path, {"work": work}, stall_handler=supervise, stall_options=options) as app:
+        report: dict[str, Any] = app.stall_supervisor_status()
+        detail: dict[str, Any] = app.stall_supervisor_status("notice")
+        app.subscribe_stalls(handler=supervise, options=options)
+        app.stall_supervisor_status(123)  # type: ignore[arg-type]
+        app.subscribe_stalls(handler=supervise, options="unbounded")  # type: ignore[arg-type]
+        print(report, detail)

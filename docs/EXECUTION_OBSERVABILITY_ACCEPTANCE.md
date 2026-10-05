@@ -1,10 +1,1234 @@
 # Execution observability acceptance evidence
 
-This index tracks [T01–T09 and A01–A18](EXECUTION_OBSERVABILITY_GOAL.md).
-Scope revised on 2026-10-04: this Goal covers SDK functionality, robustness and
-maintainability only. The user has activated the revised SDK-only Goal. ModPort adaptation, production-provider requests and cross-project
-writes are outside the revised completion criteria. Historical integration evidence
-is retained below; it does not establish the new SDK-only A16.
+This index records [T01 to T09 and A01 to A18](EXECUTION_OBSERVABILITY_GOAL.md).
+The scope was revised on 2026-10-04 to cover the SDK alone. ModPort adaptation,
+provider requests and changes to other projects have separate acceptance requirements.
+The historical integration records below remain available; they do not satisfy the
+revised SDK-only A16.
+
+## Current status, 2026-10-06
+
+The candidate declares `0.7.0.dev2`. It is not fully accepted. CI run
+[37269716472](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37269716472)
+was cancelled at the user's request. CI and any push that triggers it remain
+paused until known failures are fixed.
+
+| Check | Current evidence |
+| --- | --- |
+| Managed supervisor, native budget capture and thread capacity | 31 cases passed in 75.589 seconds, including all 22 A12 cases |
+| WAL anchor, stream capture, storage lifetime and capacity | 20 cases passed in 34.167 seconds, including six real SQLite anchor scenarios |
+| Native packets, cancellation and clock floors | 18 cases passed in 20.971 seconds; permanent SQL errors remain failures |
+| Idle Inbox admission and immediate Run reopen | Ten cases passed in 16.755 seconds, including the original saturated-worker pressure case; `/tmp/sdk-idle-inbox-reopen-focused310.log` |
+| Completion-reader lifetime | All seven new real SQLite lifetime cases and the original reentrant thread-timeout case passed in 6.723 seconds; `/tmp/sdk-completion-reader-stable-fixture310.log` |
+| Confirmed-clock and guarded Effect crashes | All five recovery cases passed in 9.112 seconds; `/tmp/sdk-effect-confirmed-and-guarded310.log` |
+| Cleanup, capacity, notifications, Inbox and Run reopen | All 64 integration cases passed in 66.902 seconds; `/tmp/sdk-lifetime-notification-integration310.log` |
+| Types and README examples | The child-completion handoff wheel passed five public type consumers outside the checkout, plus 626 local links and six README examples with no skips; `/tmp/sdk-child-completion-handoff-types310.log` and `/tmp/sdk-child-completion-handoff-docs310.log` |
+| Last complete source run, before the latest fixes | 1,092 cases finished in 1,046.777 seconds: two failures, two errors and 17 platform skips; `/tmp/sdk-child-anchor-source-full310.log` |
+| Rebuilt public consumer and managed example | A fresh Python 3.10 virtualenv imported the sdist-rebuilt wheel from `site-packages`. All five public scenarios passed, and the managed supervisor example passed within its original 30-second subprocess limit; `/tmp/sdk-collection-current-independent310-evidence/sdk-observability-consumer-4svbk4rp/` |
+| Previous installed suite, before the child handoff and alarm receipt corrections | All 1,126 cases finished in 879.142 seconds: one failure, one error and 17 platform skips; `/tmp/sdk-collection-current-independent310.log` |
+| Previous complete installed suite | All 1,131 cases finished in 853.439 seconds: three errors and 17 platform skips; `/tmp/sdk-alarm-current-independent310.log` |
+| Latest complete installed suite and restart consumer | All 1,133 cases finished in 863.318 seconds within the original 900-second limit, with no failures or errors and 17 real-Windows skips. The wrapper and final restart consumer passed in 905.929 seconds; `/tmp/sdk-refusal-current-independent310.log`. Native matrix validation remains pending |
+| Latest retained-wheel types, packaging and docs | Five public type consumers and three packaging boundary checks passed. README checking failed at Chinese example 2: no callback within its existing 15-second wait. `/tmp/sdk-refusal-current-docs310.log`; CI remains paused during diagnosis |
+| Received positive sampling facts | The unchanged older wheel reproduced the missing ACK after actual producer capture, SQLite contention, durable receipt and recovery. The correction passed independent review and 48 source integration cases. All 11 corrected regression cases passed against its rebuilt installed wheel in 7.954 seconds; complete matrix acceptance remains pending |
+| Latest received-fact installed candidate | Five public scenarios and the managed example passed. The installed suite hit its original 900-second limit after a managed-capacity cleanup error and seven producer-fixture failures; final restart did not run. `/tmp/sdk-received-current-independent310.log` |
+| Final installed types, README and restart checks | The same retained wheel passed five public type consumers outside the checkout, 626 documentation links, all four remaining README examples with zero skips, and Kernel/Orchestrator restart consumers in six separate processes; `/tmp/sdk-received-final-types310.log`, `/tmp/sdk-received-final-docs310.log`, `/tmp/sdk-received-final-restart310/` |
+| Current registration and cleanup tests | All nine cases passed against the same installed wheel in 26.463 seconds, including actual registration-connection ownership and close before recorder publication; `/tmp/sdk-runtime-registration-current310.log` |
+| Child result to parent completion | Exact captured-fact handoff passed independent review and 65 source cases in 56.343 seconds; five cases against its sdist-rebuilt installed wheel passed in 16.057 seconds, including the unchanged native success and raw-failure scenario. Complete installed validation remains pending |
+| Interrupted native sampling receipt | A real alarm exposed a stored control-flow exception that suppressed both supervisor terminal sends. The correction passed independent review, the actual supervisor-to-parent path and 45 source integration cases in 22.707 seconds; `/tmp/sdk-uncaptured-alarm-integration310.log`. The latest installed run passed both terminal receipts, then errored in the recovery refusal assertion; see below |
+
+The current successful full-suite candidate was rebuilt from sdist and imported
+from `/tmp/tmpr6htfuwz/venv/lib/python3.10/site-packages/dispatcher_sdk/__init__.py`.
+All five public scenarios, the managed example and final restart consumer passed.
+Its complete raw suite and original 900-second command receipt are in
+`/tmp/sdk-refusal-current-independent310-evidence/sdk-observability-consumer-dov8wcqm/`.
+The exact wheel, sdist, origin record and persistent installed import record are
+under `/tmp/sdk-refusal-current-candidate310/`. All 17 skips concern genuine
+Windows file sharing or Job Objects; they do not fulfill Windows acceptance.
+The subsequent README check passed four examples before the Chinese script
+notification example missed its existing callback window. That failure is
+unresolved; full-suite success is not a complete documentation or matrix pass.
+
+One unchanged reproduction of the failed example passed, followed by one full
+six-example diagnostic run that also passed (626 local links, no skips).
+The latter forwards the original checker and preserves its 10/15/30-second
+script, callback and subprocess limits. It retains the actual scripts, raw
+outputs, SDK import path and pre-close Host health under
+`/tmp/sdk-docs-health-probe310/evidence-run1/`. The Chinese callback succeeded
+despite one reported `SettlementBusyError: database is locked`; no notification
+error was reported. The original failed run deleted its temporary databases,
+so these later passes do not establish its cause or a fix. At the user's request,
+the script-notification example was subsequently removed from both READMEs.
+The current checker passed all four remaining examples against the retained
+received-fact wheel. The removed example's historical failure remains evidence;
+it is no longer part of the current README check.
+
+Separate source review found that a supervisor's terminal checkpoint can carry
+a positive `captured_envelope` after its finish-only ACK fails. Runtime retains
+that fact in the settlement receipt but has no consumer for the supervisor's
+remaining token. The bounded real-process probe was inconclusive: its genuine
+writer acquired the lock after positive capture, but the supervisor was reaped
+with exit code -9 before any terminal packet was observed. It did not reach the
+handoff/recovery stage being tested. Evidence is under
+`/tmp/sdk-supervisor-fact-handoff-probe310/evidence-native/`; the initial sandbox
+attempt failed at local socket setup before SDK invocation. No SDK correction
+has been made from this probe, and it does not explain the README failure.
+CI remains paused.
+
+The focused regression then reached the intended receipt boundary using a
+separate real producer process, the existing native finish/pipe functions and
+actual SQLite writer contention. The unchanged wheel publishes the retained
+floor but leaves the exact marker after recovery:
+`/tmp/sdk-received-checkpoint-baseline-clock310.log`. Its earlier fixture attempt
+mixed a controlled clock with a default real-wall entry sample and failed
+before this assertion; that fixture was corrected to use its prepared clock
+checkpoint, without changing the ACK or recovery limits.
+
+Runtime now consumes positive checkpoints from its returned durable receipt
+before resolving result or cleanup obligations. Cold replay after ACK requires
+the marker to be absent and both committed clock floors to cover the fact;
+ordinary live-owner finish semantics are unchanged. Revoked executions retain
+a factual-only receipt, while cancellation winners and unknown original
+completion times remain unchanged. Independent review found one reused
+remaining-duration value; it now derives each operation's allowance from the
+same absolute cutoff. Nine focused source cases passed in 11.201 seconds
+(`/tmp/sdk-received-checkpoint-source310.log`), including actual process death
+after ACK and before journal settlement. These focused tests do not replace
+native-supervisor or public consumer acceptance, and do not attribute the
+original README timeout. The earlier 1,133-case pass predates this correction.
+The two additional cases confirm retention during independent receipt-writer
+contention and that factual ACK cannot invent an unknown original completion
+time. All 48 cases across seven affected modules passed in 48.649 seconds
+(`/tmp/sdk-received-checkpoint-integration310.log`), and independent review
+accepted the final implementation and all 11 new cases. The subsequent installed
+validation retained the original 900-second suite limit.
+
+That installed run reached the original 900-second watchdog before completing.
+Its command receipt and complete captured output are under
+`/tmp/sdk-received-current-independent310-evidence/sdk-observability-consumer-ig1wcbua/installed-suite/`;
+the exact wheel, sdist and origin record are retained under
+`/tmp/sdk-received-current-candidate310/`. Final restart did not run.
+Seven new producer fixtures rejected an actual `TimeoutError` after positive
+capture and writer acquisition had consumed the initial .1-second window.
+The fixture now retains that original error, requires both the positive fact
+and held writer, and still requires actual SQLite contention in the separate
+existing .1-second native finish operation. No bound was widened. All 11
+corrected cases passed against the same installed wheel in 7.954 seconds
+(`/tmp/sdk-received-current-fixture310.log`). SDK code was unchanged.
+
+The other error was in cleanup of the reserved-capacity fixture
+`sdk-managed-stalls-i3a_q_xf`. Its capacity assertions completed, both business
+tasks succeeded, the revoked supervisor retained its factual receipt, and
+final sampling guards were empty. File timestamps bound cleanup and the next
+test transition to about 1.577 seconds, below the original 10-second close
+window. The actual cleanup exception was lost when the suite watchdog prevented
+unittest's final traceback report. The unchanged installed case passed in
+5.686 seconds (`/tmp/sdk-received-current-capacity-repro310.log`), and the later
+managed-module run also passed that case. These passes do not identify the
+historical exception. Fixture cleanup now saves every original traceback and
+retries only the supported observation-cleanup pending exception or managed
+`supervisor_checkpoint_pending` / `supervisor_cleanup_unknown` errors, sharing
+one original 10-second deadline across all attempts for each app. Other errors
+and exhausted cleanup still fail. Direct first-close contract assertions remain
+unchanged. Independent review accepted this fixture contract correction; it is
+not a diagnosis of the lost historical exception. No speculative SDK close
+change has been made, and no further reproduction or full-suite rerun was
+started after the user's convergence instruction. The final installed type,
+remaining README and six-process restart checks all passed. SDK source is
+unchanged from the retained wheel. The fixture correction passed independent
+review, syntax checking and `git diff --check`; it has not been presented as a
+new complete-suite pass. The remaining full-suite and native matrix requirements
+will be verified by the original CI workflow, retaining its existing bounds.
+
+The preceding candidate was rebuilt from sdist and imported from
+`/tmp/tmps827c_rj/venv/lib/python3.10/site-packages/dispatcher_sdk/__init__.py`.
+Its five public consumer scenarios and managed supervisor example passed.
+The exact wheel, sdist and build/import record are retained in
+`/tmp/sdk-alarm-current-candidate310/`. Full-suite stdout, stderr and the
+900-second command receipt are under
+`/tmp/sdk-alarm-current-independent310-evidence/sdk-observability-consumer-2y874e6w/installed-suite/`.
+The previous child-publication and remaining-startup-window cases passed.
+This run instead recorded three errors: close retained a live budget owner in
+the two-parent-guard fixture; native crash recovery returned no result while a
+sampling guard remained; and the new alarm receipt case received control
+admission `TimeoutError` in its final recovery rejection assertion. The alarm
+case had already proved both receipts and preservation of its original fact.
+These errors do not establish a complete pass. CI remains paused.
+
+An unchanged three-case installed reproduction finished in 3.412 seconds;
+only native crash recovery repeated its error. Log:
+`/tmp/sdk-alarm-current-failure-repro310.log`. Both crash artifacts contain an
+unresolved sampling guard, unchanged original constraints, one business call
+and no result. The old crash gate proved entry, but could interrupt later
+sampling; refusing another claim preserves that uncertainty.
+
+The two-owner fixture passed its original refusal assertions. Historical rows
+show its first ACK committed and the second guard remained; precise cleanup
+timing was not recorded. One unchanged forwarding probe passed with a 31ms
+close and no dropped records (`/tmp/sdk-two-guard-cleanup-probe310/evidence/timing.json`).
+After all refusal assertions, the revised fixture explicitly publishes each
+exact retained fact under its existing individual .1-second ACK bound. The
+SDK's final close bound is unchanged. Independent review found no blocker.
+
+Sampling retries had a separate diagnostic hole: an admission timeout could
+replace an unresolved-clock error already established by SQL. A deterministic
+real-SQLite test fails against the retained wheel at that replacement, while
+its initial-admission timeout control passes
+(`/tmp/sdk-sampling-refusal-baseline310.log`). The correction retains the same
+original refusal and chains the later timeout; initial admission and newly
+armed errors remain unchanged. The alarm receipt test now uses public clock
+diagnostics and `admission_budget` to prove recovery refusal and unchanged
+facts. Independent review accepted both changes. All four focused source
+cases passed in 1.879 seconds (`/tmp/sdk-sampling-refusal-focused310.log`).
+All 60 budget, owner, child-cleanup, entry and supervision integration cases
+then passed in 33.537 seconds (`/tmp/sdk-sampling-refusal-integration310.log`).
+The corrected positive crash fixture passed in 3.262 seconds. Its real native
+receipt confirms both parent and supervisor checkpoints, no remaining guard,
+physical containment and an unpersisted result before exit 73. Restart retains
+the original .8-second constraint and reaches an exhausted result with exactly
+one business call. Evidence:
+`/tmp/sdk-confirmed-native-receipt-crash310-evidence/sdk-observability-native-4bsla_qo/`.
+The crash stage is now explicitly after native receipt and before result
+persistence; separate armed-crash cases continue to require unknown-clock
+refusal. Independent review accepted the new fixture boundary; Windows behavior
+has only been reviewed in source. Complete installed validation remains required.
+
+The retained pre-correction wheel also passed all five public type consumers,
+626 local links and six README examples with no skips:
+`/tmp/sdk-alarm-current-types310.log` and `/tmp/sdk-alarm-current-docs310.log`.
+
+The previous installed suite retained failures in cancellation lock admission, cancellation
+diagnostic ordering and child ownership-release readiness, plus an error while
+setting up the expired child-receipt read. Its full stdout, stderr and timeout
+receipt are under the public-consumer artifact's `installed-suite/` directory.
+An unchanged four-case installed reproduction finished in 9.054 seconds: lock
+admission and the child-receipt case passed; cancellation observation lacked its
+requested phase, and the child again missed its original two-second readiness
+window (`/tmp/sdk-current-installed-failure-repro310.log`). These results do not
+establish a complete regression pass. Diagnosis is continuing with the original
+deadlines and retained storage evidence.
+
+Cancellation diagnosis found that fallback note projection used publication time
+instead of a retained `captured_at`. The corrected projection also uses the
+captured observation time for process freshness. Optional cancellation writes
+now share the remaining original control allowance; failed or skipped facts use
+the existing bounded local buffer, without claiming persistence. Explicit
+cancellation-journal failures still surface after physical cleanup. Independent
+review found no blocker. All 36 focused cancellation, receipt and delayed-note
+cases passed in 52.462 seconds (`/tmp/sdk-cancel-diagnostic-bounds310.log`).
+This source correction has not yet passed complete installed or native validation.
+
+The unchanged child ownership case passed once under forwarding timing probes
+in 5.826 seconds (`/tmp/sdk-child-readiness-timing-current310.log`). Its four
+collector registrations consumed 0.192 seconds in total. The retained report
+`/tmp/sdk-child-readiness-timing-current310.json` records original 4/3/2-second
+parent, child and readiness limits, with no dropped trace events. Nested spans
+are inclusive; this passing probe does not attribute the earlier readiness
+failures to collector registration alone or establish complete acceptance.
+
+SDK-managed recorders now defer collector registration to their owned flusher.
+Runtime creates one recorder per claimed lease and scope; public and manually
+constructed recorders retain registration at construction, so late flushes
+cannot reverse their replacement order. All 39 focused journal, flusher and
+child ownership cases passed in 22.007 seconds
+(`/tmp/sdk-managed-collector-registration310.log`). The two new cases check
+close before the first flush and reversed public flush order using real SQLite.
+Complete installed and native validation of this change remain pending.
+
+Independent review found no blocker in the private registration change. The
+following integration run finished 90 cases in 179.841 seconds with one failure
+(`/tmp/sdk-managed-collector-integration310.log`). The reserved-capacity case
+exhausted its original eight-second wait for two Inbox notices, before reaching
+its capacity assertions. Both business handlers entered. Retained cleanup data
+includes a `database is locked` error during the reserved execution's guarded
+claim; it does not yet explain the missing second notice. The raw records are
+under `/tmp/sdk-managed-collector-integration310-evidence/sdk-managed-stalls-ml_z2jev/`.
+The other 89 cases passed. This failure remains open; CI stays paused.
+
+Retained rows narrow that failure to late Inbox delivery: both stall episodes
+formed by `1791222061.366`, and both bridges completed by `1791222063.140`.
+The second Inbox acceptance occurred at `1791222067.046`, after cleanup began
+at `1791222066.833`. See `/tmp/sdk-managed-notice-failure-timeline310.json`.
+A forwarding run of the unchanged case passed in 7.922 seconds, but recorded
+1.130 seconds inside notification ACK's native `BEGIN IMMEDIATE` and 2.831
+seconds inside a coordinator BEGIN. Parent trace history was complete; its
+separate critical-event ring overwrote 353 entries. Child timings were omitted.
+
+Store, result delivery and Inbox transactions now retry BEGIN within the
+connection's original busy timeout, restoring that timeout before the body.
+Clock sampling, savepoints, bodies and COMMIT remain unchanged. Independent
+review found no blocker. The same probe then passed in 10.614 seconds: ACK fell
+from 1.188 to 0.073 seconds, while the complete case took longer because it
+also waited for the managed handler. Both-notice readiness was 5.436 seconds
+before and 5.332 seconds afterward. This supports the admission change, not an
+overall throughput or complete-regression claim. Raw before/after records are
+`/tmp/sdk-managed-notice-probe/timings.json` and `after-timings.json`.
+
+After this change, all 78 notification, result, durability, managed-supervisor
+and pressure cases passed in 169.088 seconds, including all 22 managed cases
+and the original capacity-shortage test. Seven added real writer-admission
+tests passed in 6.812 seconds. They cover the configured cutoff, zero-timeout
+admission, body execution once, timeout/durability restoration, original SQL
+errors, restoration failure cleanup and expiry after wall-clock rollback.
+Logs: `/tmp/sdk-notification-admission-integration310.log` and
+`/tmp/sdk-notification-writer-admission310.log`. Complete installed and native
+validation remain outstanding.
+
+The preceding independent rebuild finished
+(`/tmp/sdk-notification-current-independent310.log`). Its fresh Python 3.10
+virtualenv imported `/tmp/tmpg_k0xicw/venv/lib/python3.10/site-packages/dispatcher_sdk/__init__.py`.
+All five public consumer scenarios and the managed supervisor example have
+passed; the example retained its original 30-second limit. The installed suite
+timed out at 900 seconds after 933 passes and one failure, while starting
+`test_blocked_bridge_does_not_block_tick_and_close_reports_pending`. Evidence:
+`/tmp/sdk-notification-current-independent310-evidence/sdk-observability-consumer-ikx4xdy0/`.
+
+The sole recorded failure, `test_initializing_context_keeps_actual_connection_storage_pending`,
+failed identically in an unchanged installed reproduction in 3.434 seconds
+(`/tmp/sdk-notification-current-failure-repro310.log`). Its gate waits for
+collector registration on the handler thread. That operation now runs on the
+owned flusher; Context attachment itself opens no SQLite connection. The revised
+test holds the actual registration connection and verifies storage retention
+until physical close. A separate case covers close before recorder publication,
+including refusal to start business work afterward. All nine cleanup cases
+passed against the same installed wheel in 26.463 seconds
+(`/tmp/sdk-runtime-registration-current310.log`). Original timing limits and
+historical failure evidence remain unchanged. Suite duration is still unresolved.
+
+The exact rebuilt wheel was retained under `/tmp/sdk-notification-current-wheel310/`
+and installed for the current public typing and README checks. Import evidence
+is `/tmp/sdk-notification-current-installed-import310.json`.
+
+The suite-duration investigation ruled out repeated native identity reads as a
+priority: they accounted for only 64.68 milliseconds of inclusive time in a
+6.685-second passing public parent/child scenario
+(`/tmp/sdk-observation-identity-timing310.json`). A broader parent-only profile
+failed with a retained `OperationalError: database is locked`, took 12.550
+seconds and overflowed its event buffer. Its overhead and missing child-side
+origin prevent using it as normal-run timing evidence
+(`/tmp/sdk-parent-cost-timing310.json`).
+
+A narrower forwarding probe passed in 7.479 seconds. It recorded 22 empty
+notification event pages that still entered result-clock write transactions,
+occupying the coordinator for 2.080 seconds in total. The Host now uses a
+private read-only readiness check before collection. Planned cancellations
+remain bound to the watched attempt; unrelated Kernel events still advance
+cursors, and pending or delivering notification/result rows retain the shared
+clock path. Public collection is unchanged. Independent source review found
+no blocker. The same scenario on the changed source passed in 6.014 seconds,
+with zero empty-page write transactions. Both narrow probes retained the
+original deadlines and all timing records. These are individual runs, not a
+complete-suite performance result: `/tmp/sdk-empty-notification-timing310.json`
+and `/tmp/sdk-empty-notification-after310.json`. All 78 notification, result,
+durability, managed-supervisor and pressure integration cases then passed in
+138.588 seconds (`/tmp/sdk-collection-readiness-integration310.log`), including
+all 22 managed-supervisor cases. Eight added readiness cases passed in 4.297
+seconds (`/tmp/sdk-collection-readiness-edge310.log`): actual writer contention,
+public clock observation, planned and historical cancellations, unrelated
+events, a racing cancellation through successive Host pumps, and notification
+and result lease fencing after wall rollback. The next independent installed
+candidate finished within the original limits; its wrapper log is
+`/tmp/sdk-collection-current-independent310.log`. Its five public scenarios and
+managed-supervisor example passed from
+`/tmp/tmptdutsyqt/venv/lib/python3.10/site-packages/dispatcher_sdk/__init__.py`.
+The exact sdist-rebuilt wheel is retained in `/tmp/sdk-collection-current-wheel310/`,
+and public evidence is under
+`/tmp/sdk-collection-current-independent310-evidence/sdk-observability-consumer-4svbk4rp/`.
+The installed full suite completed 1,126 cases in 879.142 seconds, with one
+failure, one error and 17 platform skips. The held-child-publication success
+case returned a parent snapshot without a result, and its fixture then raised
+`AttributeError` while recording that result. The remaining-startup-window
+case expected `handler_process_start_failure` but received `budget_clock_unknown`.
+Both retained failures are under diagnosis. The wrapper's final restart
+consumer did not run because the installed suite failed. Complete installed
+and native acceptance remain pending.
+
+An unchanged two-case reproduction against that retained wheel finished in
+13.620 seconds (`/tmp/sdk-collection-current-failure-repro310.log`). Startup
+restoration passed; the held-child-publication success case again returned a
+parent snapshot without a result, followed by the fixture's `AttributeError`.
+Its retained business receipt contains the exact successful child result, but
+the parent completion clock remains unknown. The original assertions and
+deadlines remain unchanged. The
+same installed wheel passed all five public type consumers and 626 local links
+plus six README examples. Its import record is
+`/tmp/sdk-collection-current-installed-import310.json`.
+
+Two bounded forwarding probes then recorded actual sampler ownership without
+adding SQL, wall samples, ACKs or filesystem writes during sampling. The first
+passed in 12.316 seconds. The second reproduced the error in the raw-failure
+branch in 12.372 seconds. Its trace is
+`/tmp/sdk-completion-sampling-probe310/evidence-run2/sampling.json`.
+The same worker armed and captured token `d2f54734-6ec5-4686-a302-0d6e6411b6bd`;
+child result proof borrowed it, but parent completion recognized only the
+Context's separate sampler and refused that token throughout its original
+0.1-second window. Cleanup acknowledged the exact captured fact afterward.
+No process trace was missing or dropped. This establishes an ownership handoff
+defect for that reproduction; the earlier failures lack this token-level trace.
+
+Successful factual child delivery now retains one exact owner/pending tuple for
+its bound Context's completion reader. The handoff occurs after physical reader
+close and the original final budget check. Exact Context, capability, Kernel,
+command and lease bindings plus current registry/tuple identity are required.
+Existing foreign/extra/ancestry guard refusals and cleanup ACK ownership remain
+unchanged. Both new positive tests failed against the preceding installed wheel
+with the same clock error (`/tmp/sdk-child-completion-handoff-baseline310.log`).
+All 65 related source cases passed after the correction in 56.343 seconds,
+including success, raw child failure, foreign bindings, replaced tuples,
+registration changes, reader lifetime and the unchanged native end-to-end case.
+Independent review found no blocker. Full installed and native acceptance remain
+pending.
+
+The sdist-rebuilt wheel then passed all four new ownership cases and the
+unchanged native success/raw-failure case outside the checkout: five cases in
+16.057 seconds (`/tmp/sdk-child-completion-handoff-installed310.log`).
+`/tmp/sdk-child-completion-handoff-build310/import.json` records the actual
+`venv/lib/python3.10/site-packages/dispatcher_sdk/__init__.py` import.
+That directory retains the sdist, rebuilt source, wheel and virtualenv; the
+successful build log is `/tmp/sdk-child-completion-handoff-rebuild310.log`.
+An earlier packaging attempt failed on the read-only default pip cache, before
+wheel creation; rerunning the same sdist build with pip caching disabled passed.
+The installed candidate also passed five public type consumers and 626 local
+links plus six README examples. These focused checks do not replace the full
+installed suite or native matrix.
+
+Three unchanged startup forwarding probes passed in 1.461, 1.507 and 1.524
+seconds; reports are under `/tmp/sdk-startup-forward-probe310/` and its
+`-repeat1` and `-repeat2` siblings. One crossed the startup deadline during a
+known captured sample and still acknowledged that exact fact before returning
+the expected startup failure. None reproduced the original SQLite lock failure.
+Killed workers did not publish their in-memory restore trace, so that stage is
+explicitly unobserved. The original startup failure remains under diagnosis;
+these passing probes do not discharge it.
+
+A separate controlled captured-ACK contention probe passed in 1.406 seconds
+against the handoff wheel (`/tmp/sdk-startup-captured-ack-probe310/`). A real
+fixture writer blocked the supervisor's already captured token. Both parent
+and supervisor recorded SQLite lock failures; the original startup alarm then
+interrupted ACK. When parent termination began, the fixture released its writer.
+The supervisor acknowledged the original token, sent its timeout receipt and
+physically closed its Kernel; the parent recovered that receipt after termination
+and returned the expected startup failure. The supervisor's eventual exit code
+was `-9`, unlike the historical self-close failure with exit code `1`. This run
+does not reproduce that original failure or establish what happened before its
+sampling capture. All writer ownership and cleanup stages were observed; the
+killed worker's restore buffer remains unavailable.
+
+A second controlled probe reached the missing boundary using the original
+native alarm: arm COMMIT completed, then the alarm interrupted before a clock
+fact was captured. The owner retained `(token, None)` and the original
+`_DeadlineExpired`. `_finish_budget_capture` rethrew that stored control-flow
+exception twice, suppressing both terminal sends; supervisor close then refused
+the unresolved sample and exited with code `1`. The original startup assertion
+still passed in this run because the parent took its ordinary startup-expiry
+fallback. The missing receipt is nevertheless directly observed in
+`/tmp/sdk-startup-uncaptured-arm-probe310/timing.json`. This establishes the
+packet-loss defect; the historical failure did not record that exact internal
+state, so its complete timing remains unavailable.
+
+Uncaptured cleanup now returns an unknown checkpoint with the exact token and
+original error instead of invoking an impossible ACK and rethrowing the retained
+alarm. It preserves the guard, captured-envelope absence and original envelope.
+The captured-fact branch still has its original exception boundary and allowance;
+fresh operator interrupts are not caught more broadly. Independent review found
+no blocker. A new isolated real-alarm/SQLite/pipe regression failed against the
+preceding installed wheel (`/tmp/sdk-uncaptured-alarm-baseline310.log`) and passed
+after correction. It checks two actual receipts, no additional SQL or wall
+sample, unchanged pending ownership, explicit failed close, and recovery refusal.
+
+The full supervisor probe after correction passed in 1.397 seconds with every
+controlled stage reached. Its parent received the exact unknown checkpoint and
+original alarm error; the unresolved guard and subsequent supervisor close
+failure remained visible. Before/after assertions and import paths are retained
+in `/tmp/sdk-uncaptured-alarm-before-after310.json`; the fixed source trace is
+`/tmp/sdk-startup-uncaptured-arm-fixed-source310/timing.json`. Both runs denied
+business invocation and retained their original startup/control deadlines.
+All 45 native-budget, owner-registry, handler-entry and supervision integration
+cases then passed in 22.707 seconds. Complete installed and native matrix
+validation of the combined corrections remains pending.
+
+A read-only audit of CI run `37203657162` reconciled eight leaf failures in five
+categories: wait-policy fixture activation, checkpoint-note expiry, Windows
+marker sharing, deferred timeout settlement, and missing script byte counts.
+Three isolated-consumer failures wrap those same nested failures. Current
+fixtures and corrective source paths have local witnesses, but the original
+Windows checkpoint expiry and script-loss causes remain unattributed. The old
+records establish no additional current source defect; they also do not close
+native acceptance. Retained raw failures are in
+`/tmp/sdk-ci-audit-failures-37203657162.json`.
+
+The source error is temporary-directory cleanup after bounded thread timeout and
+reentrant close. The retained directory has Kernel WAL/SHM files. Source inspection
+confirms that a late handler can admit an independent completion reader after
+Context close; the exact connection that produced the residue was not recorded.
+The exact original residue-producing connection remains unidentified.
+
+The reader now reserves Context ownership before raw wall sampling or SQLite
+admission. Context close atomically refuses later reservations. Admitted readers
+retain storage and capacity through the entire body and any failed physical
+close; Runtime retries only physical close on the exact reader after the body
+has left. Capture and cleanup release admission retain their original absolute
+deadlines. Independent review found two test proof gaps, now covered by actual
+lock timeout arguments and zero-SQL traces during retry. Initial tests exposed
+a fixture assignment typo and mutable captured fixture state; both are fixed.
+The final eight lifetime cases passed. Existing completion and default connection
+affinity cases passed in the preceding 34-case run, whose three errors were
+limited to that fixture (`/tmp/sdk-completion-reader-corrected310.log`).
+
+The pressure failure is late stall callback delivery under saturated workers.
+The callback did arrive after its original eight-second readiness wait failed.
+Its saved notice was observed at `1791215977.4732375`, bridged at
+`1791215979.29661`, accepted into the Inbox at `1791215983.8752928`, and invoked at
+`1791215984.511407`. These times identify the delayed stages; they do not yet
+identify the lock owner or justify extending the wait.
+
+An unchanged instrumented pressure case later passed in 12.550 seconds
+(`/tmp/sdk-stall-trace-run310.log`). During its first Inbox writer admission wait
+of 1.030 seconds, budget-sampling transactions occupied about 0.695 seconds and
+empty Inbox claims about 0.135 seconds. These are competing writer intervals,
+not a single long transaction. The first delivery window is recorded; later
+parent trace records hit the configured cap, and forked handler traces are absent.
+Background Inbox consumers now use a readonly advisory check while idle.
+Any pending message for their source or any processing lease retains the
+original atomic claim and logical-clock protection. Public claims are unchanged.
+
+Two further recovery checks failed: generation-zero replay was refused with
+`process_cleanup_in_flight`, and immediate applied Effect recovery remained
+`queued` when the fixture expected `succeeded`. These outcomes need causal
+diagnosis; they do not authorize releasing unresolved cleanup ownership or
+extending the original recovery budget.
+
+A forwarding reopen probe passed in 1.472 seconds and recorded completed
+Future/Context cleanup with stale local thread ownership at `run_once` return
+(`/tmp/sdk-recovery-forward-reopen310.log`). Driver retirement now revisits only
+that exact completed generation through the existing ownership checks. The
+focused regressions cover both immediate reopen and refusal while actual
+handler cleanup is still held.
+
+The original Effect probe passed in 1.765 seconds without sampling guards
+(`/tmp/sdk-recovery-forward-effect310.log`). A separate deterministic probe
+forced actual process death after the durable sampling marker committed and
+before its original sample/ACK. The same marker survived resolution and blocked
+the replay claim, leaving attempt/fence unchanged and reproducing the original
+`queued` assertion in 1.266 seconds (`/tmp/sdk-effect-orphan-forward310.log`).
+This demonstrates the protective behavior; it does not identify the unrecorded
+guard state in the failed complete run. The positive recovery fixture now holds
+the actual Context budget lock across its original crash phase and checks
+confirmed entry with no pending token or durable guard before mutation. It adds
+no clock sample or ACK. All four original recovery cases and the separate real
+orphan refusal case passed in 9.112 seconds. The latter preserves the same
+guard, response, original constraints and floor, with no second invocation or result.
+
+The installed suite keeps its 900-second limit. Public consumer and managed
+supervisor example limits remain 180 and 30 seconds. The latest source run also
+exceeds the installed suite's original limit; its per-case timings are saved at
+`/tmp/sdk-child-anchor-source310-timings.json`. The corrective records below retain earlier
+candidates, failed attempts and their original evidence.
+
+## Corrective history, 2026-10-05
+
+CI remains paused: run [37269716472](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37269716472)
+was cancelled at the user's request. Known defects must be fixed before another CI
+run or a push that triggers CI. The working tree below is not a completed candidate.
+
+An earlier complete source diagnostic ran 1,051 cases in 967.504 seconds, with
+four failures and 17 platform skips
+(`/tmp/sdk-positive-guard-current-source-full310.log`). Per-case timings are in
+`/tmp/sdk-positive-guard-current-source310-timings.json`; the original installed
+suite cutoff remains 900 seconds. The strict positive and expired foreign-guard
+recovery cases passed. Remaining failures were initial completed-result delivery
+under a main writer, child readiness before its contention writer, permanently
+unknown completion time after successful binding recovery, and a tardy second
+managed stall notice before the capacity assertions.
+
+Tokenless write-admission failure now has a readonly fallback: guard absence
+and the canonical floor share one SQLite snapshot. An existing transaction is
+refused so stale snapshots and uncommitted floors cannot become authority; the
+caller transaction remains untouched. Successful proof merges only the original
+envelope's checkpoint. Foreign guards remain fenced, and neither raw wall
+sampling nor ACK/guard retirement occurs in this fallback. The first 36-case
+run passed completed-result delivery and strict guards, but failed a newly
+authored comparison using a later rather than identical elapsed sample, and
+the original two-second readiness precondition
+(`/tmp/sdk-readonly-floor-guard310.log`, 68.526 seconds). The comparison now uses
+the same retained checkpoint; no tolerance or original bound was widened.
+
+An actual traced readiness reproduction passed unchanged in 5.661 seconds
+(`/tmp/sdk-child-readiness-native-trace310.log`). Its bounded SQL evidence is
+`/tmp/sdk-child-readiness-native-trace310-evidence/sdk-child-storage-contention-l65qdl9x/readiness-native-trace.json`.
+Independent review approved removal of duplicated live parent verifications
+and one redundant fresh sampling before readonly receipt attachment. Targeted
+Kernel claim still atomically checks the original parent lease, confirmed entry,
+guards and inherited limits. The subsequent 50-case integration passed 49 in
+78.186 seconds (`/tmp/sdk-guard-cold-entry-reviewed310.log`); the completed child
+was actually delivered through the bounded rescue, but its successful parent
+outcome became permanently unknown when completion-time capture waited on the
+shared Kernel lock. Independent factual completion-clock capture now samples
+the actual return once and reads a bounded committed snapshot, retaining the
+same conservative elapsed floor, exact ancestry and original 0.1-second window.
+It never arms, acknowledges or clears a budget sample. The first 77-case run
+passed delivery and current binding recovery but found two test construction/
+raw-error assertions (`/tmp/sdk-factual-completion-integrated310.log`). The
+next 38-case run exposed another overly specific wait-error assertion: an exact
+sampling-unresolved refusal preceded successful immutable result rescue and
+parent settlement. The assertion now admits only that exact sampling refusal;
+foreign-guard denial, original cutoffs, exact result identity and one business
+invocation remain required. Independent review approved the production path and
+the narrow fixture corrections. All 41 completion, settlement, binding,
+delivery and strict-guard cases passed in 53.560 seconds
+(`/tmp/sdk-completion-rescue-corrected310.log`), and the five public type consumers
+passed (`/tmp/sdk-completion-current-public-types.log`).
+
+A12's retained databases show both episodes were formed and bridged before the
+failed readiness wait, while the Orchestrator-to-application Inbox handoff was
+late. A real, unchanged one-case trace passed in 7.990 seconds
+(`/tmp/sdk-a12-notice-latency-before310.log`); bounded timing evidence at
+`/tmp/sdk-a12-notice-latency-before310/latency-trace.json` records notification
+BEGIN waits of 0.930, 0.831 and 0.630 seconds. Older real SQL evidence also
+records eight empty delivery COMMITs consuming 0.254 seconds within a 1.116-second
+ring tail. Host polling now reads both notification and result queues in one
+readonly statement and skips a write claim only when neither has pending or
+leased work. Explicit public delivery/claim semantics remain unchanged; any
+candidate retains original atomic clock and lease checks, and read errors stay
+errors. Independent review approved the scope. The 44 notification/Host/Inbox
+cases passed in 27.275 seconds (`/tmp/sdk-a12-idle-delivery-corrected310.log`);
+the strengthened real writer/read-through and shared-result lease rollback
+proofs passed in 1.769 seconds (`/tmp/sdk-a12-idle-proof-final310.log`). The
+complete managed suite then passed all 22 cases in 81.777 seconds
+(`/tmp/sdk-managed-idle-delivery-final310.log`), including the original second
+notice/capacity assertion, actual memory denial, source/notice cutoffs and cleanup
+ownership. The candidate was rebuilt and installed from
+`/tmp/sdk-completion-idle-final-wheel310/dispatcher_sdk-0.7.0.dev2-py3-none-any.whl`;
+build and installation completed successfully. The complete current source
+run is retained at `/tmp/sdk-completion-idle-final-source-full310.log`, with
+fresh per-case timing destination `/tmp/sdk-completion-idle-final-source310-timings.json`.
+The complete source run finished 1,070 cases in 974.287 seconds, with one
+failure, two errors and 17 platform skips. It did not pass; elapsed time still
+exceeds the unchanged 900-second installed-suite cutoff. The failure was the
+healthy successor's startup, after the original admission-timeout classification
+and capacity release had succeeded. Retained SQL timing identifies a first
+synchronous Context binding publication taking 0.0858 seconds, on top of about
+0.090 seconds of entry preparation and further collector setup, before the
+original 0.250-second startup signal. Current binding now uses the handler
+recorder's existing retained asynchronous publication/retry mechanism;
+collector registration and first-entry ACK order stay unchanged.
+
+One error identifies a completion-clock integration defect: a Context's own
+already captured, pending exact-token fact was treated as an unowned unknown
+clock, retaining its original value but making its receipt permanently
+unsettleable. Narrow factual-clock proof for that live owner is now implemented;
+foreign, additional and uncaptured guards must remain unknown and no guard may
+be cleared by completion capture. The other error is the new late-ACK fixture's
+sampling refusal; its separate 0.035-second sleep and ACK operation do not prove
+ACK completed within the caller's original 0.1-second window. Actual stage
+timings and raw errors are being retained before choosing a correction.
+Complete corrected source, independent installed and native acceptance remain open.
+
+The corrected owner proof and asynchronous binding integration passed 60 cases
+in 63.320 seconds (`/tmp/sdk-owned-clock-async-binding-first310.log`), including
+the original pending-token result and healthy successor startup assertions.
+Fresh independent review then found that a real SQLite progress interruption
+could replace a preceding refusal at deadline exhaustion. The correction requires
+this reader's timeout state and an actual SQLite interruption; unrelated SQL
+errors remain raw. Independent review approved it, and all 22 completion-clock
+cases passed in 7.938 seconds (`/tmp/sdk-completion-interrupt310.log`). New real
+SQLite tests preserve the same original guard exception under recursive-query
+progress timeout and the same permanent missing-table error after expiration.
+These focused passes do not replace the pending complete or installed acceptance.
+
+The ACK fixture now triggers the actual original-token acknowledgement after a
+real sampling refusal, removing its artificial pre-ACK sleep while retaining the
+original 0.1-second capture window. Independent review approved this ordering;
+post-COMMIT diagnostic timestamps do not impose a scheduler-dependent order on
+the reader. The 62-case completion/ownership/binding integration passed in
+67.933 seconds (`/tmp/sdk-completion-ordered-ack310.log`). Native observation,
+script output/recovery, process integration and all managed supervision cases
+passed together: 46 cases in 163.855 seconds
+(`/tmp/sdk-clock-binding-native-managed310.log`). Types passed all five consumers;
+documentation checked 554 links and six README examples with no skips.
+
+The current source wheel was rebuilt and reinstalled successfully from
+`/tmp/sdk-owned-completion-current-wheel310/dispatcher_sdk-0.7.0.dev2-py3-none-any.whl`.
+The complete corrected source run finished at
+`/tmp/sdk-owned-completion-source-full310.log`, with a new per-case timing
+destination `/tmp/sdk-owned-completion-source310-timings.json`. There is no current
+complete source, isolated rebuilt-wheel or native matrix pass yet.
+
+That run completed 1,077 cases in 980.226 seconds, with two failures, one error
+and 17 platform skips. Previous pending-value and healthy-startup defects passed.
+Remaining failures are the real writer-cutoff child rescue and active native
+cancellation cleanup; the error is a foreign-owner ACK fixture with an independent
+pre-ACK sleep. Child rescue cannot acquire the shared Kernel RLock inside its
+original proof window even after recorded native writer rollback. The artifact
+does not identify the owning thread; the budget monitor and other control writers
+remain competing contenders. An independent readonly factual reader is now
+integrated, retaining exact positive capture ownership and a fresh final authority
+snapshot after the sole result read. The focused 78-case integration finished
+with four positive fixtures refusing a wall read in the real entry revocation
+check, before the factual proof began. Their no-wall assertion now covers the
+actual rescue only; the 13-case clock cleanup suite passed in 10.267 seconds
+(`/tmp/sdk-child-factual-scoped-wall310.log`). The public writer-cutoff rescue,
+fresh final cancellation, real final progress interrupt and permanent SQL error
+passed in the original focused run. Independent final source review approved
+the exact ownership, scalar lease checks and preserved timeout/error causes.
+
+Cancellation returned the original cancelled winner but no explicit physical
+cleanup callback. The supervisor was killed before producing its containment
+packet; EOF classification followed full-window budget retry, and parent capture
+could not observe a newly ready packet during that retry. EOF now proceeds to
+bounded factual containment first. Ready original packets interrupt only transient
+capture retries, and revocation gives packet publication the existing one-second
+grace. An independent review found and corrected a permanent-error masking path:
+packet recovery now retains permanent control failure while separately retaining
+explicit physical cleanup evidence. The 18 native capture/packet/cancellation/
+cleanup/parent-floor cases passed in 20.971 seconds
+(`/tmp/sdk-packet-error-gating310.log`), including real BUSY and permanent SQL errors
+with the original pipe becoming ready during capture. These are focused source
+passes. A newer current-source wheel, including these fixes and the readonly
+flush anchor, was built and installed successfully from
+`/tmp/sdk-child-anchor-current-wheel310/dispatcher_sdk-0.7.0.dev2-py3-none-any.whl`.
+Its actual import outside the checkout was confirmed under
+`/tmp/sdk-a05-a12-current-installed310/lib/python3.10/site-packages`.
+
+The measured dormant-sampler probe completed ten genuine empty ticks in 0.0399
+seconds using 40 readonly journal connections, with unchanged persisted state
+and no errors (`/tmp/sdk-dormant-stall-baseline-corrected310/evidence.json`). No
+optimization is justified by that small cost. The prior complete run's exact
+installed-suite subset projects 1,066 cases and 972.828 seconds; this projection
+is not an actual installed-suite result and does not alter the original 900-second
+cutoff. Its 10,000-summary case spent 1.297 seconds in readonly pagination, versus
+18.284 seconds of actual execution. Budget-capture and flush costs require direct
+stage attribution before choosing further changes. A separate native stage
+probe passed the unchanged case in 19.969 seconds. Its actual handler recorded
+157 captures taking 4.931 seconds and 206 flush attempts taking 11.320 seconds;
+these overlapping inclusive durations cannot be added. An external idle
+readonly connection held only during the existing flusher's lifetime reduced
+the same case to 13.117 seconds, with 174 flush attempts taking 4.420 seconds
+(`/tmp/sdk-summary-anchor-budget-stages310.log`). Capture durability and original
+limits were unchanged. This measured improvement supports the narrow production
+anchor now integrated, without a transaction, retained cursor or new public
+close API. Physical close remains owned by the existing live worker; admission
+failure releases failed setup before ordinary flushing. Close refusal retains
+the original connection and live worker. The production native pressure,
+cancellation, stream and existing storage-lifetime suite passed 14 cases in
+40.741 seconds (`/tmp/sdk-flush-anchor-native-first310.log`); the pressure artifact
+records 12.967 seconds and 201 pages with no failures. Public types passed five
+consumers, and the current installed wheel passed six README examples with zero
+skips and 554 links. New anchor lifecycle verification and a complete unchanged
+900-second installed-suite pass remain required.
+
+The current-source managed supervisor, native budget-capture and thread-capacity
+integration passed 31 cases in 75.589 seconds
+(`/tmp/sdk-child-anchor-managed-current310.log`). It includes the 22 A12 cases,
+actual native memory denial, capacity shortage, original deadline/result replay
+and retained physical collector ownership. No original budget was enlarged.
+
+The anchor lifecycle, stream, Runtime storage and thread capacity suite passed
+20 cases in 34.167 seconds (`/tmp/sdk-flush-anchor-lifetime-final310.log`). Six
+new real SQLite scenarios prove idle WAL checkpoint/fresh visibility and FULL
+or NORMAL writer durability, genuine missing-file admission fallback, manual
+flushing, same-connection close retry without flush replay, exact handler flusher
+storage/capacity retention, and failed setup cursor release before ordinary work.
+Direct recorder close now joins its existing worker only within the same caller
+deadline's remaining time; a persisted telemetry receipt does not discharge a
+blocked physical connection. The revised current-source wheel was rebuilt and
+installed at `/tmp/sdk-child-anchor-joined-wheel310/dispatcher_sdk-0.7.0.dev2-py3-none-any.whl`.
+The sequential 1,092-case complete source run is active at
+`/tmp/sdk-child-anchor-source-full310.log`, retaining fresh per-case timings at
+`/tmp/sdk-child-anchor-source310-timings.json`. Source files and tests are frozen
+during that run; it excludes only the separately required nested installed
+consumer test, as earlier runs did. No current complete pass is claimed yet.
+
+The complete 1,057-case diagnostic finished in 992.597 seconds with six failures,
+two errors and 17 skips (`/tmp/sdk-recorder-ownership-final-source-full310.log`).
+It did not pass, and its elapsed time exceeds the unchanged 900-second installed
+suite limit. Its raw failures identify receipt-fixture admission consumption,
+bounded readonly proof refusal, child readiness, Run-expiry classification,
+pending thread-entry clock observation and parent revocation precedence. The
+entry gate now observes wall advancement through its durable pending-entry
+protocol under the same Context budget lock; confirmed entry keeps pure elapsed
+projection. Only the producer's exact Run-deadline CAS fact becomes a timeout;
+unmarked and malformed CAS failures retain the original generic failure. Child
+recovery first performs bounded readonly parent-revocation inspection. None of
+these paths replay business or extend the original work window.
+
+The entry/receipt/result-proof corrective integration passed 55 cases in 58.738
+seconds (`/tmp/sdk-source-eight-corrections310.log`). A subsequent 44-case run
+retained one strict fresh-recovery failure
+(`/tmp/sdk-parent-revocation-child-contention310.log`), while the actual native
+cross-store crash/revoked-parent path and five original child-contention cases
+passed. The failure's real foreign sampling marker remained committed, but
+capture admission timed out before checking it and the retry window returned
+trusted positive cached time. Recognized non-token capture admission failures
+now retry within the same native work cutoff. Expiry performs only bounded
+readonly classification; unresolved foreign markers remain unknown, and proven
+absence preserves the original transient failure. Successful capture retry uses
+the existing canonical-floor import. The first 35-case correction passed in
+64.234 seconds (`/tmp/sdk-positive-initial-guard310.log`), including a new real
+foreign-marker witness that exhausts capture admission before its guard read.
+Independent review then required optional proof handling for custom Kernels and
+expiry classification before any zero-timeout capture. Those adjustments and
+the current complete source/installed/native candidate remain under validation.
+
+The 1,057-case source run stopped after 84 tests with one error in 115.743
+seconds (`/tmp/sdk-expired-guard-final-source-full310.log`). Its delivery-cause
+fixture held the real control lock before reconstructing an expired window,
+although the case explicitly models a window already reconstructed and attached.
+The fixture now constructs that same real window before holding the lock. The
+production initial recovery guard remains unchanged, as do the original proof's
+0.1-second bound, error identity and cause assertions. Independent review approved
+the staging correction. All seven delivery-diagnostic and expired-guard cases
+passed in 3.315 seconds (`/tmp/sdk-child-initial-vs-delivery-control310.log`).
+This focused result does not establish full candidate acceptance.
+
+The next source run stopped after 260 tests in 255.220 seconds on a stale schema-4
+metadata assertion (`/tmp/sdk-initial-vs-delivery-final-source-full310.log`).
+Current-store isolation, strict marker types, preflight and activation fixtures
+now describe Kernel schema 5; the legacy managed-gate fixture explicitly applies
+both 3-to-4 and 4-to-5 upgrades, preserving the intermediate historical assertion.
+The invalid-marker case still rejects schema 4, a future integer version, and
+noninteger representations of the current version. Current storage documentation
+is aligned; Orchestrator schema remains 4. All 45 isolation, managed-gate,
+preflight and activation cases passed in 19.115 seconds
+(`/tmp/sdk-schema5-current-contract310.log`). Original retained-outcome copy
+semantics and a new complete current candidate run remain required.
+
+The retained-outcome suite passed 12 of 13 cases in 19.237 seconds
+(`/tmp/sdk-schema5-original-settlement310.log`). The failed lifecycle-contention
+case persisted the original result but blocked its public caller. An unchanged
+real-lock reproduction failed in 1.894 seconds; its `lifecycle-caller.json`
+captures the driver waiting at the unbounded recorder-removal lifecycle lock
+(`/tmp/sdk-lifecycle-recorder-baseline310.log` and its evidence directory).
+Active and retired recorder ownership now uses the existing independently guarded
+lifecycle condition; recorder I/O stays outside that lock. Exact active entries
+retain capacity until close and removal, and live retired workers are retained
+before removal. Independent review approved the ownership and lock ordering.
+All 18 result-retention, collector-capacity and repeated-close cases passed in
+26.365 seconds (`/tmp/sdk-lifecycle-recorder-integrated310.log`). Neither business
+budgets nor the original caller-return assertion were widened.
+
+A05 now has schema-5 write-ahead sampling guards and exact live-owner retries.
+Unacknowledged sampling fences fresh recovery and descendant business admission;
+acknowledgement only advances the canonical clock floor, preserving constraints.
+A real committed arm could exhaust the original short admission window before
+`current_time()` retained its capture. The corrected path reads the committed
+watermark under its already-owned lock and retains the captured floor before
+checking the acknowledgement deadline. Targeted child claim failures also transfer
+the same live sampler into the original child retry window. These changes do not
+clear foreign or interrupted-process markers.
+
+Five focused real-storage/native-clock cases passed in
+`/tmp/sdk-a05-canonical-monitor-integration310.log`, including independent writer
+contention, slow committed arm return, exact-owner transfer, signal-handler I/O
+exclusion, and a forward wall jump immediately after consuming a committed
+checkpoint once. That integrated run still failed two original child-contention
+cases. After correcting live-sampler races, all five original child-contention
+cases passed unchanged in 15.362 seconds
+(`/tmp/sdk-a05-sampling-owner-race-retry310.log`). The subsequent combined
+clock/storage/child-capacity/collector/close suite passed 52 in 51.200 seconds
+(`/tmp/sdk-a05-storage-capacity-integrated310.log`). Earlier native parent-only
+and supervisor-only forward-floor recovery cases passed locally. A wider 53-case
+native/budget run then retained one failure and one error: the public snapshot's
+elapsed floor was absent from its original receipt, and supervisor entry performed
+a redundant capture before forwarding committed entry. The receipt correction
+passed its actual reopen case in 1.205 seconds. Native entry now consumes and
+forwards the committed entry packet before another sample; known expiry keeps its
+original timeout cause. Twelve focused native/Windows-budget cases passed in
+6.006 seconds (`/tmp/sdk-a05-native-terminal-own-cleanup310.log`); actual native
+Windows execution remains unverified.
+
+A fresh ownership review found that a short child window and pre-handler
+admission could discard an unresolved helper. The live helper now resides in
+`execution_kernel/budget_capture.py`, and Kernel retains each pending exact-token
+owner independently of the caller's lifetime. Its owner lock protects a distinct
+finish-only operation; existing Runtime maintenance and close can publish the
+retained fact without another sample. Arm and ACK transactions use only committed
+clock authority; the first raw wall observation occurs after the durable guard.
+An interrupted uncommitted RELEASE/COMMIT rolls back its writer, while only the
+same retained owner may reconcile an ACK that actually committed before
+interruption. Fresh Kernels cannot infer or clear that owner's marker.
+
+Four actual SQLite regressions passed in 1.090 seconds
+(`/tmp/sdk-a05-budget-owner-registry310.log`): dropped expired caller with exact
+owner retention, interrupted committed ACK, zero wall reads before committed
+arm, and interrupted RELEASE with independent writer admission afterward. An
+initial combined native/owner/collector/queue/child-capacity suite passed 27 in
+15.260 seconds (`/tmp/sdk-kernel-owner-first-integrated310.log`). The queue selector
+also excludes unresolved guarded roots; independent queued work remains eligible.
+ACK now atomically promotes the same protected floor into the Kernel clock
+watermark. A separate real managed-Run/lease/effect witness passed in 0.349 seconds
+(`/tmp/sdk-a05-budget-owner-watermark-authority310.log`): after raw-wall rollback,
+a fresh Kernel rejects expired source authority and cannot claim the queued
+sibling. ACK performs zero new raw wall observations and retains every original
+cutoff and identity. These focused passes do not establish a complete candidate
+regression.
+
+Thread capacity now remains charged until exact-generation handler and driver
+collector ownership ends. A held real SQLite flusher verified a successful original
+business result, a still-queued successor, usable owner-thread connection, and
+successor admission only after release:
+`/tmp/sdk-thread-collector-capacity310-v3.log` and
+`/tmp/sdk-thread-collector-capacity-phjcr2uh/evidence.json`.
+An unresolved captured clock fact also retains its Context and Kernel writer;
+cleanup retries acknowledge only that fact under a shared maintenance deadline.
+The repeated-close path passed its independent real-writer regression in 2.351
+seconds (`/tmp/sdk-budget-capture-close-lifetime310.log`): the first close retained
+storage and capacity; the second acknowledged the original token, with no new
+sample, deadline increase or business replay. The original result receipt stayed
+unchanged. A separate actual idle-coordinator writer probe also passed; empty
+polling no longer acquires an observation write transaction. ChildService close
+now shares its original caller deadline across coordinator join, lock inspection
+and Future wait; pending ownership retains Kernel and journal storage. Two real
+SQLite coordinator/worker close regressions passed in 0.774 seconds
+(`tests/test_child_service_close_lifetime.py`). A stopped coordinator cannot submit
+business after returning from a contended journal transaction.
+
+A12 includes an independent process Runtime, bounded capacity and configured
+memory admission, inherited original notice/source cutoffs, explicit resource
+shortage, stable receipt identity, and cleanup ownership. An actual isolated Linux
+worker rejected a 512 MiB + 1 allocation under a 512 MiB address-space limit and
+released its reservation. This establishes native memory enforcement for that
+worker, not aggregate Linux RSS or native Windows Job acceptance. The latest
+17-case Python 3.10 diagnostic failed five assertions and produced two errors in
+128.988 seconds (`/tmp/sdk-managed-supervisor-17-python310-diagnostic.log`):
+queued pre-business admission/receipt contention, source-control races, notification
+acknowledgement, and Host close failed. Corrective source now retains the original
+admission deadline and exact helpers across Futures, retries only known transient
+control errors, and always attempts independent Host stop after a managed-close
+error. A cleanup-note fixture now holds a real rollback-journal EXCLUSIVE read
+block rather than treating a healthy WAL reader as blocked. The first focused
+eight-path run then found a consolidation import defect: Context imported a helper
+from the wrong private module, causing no actual handler invocation. After fixing
+the dynamic import, seven paths passed in 47.014 seconds and corrected independent
+Host close passed in 0.377 seconds. The complete current-watermark 19-case run
+passed 17 in 98.306 seconds with two fixture errors
+(`/tmp/sdk-managed-supervisor-full19-watermark310.log`): a private one-shot fixture
+bypassed production's frozen admission retry, and the held-writer fixture rejected
+a real post-arm timeout before ACK. Their correction keeps the original .05/.1
+publication and original source/notice windows, requires the same exact captured
+fact and real subsequent ACK writer failure, and does not change production.
+Both fixture corrections passed their focused rerun in 6.466 seconds. A later
+stopping-status query found that the independent business Kernel may already be
+closed while managed cleanup retains storage. Status now reads the original
+control and execution in one bounded read-only snapshot. Three stopping/byte-cap/
+lock-admission cases passed in 2.496 seconds
+(`/tmp/sdk-managed-supervisor-stopping-status-original-bounds310.log`).
+
+Fresh review also found two ownership gaps. A pre-native admission can retain a
+clock fact without creating a Context, so capacity release and status now consult
+the exact-execution Kernel owner registry. Unavailable registry inspection stays
+unknown and retains the reservation. CPython executor submission can enqueue a
+WorkItem before thread creation raises; a per-attempt gate now permits dispatch
+only after its Future is registered. Failed submission retires that executor,
+preserves the original error and receipt, and prevents further claims while
+accepted work finishes. Independent read-only review approved these transitions.
+Six focused cases passed in 6.613 seconds
+(`/tmp/sdk-managed-supervisor-executor-registry-focused6-310.log`), including an
+actual queued WorkItem becoming RUNNING before rejection and a real pre-native
+clock owner retained without Context or process. The complete 21-case current
+managed suite remains pending.
+
+The complete reviewed 21-case run then passed 19 with two failures in 99.586
+seconds (`/tmp/sdk-managed-supervisor-full21-reviewed310.log`). Its actual
+timeout result and one handler invocation were retained, but notification retry
+did not become dead within the original eight-second wait. The managed Inbox
+used a zero busy timeout and a single immediate BEGIN attempt; bounded write-lock
+admission is being corrected without changing the original receipt or handler
+budgets. A strict common-sample assertion also exposed a one-ULP clock-floor
+extension from floating-point reassociation. Checkpoint construction now rounds
+the exact elapsed affine floor upward only when the nearest float lies below it;
+exact and unchanged anchors stay unchanged. Twenty-five clock/owner/native
+cases passed in 2.664 seconds (`/tmp/sdk-clock-floor-fractional-current310.log`),
+including persisted fractional anchors and the original no-drift examples.
+Independent read-only review approved the numerical and ownership integration;
+the separate Inbox correction and current complete rerun remain pending.
+
+A wider current A05/native/collector/close run retained one failure and one error
+among 70 cases in 73.132 seconds
+(`/tmp/sdk-a05-current-floor-lifetime-integrated310.log`). Internal checkpoint
+diagnostics had been merged into an actual provider's original error details;
+they now remain separate outcome/settlement evidence, preserving the provider
+error exactly on POSIX and Windows. The independent all-writer fixture also
+rejected a real exact post-arm admission timeout; it now accepts that specific
+cause only with the original token, captured envelope and held transactions.
+Seven focused provider/recovery/floor cases then passed in 26.375 seconds
+(`/tmp/sdk-a05-provider-raw-clock-current310.log`). Original publication windows,
+business constraints and raw failure facts are unchanged; the complete current
+candidate remains unverified.
+
+The reviewed current A05 integration subsequently passed all 73 cases in 63.485
+seconds (`/tmp/sdk-a05-raw-facts-reviewed-integrated310.log`): original parent/
+tool cutoffs, process and thread terminal floors, original provider failures,
+guarded recovery, exact owner registry, fractional checkpoint persistence,
+child/collector/close ownership and actual entered serialization. Parent and
+supervisor capture-error causes remain separate from provider details and are
+frozen in settlement evidence. This is current local integration evidence;
+installed-candidate and native Windows acceptance remain required.
+
+The managed Inbox now retries only BEGIN admission within its original .1-second
+connection/operation cutoff. Its original clock/savepoint protocol and receipt
+leases remain intact, and neither the body nor COMMIT is replayed. Independent
+source review found no blocker. Two focused cases passed in 11.221 seconds
+(`/tmp/sdk-managed-inbox-original-window-focused2-310.log`). Actual held-writer
+evidence (`/tmp/sdk-managed-stalls-7ffjcj6b/managed-inbox-original-admission.json`)
+records the previous single-attempt BUSY, six BEGIN attempts with a .04-second
+writer release and exactly one mutation, and .100428 seconds of admission while
+the writer stays held with the exact original receipt unchanged. The original
+timeout scenario also encountered real participating main-database contention
+and completed notification retry to dead with one native invocation and unchanged
+command/Run cutoffs
+(`/tmp/sdk-managed-stalls-gji2ovbg/original-timeout-terminal.json`). Its SQL trace
+is a bounded ring, and native worker SQL is explicitly unavailable. Complete
+current 22-case managed and installed-candidate acceptance remains pending.
+
+The complete frozen current managed suite then passed all 22 cases in 82.470
+seconds (`/tmp/sdk-managed-supervisor-full22-inbox-frozen310.log`, compressed
+snapshot `/tmp/sdk-managed-supervisor-full22-inbox-frozen310-summary.json`). It
+covers the original source/notice bounds, actual native memory denial, separate
+capacity, factual collector/clock cleanup, original timeout receipt replay,
+result restart without business replay, rejected executor dispatch and bounded
+status. The current candidate-wide Python 3.10 source/rebuilt-installed run is
+now in progress (`/tmp/sdk-a05-a12-current-candidate-full310.log`, acceptance
+directory `/tmp/sdk-a05-a12-current-candidate310-evidence`). Its isolated suite
+still uses the original 900-second cutoff. A05/A12 now have current local
+integration passes; candidate-wide and native matrix completion remain pending.
+
+That first candidate-wide run was interrupted by the primary with SIGINT
+(exit 130) after eight child-fixture errors and one inherited guard assertion
+failure. No complete source/installed pass is claimed. Host-namespace inspection
+confirmed no remaining processes from that validation. A three-case causal
+probe (`/tmp/sdk-current-child-fixture-causal310.log`, 10.996 seconds) retained
+the exact errors: a completed child fixture used frozen raw wall time below
+its actual logical start, and a preentry fixture supplied literal start 100
+instead of the original child's actual claimed start. The fixture corrections
+use original SDK timestamps and preserve fixed completion 102, original error,
+all cutoffs and entry-state assertions. The inherited guard failure was not
+reproduced by that probe or the full 18-case receipt module, which passed in
+26.922 seconds (`/tmp/sdk-current-child-receipt-causal310.log`). Its historical
+failure remains retained for the next complete candidate run; no widened
+timing assertion or additional retry was added.
+
+The timestamp fixture corrections passed eight of nine cases first; the
+remaining no-DML assertion included the fixture's own live guarded budget
+observation during setup, before the read-only delivery call. Aging now uses the
+existing frozen native cutoff, with the real writer still held. The actual
+delivery's no-BEGIN/no-DML, unchanged watermark, exact result and shared .1-second
+read window assertions stay intact. Both complete fixture modules then passed
+all nine in 3.473 seconds
+(`/tmp/sdk-child-original-timestamp-readonly-fixtures9-310.log`). No SDK change
+was needed for these fixture corrections. Source-wide regression is now run
+before the separate rebuilt-wheel consumer, with every source case retained
+and immediate failure reporting; both must pass on the same frozen source.
+
+The first sequential source harness stopped after 52 cases on an invalid mixed
+import setup (`/tmp/sdk-a05-a12-reviewed-source-full310.log`): the parent imported
+new source through a local `sys.path` override, while its restart subprocess
+imported an older wheel from the harness interpreter. The old child rejected the
+new guard table before reaching its intended crash. This is not SDK acceptance
+or an SDK schema regression. The current frozen wheel was built and installed
+into `/tmp/sdk-a05-a12-current-installed310`; its actual SDK import is that
+environment's `site-packages`. The unchanged real restart case then passed with
+that installed candidate in 1.139 seconds
+(`/tmp/sdk-current-installed-restart-original-path310.log`). Further source runs
+use both the current installation and inherited source import configuration;
+the separate rebuilt-installed run still strips source paths.
+
+The public managed supervisor example also completed both actual business and
+reserved handler execution
+(`/tmp/sdk-managed-supervisor-public-example310.log`). A separate actual process
+serialization witness passed in 3.003 seconds
+(`/tmp/sdk-result-serialization-entered310.log`): its worker recorded entry into
+the slow JSON serializer before the original one-second deadline stopped it,
+confirmed cleanup, and prevented its delayed write. This new witness does not
+alter or establish serializer entry for the original 20-millisecond fixture.
+
+The current installed public supervisor example now holds the source execution
+until the managed handler succeeds and its notice is consumed, then releases the
+business task within the original eight-second caller window. Its previous fixed
+three-second source lifetime failed with a checkpoint admission timeout; that
+historical cause remains retained without claiming a proven lifetime attribution.
+The corrected actual installed path passed
+(`/tmp/sdk-current-installed-managed-example-release310.log`); its supervisor
+reported 1.757 seconds remaining from the original two-second handler budget.
+Optional evidence retains the actual SDK import, original cutoffs and source
+snapshot before release. The rebuilt-wheel acceptance invokes this public example.
+
+The coherent fail-fast source run stopped after 68 cases in 95.267 seconds
+(`/tmp/sdk-a05-a12-coherent-source-full310.log`): one synthetic `_await` row lacked
+the parent identity now required for exact budget-owner retention. The fixture
+now supplies its actual Context and lease, preserving errors and assertions.
+Its subsequent complete module exposed two actual native delayed-delivery
+failures (`/tmp/sdk-child-completed-delivery-authority310.log`): the child result
+committed before its original five-second cutoff, but the parent returned a
+checkpoint admission timeout instead of that result. Original result and request
+facts are retained in `/tmp/sdk-child-completed-delivery-evidence-228mlt_2`.
+Bounded parent exception diagnostics were added without changing any deadline;
+the first diagnostic native case passed in 13.376 seconds, so the precise
+historical failing call remains unresolved. CI stays paused during diagnosis.
+
+Independent review identified a concrete expired-delivery gap, reproduced with
+actual guarded capture and a held SQLite writer. Error classification could
+retry the pending checkpoint and throw before result proof. Classification now
+projects only the retained elapsed floor; exact known-owner ACK and the existing
+read-only result proof share one original .1-second factual window. No new sample
+or business is admitted. Parent and child ancestry guards are checked before and
+after the result read; foreign and uncaptured guards remain unresolved.
+All four initial regressions failed before correction
+(`/tmp/sdk-child-result-clock-proof-baseline2-310.log`), including actual unsafe
+delivery past foreign or concurrently committed guards. The corrected integration
+passed all 26 in 31.927 seconds
+(`/tmp/sdk-child-result-clock-proof-integrated310.log`), retaining the original
+no-BEGIN/no-DML delivery tests. A fifth actual uncaptured-owner case passed in
+.794 seconds (`/tmp/sdk-child-result-uncaptured-original310.log`); ordinary close
+also refuses this unresolved owner. Five public typing consumers passed.
+
+The second coherent source run stopped after 93 cases in 119.459 seconds
+(`/tmp/sdk-a05-a12-coherent-source-full310-v2.log`): cancellation committed and
+the receipt reader returned revoked, but total elapsed .869090 exceeded the
+unchanged .7-second assertion. Existing evidence did not distinguish cancellation
+admission, reader return or scheduling. The fixture now records those phases,
+raw errors and bounded SQL before assertions. All 18 original receipt cases
+passed in the subsequent combined run
+(`/tmp/sdk-child-clock-cleanup-receipt-original-bounds310.log`); the cancellation
+record retains elapsed .199602 and committed cancellation
+(`/tmp/sdk-child-clock-checkpoint-1ss260gj/evidence.json`). That combined run was
+not a whole pass because its new uncaptured-owner fixture needed the specific
+original Kernel timeout and explicit interrupted-fixture close handling; the
+separate corrected fifth case passed as recorded above. Complete frozen source,
+rebuilt installed and native matrix acceptance remain required.
+
+The proof handler additionally retains the original exception when a successful
+exact ACK consumes the shared factual window before the read can begin. This is
+local proof classification, not broader business retry. Independent review found
+no further blocker. Six clock-cleanup cases and six existing propagation cases
+passed in 6.925 seconds
+(`/tmp/sdk-child-result-clock-shared-proof-final310.log`), including actual ACK
+followed by the same deadline's expiry, with no child read and the original
+result unchanged. The corrected wheel was rebuilt and reinstalled into the same
+current Python 3.10 environment before the next frozen source run
+(`/tmp/sdk-a05-a12-clock-proof-source-full310.log`, artifacts
+`/tmp/sdk-a05-a12-clock-proof-source310-evidence`). No complete pass is yet claimed.
+
+That next complete source run stopped after 73 cases in 110.298 seconds on
+the real held-writer child-result path
+(`/tmp/sdk-a05-a12-clock-proof-source-full310.log`). The newly guarded reader
+refused an unpublished sample, retaining the original BUSY. A controlled
+different-live-owner witness then failed on the same structural omission
+(`/tmp/sdk-child-result-other-live-owner-baseline310.log`): Context and child
+wait helpers are distinct. Factual cleanup now visits only registered parent/
+child owners, within the original proof deadline and with nonblocking owner
+admission. Unknown or empty registry inspection skips that cleanup; unrelated
+executions cannot spend its allowance.
+
+Two intermediate integration failures are preserved in
+`/tmp/sdk-child-result-targeted-owner-proof-integrated310.log`; the empty-registry
+lock-timeout cause was corrected without broader retry. The later native stack
+(`/tmp/sdk-child-completed-delivery-evidence-1nxaab3u/success/parent-exception.json`)
+confirmed initial refusal of a sampling guard owned outside the reader's Kernel.
+A controlled independent-Kernel live publisher also failed before correction
+(`/tmp/sdk-child-result-foreign-live-owner-baseline310.log`). Initial proof
+admission now waits only for the original owner's sampling ACK within the same
+.1-second window, releasing the reader lock between fresh authority checks.
+It never clears a foreign marker or retries the result read; final guards and
+permanent/storage failures remain immediate. All nine new clock-cleanup cases
+and original readonly/native-delivery/propagation cases passed, 28 in 35.127
+seconds (`/tmp/sdk-child-result-live-owner-authority-integrated310.log`), including
+the actual foreign owner's .03-second delayed publication. No complete source,
+installed or native matrix pass is claimed yet; CI remains paused.
+
+After independent final review and five public typing passes, the frozen
+live-owner source was rebuilt and reinstalled before another complete source
+run (`/tmp/sdk-a05-a12-live-owner-source-full310.log`, artifacts
+`/tmp/sdk-a05-a12-live-owner-source310-evidence`). The actual installed import
+is recorded in `/tmp/sdk-live-owner-installed-import310.json`. That source-wide
+run stopped after 87 cases in 114.584 seconds: an old protocol-only inspection
+fixture omitted the command and lease fields used by exact result admission.
+The fixture now supplies its original synthetic identity; its three tests passed
+in .436 seconds (`/tmp/sdk-child-inspection-protocol-fields310.log`). The separate
+sdist/rebuilt-wheel consumer and full installed suite still retain their original
+cutoffs and remain pending until source-wide success.
+
+The earlier Windows 3.12 raw-script failure also exposed a concrete counter-loss
+path: a script could save bytes before its worker's activity batch persisted.
+A controlled reproduction now holds a real observation-journal writer through
+the original two-second native timeout. It retained the exact 20-byte physical
+log and `recovery_required` state, then failed with missing `stdout_bytes` while
+artifact recovery was disabled (`/tmp/sdk-script-output-loss-held-writer-baseline310.log`,
+4.305 seconds). Earlier stdin-based and cross-spawn mock attempts were invalid
+test harnesses and do not establish SDK failures. The correction retains a
+separate saved-byte fact after native containment, merges it as a maximum floor,
+and retries its publication independently of business settlement. Historical
+effect association must use immutable preparation events when the same effect
+has been re-prepared after explicit not-applied recovery. No emission timestamps
+or successful telemetry flush are invented. Final source, installed and native
+Windows acceptance of this correction remains pending.
+
+The history correction passed six real SQLite/file cases in 2.376 seconds
+(`/tmp/sdk-script-output-recovery-history-focused310.log`), including supported
+not-applied recovery and re-preparation of the same stable effect. A fresh
+independent review confirmed that the original event association and close
+ownership corrections resolve the reported blockers. The wheel was rebuilt and
+installed, but the combined script run provides Linux source verification:
+16 tests passed in 23.549 seconds (`/tmp/sdk-script-output-native-integrated310.log`).
+The raw-timeout witness imported `/root/dispatcher-sdk/src/dispatcher_sdk/__init__.py`;
+see `/tmp/sdk-script-raw-timeout-ac6h73a4/evidence.json`. Its held-writer
+native witness returned `recovery_required`, preserved the physical 20 bytes,
+recovered the count with unknown emission timestamps, and prevented the later
+escape file under the unchanged two-second execution cutoff. The unavailable
+activity-journal query also read the same persisted saved-byte receipt. A separate
+real-storage revocation test passed in .546 seconds
+(`/tmp/sdk-script-revocation-factual-settlement310.log`): busy receipt storage
+retained the factual cleanup obligation and later publication issued no Kernel
+result CAS or business write. A newly rebuilt final wheel then passed all five
+public typing consumers, compilation/diff checks and 554 documentation links
+plus six README examples using the current installed SDK. Its actual import is
+recorded in `/tmp/sdk-script-output-final-installed-import310.json`.
+
+The next complete run discovered one further child-inspection failure after 108
+cases in 144.970 seconds (`/tmp/sdk-script-output-final-source-full310.log`,
+retained stores `/tmp/sdk-script-output-final-source310-evidence`). Under persistent
+receipt contention, terminal exception handling sampled the budget again, and
+the fixture's diagnostic `remaining()` call retried that pending sample before
+recording the original exception. Diagnostics now project the retained floor.
+SDK retries retain the actual receipt BUSY across the original window, including
+its original SQLite cause and any later transient control failure. Positive
+admission still uses authoritative samples; known revocation and permanent
+failures still propagate. The deterministic pre-fix terminal witness failed
+(`/tmp/sdk-child-receipt-terminal-original-error-baseline310.log`), then all 31
+receipt/inspection/clock-cleanup tests passed in 34.012 seconds
+(`/tmp/sdk-child-receipt-terminal-original-error-integrated310-v2.log`). Independent
+review found no remaining blocker in that correction.
+
+A separate review confirmed that a valid execution ID over 1024 bytes could make
+optional artifact identity construction reject an already-observed native outcome.
+The marker now degrades to an explicit unknown observation identity and retains
+the real cleanup confirmation. No business identifier limit was introduced.
+The newly rebuilt wheel passed the actual native long-ID success case and the
+original persistent-contention case together in 1.746 seconds
+(`/tmp/sdk-receipt-cause-long-identity-current-native310.log`). The complete source
+and separate installed-consumer regressions remain pending.
+
+The following full run stopped at 101 cases in 130.221 seconds
+(`/tmp/sdk-receipt-cause-final-source-full310.log`, retained stores
+`/tmp/sdk-receipt-cause-final-source310-evidence`). An inherited fresh-recovery
+case did not report its unresolved sampling guard. Its single-case diagnostic
+rerun passed in 10.334 seconds, so the original artifact alone cannot establish
+whether the guard was checked before the stored work window expired. Independent
+source review found a deterministic classification hole: initial construction of
+an already-expired window returned trusted zero without checking a foreign
+durable guard. It admitted no business, but hid unresolved clock authority.
+
+A new actual-storage witness deliberately ages the same original .3-second tool
+constraint after a failed sampling ACK. It failed before the correction in .644
+seconds (`/tmp/sdk-child-expired-fresh-guard-baseline310.log`). Expired initial
+construction now performs one bounded readonly ancestry check; no new wall
+sample, ACK, drain, write or budget extension occurs, and later projections
+remain free of I/O. All 41 clock/receipt/inspection/cleanup cases passed in 51.741
+seconds (`/tmp/sdk-child-expired-fresh-guard-integrated310.log`), with original
+guard assertions unchanged. Fresh independent review found no remaining blocker
+in this fix. Complete current-source and installed-consumer acceptance is pending.
+
+A05, A12, installed-candidate regression and native Windows matrix acceptance
+remain incomplete. Historical successes below do not override these failures.
 
 Earlier candidate `12771d9ea00fcd58f4948d58f12c4aa903be8f12` failed all
 16 environments in [run 37200662333](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37200662333);
@@ -99,6 +1323,51 @@ writer initialization, not the native pre-COMMIT note-expiry stage. It establish
 A05 as incomplete, without attributing that older native failure's precise cause.
 The defect is not fixed: an in-memory floor cannot prove recovery after a crash,
 and persisting only to Kernel would not cover simultaneous failure of all stores.
+
+A separate, reproduced inheritance defect was found in `_bind_child_limits`:
+new submission and queued submission/adoption replay replaced a stronger incoming
+checkpoint with the weaker canonical parent/old-child checkpoint. Two real-SQLite
+tests failed on all three paths, losing approximately 3.55–3.61 seconds of floor
+(`/tmp/sdk-incoming-child-floor-baseline310.log`, with retained databases and
+supplied/bound envelopes). The local correction retains the strongest checkpoint
+after all inputs are advanced to the same clock sample. Parent constraints and
+storage, child/tool constraints, entry metadata and ownership semantics remain
+unchanged. Replaying an older envelope cannot weaken the retained floor.
+Independent review found no blocker. Six checkpoint tests passed in 7.684 seconds
+(`/tmp/sdk-incoming-child-floor-final310.log`); 37 budget, capacity and native
+parent-floor integration tests passed in 16.441 seconds
+(`/tmp/sdk-incoming-child-floor-integration310.log`). An earlier corrected run's
+only failure was one ULP of epoch-float projection rounding; its raw log remains
+`/tmp/sdk-incoming-child-floor-corrected310.log`. The comparison now allows four
+ULPs of numeric rounding, about .954 microseconds at the captured epoch, without
+changing any production cutoff or work window. This fix does not resolve the
+separate failed-persistence recovery defect.
+
+The first complete regression process disappeared without an exit receipt or
+unittest summary; its log ends during receipt contention. No test discovery or
+multiprocessing worker remained in the same host boot/PID namespace. The cause
+is unknown and no pass is claimed (`/tmp/sdk-incoming-floor-full310.log`,
+`/tmp/sdk-incoming-floor-full310-interrupted.json`). Initial default-sandbox
+`/proc` inspection was insufficient to establish host process absence; subsequent
+read-only inspection in host PID namespace `pid:[4026531836]` confirmed that only
+the new supervised regression remained, with no original discovery process.
+A supervised full regression
+was then started as `sdk-incoming-floor-regression-20261005.service`, with no
+automatic retry, the existing CI 45-minute overall limit and the unchanged
+900-second installed-suite limit. After the launch command exited, service
+state was `active/running`, supervisor PID 2092693 and test PID 2092694. Its
+current execution/exit record is `/tmp/sdk-incoming-floor-supervised310.json`,
+log `/tmp/sdk-incoming-floor-supervised310.log` and retained raw evidence
+`/tmp/sdk-incoming-floor-supervised310-evidence`. This is started, not verified
+complete; final source and fresh installed results still require inspection.
+Its fresh wheel passed all five public consumer scenarios, with actual import
+`/tmp/tmpcvkcvpt3/venv/lib/python3.10/site-packages/dispatcher_sdk/__init__.py`
+(`/tmp/sdk-incoming-floor-supervised310-evidence/sdk-observability-consumer-l7sfp2b5/summary.json`
+and `environment.json`). The complete installed suite is still running under
+its original 900-second bound. The outer log has already marked
+`test_child_wait_preserves_busy_error_without_revoking_parent` as ERROR; final
+traceback and causal attribution remain pending. These facts do not establish
+a successful complete regression or installed suite.
 
 The diagnostic/classification corrections passed 18 focused source tests in
 22.168 seconds (`/tmp/sdk-ci-native-corrections-integrated310.log`), and three
@@ -462,19 +1731,21 @@ NOTICE. Packaging retains both files. The dedicated README check passed 550
 local links and six examples without skips; `/tmp/sdk-readme-license-docs.log`
 records this documentation-only change.
 
-T01–T07 have implementation and Linux evidence for the existing paths, but
-T01/T06/T07 still require the supervisor-agent contract and A12 path. T08 has
-local installation and regression evidence but still needs the native matrix.
-T09 has independent corrective reviews; its final closure also requires the new
+The following task and gate snapshot is historical. The current implementation
+and running candidate checks are recorded in **Current status, 2026-10-06** above.
+At this earlier point, T01–T07 had implementation and Linux evidence, but
+T01/T06/T07 still required the supervisor-agent contract and A12 path. T08 had
+local installation and regression evidence but still needed the native matrix.
+T09 had independent corrective reviews; its final closure also required the new
 A12 path and T08 acceptance.
 
-| Completion condition | Current status |
+| Completion condition | Status at that earlier snapshot |
 | --- | --- |
-| G1 All mandatory scenarios | Incomplete: A12 managed supervisor-agent path is missing; native Windows and CI pending |
-| G2 Installed public API, types, docs and examples | Existing paths passed on Linux outside checkout; supervisor-agent contract and installed witness missing |
+| G1 All mandatory scenarios | Incomplete: latest complete source run has one failure and two errors; corrected source, independently rebuilt installed candidate and native Windows/CI pending |
+| G2 Installed public API, types, docs and examples | Five current public typing fixtures passed; complete freshly rebuilt installed API/example witness remains pending |
 | G3 Same candidate across required platforms | Pending Windows and CI for this implementation |
 | G4 Compatibility and explicit storage upgrade | Linux regression passed; native matrix still required |
-| G5 Ownership and maintainability review | Existing paths reviewed; supervisor-agent admission/ownership still require implementation and review |
+| G5 Ownership and maintainability review | Managed admission/ownership implemented and independently reviewed; current corrective completion-clock integration/review remains open |
 
 ## Earlier local failures and corrections
 
@@ -566,9 +1837,10 @@ The last command includes the isolated rebuilt-wheel consumer suite. A focused
 pass does not replace it. Five public typing fixtures and `scripts/check_docs.py`
 are also required. The latter runs all six README examples on Linux.
 
-## Scenario mapping
+## Scenario mapping and historical baseline
 
-The status below describes current evidence, not final Goal acceptance. Raw
+The table retains the `969f0da` baseline and subsequent intermediate findings;
+it does not establish acceptance of the current working tree. Raw
 host paths identify retained artifacts for this run; they are not portable
 links or substitutes for the candidate CI artifacts.
 All Linux-applicable witnesses below passed in the complete source and installed
@@ -576,20 +1848,46 @@ All Linux-applicable witnesses below passed in the complete source and installed
 candidate regression and native matrix verification, including cases skipped on
 Linux.
 
-| Scenario | Implementation and witness | Current evidence / remaining requirement |
+Current updates to that baseline:
+
+- A05: five confirmed-clock and guarded-crash recovery cases passed locally.
+  Original-budget, rollback and unknown-clock protection still require the
+  current complete installed suite and native matrix; the five public scenarios
+  alone do not close A05.
+- A12: all 22 managed cases passed in the latest 78-case integration run, including
+  the original two-notice readiness case after BEGIN-admission correction. The
+  current installed managed example passed. Complete installed/native acceptance
+  remains pending; earlier readiness failures remain in the evidence above.
+- A15/A16: the current `ikx4xdy0` rebuilt installation passed all five public
+  scenarios, including raw child/tool failure, conditional cancellation and
+  cleanup across controller restart without business replay. Actual imports and
+  receipts are linked by the current status section. The same wheel passed all
+  five public type consumers and six README examples outside the checkout.
+- A18: the latest installed suite timed out at its original 900-second limit
+  with one recorded failure. Previous complete passes and the cancelled CI run do not
+  establish current matrix acceptance.
+
+Independent reviews have covered guarded budget ownership, completion-reader
+lifetime, managed admission and capacity, cancellation evidence, private
+collector registration and the shared BEGIN-admission helper. No additional
+unreviewed behavior was identified in the latest T09/G5 coverage audit. The
+remaining acceptance work is execution evidence and reconciliation of results;
+this review record does not replace the required complete or native tests.
+
+| Scenario | Implementation and witness | Historical evidence / remaining requirement at that point |
 | --- | --- | --- |
 | A01 Startup phases | `test_observability_native_acceptance`: queue, real deserialization and module import, ready, entry, model request, raw bootstrap failure | Linux source and installed candidate passed; genuine missing-module import keeps the original ModuleNotFoundError and reports no false ready/entry/model event. Windows pending. |
 | A02 Raw output and progress | Same native suite: segmented bytes, heartbeat, tool response, new/replayed progress; `test_observation_processes` | Linux focused passed; original byte files and separate metric snapshots retained. Candidate matrix pending. |
 | A03 Unknown / old attempts | `test_observation_journal`, `test_observation_processes`, `test_stall_supervision` | Source and installed regressions cover inaccessible identity, collector replacement and old reports. No PID-only exit inference. Native matrix pending. |
 | A04 Effective deadlines | Native Run/tool cutoff witness; `test_runtime_deadline_envelopes`, `test_execution_budget` | Actual shortest cutoff, stopped process tree, inherited parent window and reserve semantics covered. Reported tool cause keeps its original message. Candidate matrix pending. |
-| A05 Restart and short waits | Native controller crash after confirmed entry; native short `Task.wait`; budget/recovery tests; real dual-writer floor-loss probe | Existing restart/short-wait cases passed. A confirmed defect remains: failed checkpoint writes followed by rollback let a fresh ChildService recover a longer window and actually admit a queued child. No business ran in the probe; A05 remains incomplete. |
+| A05 Restart and short waits | Native controller crash after confirmed entry; native short `Task.wait`; budget/recovery tests; real dual-writer floor-loss probe | Historical restart/short-wait cases passed. The working tree now fences failed sampling before recovery and retains exact pending owners after caller expiry; four real SQLite lifetime/interruption cases passed. Complete current source/installed/native regression remains pending; A05 is incomplete. |
 | A06 Parent waits / capacity | `test_managed_children_capacity`, `test_runtime_deadline_envelopes`, public native parent/child witness | Actual children return success and original failure; parent retains a touched 16 MiB buffer and actual memory readings while waiting; peak capacity two and queued successor work passed locally. This is observed process memory, not a new global memory reservation API. Native matrix pending. |
 | A07 Rejection / partial registration | Child admission suite and native cross-store controller crash | Actual independent request reservation exists while Kernel child is absent; exit 73 and original-budget recovery close the wait without child business. Earlier stalled runs remain retained. Candidate matrix pending. |
 | A08 Cancellation / natural completion | Native pressure, Runtime lifecycle, Windows Job and sandbox tests | Linux descendant markers stop; Kernel winner and cleanup proof remain distinct. Current Windows Jobs pending. |
 | A09 Cleanup failure / exit cause | `test_sandbox_runtime` cleanup-failure restart with native worker business-call log; process exit classifiers; shared cgroup clue witness | Restart retries disposal only and keeps collected output; call count does not increase. Exit 137 remains status/unknown OOM even with readable shared cgroup counters. Provider is explicitly a persistent fake; native worker is real. Candidate matrix pending. |
 | A10 Stall windows | `test_stall_supervision` | Complete consecutive windows, activity distinctions, exemptions, unknown gaps, replacement and rollback passed. Native matrix pending. |
 | A11 Durable notification | Two real evaluator processes; abrupt exit after orchestration enqueue; repeated native crashes through delivery exhaustion and explicit retry | Same notice ID, one application notification, bounded attempts and explicit dead state passed. Native matrix pending. |
-| A12 Supervision capacity and conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Confirmed progress defeats stale cancellation; fixed callback capacity keeps local deadlines working. Managed supervisor-agent capacity, memory/budget admission and shortage witness are missing; A12 is incomplete independently of current CI. |
+| A12 Supervision capacity and conditional disposition | Actual progress commit between public recheck and cancellation transaction; saturated native workers with blocked callback | Managed process capacity, native memory/budget admission, shortages and ownership are implemented. Earlier frozen local22 passed; latest complete source run failed the two-notice readiness precondition before capacity assertions. Current correction, installed witness and native matrix remain required; A12 is incomplete. |
 | A13 Pressure / bounded reads | Native pressure suite: 10,000 summaries, overflowing raw output and blocked activity writer; independent settlement notes; oversized receipts / exhausted query budget | Kernel and telemetry pressure do not claim a completed observation. Runtime and standalone reads expose loss, partial receipts, bounds and cursors. Linux regression passed; native matrix pending. |
 | A14 Compatibility / upgrade | Explicit copy upgrade and storage regressions; historical `v0.7.0.dev0` writer; real pending outcome and original sidecar owner | Historical installed writer rejects new storage with `StorageIsolationError`; current writer reopens it. Core copy preserves history, remains inactive, and does not migrate external journals. Original owner recovers the exact pending result without business replay. Native matrix pending. |
 | A15 Installed entry | Isolated wheel consumer suite and portable public example | `969f0da` rebuilt-wheel consumer, complete source/installed suites and separately installed original portable example passed. Native matrix pending. |
@@ -783,7 +2081,14 @@ completion timestamps, deferred result settlement, transient SQLite errors
 misclassified as revoked authority, lost final-flush evidence, missing native
 bootstrap errors, original deadline cause, readonly receipt mutation, nested
 control deadlines, child storage replay, conservative clock receipt recovery,
-targeted execution capacity and query-size fallback. Further review verified timer-floor retention across parent/supervisor/Windows paths, signal interruption, inherited child pre-entry settlement and original startup-failure classification. The final review also verified that SDK-owned read expiry retries cannot extend the child window or bypass incomplete checkpoint facts. Complete Linux source and installed verification passed; native Windows and CI remain required.
+targeted execution capacity and query-size fallback. Further review verified
+timer-floor retention across parent, supervisor and Windows paths, signal
+interruption, inherited child pre-entry settlement and original startup-failure
+classification. That review also verified that SDK-owned read expiry retries
+cannot extend the child window or bypass incomplete checkpoint facts.
+Historical candidate `969f0da` passed complete Linux source and installed
+verification. The current candidate still needs complete installed acceptance
+and native Windows/CI validation; see the current-status section above.
 
 The independent journals retain facts; they do not authorize a new execution,
 extend an original budget or prove application consumption. Missing storage,

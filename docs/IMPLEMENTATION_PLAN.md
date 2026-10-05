@@ -1,5 +1,10 @@
 # Reliability and sandbox implementation plan
 
+This is the 2026-09-07 implementation and delivery record for the 0.6.0
+candidate. Its results are historical. Current development contracts are in
+[the SDK guide](SDK.md); observability acceptance is tracked in
+[the current acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md).
+
 Status: implementation verified on 2026-09-07; version 0.6.0 is prepared for delivery.
 Approved implementation scope: 2026-09-07.
 

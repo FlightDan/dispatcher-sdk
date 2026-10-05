@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -56,6 +55,11 @@ _MAX_RECORD_BYTES = 256 * 1024
 
 
 def _transient_control_error(error: Exception) -> bool:
+    if (isinstance(error, BudgetClockUnknownError)
+            and str(error) == "budget_clock_sample_unresolved:sampling"):
+        # Wait for a live owner's publication within the original child window.
+        # This does not clear its marker or permit business while it is pending.
+        return True
     if isinstance(error, InspectionBudgetExceeded):
         # This expires one read attempt, not the original child wait window.
         return True
@@ -66,32 +70,204 @@ def _transient_control_error(error: Exception) -> bool:
         return error.rollback_confirmed
     return isinstance(error, TimeoutError) and str(error) in (
         "Kernel control lock admission timed out", "Kernel control admission budget elapsed",
-        "child lifecycle admission timed out", "observation schema admission budget elapsed")
+        "child lifecycle admission timed out", "observation schema admission budget elapsed",
+        "budget capture owner admission timed out", "budget capture exhausted its original native window")
 
 
 def _merge_checkpoint(envelope, checkpoint):
-    if checkpoint.elapsed_at >= envelope.checkpoint.elapsed_at:
-        return envelope.recheckpoint(sample=checkpoint)
-    return replace(envelope, checkpoint=checkpoint).recheckpoint(sample=envelope.checkpoint)
+    return envelope.with_clock_floor(checkpoint)
 
 
 class _RetryWindow:
     """One conservative work window, retained across every storage replay."""
 
-    def __init__(self, envelope: BudgetEnvelope, kernel: Any, stop=None):
+    def __init__(self, envelope: BudgetEnvelope, kernel: Any, stop=None, *, execution_id=None):
         self.envelope, self.kernel, self.stop = envelope, kernel, stop
+        self.execution_id = execution_id or next((item.origin_id[len("execution:"):]
+            for item in reversed(envelope.constraints) if item.source == "execution"
+            and item.origin_id.startswith("execution:")), None)
         self.on_advance = None
+        self._projecting = False
         self.deadline = math.inf
-        self.remaining()
+        self._pending_sample = None
+        self._pending_sample_owner = None
+        self._pending_sample_error = None
+        self._capture = None
+        self._delivery_deadline = None
+        if hasattr(kernel, "_sample_budget") and self.execution_id is not None:
+            from .budget_capture import _KernelBudgetCapture
+            self._capture = _KernelBudgetCapture(kernel, self.execution_id)
+        remaining = self.remaining()
+        check_clock = getattr(kernel, "_assert_budget_clock", None)
+        if remaining <= 0 and self._capture is not None and check_clock is not None:
+            # Expiry denies work, but cannot turn a foreign unresolved sample
+            # into known clock authority. Only initial reconstruction needs
+            # this bounded read; later projections stay free of I/O.
+            with kernel._control_lock(.1):
+                check_clock(kernel._connection, self.execution_id)
+
+    def _project_elapsed(self):
+        # Establish the native work cutoff before attempting any new sample.
+        # This uses the retained floor, never a new authoritative wall reading.
+        sample = sample_clock(wall_time=self.envelope.checkpoint.wall_at)
+        self.envelope = self.envelope.recheckpoint(sample=sample)
+        view = self.envelope.view(sample=self.envelope.checkpoint)
+        if view.clock_status != "trusted" or view.remaining_work_seconds is None:
+            raise BudgetClockUnknownError(view.unknown_reason or "child clock continuity cannot be established")
+        self.deadline = min(self.deadline, time.monotonic() + view.remaining_work_seconds)
+        return max(0., min(view.remaining_work_seconds, self.deadline - time.monotonic()))
+
+    def _adopt_sample_owner(self, error):
+        owner = getattr(error, "budget_sample_owner", None)
+        if (owner is None or owner.kernel is not self.kernel
+                or owner.execution_id != self.execution_id or owner._pending is None):
+            return
+        # Transfer the live helper, not a duplicate token retry authority.
+        # Claim retries and this window now share the exact original obligation.
+        self._pending_sample_owner = owner
+        self._pending_sample = owner._pending
+        self._pending_sample_error = error
+        captured = self._pending_sample[1]
+        if captured is not None:
+            self.envelope = self.envelope.with_clock_floor(captured.checkpoint)
+
+    def _resume_sample(self):
+        # Publication retries belong to this exact live window and captured
+        # token. They do not arm another sample or renew its work deadline.
+        while self._pending_sample is not None:
+            if self.stop is not None and self.stop.is_set():
+                raise ChildExecutionError("child_service_closed", "child service stopped before response settlement")
+            remaining = self._project_elapsed()
+            if remaining <= 0:
+                raise self._pending_sample_error
+            token, captured = self._pending_sample
+            if captured is None:
+                raise self._pending_sample_error
+            try:
+                if self._pending_sample_owner is not None:
+                    published = self._pending_sample_owner.finish_pending(
+                        self.envelope, timeout_seconds=min(.1, remaining))
+                else:
+                    published = self.kernel._finish_budget_sample(
+                        token, self.execution_id, captured, timeout_seconds=min(.1, remaining))
+            except Exception as exc:
+                exc.budget_sample_token = token
+                exc.budget_sample_envelope = captured
+                self._pending_sample_error = exc
+                if not _transient_control_error(exc):
+                    raise
+                remaining = self._project_elapsed()
+                if remaining <= 0:
+                    raise
+                if self.stop is None:
+                    time.sleep(min(.005, remaining))
+                else:
+                    self.stop.wait(min(.005, remaining))
+            else:
+                self.envelope = self.envelope.with_clock_floor(published.checkpoint)
+                self._pending_sample = self._pending_sample_error = self._pending_sample_owner = None
+
+    def _raise_expired_capture(self, error):
+        # This read only classifies uncertainty; it cannot grant fresh time.
+        check_clock = getattr(self.kernel, "_assert_budget_clock", None)
+        control_lock = getattr(self.kernel, "_control_lock", None)
+        if check_clock is not None and control_lock is not None:
+            try:
+                with control_lock(.1):
+                    check_clock(self.kernel._connection, self.execution_id)
+            except Exception as proof_error:
+                if (not isinstance(proof_error, BudgetClockUnknownError)
+                        and _transient_control_error(proof_error)):
+                    raise error from proof_error
+                raise
+        raise error
 
     def remaining(self) -> float:
         if self.stop is not None and self.stop.is_set():
             raise ChildExecutionError("child_service_closed", "child service stopped before response settlement")
-        wall = self.kernel._wall_time() if hasattr(self.kernel, "_wall_time") else None
-        sample = sample_clock(wall_time=wall)
-        view = self.envelope.view(sample=sample)
         previous = self.envelope.checkpoint
-        self.envelope = self.envelope.recheckpoint(sample=sample)
+        sampler = getattr(self.kernel, "_sample_budget", None)
+        if sampler is not None and self.execution_id is not None and not self._projecting:
+            remaining = self._project_elapsed()
+            if self._pending_sample is not None:
+                self._resume_sample()
+            elif remaining > 0:
+                while True:
+                    try:
+                        self.envelope = self._capture(
+                            self.envelope, timeout_seconds=min(.1, remaining))
+                    except Exception as exc:
+                        token = getattr(exc, "budget_sample_token", None)
+                        captured = getattr(exc, "budget_sample_envelope", None)
+                        waiting_owner = (isinstance(exc, BudgetClockUnknownError)
+                            and str(exc) == "budget_clock_sample_unresolved:sampling")
+                        if token is not None:
+                            self._pending_sample_owner = getattr(exc, "budget_sample_owner", self._capture)
+                            self._pending_sample = (token, captured)
+                            self._pending_sample_error = exc
+                            if captured is None or not _transient_control_error(exc):
+                                raise
+                            self.envelope = self.envelope.with_clock_floor(captured.checkpoint)
+                            self._resume_sample()
+                        elif waiting_owner:
+                            # No business is admitted while another sampler's
+                            # floor remains unpublished. Waiting spends this
+                            # original call window and cannot clear its token.
+                            remaining = self._project_elapsed()
+                            if remaining <= 0 or (self.stop is not None and self.stop.is_set()):
+                                raise
+                            if self.stop is None:
+                                time.sleep(min(.005, remaining))
+                            else:
+                                self.stop.wait(min(.005, remaining))
+                            continue
+                        elif not _transient_control_error(exc):
+                            raise
+                        else:
+                            # Admission may expire before ancestry is checked.
+                            # Cached time cannot prove absence of a foreign
+                            # captured floor; retry within this original window.
+                            remaining = self._project_elapsed()
+                            if remaining <= 0:
+                                self._raise_expired_capture(exc)
+                            read_floor = getattr(self.kernel, "_read_budget_floor", None)
+                            if read_floor is not None:
+                                try:
+                                    checkpoint = read_floor(self.execution_id,
+                                        timeout_seconds=min(.1, remaining))
+                                except Exception as proof_error:
+                                    if not _transient_control_error(proof_error):
+                                        raise
+                                    if isinstance(proof_error, BudgetClockUnknownError):
+                                        # Preserve the precise foreign-guard
+                                        # refusal if the original window expires.
+                                        exc = proof_error
+                                else:
+                                    self.envelope = self.envelope.with_clock_floor(checkpoint)
+                                    break
+                            if self.stop is not None and self.stop.is_set():
+                                raise ChildExecutionError("child_service_closed",
+                                    "child service stopped before response settlement") from exc
+                            if self.stop is None:
+                                time.sleep(min(.005, remaining))
+                            else:
+                                self.stop.wait(min(.005, remaining))
+                            remaining = self._project_elapsed()
+                            if remaining <= 0:
+                                self._raise_expired_capture(exc)
+                            if self.stop is not None and self.stop.is_set():
+                                raise ChildExecutionError("child_service_closed",
+                                    "child service stopped before response settlement") from exc
+                            continue
+                    break
+            self._project_elapsed()
+            sample = self.envelope.checkpoint
+        else:
+            wall = (self.envelope.checkpoint.wall_at if self._projecting else
+                    self.kernel._wall_time() if hasattr(self.kernel, "_wall_time") else None)
+            sample = sample_clock(wall_time=wall)
+            self.envelope = self.envelope.recheckpoint(sample=sample)
+        view = self.envelope.view(sample=sample)
         if view.clock_status != "trusted" or view.remaining_work_seconds is None:
             raise BudgetClockUnknownError(view.unknown_reason or "child clock continuity cannot be established")
         self.deadline = min(self.deadline, time.monotonic() + view.remaining_work_seconds)
@@ -99,6 +275,15 @@ class _RetryWindow:
         if self.on_advance is not None and self.envelope.checkpoint.wall_at > projected + .001:
             self.on_advance(self.envelope)
         return max(0., min(view.remaining_work_seconds, self.deadline - time.monotonic()))
+
+    @contextmanager
+    def project(self):
+        """Use the just-guarded floor while an authority operation owns its lock."""
+        previous, self._projecting = self._projecting, True
+        try:
+            yield
+        finally:
+            self._projecting = previous
 
     def timeout(self) -> float:
         remaining = self.remaining()
@@ -110,7 +295,10 @@ class _RetryWindow:
 def _retry(window: _RetryWindow, operation, *, kernel=None, store=None):
     last_error = None
     while True:
-        remaining = window.remaining()
+        # The enclosing call already captured one durable clock floor. A read
+        # or timeout calculation is not another independent wall observation.
+        with window.project():
+            remaining = window.remaining()
         if remaining <= 0:
             if last_error is not None:
                 raise last_error
@@ -118,9 +306,11 @@ def _retry(window: _RetryWindow, operation, *, kernel=None, store=None):
         try:
             lock = getattr(kernel, "_control_lock", None)
             with lock(min(.1, remaining)) if lock is not None else nullcontext():
-                with store.bound(window) if store is not None else nullcontext():
-                    return operation()
+                with window.project():
+                    with store.bound(window) if store is not None else nullcontext():
+                        return operation()
         except Exception as exc:
+            window._adopt_sample_owner(exc)
             if not _transient_control_error(exc):
                 raise
             last_error = exc
@@ -184,21 +374,48 @@ def _verify_parent(kernel: Any, lease: ExecutionLease) -> None:
         kernel.verify(lease)
 
 
+def _inspect_parent_revocation(kernel: Any, lease: ExecutionLease) -> None:
+    """Give known lease revocation precedence over reconstruction of its clock.
+
+    This read grants no authority and creates no clock sample. An unavailable
+    observation leaves the existing budget/entry checks fully responsible for
+    admission; a genuinely live parent still encounters any unresolved guard.
+    """
+    inspect = getattr(kernel, "_verify_active_lease_readonly", None)
+    if inspect is None:
+        # Older custom Kernel implementations retain their existing checks.
+        # Never substitute the writing business verify primitive here.
+        return
+    try:
+        lock = getattr(kernel, "_control_lock", None)
+        with lock(.1) if lock is not None else nullcontext():
+            inspect(lease)
+    except (StaleFenceError, InvalidStateTransitionError, ExecutionNotFoundError) as exc:
+        raise ChildExecutionError("parent_authority_revoked", str(exc),
+                                  execution_id=lease.execution_id) from exc
+    except Exception as exc:
+        if not _transient_control_error(exc):
+            raise
+
+
 def _wait_parent_entry(kernel: Any, lease: ExecutionLease, envelope: BudgetEnvelope,
                        stop: threading.Event | None = None, *, window=None) -> None:
     """Wait for the durable ACK within the worker's already captured work window."""
-    window = window or _RetryWindow(envelope, kernel, stop)
+    window = window or _RetryWindow(envelope, kernel, stop, execution_id=lease.execution_id)
     while True:
         if stop is not None and stop.is_set():
             raise ChildExecutionError("child_service_closed", "child service stopped before parent entry confirmation")
         try:
             # A bounded authority read remains meaningful after work expiry;
             # it may prove cancellation before any new business admission.
-            try:
-                _verify_parent(kernel, lease)
-            except Exception as exc:
-                if not _transient_control_error(exc):
-                    raise
+            with window.project():
+                expired = window.remaining() <= 0
+            if expired:
+                try:
+                    _verify_parent(kernel, lease)
+                except Exception as exc:
+                    if not _transient_control_error(exc):
+                        raise
             _retry(window, lambda: kernel.verify(lease), kernel=kernel)
         except ChildExecutionError as exc:
             if exc.code == "child_wait_timeout":
@@ -207,8 +424,9 @@ def _wait_parent_entry(kernel: Any, lease: ExecutionLease, envelope: BudgetEnvel
             raise
         except (StaleFenceError, InvalidStateTransitionError, ExecutionNotFoundError) as exc:
             raise ChildExecutionError("parent_authority_revoked", str(exc), execution_id=lease.execution_id) from exc
-        wall = kernel._wall_time() if hasattr(kernel, "_wall_time") else None
-        view = window.envelope.view(sample=sample_clock(wall_time=wall))
+        with window.project():
+            window.remaining()
+        view = window.envelope.view(sample=window.envelope.checkpoint)
         if view.clock_status != "trusted":
             raise BudgetClockUnknownError(view.unknown_reason)
         if view.remaining_work_seconds is None:
@@ -225,6 +443,7 @@ def _wait_parent_entry(kernel: Any, lease: ExecutionLease, envelope: BudgetEnvel
         if (limits is not None and limits.get("entry_state") == "confirmed"
                 and (limits.get("entry_attempt"), limits.get("entry_fence")) == (lease.attempt, lease.fence)):
             return
+        window.remaining()
         duration = min(.05, view.remaining_work_seconds)
         if stop is None:
             time.sleep(duration)
@@ -274,41 +493,71 @@ class _Store:
                 raise ChildExecutionError("parent_authority_revoked", str(exc),
                                           execution_id=lease.execution_id) from exc
 
+        receipt_error: SettlementBusyError | None = None
+
+        def read_receipt(operation):
+            nonlocal receipt_error
+            try:
+                return operation()
+            except SettlementBusyError as exc:
+                receipt_error = exc
+                raise
         try:
             while True:
                 try:
-                    remaining = window.remaining()
+                    with window.project():
+                        remaining = window.remaining()
                     if remaining <= 0:
                         raise SettlementBusyError("child checkpoint inspection exhausted its original window")
                     deadline = time.monotonic() + min(.1, remaining)
-                    facts = self._facts(timeout_seconds=min(.1, remaining))
+                    facts = read_receipt(lambda: self._facts(timeout_seconds=min(.1, remaining)))
                     if facts is None:
                         report = None
                         break
-                    duration = min(window.remaining(), deadline - time.monotonic())
+                    with window.project():
+                        duration = min(window.remaining(), deadline - time.monotonic())
                     if duration <= 0:
                         raise SettlementBusyError("child checkpoint inspection admission budget elapsed")
-                    report = facts.inspect_notes(row["child_execution_id"], limit=50,
-                                                 max_bytes=256*1024, timeout_seconds=duration)
+                    report = read_receipt(lambda: facts.inspect_notes(row["child_execution_id"], limit=50,
+                                                 max_bytes=256*1024, timeout_seconds=duration))
                     truncated = report.get("truncated") or any(note.get("truncated") for note in report["notes"])
                     if (report.get("timed_out") and not truncated and
                             report.get("unknown_reason") == "settlement_notes_inspection_timeout"):
-                        raise SettlementBusyError(report.get("error") or "child checkpoint inspection timed out")
+                        receipt_error = SettlementBusyError(report.get("error") or "child checkpoint inspection timed out")
+                        raise receipt_error
                     if not report["complete"] or report.get("has_more") or truncated:
                         raise BudgetClockUnknownError("child budget checkpoint inspection is incomplete")
                     break
-                except SettlementBusyError:
-                    remaining = window.remaining()
+                except Exception as error:
+                    if not (isinstance(error, SettlementBusyError) or _transient_control_error(error)):
+                        raise
+                    # Failed inspection admits no business. Project its
+                    # retained floor so a terminal receipt error cannot be
+                    # replaced by another sample/ACK past the original cutoff.
+                    with window.project():
+                        remaining = window.remaining()
                     # A spent business window still permits one bounded
                     # observation of known revocation. This never admits a
                     # receipt read, result rescue, or new child work.
                     try:
                         inspect_parent(min(.1, remaining) if remaining > 0 else .1)
                     except Exception as exc:
-                        if remaining <= 0 or not _transient_control_error(exc):
+                        if not _transient_control_error(exc):
                             raise
-                    remaining = window.remaining()
+                        if remaining <= 0:
+                            if receipt_error is not None and receipt_error.__cause__ is not None:
+                                receipt_error.original_receipt_cause = receipt_error.__cause__
+                            if receipt_error is not None and error is not receipt_error:
+                                error.parent_inspection_error = exc
+                                raise receipt_error from error
+                            raise error from exc
+                    with window.project():
+                        remaining = window.remaining()
                     if remaining <= 0:
+                        if receipt_error is not None and error is not receipt_error:
+                            if receipt_error.__cause__ is not None:
+                                receipt_error.original_receipt_cause = receipt_error.__cause__
+                            raise receipt_error from error
                         raise
                     if window.stop is None:
                         time.sleep(min(.01, remaining))
@@ -435,8 +684,11 @@ class HandlerChildren:
 
     def __init__(self, kernel: Any, command: ExecutionCommandV2,
                  parent_lease: ExecutionLease, budget_envelope: BudgetEnvelope,
-                 service_spec: Mapping[str, Any], *, journal: Any = None) -> None:
+                 service_spec: Mapping[str, Any], *, journal: Any = None,
+                 _budget_context: Any = None) -> None:
         self.kernel, self.command, self.parent_lease = kernel, command, parent_lease
+        self._budget_context = _budget_context
+        self._completion_capture = None
         self.budget_envelope = budget_envelope
         self.service_spec = dict(service_spec)
         self.capacity = self.service_spec.get("capacity", 1)
@@ -468,7 +720,11 @@ class HandlerChildren:
                                       execution_id=self.command.execution_id) from exc
 
     def _budget(self, request_id: str, timeout_seconds: float | None) -> BudgetEnvelope:
-        view = self.budget_envelope.view()
+        # Establish the original local cutoff from persisted clock authority.
+        # The retry window arms before it first samples the current wall clock.
+        sample = sample_clock(wall_time=self.budget_envelope.checkpoint.wall_at)
+        self.budget_envelope = self.budget_envelope.recheckpoint(sample=sample)
+        view = self.budget_envelope.view(sample=sample)
         if view.clock_status != "trusted":
             raise BudgetClockUnknownError(view.unknown_reason)
         if view.remaining_work_seconds is None:
@@ -478,15 +734,13 @@ class HandlerChildren:
         assert view.effective_work_deadline_at is not None
         envelope = self.budget_envelope.derive(source="parent",
             origin_id=f"parent:{self.command.execution_id}:{self.parent_lease.attempt}:{self.parent_lease.fence}",
-            deadline_at=view.effective_work_deadline_at)
+            deadline_at=view.effective_work_deadline_at, sample=sample)
         if timeout_seconds is not None:
             envelope = envelope.derive(source="tool", origin_id=(
                 f"child-call:{self.command.execution_id}:{self.parent_lease.attempt}:"
                 f"{self.parent_lease.fence}:{request_id}"),
-                                       timeout_seconds=_positive(timeout_seconds, "timeout_seconds"))
-        window = _RetryWindow(envelope, self.kernel)
-        self._active(window)
-        return window.envelope
+                                       timeout_seconds=_positive(timeout_seconds, "timeout_seconds"), sample=sample)
+        return envelope
 
     def _depth(self, window=None) -> int:
         limits = (self.kernel.get_execution_limits(self.command.execution_id) if window is None else
@@ -528,7 +782,7 @@ class HandlerChildren:
         depth = self._depth(window)
         command_json = None if child_command is None else _encode(child_command.to_dict())
         budget_json, lease_json = _encode(window.envelope.to_dict()), _encode(self.parent_lease.to_dict())
-        view = window.envelope.view()
+        view = window.envelope.view(sample=window.envelope.checkpoint)
         if view.clock_status != "trusted" or not view.remaining_work_seconds:
             raise ChildExecutionError("child_budget_exhausted", "child has no trusted remaining work time")
         wait_id = str(uuid.uuid4())
@@ -607,6 +861,7 @@ class HandlerChildren:
             handler_contract_version=handler_contract_version, retry_policy=RetryPolicy(),
             timeout_seconds=timeout, payload=payload)
         window = _RetryWindow(envelope, self.kernel)
+        self._active(window)
         row = _retry(window, lambda: self._enqueue(request_id=request_id, child_id=child_id, action="run",
                             child_command=child, envelope=envelope, window=window), store=self.store)
         return self._await(row)
@@ -617,6 +872,7 @@ class HandlerChildren:
         _identifier(execution_id, "execution_id")
         envelope = self._budget(request_id, timeout_seconds)
         window = _RetryWindow(envelope, self.kernel)
+        self._active(window)
         try:
             target = _retry(window, lambda: self.kernel.get(execution_id), kernel=self.kernel)
         except ExecutionNotFoundError as exc:
@@ -644,7 +900,9 @@ class HandlerChildren:
         return value
 
     def _await(self, row: Mapping[str, Any]) -> dict[str, Any]:
-        window = _RetryWindow(BudgetEnvelope.from_dict(json.loads(row["budget_json"])), self.kernel)
+        _inspect_parent_revocation(self.kernel, self.parent_lease)
+        window = _RetryWindow(BudgetEnvelope.from_dict(json.loads(row["budget_json"])), self.kernel,
+                              execution_id=row["parent_execution_id"])
         attached = False
         try:
             self.store.attach(row, window)
@@ -660,17 +918,31 @@ class HandlerChildren:
                 # A busy read can be the last error retained by _retry when
                 # the same trusted original window expires. Do not treat
                 # contention during a live window as completed delivery.
-                wait_expired = window.remaining() <= 0
+                with window.project():
+                    wait_expired = window.remaining() <= 0
             if not wait_expired:
                 raise
+            previous_deadline = window._delivery_deadline
+            window._delivery_deadline = time.monotonic() + .1
             try:
-                completed = self._completed_result(row, window)
+                from .child_factual_read import uses_independent_reader
+                if uses_independent_reader(self.kernel):
+                    # Factual delivery borrows exact captured floors. It must
+                    # not spend its proof allowance on writer admission/ACK.
+                    completed = self._completed_result(row, window)
+                else:
+                    completed = self._complete_result_after_publication(row, window)
             except Exception as proof_error:
-                if _transient_control_error(proof_error):
+                if (_transient_control_error(proof_error)
+                        or isinstance(proof_error, (BudgetClockUnknownError, InspectionBudgetExceeded))
+                        or (isinstance(proof_error, TimeoutError)
+                            and str(proof_error) == "child result proof admission budget elapsed")):
                     # Keep the original wait outcome and its identity while
                     # retaining why the bounded delivery proof was unknown.
                     raise exc from proof_error
                 raise
+            finally:
+                window._delivery_deadline = previous_deadline
             if completed is None:
                 raise
             # The durable request remains the service's publication obligation.
@@ -678,8 +950,73 @@ class HandlerChildren:
             # releases an unresolved child reservation.
             return self._result(completed)
 
+    def _complete_result_after_publication(self, row, window):
+        """Retain the existing custom/in-memory Kernel settlement fallback."""
+        # Finishing a retained observation is factual cleanup, not
+        # another sample or business admission. It shares the existing
+        # result proof's deadline and cannot clear a foreign guard.
+        owner = window._pending_sample_owner or window._capture
+        if owner is not None and owner._pending is not None:
+            if (owner.kernel is not self.kernel
+                    or owner.execution_id != self.command.execution_id
+                    or (row["parent_execution_id"], row["parent_attempt"], row["parent_fence"]) != (
+                        self.command.execution_id, self.parent_lease.attempt, self.parent_lease.fence)):
+                raise BudgetClockUnknownError("child result checkpoint owner cannot be established")
+            published = owner.finish_pending(window.envelope,
+                timeout_seconds=max(0., window._delivery_deadline-time.monotonic()))
+            window.envelope = window.envelope.with_clock_floor(published.checkpoint)
+            window._pending_sample = window._pending_sample_owner = window._pending_sample_error = None
+        drain = getattr(self.kernel, "_drain_budget_samples", None)
+        sample_status = getattr(self.kernel, "_budget_sample_status", None)
+        execution_ids = (self.command.execution_id, row["child_execution_id"])
+        if (drain is not None and sample_status is not None
+                and any(sample_status(execution_id) is True for execution_id in execution_ids)
+                and (row.get("parent_execution_id"), row.get("parent_attempt"),
+                row.get("parent_fence")) == (
+                    self.command.execution_id, self.parent_lease.attempt, self.parent_lease.fence)):
+            # A Context monitor owns a different helper from this wait.
+            # Visit only exact locally retained parent/child facts; an
+            # unrelated capture must not spend this proof's allowance.
+            drain(window._delivery_deadline, execution_ids=execution_ids)
+        return self._completed_result(row, window)
+
+    @contextmanager
+    def _completed_result_authority(self, row: Mapping[str, Any], deadline: float):
+        """Observe a live sampler's ACK within the existing factual window."""
+        waiting = None
+        lock = getattr(self.kernel, "_control_lock", None)
+        while True:
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                if waiting is not None:
+                    raise waiting
+                raise TimeoutError("child result proof admission budget elapsed")
+            with lock(remaining) if lock is not None else nullcontext():
+                self.kernel._verify_active_lease_readonly(self.parent_lease)
+                try:
+                    self.kernel._assert_budget_clock(self.kernel._connection, self.command.execution_id)
+                    self.kernel._assert_budget_clock(self.kernel._connection, row["child_execution_id"])
+                except BudgetClockUnknownError as error:
+                    if str(error) != "budget_clock_sample_unresolved:sampling":
+                        raise
+                    waiting = error
+                else:
+                    # The reader and its final guards are outside the wait's
+                    # catch: a late guard cannot cause a second result read.
+                    yield
+                    return
+            remaining = deadline-time.monotonic()
+            if remaining > 0:
+                time.sleep(min(.005, remaining))
+
     def _completed_result(self, row: Mapping[str, Any], window: _RetryWindow) -> dict[str, Any] | None:
         """Read an already committed result once after diagnostic delivery lag."""
+        from .child_factual_read import read_completed_result, uses_independent_reader
+        if uses_independent_reader(self.kernel):
+            return read_completed_result(self, row, window)
+        deadline = window._delivery_deadline
+        if deadline is None:
+            deadline = time.monotonic() + .1
         sample = sample_clock(wall_time=self.kernel._wall_time())
         views = [envelope.view(sample=sample) for envelope in (
             BudgetEnvelope.from_dict(json.loads(row["budget_json"])), window.envelope)]
@@ -692,9 +1029,7 @@ class HandlerChildren:
             return None
         checking_parent = True
         try:
-            lock = getattr(self.kernel, "_control_lock", None)
-            with lock(.1) if lock is not None else nullcontext():
-                self.kernel._verify_active_lease_readonly(self.parent_lease)
+            with self._completed_result_authority(row, deadline):
                 checking_parent = False
                 snapshot = self.kernel.get(row["child_execution_id"])
                 if snapshot.state not in _TERMINAL or snapshot.result is None:
@@ -715,6 +1050,8 @@ class HandlerChildren:
                 # This shares the same admission deadline, not another wait.
                 checking_parent = True
                 self.kernel._verify_active_lease_readonly(self.parent_lease)
+                self.kernel._assert_budget_clock(self.kernel._connection, self.command.execution_id)
+                self.kernel._assert_budget_clock(self.kernel._connection, row["child_execution_id"])
                 return result.to_dict()
         except (StaleFenceError, InvalidStateTransitionError) as exc:
             raise ChildExecutionError("parent_authority_revoked", str(exc),
@@ -810,7 +1147,19 @@ class ChildService:
                         self._last_error = f"{type(exc).__name__}: {exc}"
                     del self._futures[key]
             free = self.capacity - len(self._futures)
-            if free <= 0 and time.monotonic() - self._last_renewal < .5:
+            renewal_due = (bool(self._futures) and time.monotonic() - self._last_renewal >= .5)
+            if free <= 0 and not renewal_due:
+                return
+            # This is only a scheduling hint for the observation journal's
+            # ownership lease. Actual claim still atomically rechecks below;
+            # budget capture happens in _execute before business admission.
+            with self.store.read() as connection:
+                candidate = connection.execute(
+                    "SELECT 1 FROM sdk_child_requests WHERE source_id=? "
+                    "AND state IN ('pending','running') AND action IN ('run','adopt') "
+                    "AND (service_owner IS NULL OR owner_expires_at<=?) LIMIT 1",
+                    (self.store.source_id, self.store.journal.clock())).fetchone()
+            if candidate is None and not renewal_due:
                 return
             with self.store.transaction() as (connection, now):
                 if time.monotonic() - self._last_renewal >= .5:
@@ -832,6 +1181,8 @@ class ChildService:
                         "UPDATE sdk_child_requests SET service_owner=?,owner_expires_at=?,updated_at=? "
                         "WHERE source_id=? AND parent_execution_id=? AND request_id=?",
                         (self.owner, now + 2, now, self.store.source_id, row["parent_execution_id"], row["request_id"]))
+            if self._stop.is_set():
+                return
             for row in rows:
                 record = dict(row)
                 future = self._pool.submit(self._execute, record)
@@ -850,6 +1201,10 @@ class ChildService:
             row = dict(record)
             try:
                 lease = ExecutionLease.from_dict(json.loads(row["parent_lease_json"]))
+                _inspect_parent_revocation(self.runtime.kernel, lease)
+                window = _RetryWindow(BudgetEnvelope.from_dict(json.loads(row["budget_json"])),
+                    self.runtime.kernel, self._stop, execution_id=row["parent_execution_id"])
+                self.store.attach(row, window)
                 _verify_parent(self.runtime.kernel, lease)
                 with self.runtime.kernel._control_lock(.1) if hasattr(self.runtime.kernel, "_control_lock") else nullcontext():
                     snapshot = self.runtime.kernel.get(row["child_execution_id"])
@@ -860,7 +1215,8 @@ class ChildService:
                     self.store.finish(row, "unknown", error={"code": "child_recovery_required",
                         "message": snapshot.recovery_reason or "observed target requires recovery"})
                 else:
-                    view = BudgetEnvelope.from_dict(json.loads(row["budget_json"])).view()
+                    window.remaining()
+                    view = window.envelope.view(sample=window.envelope.checkpoint)
                     if view.clock_status != "trusted":
                         raise BudgetClockUnknownError(view.unknown_reason)
                     if not view.remaining_work_seconds:
@@ -895,8 +1251,10 @@ class ChildService:
         lease = None
         try:
             lease = ExecutionLease.from_dict(json.loads(row["parent_lease_json"]))
+            _inspect_parent_revocation(self.runtime.kernel, lease)
             envelope = BudgetEnvelope.from_dict(json.loads(row["budget_json"]))
-            window = _RetryWindow(envelope, self.runtime.kernel, self._stop)
+            window = _RetryWindow(envelope, self.runtime.kernel, self._stop,
+                                  execution_id=row["parent_execution_id"])
             self.store.attach(row, window)
             def control(operation):
                 return _retry(window, operation, kernel=self.runtime.kernel)
@@ -915,7 +1273,7 @@ class ChildService:
             if row["depth"] > self.max_depth:
                 raise ChildExecutionError("child_depth_exceeded", "configured child depth would be exceeded")
             _wait_parent_entry(self.runtime.kernel, lease, envelope, self._stop, window=window)
-            budget = window.envelope.view()
+            budget = window.envelope.view(sample=window.envelope.checkpoint)
             if budget.clock_status != "trusted":
                 raise BudgetClockUnknownError(budget.unknown_reason)
             if not budget.remaining_work_seconds:
@@ -941,7 +1299,7 @@ class ChildService:
             while not self._stop.is_set():
                 control(lambda: self.runtime.kernel.verify(lease))
                 window.remaining()
-                view = window.envelope.view()
+                view = window.envelope.view(sample=window.envelope.checkpoint)
                 if view.clock_status != "trusted":
                     raise BudgetClockUnknownError(view.unknown_reason)
                 if not view.remaining_work_seconds:
@@ -956,7 +1314,6 @@ class ChildService:
                         "message": snapshot.recovery_reason or "child requires explicit effect recovery"}))
                     return
                 if row["action"] != "observe" and snapshot.state == "queued":
-                    control(lambda: self.runtime.kernel.verify(lease))
                     _retry(window, lambda: self.runtime.run_once(execution_id=row["child_execution_id"]))
                 else:
                     self._stop.wait(min(self.poll_interval, view.remaining_work_seconds))
@@ -1006,6 +1363,17 @@ class ChildService:
                 "last_error": self._last_error,
                 "actions": [row["action"] for future, row in self._futures.values() if not future.done()]}
 
+    def _close_pending(self) -> bool:
+        """Inspect live storage ownership without waiting behind its owner."""
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        if not self._lock.acquire(blocking=False):
+            return True
+        try:
+            return any(not future.done() for future, _ in self._futures.values())
+        finally:
+            self._lock.release()
+
     def close(self, *, timeout_seconds: float = 5.0) -> dict[str, Any]:
         deadline = time.monotonic() + _positive(timeout_seconds, "timeout_seconds")
         self._stop.set()
@@ -1013,15 +1381,30 @@ class ChildService:
         thread = self._thread
         if thread is not None:
             thread.join(max(0, deadline - time.monotonic()))
-        with self._lock:
-            futures = tuple(future for future, _ in self._futures.values())
+        inspected = self._lock.acquire(timeout=max(0, deadline - time.monotonic()))
+        futures = ()
+        workers = ()
+        pool = None
+        if inspected:
+            try:
+                workers = tuple(self._futures.values())
+                futures = tuple(future for future, _ in workers)
+                pool = self._pool
+            finally:
+                self._lock.release()
         if futures:
             wait(futures, timeout=max(0, deadline - time.monotonic()))
-        if self._pool is not None:
-            self._pool.shutdown(wait=False, cancel_futures=True)
-        report = self.health()
-        report["unfinished_workers"] = sum(not future.done() for future in futures)
-        return report
+        # A coordinator may still hold the scheduling lock inside SQLite.
+        # Its stop flag prevents new submissions after that operation returns;
+        # a later close can finish pool shutdown after ownership is inspectable.
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        unfinished = sum(not future.done() for future in futures) if inspected else None
+        actions = [row["action"] for future, row in workers if not future.done()] if inspected else None
+        return {"state": "stopped", "capacity": self.capacity, "max_depth": self.max_depth,
+            "active_workers": unfinished, "last_error": self._last_error, "actions": actions,
+            "unfinished_workers": unfinished, "dispatcher_alive": thread is not None and thread.is_alive(),
+            "inspection_pending": not inspected}
 
     def __enter__(self) -> ChildService:
         return self.start()

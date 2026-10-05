@@ -355,6 +355,72 @@ class SettlementJournal:
                 "ORDER BY created_at,execution_id,attempt,fence LIMIT ?", (limit,)).fetchall()
             return [_record(row) for row in rows]
 
+    def pending_script_output(self, *, timeout_seconds: float = .1) -> list[dict[str, Any]]:
+        """Find one original artifact obligation, including settled executions.
+
+        Cleanup confirmation belongs to the original outcome receipt. A result
+        state or the existence of a file cannot substitute for that fact.
+        Business payloads are neither loaded nor replayed by this maintenance.
+        """
+        with self._connection(timeout_seconds) as connection:
+            row = connection.execute(
+                "SELECT r.execution_id,r.attempt,r.fence, "
+                "CASE WHEN length(CAST(json_extract(r.evidence_json,'$.script_output_recovery') AS BLOB))<=16384 "
+                "THEN json_extract(r.evidence_json,'$.script_output_recovery') END AS marker "
+                "FROM settlement_records r "
+                "WHERE json_extract(r.evidence_json,'$.script_output_recovery.cleanup_confirmed')=1 "
+                "AND NOT EXISTS (SELECT 1 FROM settlement_notes n WHERE "
+                "n.execution_id=r.execution_id AND n.attempt=r.attempt AND n.fence=r.fence "
+                "AND n.phase='script_output_saved') "
+                "ORDER BY r.created_at,r.execution_id,r.attempt,r.fence LIMIT 1").fetchone()
+            if row is None:
+                return []
+            if row["marker"] is None:
+                raise SettlementBindingError("script output identity exceeds its fact bound")
+            return [{"identity": {"execution_id": row["execution_id"],
+                                  "attempt": row["attempt"], "fence": row["fence"]},
+                     "evidence": {"script_output_recovery": json.loads(row["marker"])}}]
+
+    def record_script_output(self, identity: ExecutionLease | Mapping[str, Any],
+                             evidence: dict[str, Any], *, timeout_seconds: float = .1) -> dict[str, Any]:
+        """Retain the first bounded post-containment artifact fact exactly once."""
+        key = _key(identity)
+        encoded = _json(evidence)
+        if len(encoded.encode("utf-8")) > 4096:
+            raise ValueError("script output fact exceeds 4096 bytes")
+        with self._connection(timeout_seconds, write=True) as connection:
+            previous = connection.execute(
+                "SELECT * FROM settlement_notes WHERE execution_id=? AND attempt=? AND fence=? "
+                "AND phase='script_output_saved' ORDER BY sequence LIMIT 1", key).fetchone()
+            if previous is not None:
+                return _note(previous)
+            marker = connection.execute(
+                "SELECT json_extract(evidence_json,'$.script_output_recovery.cleanup_confirmed') "
+                "FROM settlement_records WHERE execution_id=? AND attempt=? AND fence=?", key).fetchone()
+            if marker is None or marker[0] != 1:
+                raise SettlementConflictError("original script containment confirmation is unavailable")
+            cursor = connection.execute(
+                "INSERT INTO settlement_notes(note_id,execution_id,attempt,fence,phase,evidence_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?)", (str(uuid4()), *key, "script_output_saved", encoded, time.time()))
+            return _note(connection.execute("SELECT * FROM settlement_notes WHERE sequence=?",
+                                           (cursor.lastrowid,)).fetchone())
+
+    def inspect_script_output(self, identity: Mapping[str, Any], *,
+                              timeout_seconds: float = .1) -> dict[str, Any] | None:
+        """Read one saved-output fact independently of diagnostic pagination."""
+        key = _key(identity)
+        with self._connection(timeout_seconds) as connection:
+            row = connection.execute(
+                "SELECT sequence,note_id,execution_id,attempt,fence,phase,created_at, "
+                "CASE WHEN length(CAST(evidence_json AS BLOB))<=4096 THEN evidence_json END AS evidence_json "
+                "FROM settlement_notes WHERE execution_id=? AND attempt=? AND fence=? "
+                "AND phase='script_output_saved' ORDER BY sequence LIMIT 1", key).fetchone()
+            if row is None:
+                return None
+            if row["evidence_json"] is None:
+                raise SettlementBindingError("saved output fact exceeds its inspection bound")
+            return _note(row)
+
     def settle(self, identity: ExecutionLease | Mapping[str, Any], state: str, evidence: Mapping[str, Any], *,
                timeout_seconds: float = .1, expected_revision: int | None = None) -> dict[str, Any]:
         """CAS settlement facts; resolved rows permit only exact replay.
@@ -431,6 +497,39 @@ class SettlementJournal:
             return report
 
 
+def merge_script_output(report: dict[str, Any], fact: dict[str, Any]) -> None:
+    """Merge a persisted saved-byte floor without adding duplicate counters.
+
+    File size proves retained bytes. It does not prove when those bytes were
+    emitted, that telemetry flushed, or that any material progress occurred.
+    Collector timestamps continue to describe only their captured activity.
+    """
+    evidence = fact["evidence"]
+    for stream in ("stdout", "stderr"):
+        saved = evidence.get("streams", {}).get(stream, {})
+        output = report.setdefault("output", {}).setdefault(stream, {})
+        count = saved.get("saved_bytes")
+        if type(count) is not int or count < 0:
+            output["saved_output_unknown_reason"] = saved.get("unknown_reason", "artifact_fact_unavailable")
+            report["complete"] = False
+            continue
+        metric = report.setdefault("metrics", {}).setdefault(
+            stream + "_bytes", {"count": 0, "first_at": None, "last_at": None})
+        collected_count = metric["count"]
+        metric["count"] = max(collected_count, count)
+        output.update(known=True, first_missing=metric.get("first_at") is None,
+                      saved_bytes=count, saved_at=evidence.get("sampled_at"),
+                      saved_path=saved.get("path"), count_basis="max_collected_and_saved_bytes")
+        if count > collected_count:
+            output["emission_timing_complete"] = False
+            report["complete"] = False
+            report.setdefault("unknown_reason", "script_output_timing_incomplete")
+    report["script_output_fact"] = {"note_id": fact["note_id"],
+        "identity": fact["identity"], "source": evidence.get("source"),
+        "cleanup_confirmed": evidence.get("cleanup_confirmed"),
+        "persisted_at": fact["created_at"]}
+
+
 def merge_diagnostic_notes(report: dict[str, Any], notes: dict[str, Any], *,
                            process_freshness: float) -> None:
     """Merge persisted observation facts without changing Kernel authority."""
@@ -443,10 +542,11 @@ def merge_diagnostic_notes(report: dict[str, Any], notes: dict[str, Any], *,
                 identity.get("attempt"), identity.get("fence")):
             continue
         evidence = note.get("evidence") or {}
+        captured_at = evidence.get("captured_at", evidence.get("observed_at", note["created_at"]))
         phases = report.setdefault("phases", [])
         if not any(item.get("phase") == note.get("phase") for item in phases):
             phases.append({**note["identity"], "phase": note["phase"],
-                "captured_at": evidence.get("observed_at", note["created_at"]),
+                "captured_at": captured_at,
                 "persisted_at": note["created_at"], "details": evidence,
                 "diagnostic_note_id": note["note_id"]})
         if evidence.get("telemetry_incomplete") is True:
@@ -454,11 +554,11 @@ def merge_diagnostic_notes(report: dict[str, Any], notes: dict[str, Any], *,
         if note.get("phase") == "handler_entered" and evidence.get("worker_pid") is not None:
             processes = report.setdefault("processes", [])
             if not any(item.get("process_id") == "worker" for item in processes):
-                age = time.time() - note["created_at"]
+                age = time.time() - captured_at
                 fresh = 0 <= age <= process_freshness
                 processes.append({**note["identity"], "process_id": "worker", "role": "worker",
                     "state": "alive" if fresh else "unknown", "last_observed_state": "alive",
-                    "observed_at": evidence.get("observed_at", note["created_at"]),
+                    "observed_at": captured_at,
                     "persisted_at": note["created_at"], "registration": {"pid": evidence["worker_pid"],
                     "birth_identity": evidence.get("birth_identity"), "namespace": evidence.get("namespace"),
                     "source": "worker_self_report"}, "evidence": evidence.get("process_evidence", {}),
@@ -466,6 +566,6 @@ def merge_diagnostic_notes(report: dict[str, Any], notes: dict[str, Any], *,
         if note.get("phase") == "process_cleanup" and evidence.get("state") == "confirmed":
             for process in report.get("processes", []):
                 if process.get("process_id") == "worker":
-                    process.update(state="exited", last_observed_state="exited", observed_at=note["created_at"],
+                    process.update(state="exited", last_observed_state="exited", observed_at=captured_at,
                         evidence={"source": "runtime_supervisor_reaped", "cleanup": "confirmed",
                         "diagnostic_note_id": note["note_id"]}, unknown_reason=None)

@@ -7,19 +7,20 @@ remain at least once and require their own idempotency or outbox protocol.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 import inspect
 import json
 import math
 from pathlib import Path
 import sqlite3
-from ..storage_connection import connect as storage_connect
+from ..storage_connection import _connect_readonly, connect as storage_connect
 import time
 from typing import Any, Callable, Iterator, Literal, TypedDict, cast
 import uuid
 
 from ..durability import Durability, configure_sqlite_connection, validate_durability
+from .._sqlite_admission import begin_immediate
 from ..execution_kernel.errors import StaleFenceError
 from .contracts import CommandConflict, canonical
 
@@ -229,7 +230,7 @@ class NotificationInbox:
     def _transaction(self) -> Iterator[tuple[sqlite3.Connection, Callable[[], float]]]:
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            begin_immediate(connection)
             watermark = float(connection.execute("SELECT value FROM main.notification_inbox_clock WHERE id=1").fetchone()[0])
 
             def now() -> float:
@@ -375,6 +376,28 @@ class NotificationInbox:
                 (lease_id, owner, expiry, now, row["source_id"], row["notification_id"]))
             return InboxLease(row["source_id"], row["notification_id"], lease_id, owner, row["fence"] + 1,
                               expiry, row["attempts"] + 1, json.loads(row["payload"]))
+
+    def _delivery_ready(self, source_id: str) -> bool:
+        """Advise an owned background consumer without writing an idle clock.
+
+        Pending work still uses the original atomic claim and logical clock.
+        Any processing lease also keeps that claim, including expiry cleanup
+        for other sources. A racing accept is seen at the next existing poll.
+        """
+        from .._inspection import InspectionBudget
+
+        budget = InspectionBudget(.1, None)
+        _identity(source_id, "source_id")
+        with closing(_connect_readonly(self.db_path, timeout=0)) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA trusted_schema=OFF")
+            budget.install(connection)
+            ready = connection.execute(
+                "SELECT 1 FROM notification_inbox_messages WHERE state='processing' "
+                "UNION ALL SELECT 1 FROM notification_inbox_messages "
+                "WHERE state='pending' AND source_id=? LIMIT 1", (source_id,)).fetchone() is not None
+            budget.check()
+            return ready
 
     def consume(self, lease: InboxLease,
                 mutation: Callable[[sqlite3.Connection, Any], Any] | None = None) -> InboxRecord:

@@ -1,7 +1,7 @@
 # Durable integration engineering principles
 
-This guide turns recurring integration failures into reusable engineering
-rules for applications built on a durable SDK. It complements the API and
+This guide describes how to prepare deployments, diagnose failed Runs and
+report validation for applications built on a durable SDK. It complements the API and
 recovery contracts; it does not move application policy, product acceptance or
 domain-specific states into the SDK.
 
@@ -19,9 +19,11 @@ work. Record these coordinates independently:
 - execution and orchestration contract versions;
 - each persistent storage schema version;
 - handler or plugin registry revision;
-- deployment artifact digest and configuration or durability profile.
+- host-supplied deployment artifact identity and configuration or durability profile.
 
-A diagnostic bundle should make the coordinates machine-readable. For example:
+Use identities supplied by the host or existing SDK records. Do not introduce
+additional hash checks or invent missing provenance fields to complete the bundle.
+A diagnostic bundle should make the available coordinates machine-readable. For example:
 
 ```json
 {

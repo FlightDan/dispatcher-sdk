@@ -1,5 +1,9 @@
 # A01 至 A04 实现验证记录
 
+本文保留 2026-09-07 的候选身份与验证结果，不证明当前开发候选已通过。
+当前 API 见[诊断与投影](SDK_DIAGNOSTICS_AND_PROJECTIONS.md)，
+当前观测能力的验证状态见[验收记录](EXECUTION_OBSERVABILITY_ACCEPTANCE.md)。
+
 日期：2026-09-07。范围：[能力增量策略](SDK_CAPABILITY_INCREMENT_STRATEGY.md)中的 A01 至 A04，包括 A04b 持久化取消回执。实现及本轮 Linux 验证已完成，未发布。
 
 ## 候选身份

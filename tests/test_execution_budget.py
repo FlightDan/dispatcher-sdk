@@ -97,6 +97,20 @@ class ExecutionBudgetTests(unittest.TestCase):
         self.assertEqual(view.observed_at, 1090)
         self.assertEqual(view.remaining_hard_seconds, 10)
 
+    def test_recovered_fractional_clock_anchor_cannot_regain_one_ulp_of_budget(self):
+        original = BudgetEnvelope((DeadlineConstraint("original", "run", 1791192986),),
+            checkpoint(wall=1791192976.1234567, elapsed=812174.123456789))
+        advanced = original.recheckpoint(sample=checkpoint(wall=0, elapsed=812174.2234567889))
+        restored = BudgetEnvelope.from_dict(json.loads(json.dumps(advanced.to_dict())))
+        self.assertEqual(restored.constraints, original.constraints)
+        for elapsed in (812174.2234567889, 812174.3234567889, 812175.123456789):
+            with self.subTest(elapsed=elapsed):
+                sample = checkpoint(wall=0, elapsed=elapsed)
+                before, after = original.view(sample=sample), restored.view(sample=sample)
+                self.assertGreaterEqual(after.observed_at, before.observed_at)
+                self.assertLessEqual(after.remaining_work_seconds, before.remaining_work_seconds)
+                self.assertLessEqual(after.remaining_hard_seconds, before.remaining_hard_seconds)
+
     def test_unknown_restart_refuses_business_without_inventing_remaining(self):
         envelope = BudgetEnvelope((DeadlineConstraint("run-a", "run", 1100),), checkpoint())
         samples = (checkpoint(1050, 150, "host-boot-b"),

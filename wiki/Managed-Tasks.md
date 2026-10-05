@@ -15,10 +15,15 @@ def double(payload, context):
     return payload * 2
 
 
-with Dispatcher("tasks.sqlite3", {"double": double}) as app:
-    task = app.submit("double", 21, request_id="message-42")
-    result = task.wait(timeout=10)
-    print(result["value"])
+def main():
+    with Dispatcher("tasks.sqlite3", {"double": double}) as app:
+        task = app.submit("double", 21, request_id="message-42")
+        result = task.wait(timeout=10)
+        print(result["value"])
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 Use a durable application identity as `request_id`. Repeating the same ID and
@@ -29,6 +34,12 @@ content returns the original task; changed content raises
 Process isolation is the default. It can terminate supervised trusted code, but
 it does not restrict filesystem or network access. Thread mode must be selected
 explicitly and cannot kill a blocked call.
+
+`task.observe()` and `task.events()` read saved execution facts without claiming
+work or changing deadlines. Handlers can report output, waits and progress through
+`context.activity`; stall policies are opt-in. See [execution activity and
+supervision](../docs/EXECUTION_OBSERVABILITY.md) for the reporting and recovery
+contracts, including the reserved managed handler.
 
 ## Results and application work
 

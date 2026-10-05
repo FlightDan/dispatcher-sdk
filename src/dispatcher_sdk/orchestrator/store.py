@@ -7,6 +7,7 @@ import sqlite3
 from contextlib import contextmanager
 
 from ..durability import configure_sqlite_connection
+from .._sqlite_admission import begin_immediate
 from ..storage_connection import connect as storage_connect
 from ..content import CONTENT_SCHEMA, decode_value, encode_value
 from .contracts import CommandConflict, OrchestrationError, HistoryExpired, EventCursorExpired, RunDisposed, TERMINAL, canonical
@@ -275,7 +276,7 @@ class StoreMixin:
     def _transaction(self):
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            begin_immediate(connection)
             yield connection
             self._failpoint("before_commit")
             connection.commit()

@@ -11,7 +11,7 @@ The release workflow uses the repository's temporary GitHub token.
 3. Inspect the staged source and release artifacts for secrets and private data.
    The workflow runs Gitleaks against source; source archives must contain only
    the SDK, public docs, tests, examples and release metadata.
-4. Push a tag matching the package version, for example `v0.6.0`.
+4. Push a tag matching the package version, for example `v0.7.0.dev2`.
    The workflow verifies that the tag and distribution version agree, then tests
    the tagged candidate, builds the source archive and wheel, generates
    `SHA256SUMS`, and publishes a GitHub prerelease.

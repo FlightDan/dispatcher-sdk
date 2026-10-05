@@ -22,7 +22,8 @@ class ResultConflictError(ExecutionKernelError):
 
 
 class CASConflictError(ExecutionKernelError):
-    pass
+    # Optional producer facts for deadline classification, never authority.
+    _budget_deadline: Mapping[str, Any] | None = None
 
 
 class StorageIsolationError(ExecutionKernelError):

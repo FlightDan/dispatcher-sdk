@@ -23,8 +23,11 @@ import time
 import traceback
 from typing import Any, Callable, Mapping, Optional
 
+from .._sqlite_errors import is_sqlite_contention
 from .context import HandlerContext, HandlerEffects
 from .budget import BudgetClockUnknownError, BudgetEnvelope, sample_clock
+from .budget_capture import _KernelBudgetCapture
+from .completion_clock import capture_completion_time
 from .contracts import ExecutionCommandV2, ExecutionLease
 from .errors import EffectRecoveryRequiredError, HandlerExecutionError
 from ._registry import Handler
@@ -221,14 +224,13 @@ def _invoke_handler(
 
 
 def _capture_completion_time(outcome: dict[str, Any], context: HandlerContext) -> None:
-    """Retain logical completion time without waiting on shared control locks.
+    """Retain the original logical completion fact under one control bound.
 
     Raw wall time can roll back below a durably observed lease expiry. The
     original result must not use that rollback as proof of timely completion.
     """
     try:
-        with context._kernel._control_lock(.1):
-            outcome["completed_at"] = context._kernel.current_time()
+        outcome["completed_at"] = capture_completion_time(context)
         outcome["completion_time_known"] = True
     except Exception as exc:
         outcome["completion_time_known"] = False
@@ -237,6 +239,102 @@ def _capture_completion_time(outcome: dict[str, Any], context: HandlerContext) -
 
 def _budget_sample(now: Any):
     return sample_clock(wall_time=now() if callable(now) else None)
+
+
+def _elapsed_budget_sample(envelope: BudgetEnvelope):
+    return sample_clock(wall_time=envelope.checkpoint.wall_at)
+
+
+
+def _capture_budget_floor(envelope: BudgetEnvelope, capture: Any,
+                          timeout_seconds: float) -> BudgetEnvelope:
+    """Preserve captured authority and the causal error when publication fails."""
+    try:
+        return capture(envelope, timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        if isinstance(exc, (BudgetClockUnknownError, HandlerExecutionError)):
+            raise
+        error = BudgetClockUnknownError(f"budget_clock_capture_failed:{type(exc).__name__}: {str(exc)[:4096]}")
+        error.budget_sample_token = getattr(exc, "budget_sample_token", None)
+        error.budget_sample_envelope = getattr(exc, "budget_sample_envelope", None)
+        raise error from exc
+
+
+def _finish_budget_capture(capture: Any, envelope: BudgetEnvelope | None,
+                           *, timeout_seconds: float = .1):
+    """Publish one owned fact after containment, without observing wall time."""
+    pending = getattr(capture, "_pending", None)
+    if pending is None:
+        return envelope, {"state": "confirmed"}
+    token, captured = pending
+    if captured is None:
+        # An interrupted arm has no fact to acknowledge. Re-entering its
+        # capture would rethrow a retained native alarm and prevent the
+        # supervisor from publishing even its containment/timeout receipt.
+        # Keep the guard and original error; this is no new observation.
+        error = getattr(capture, "_error", None)
+        if error is None:
+            error = BudgetClockUnknownError("budget_clock_sample_unresolved:sampling")
+        return envelope, {"state": "unknown", "token": token,
+            "captured_envelope": None, "error": _control_error_details(error.__cause__ or error)}
+    envelope = captured if envelope is None else envelope.with_clock_floor(captured.checkpoint)
+    try:
+        published = capture.finish_pending(envelope, timeout_seconds=timeout_seconds)
+        return published, {"state": "confirmed", "token": token}
+    except Exception as error:
+        return envelope, {"state": "unknown", "token": token,
+            "captured_envelope": None if captured is None else captured.to_dict(),
+            "error": _control_error_details(error.__cause__ or error)}
+
+
+def _transient_capture_error(error: BaseException) -> bool:
+    cause = error.__cause__ or error
+    return (is_sqlite_contention(cause) or isinstance(cause, TimeoutError)
+        or str(error) == "budget_clock_sample_unresolved:sampling")
+
+
+def _capture_budget_until(envelope: BudgetEnvelope, capture: Any, deadline: float,
+                          *, hard: bool = False, on_capture: Any = None,
+                          stop_retry: Any = None) -> BudgetEnvelope:
+    """Retry guarded capture inside an already established native cutoff."""
+    last_error = None
+    while True:
+        projected = envelope.recheckpoint(sample=_elapsed_budget_sample(envelope))
+        bound = projected.deadline_monotonic(hard=hard, sample=projected.checkpoint)
+        deadline = min(deadline, math.inf if bound is None else bound)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if last_error is not None:
+                last_error.budget_sample_envelope = envelope
+                raise last_error
+            return projected
+        try:
+            published = _capture_budget_floor(projected, capture, min(.1, remaining))
+            if on_capture is not None:
+                on_capture(published)
+            return published
+        except BudgetClockUnknownError as exc:
+            captured = getattr(exc, "budget_sample_envelope", None)
+            if captured is not None:
+                envelope = envelope.with_clock_floor(captured.checkpoint)
+                if on_capture is not None:
+                    on_capture(envelope)
+            if not _transient_capture_error(exc):
+                raise
+            # A ready original packet is a fact, not new execution authority.
+            # Let its caller read it while retaining this exact refusal and
+            # pending capture, instead of retrying until the business cutoff.
+            if stop_retry is not None and stop_retry():
+                raise
+            last_error = exc
+            projected = envelope.recheckpoint(sample=_elapsed_budget_sample(envelope))
+            bound = projected.deadline_monotonic(hard=hard, sample=projected.checkpoint)
+            deadline = min(deadline, math.inf if bound is None else bound)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                exc.budget_sample_envelope = envelope
+                raise
+            time.sleep(min(.005, remaining))
 
 
 def _merge_budget_floor(base: BudgetEnvelope, observed: BudgetEnvelope) -> BudgetEnvelope:
@@ -249,13 +347,44 @@ def _merge_budget_floor(base: BudgetEnvelope, observed: BudgetEnvelope) -> Budge
 class _BudgetTracker:
     """Retain the exact samples used by one local deadline observer."""
 
-    def __init__(self, envelope: BudgetEnvelope | None, now: Any) -> None:
+    def __init__(self, envelope: BudgetEnvelope | None, now: Any,
+                 capture_budget: Any = None, *, guarded: bool = False) -> None:
         self.envelope, self.now = envelope, now
+        self.capture_budget, self.guarded = capture_budget, guarded or capture_budget is not None
+        self.capture_error: Exception | None = None
+        self.on_capture: Any = None
 
-    def bound(self, deadline: float, *, hard: bool = False) -> float:
+    def _retain_capture(self, envelope: BudgetEnvelope) -> None:
+        self.envelope = envelope if self.envelope is None else _merge_budget_floor(self.envelope, envelope)
+        if self.on_capture is not None:
+            self.on_capture(self.envelope)
+
+    def bound(self, deadline: float, *, hard: bool = False,
+              stop_retry: Any = None) -> float:
         if self.envelope is None:
             return deadline
-        self.envelope = self.envelope.recheckpoint(sample=_budget_sample(self.now))
+        if self.guarded:
+            self.envelope = self.envelope.recheckpoint(sample=_elapsed_budget_sample(self.envelope))
+            original = self.envelope.deadline_monotonic(hard=hard, sample=self.envelope.checkpoint)
+            deadline = min(deadline, math.inf if original is None else original)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return deadline
+            if self.capture_budget is None:
+                raise BudgetClockUnknownError("budget_clock_capture_unavailable")
+            try:
+                self.envelope = _capture_budget_until(
+                    self.envelope, self.capture_budget, deadline, hard=hard,
+                    on_capture=self._retain_capture, stop_retry=stop_retry)
+                self.capture_error = None
+            except Exception as exc:
+                captured = getattr(exc, "budget_sample_envelope", None)
+                if captured is not None:
+                    self.envelope = self.envelope.with_clock_floor(captured.checkpoint)
+                self.capture_error = exc
+                raise
+        else:
+            self.envelope = self.envelope.recheckpoint(sample=_budget_sample(self.now))
         bound = self.envelope.deadline_monotonic(hard=hard, sample=self.envelope.checkpoint)
         return deadline if bound is None else min(deadline, bound)
 
@@ -298,6 +427,7 @@ def _confirm_handler_entry(context: HandlerContext) -> None:
     """Complete the SDK's durable pending-to-confirmed entry handshake."""
     captured = context.budget_envelope
     last_error = None
+    native_deadline = captured.deadline_monotonic(sample=context._sample())
 
     def check_budget():
         view = context.budget
@@ -315,9 +445,9 @@ def _confirm_handler_entry(context: HandlerContext) -> None:
         return view
 
     while True:
-        view = check_budget()
-        captured = captured.recheckpoint(sample=context.budget_envelope.checkpoint)
         try:
+            view = check_budget()
+            captured = captured.recheckpoint(sample=context.budget_envelope.checkpoint)
             # Admission was already marked pending before dispatch, including
             # retry attempts. A crash at this intermediate ACK cannot authorize
             # another attempt using an unconfirmed, weaker clock floor.
@@ -333,6 +463,7 @@ def _confirm_handler_entry(context: HandlerContext) -> None:
                 confirmed = context._kernel.confirm_handler_entry(context.lease, captured,
                     timeout_seconds=min(.1, view.remaining_work_seconds))
                 context._budget_envelope = confirmed
+                context._entry_confirmed = True
                 if context.children is not None:
                     context.children.budget_envelope = confirmed
             # The committed checkpoint defines the ACK boundary. Sampling wall
@@ -346,16 +477,31 @@ def _confirm_handler_entry(context: HandlerContext) -> None:
         except HandlerExecutionError:
             raise
         except Exception as exc:
-            sqlite_code = getattr(exc, "sqlite_errorcode", None)
-            busy = isinstance(exc, sqlite3.OperationalError) and (
-                (isinstance(sqlite_code, int) and sqlite_code & 0xff in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
-                or (sqlite_code is None and str(exc).lower() in {
-                    "database is locked", "database table is locked", "database schema is locked"}))
+            busy = is_sqlite_contention(exc)
             control_busy = isinstance(exc, TimeoutError) and str(exc) in {
                 "Kernel control lock admission timed out", "Kernel control admission budget elapsed"}
-            if busy or control_busy:
+            competing_sample = (isinstance(exc, BudgetClockUnknownError)
+                and str(exc) == "budget_clock_sample_unresolved:sampling")
+            if busy or control_busy or competing_sample:
                 last_error = exc
-                time.sleep(min(.01, view.remaining_work_seconds))
+                retained = getattr(exc, "budget_sample_envelope", None)
+                if retained is not None:
+                    with context._budget_lock:
+                        context._budget_envelope = context.budget_envelope.with_clock_floor(retained.checkpoint)
+                # A publication retry projects the same retained floor; it
+                # cannot arm a second wall observation or renew entry's timer.
+                envelope = context.budget_envelope
+                projected = envelope.view(sample=_elapsed_budget_sample(envelope))
+                remaining = projected.remaining_work_seconds
+                if native_deadline is not None:
+                    remaining = min(remaining or 0, native_deadline - time.monotonic())
+                if projected.clock_status != "trusted" or remaining is None or remaining <= 0:
+                    details = projected.to_dict()
+                    details["storage_error"] = _control_error_details(exc)
+                    raise HandlerExecutionError("execution_deadline_exhausted",
+                        "execution work deadline elapsed before durable entry confirmation",
+                        details=details) from exc
+                time.sleep(min(.01, remaining))
                 continue
             code = "budget_clock_unknown" if isinstance(exc, BudgetClockUnknownError) else "entry_confirmation_unknown"
             details = _control_error_details(exc)
@@ -413,7 +559,17 @@ def _budget_outcome(outcome: dict[str, Any], envelope: BudgetEnvelope | None,
 def _wait_packet(receiver: Any, deadline: float, tracker: _BudgetTracker,
                  *, hard: bool = False) -> tuple[dict[str, Any] | None, float]:
     while True:
-        deadline = tracker.bound(deadline, hard=hard)
+        # Already available factual packets do not require another clock write.
+        if tracker.guarded and receiver.poll(0):
+            return _receive_packet(receiver), deadline
+        try:
+            deadline = tracker.bound(deadline, hard=hard, stop_retry=lambda: receiver.poll(0))
+        except BudgetClockUnknownError as error:
+            if not _transient_capture_error(error):
+                raise
+            if receiver.poll(0):
+                return _receive_packet(receiver), deadline
+            raise
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None, deadline
@@ -425,6 +581,13 @@ def _close_context(context: HandlerContext | None) -> dict[str, Any]:
     if context is not None:
         try:
             receipt = context.close()
+            checkpoint = receipt.get("budget_checkpoint") if type(receipt) is dict else None
+            if type(checkpoint) is dict and checkpoint.get("state") != "confirmed":
+                pending = getattr(context._budget_capture, "_pending", None)
+                return {"state": "unknown", "reason": "owned budget checkpoint remains pending",
+                    "budget_checkpoint": {**checkpoint,
+                        "token": None if pending is None else pending[0],
+                        "captured_envelope": None if pending is None or pending[1] is None else pending[1].to_dict()}}
             if type(receipt) is dict and (receipt.get("state") in {"unknown", "degraded", "pending"}
                     or receipt.get("pending_events", 0) or receipt.get("pending_bytes", 0)):
                 return {"state": "unknown", "reason": str(receipt.get("reason") or receipt.get("unknown_reason")
@@ -440,13 +603,17 @@ def _close_context(context: HandlerContext | None) -> dict[str, Any]:
 class _DeadlineGuard:
     """Local hard timer; neither SQLite nor telemetry is read by the alarm."""
 
-    def __init__(self, deadline: float, envelope: BudgetEnvelope | None, now: Any) -> None:
+    def __init__(self, deadline: float, envelope: BudgetEnvelope | None, now: Any,
+                 capture_budget: Any = None, *, guarded: bool = False) -> None:
         self.envelope, self.now = envelope, now
+        self.capture_budget, self.guarded = capture_budget, guarded or capture_budget is not None
+        self.capture_error: BaseException | None = None
         # The alarm is the sole writer of this slot. Interrupted normal code
         # must never overwrite the only observation of a forward clock jump.
         self._alarm_envelope: BudgetEnvelope | None = None
         if envelope is not None:
-            self.envelope = envelope.recheckpoint(sample=_budget_sample(now))
+            self.envelope = envelope.recheckpoint(sample=(
+                _elapsed_budget_sample(envelope) if self.guarded else _budget_sample(now)))
         self.inherited_work_deadline = self._bound(math.inf)
         self.inherited_hard_deadline = self._bound(math.inf, hard=True)
         self.deadline = self._bound(deadline)
@@ -467,6 +634,15 @@ class _DeadlineGuard:
         bound = envelope.deadline_monotonic(hard=hard, sample=envelope.checkpoint)
         return deadline if bound is None else min(deadline, bound)
 
+    def _retain_capture(self, envelope: BudgetEnvelope) -> None:
+        previous = self.snapshot()
+        self.envelope = envelope if previous is None else _merge_budget_floor(previous, envelope)
+        self.inherited_work_deadline = self._bound(self.inherited_work_deadline)
+        self.inherited_hard_deadline = self._bound(self.inherited_hard_deadline, hard=True)
+        self.hard_deadline = self._bound(self.hard_deadline, hard=True)
+        self.deadline = self._bound(self.deadline, hard=self.cleanup)
+        self._refresh_elapsed_limit()
+
     def _refresh_elapsed_limit(self) -> None:
         if self.envelope is not None and self.envelope.constraints:
             anchor = self.envelope.checkpoint
@@ -475,12 +651,35 @@ class _DeadlineGuard:
                     item.deadline_at if self.cleanup else item.work_deadline_at
                     for item in self.envelope.constraints) - anchor.wall_at
 
-    def remaining(self, *, resample: bool = False) -> float:
+    def remaining(self, *, resample: bool = False, stop_retry: Any = None) -> float:
         if self.envelope is not None:
             envelope = self.snapshot()
             assert envelope is not None
             if resample:
-                sample = _budget_sample(self.now)
+                if self.guarded:
+                    remaining = self.deadline - time.monotonic()
+                    if remaining > 0:
+                        if self.capture_budget is None:
+                            raise BudgetClockUnknownError("budget_clock_capture_unavailable")
+                        try:
+                            envelope = _capture_budget_until(
+                                envelope, self.capture_budget, self.deadline, hard=self.cleanup,
+                                on_capture=self._retain_capture, stop_retry=stop_retry)
+                        except BaseException as exc:
+                            self.capture_error = exc
+                            captured = getattr(exc, "budget_sample_envelope", None)
+                            if captured is not None:
+                                self._retain_capture(envelope.with_clock_floor(captured.checkpoint))
+                            retained = self.snapshot()
+                            if retained is not None:
+                                view = retained.view(sample=retained.checkpoint)
+                                exhausted = view.remaining_hard_seconds if self.cleanup else view.remaining_work_seconds
+                                if exhausted == 0:
+                                    raise _DeadlineExpired() from exc
+                            raise
+                    sample = _elapsed_budget_sample(envelope)
+                else:
+                    sample = _budget_sample(self.now)
             else:
                 # The alarm must not reenter filesystem/codec code. Its known
                 # local domain already identifies the native elapsed clock.
@@ -488,7 +687,8 @@ class _DeadlineGuard:
                 elapsed = (time.clock_gettime(time.CLOCK_BOOTTIME)
                     if anchor.domain_scope == "boot" and anchor.domain_id is not None
                     and anchor.domain_id.startswith("linux-boot:") else time.monotonic())
-                sample = replace(anchor, wall_at=time.time() if self.now is None else anchor.wall_at,
+                sample = replace(anchor, wall_at=(time.time() if self.now is None and not self.guarded
+                                                  else anchor.wall_at),
                                  elapsed_at=elapsed)
             observed = envelope.recheckpoint(sample=sample)
             if not resample:
@@ -516,7 +716,8 @@ class _DeadlineGuard:
             observed = self.snapshot()
             assert observed is not None
             entered = _merge_budget_floor(entered, observed)
-        self.envelope = entered.recheckpoint(sample=_budget_sample(self.now))
+        self.envelope = entered.recheckpoint(sample=(
+            _elapsed_budget_sample(entered) if self.guarded else _budget_sample(self.now)))
         self.deadline = min(self.inherited_work_deadline,
                             self._bound(float(packet_deadline)))
         hard_deadline = packet.get("hard_deadline_monotonic", packet_deadline)
@@ -731,6 +932,10 @@ def _worker_entry(
     stage = "worker_deserialization"
     try:
         os.setpgid(0, 0)
+        from .resources import apply_process_memory_limit
+        stage = "worker_resource_admission"
+        apply_process_memory_limit((service_spec or {}).get("process_memory_limit_bytes"))
+        stage = "worker_deserialization"
         if isinstance(handler, bytes):
             # Trusted invocation bytes are decoded only inside the already
             # timed/contained worker, so imports and __setstate__ can report
@@ -816,8 +1021,19 @@ def _supervisor_entry(
     subreaper = False
     business_outcome_json: str | None = None
     guard: _DeadlineGuard | None = None
+    supervisor_kernel: SQLiteKernel | None = None
+    handler_entered = False
+    stage = "supervisor_setup"
 
     def send_parent(packet: dict[str, Any]) -> None:
+        if guard is not None and packet.get("cleanup_confirmed") is True:
+            # The tree is already contained. This bounded exact-token ACK
+            # owns factual cleanup time, never another business allowance.
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            published, checkpoint = _finish_budget_capture(guard.capture_budget, guard.snapshot())
+            if published is not None:
+                guard._retain_capture(published)
+            packet = {**packet, "budget_checkpoint": checkpoint}
         observed = None if guard is None else guard.snapshot()
         if observed is not None:
             packet = {**packet, "observed_budget_envelope": observed.to_dict()}
@@ -842,6 +1058,7 @@ def _supervisor_entry(
         guard = _DeadlineGuard(
             time.monotonic() + command.timeout_seconds if startup_deadline is None else startup_deadline,
             budget_envelope, now,
+            guarded=bool((service_spec or {}).get("guard_budget")),
         )
 
         def expire(_signum: int, _frame: Any) -> None:
@@ -861,6 +1078,18 @@ def _supervisor_entry(
         previous_alarm = signal.signal(signal.SIGALRM, expire)
         try:
             guard.arm()
+            if guard.guarded:
+                remaining = guard.remaining()
+                if remaining <= 0:
+                    raise _DeadlineExpired()
+                # Install the independent alarm before opening SQLite. Neither
+                # connection admission nor a busy sampling writer owns its timer.
+                supervisor_kernel = SQLiteKernel(db_path, now=now, durability=durability,
+                    control_timeout_seconds=min(.1, remaining))
+                guard.capture_budget = _KernelBudgetCapture(supervisor_kernel, lease.execution_id)
+                if guard.remaining(resample=True) <= 0:
+                    raise _DeadlineExpired()
+                guard.arm()
             ready = _receive_packet(worker_channel)
             if type(ready) is not dict or ready.get("kind") != "worker_ready":
                 contained = _contain_tree(
@@ -875,12 +1104,15 @@ def _supervisor_entry(
                 return
             send_parent(ready)
             _send_packet(worker_channel, {"kind": "invoke"})
+            stage = "handler_entry"
             packet = _receive_packet(worker_channel)
             if type(packet) is dict and packet.get("kind") == "worker_entered":
                 guard.entered(packet)
+                handler_entered = True
                 send_parent({**packet, "kind": "handler_started",
                                             "deadline_monotonic": guard.deadline,
                                             "hard_deadline_monotonic": guard.hard_deadline})
+                stage = "handler_execution"
                 guard.arm()
                 packet = _receive_packet(worker_channel)
             elif type(packet) is dict and packet.get("kind") == "worker_completed":
@@ -892,6 +1124,27 @@ def _supervisor_entry(
                                             "cleanup_confirmed": subreaper,
                                             "outcome_json": packet.get("outcome_json")})
                 return
+            if (packet is None or type(packet) is not dict or
+                    packet.get("kind") not in {"worker_returned", "worker_completed"} or
+                    type(packet.get("outcome_json")) is not str):
+                # No remaining callable can earn a successful result. Prove
+                # physical containment before trying any clock publication;
+                # a killed worker may leave an unresolved sampling marker.
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                contained = _contain_tree(os.getpid(), worker_pid,
+                    time.monotonic() + _CLEANUP_GRACE_SECONDS, subreaper=subreaper)
+                send_parent({"kind": "handler_failed", "cleanup_confirmed": contained and subreaper,
+                    "code": "handler_process_exit",
+                    "message": ("handler process exited before reporting an outcome" if packet is None
+                        else str(packet.get("message", "handler worker failed internally"))
+                        if type(packet) is dict else "handler worker failed internally"),
+                    "details": packet.get("details", {}) if type(packet) is dict else {}})
+                return
+            if (type(packet) is dict and packet.get("kind") == "worker_returned"
+                    and type(packet.get("outcome_json")) is str):
+                # Retain factual return before a separate clock publication
+                # can fail. Deadline validation below still owns acceptance.
+                business_outcome_json = packet["outcome_json"]
             if guard.remaining(resample=True) <= 0:
                 raise _DeadlineExpired()
             if type(packet) is dict and packet.get("kind") == "worker_returned":
@@ -901,6 +1154,7 @@ def _supervisor_entry(
                     raise _DeadlineExpired()
                 business_outcome_json = packet["outcome_json"]
             guard.begin_cleanup()
+            stage = "worker_finalization"
             deadline = guard.deadline
             if type(packet) is dict and packet.get("kind") == "worker_returned":
                 send_parent({"kind": "handler_returned"})
@@ -916,8 +1170,20 @@ def _supervisor_entry(
                         business_outcome_json = json.dumps(original, allow_nan=False)
                         packet = None
                         break
-                    if guard.remaining(resample=True) <= 0:
-                        raise _DeadlineExpired()
+                    if worker_channel.poll(0):
+                        packet = _receive_packet(worker_channel)
+                        break
+                    try:
+                        if guard.remaining(resample=True,
+                                stop_retry=lambda: worker_channel.poll(0)) <= 0:
+                            raise _DeadlineExpired()
+                    except BudgetClockUnknownError as error:
+                        if not _transient_capture_error(error):
+                            raise
+                        if not worker_channel.poll(0):
+                            raise
+                        packet = _receive_packet(worker_channel)
+                        break
                     if worker_channel.poll(.01):
                         packet = _receive_packet(worker_channel)
                         break
@@ -981,6 +1247,16 @@ def _supervisor_entry(
             )
         except _DeadlineExpired:
             signal.setitimer(signal.ITIMER_REAL, 0.0)
+            # Collect only packets already written by the original worker.
+            # Expiry grants no wait or additional invocation time.
+            for _ in range(4):
+                if not worker_channel.poll(0):
+                    break
+                available = _receive_packet(worker_channel)
+                if (type(available) is dict and available.get("kind") in
+                        {"worker_returned", "worker_completed"}
+                        and type(available.get("outcome_json")) is str):
+                    business_outcome_json = available["outcome_json"]
             expired_budget = guard.snapshot()
             work_budget_expired = (expired_budget is not None and
                 expired_budget.view(sample=expired_budget.checkpoint).remaining_work_seconds == 0)
@@ -990,7 +1266,9 @@ def _supervisor_entry(
             )
             send_parent({"kind": "handler_timed_out", "cleanup_confirmed": contained and subreaper,
                                        "work_budget_expired": work_budget_expired,
-                                       "business_outcome_json": business_outcome_json})
+                                       "business_outcome_json": business_outcome_json,
+                                       "budget_capture_error": None if guard.capture_error is None else
+                                           _control_error_details(guard.capture_error.__cause__ or guard.capture_error)})
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0.0)
             if previous_alarm is not None:
@@ -1003,24 +1281,30 @@ def _supervisor_entry(
                 subreaper=subreaper,
             )
         try:
-            details = _bootstrap_diagnostic(exc, "supervisor_setup")
+            details = _bootstrap_diagnostic(exc, stage)
             send_parent(
                 {
-                    "kind": "handler_start_failed",
+                    "kind": "handler_failed" if handler_entered else "handler_start_failed",
                     "cleanup_confirmed": contained and subreaper,
                     "message": details["message"],
                     "details": details,
+                    "code": "budget_clock_unknown" if isinstance(exc, BudgetClockUnknownError)
+                        else "handler_process_start_failure",
+                    "control_error": isinstance(exc, BudgetClockUnknownError),
+                    "business_outcome_json": business_outcome_json,
                 },
             )
         except BaseException:
             pass
     finally:
+        if supervisor_kernel is not None:
+            supervisor_kernel.close()
         if worker_channel is not None:
             worker_channel.close()
         parent_sender.close()
 
 
-def _kill_supervisor(process: multiprocessing.Process) -> bool:
+def _kill_supervisor(process: multiprocessing.Process, *, wait_for_receipt: bool = False) -> bool:
     # Keep the Linux subreaper alive while its worker is being killed.  A
     # worker can be inside clone/exec when cancellation arrives; killing the
     # supervisor immediately would let a just-created, detached descendant be
@@ -1034,7 +1318,7 @@ def _kill_supervisor(process: multiprocessing.Process) -> bool:
         if not descendants:
             if quiet_since is None:
                 quiet_since = now
-            elif now - quiet_since >= _TREE_QUIET_SECONDS:
+            elif not wait_for_receipt and now - quiet_since >= _TREE_QUIET_SECONDS:
                 break
         else:
             quiet_since = None
@@ -1076,7 +1360,9 @@ class ProcessSupervisorHandle:
         with self._lock:
             if self._revocation_reason is None:
                 self._revocation_reason = reason
-            return _kill_supervisor(self._process)
+            # The same one-second grace also belongs to the supervisor's
+            # explicit containment packet and bounded finish-only ACK.
+            return _kill_supervisor(self._process, wait_for_receipt=True)
 
     def terminate(self) -> bool:
         with self._lock:
@@ -1099,17 +1385,38 @@ def invoke_process_handler(
     service_spec: dict | None = None,
     on_entered: Optional[Callable[[dict[str, Any]], None]] = None,
     on_phase: Optional[Callable[[str, dict[str, Any]], None]] = None,
+    capture_budget: Any = None,
 ) -> dict[str, Any]:
     """Run a handler behind an independently timed and reaping supervisor."""
 
-    tracker = _BudgetTracker(budget_envelope, now)
+    tracker = _BudgetTracker(budget_envelope, now, capture_budget,
+        guarded=bool((service_spec or {}).get("guard_budget")))
+    cleanup_allowed = True
+    terminal = None
+
+    def publish(outcome, envelope, entry=None):
+        published, checkpoint = _finish_budget_capture(
+            capture_budget, envelope, timeout_seconds=.1 if cleanup_allowed else 0.)
+        supervisor_checkpoint = terminal.get("budget_checkpoint") if type(terminal) is dict else None
+        capture_error = terminal.get("budget_capture_error") if type(terminal) is dict else None
+        capture_errors = {}
+        if outcome.get("budget_capture_error") is not None:
+            capture_errors["parent"] = outcome["budget_capture_error"]
+        if capture_error is not None:
+            capture_errors["supervisor"] = capture_error
+        if checkpoint.get("token") is not None or supervisor_checkpoint is not None or capture_error is not None:
+            outcome = {**outcome,
+                "budget_checkpoint": {"parent": checkpoint, "supervisor": supervisor_checkpoint},
+                **({"budget_capture_error": capture_errors} if capture_errors else {})}
+        return _budget_outcome(outcome, published, entry)
     try:
         startup_deadline = tracker.bound(time.monotonic() + start_timeout)
     except BudgetClockUnknownError as exc:
-        return _budget_outcome({"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
-                                "control_error": True, "retryable": False, "effect_ids": []}, tracker.envelope)
+        return publish({"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
+                                "control_error": True, "retryable": False, "effect_ids": [],
+                                "details": _control_error_details(exc.__cause__ or exc)}, tracker.envelope)
     if startup_deadline <= time.monotonic():
-        return _budget_outcome({"kind": "timeout", "phase": "admission", "effect_ids": []}, tracker.envelope)
+        return publish({"kind": "timeout", "phase": "admission", "effect_ids": []}, tracker.envelope)
 
     # ``spawn`` avoids forking the potentially multi-threaded caller.  The
     # freshly started, single-threaded supervisor may then safely fork its
@@ -1119,13 +1426,14 @@ def invoke_process_handler(
     process = process_context.Process(
         target=_supervisor_entry,
         args=(db_path, _SerializedHandler(handler), command, lease, now, sender, durability,
-              budget_envelope, service_spec, startup_deadline),
+              tracker.envelope, service_spec, startup_deadline),
         daemon=False,
     )
     handle = ProcessSupervisorHandle(process)
     registered = False
     try:
         process.start()
+        cleanup_allowed = False
     except BaseException:
         receiver.close()
         sender.close()
@@ -1145,6 +1453,7 @@ def invoke_process_handler(
     deadline: float | None = None
     hard_deadline: float | None = None
     terminal: Optional[dict[str, Any]] = None
+    cleanup_fact: Optional[dict[str, Any]] = None
     startup_wait_expired = False
     admission_work_expired = False
     work_wait_expired = False
@@ -1199,15 +1508,43 @@ def invoke_process_handler(
                 terminal = _receive_packet(receiver)
         observed_at = time.monotonic()
     except BudgetClockUnknownError as exc:
-        terminal = {"kind": "handler_failed", "code": "budget_clock_unknown", "message": str(exc)}
+        terminal = {"kind": "handler_failed", "code": "budget_clock_unknown", "message": str(exc),
+                    "control_error": True, "details": _control_error_details(exc.__cause__ or exc)}
         observed_at = time.monotonic()
     finally:
         reaped = handle.terminate()
+        if tracker.capture_error is not None:
+            # Containment may have produced the original packet while the
+            # guarded clock write failed. Preserve ready terminal facts once.
+            recover_acceptance = _transient_capture_error(tracker.capture_error)
+            for _ in range(4):
+                if not receiver.poll(0):
+                    break
+                available = _receive_packet(receiver)
+                if (recover_acceptance and type(available) is dict
+                        and available.get("kind") == "handler_started"
+                        and type(available.get("deadline_monotonic")) in {int, float}
+                        and math.isfinite(available["deadline_monotonic"])):
+                    started, entry = True, available
+                    deadline = float(available["deadline_monotonic"])
+                    hard_deadline = float(available.get("hard_deadline_monotonic", deadline))
+                    tracker.entered(BudgetEnvelope.from_dict(available["budget_envelope"]))
+                if (type(available) is dict and available.get("cleanup_confirmed") is True
+                        and available.get("kind") in ("handler_completed", "handler_entry_failed",
+                            "handler_timed_out", "handler_failed", "handler_start_failed")):
+                    cleanup_fact = available
+                if (recover_acceptance and type(available) is dict
+                        and available.get("kind") in (
+                        "handler_completed", "handler_entry_failed", "handler_timed_out",
+                        "handler_failed", "handler_start_failed")):
+                    terminal = available
         receiver.close()
         if registered and on_finished is not None:
             on_finished(handle)
     if not reaped:
         raise RuntimeError("handler supervisor could not be terminated")
+    cleanup_allowed = (type(terminal) is dict and terminal.get("cleanup_confirmed") is True
+        or cleanup_fact is not None and cleanup_fact.get("cleanup_confirmed") is True)
 
     budget_envelope = tracker.envelope
     observed_budget = terminal.get("observed_budget_envelope") if type(terminal) is dict else None
@@ -1217,13 +1554,12 @@ def invoke_process_handler(
 
     # A dead supervisor alone cannot prove that orphaned descendants are gone.
     # Only its explicit post-containment packet supports a durable tree receipt.
-    if (type(terminal) is dict and terminal.get("cleanup_confirmed") is True
-            and on_cleanup_confirmed is not None):
+    if cleanup_allowed and on_cleanup_confirmed is not None:
         on_cleanup_confirmed()
 
     revocation_reason = handle.revocation_reason
     if revocation_reason is not None:
-        return _budget_outcome({
+        return publish({
             "kind": "authority_revoked",
             "reason": revocation_reason,
             "effect_ids": [],
@@ -1244,7 +1580,10 @@ def invoke_process_handler(
         except (TypeError, ValueError):
             outcome = None
         if type(outcome) is dict:
-            return _budget_outcome(outcome, budget_envelope, entry)
+            if tracker.capture_error is not None:
+                outcome["budget_capture_error"] = {"state": "unknown", "error":
+                    _control_error_details(tracker.capture_error.__cause__ or tracker.capture_error)}
+            return publish(outcome, budget_envelope, entry)
     if (
         (type(terminal) is dict and terminal.get("kind") == "handler_timed_out")
         or (started and deadline is not None and observed_at >= deadline)
@@ -1277,25 +1616,34 @@ def invoke_process_handler(
                     ("kind", "code", "message", "details") if key in terminal}
         if type(original) is dict:
             outcome["details"] = {**outcome.get("details", {}), "business_outcome": original}
-        return _budget_outcome(outcome, budget_envelope, entry)
+        return publish(outcome, budget_envelope, entry)
     if type(terminal) is dict and terminal.get("kind") == "handler_entry_failed":
         try:
             outcome = json.loads(terminal["outcome_json"])
         except (KeyError, TypeError, ValueError):
             outcome = None
         if type(outcome) is dict:
-            return _budget_outcome(outcome, budget_envelope, entry)
-    if type(terminal) is dict and terminal.get("kind") == "handler_failed":
-        return _budget_outcome({
+            return publish(outcome, budget_envelope, entry)
+    if (type(terminal) is dict and (terminal.get("kind") == "handler_failed"
+            or (terminal.get("kind") == "handler_start_failed" and terminal.get("control_error")))):
+        details = {**(terminal.get("details") or {}), "exitcode": process.exitcode}
+        original = terminal.get("business_outcome_json")
+        if type(original) is str:
+            try:
+                details["business_outcome"] = json.loads(original)
+            except ValueError:
+                pass
+        return publish({
             "kind": "error",
             "code": str(terminal.get("code", "handler_process_exit")),
             "message": str(terminal.get("message", "handler process failed")),
             "retryable": False,
-            "details": {**(terminal.get("details") or {}), "exitcode": process.exitcode},
+            "control_error": terminal.get("control_error", False),
+            "details": details,
             "effect_ids": [],
         }, budget_envelope, entry)
     if started:
-        return _budget_outcome({
+        return publish({
             "kind": "error",
             "code": "handler_process_exit",
             "message": f"handler supervisor exited with code {process.exitcode}",
@@ -1308,7 +1656,7 @@ def invoke_process_handler(
         if type(terminal) is dict and terminal.get("message")
         else "handler supervisor did not reach invocation"
     )
-    return _budget_outcome({
+    return publish({
         "kind": "error",
         "code": "handler_process_start_failure",
         "message": message,

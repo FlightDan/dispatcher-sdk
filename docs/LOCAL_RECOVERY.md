@@ -84,6 +84,8 @@ the successor starts. The SDK does not infer business acceptance from completion
 - Filesystem synchronization depends on the platform. The tests do not prove
   hardware power-loss behavior or certify Windows activation on a real host.
 
-The current release supplies a verifiable stopped-source handoff, not unrestricted
-activation of an arbitrary historical backup. See the [0.7 devdoc](DEV_0_7.md)
-for the architectural tradeoffs and recorded verification.
+This API supplies a stopped-source handoff within the component limits above.
+External observation, settlement and cancellation journals are not automatically
+relocated or rebound. Preserve their original source bindings and unresolved
+obligations; see [storage and upgrades](STORAGE_AND_UPGRADES.md). The
+[0.7 devdoc](DEV_0_7.md) records the design and original validation.

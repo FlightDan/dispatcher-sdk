@@ -10,6 +10,7 @@
 | 先持久化、后 ACK 的事件消费 | `ProjectionConsumer(...).drain(...)` |
 | Run 当前无可领取工作的原因 | `sdk.inspect_work_availability(run_id)` |
 | 取消阶段、清理状态和恢复身份 | `sdk.inspect_cancellation(run_id)` |
+| 托管任务已保存的活动和事件分页 | `task.observe()` 与 `task.events()` |
 
 投影回调必须先提交幂等写入事务，再返回 `persisted` 或 `already_present`。
 回调使用由 `source_id`、`run_id` 和 `sequence` 组成的稳定事件身份去重，并在同一事务中
@@ -20,6 +21,9 @@
 
 诊断查询不会同步或修改 Run。字段缺少证据时保留 `unknown`（未知，不代表零或否定）；跨库读取也受快照一致性限制。
 工作诊断有 Effect 扫描上限；超过上限时计数为未知，不是零。
+
+执行观测也只读已记录的事实，不会领取任务、续租或清理进程。时限、子任务和可选停滞通知的
+说明见[执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md)。
 
 为 Runtime 显式配置 `cancellation_journal_path` 和 `source_id`，可以持久保存取消证据（之后用来核对取消结果的记录）。
 回执存放在独立的 schema 1（数据结构版本 1）数据库中，核心存储不会自动迁移。

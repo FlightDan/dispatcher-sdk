@@ -17,6 +17,7 @@ Python 应用中运行任务，并使用持久化状态、执行时限和显式�
 7. [常见问题](Troubleshooting-zh-CN.md)：排查待执行任务、重复通知和恢复状态。
 8. [接入工程原则](Engineering-Principles-zh-CN.md)：准备可恢复的部署和可审查的证据。
 9. [诊断与事件投影](Diagnostics-and-Projections-zh-CN.md)：检查部署身份和持久化事件，排查工作是否可用以及取消状态。
+10. [执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md)：读取已保存的活动、时限和子任务信息，并了解可选的停滞通知。
 
 使用编程 Agent 接入 SDK 时，可让它先阅读英文 [DocsforAgents](../DocsforAgents/README.md)。
 详细 API 契约统一维护在 [docs/SDK.md](../docs/SDK.md) 和
@@ -26,7 +27,7 @@ Python 应用中运行任务，并使用持久化状态、执行时限和显式�
 
 ## 版本与范围
 
-这些页面对应 0.7 开发版代码（`0.7.0.dev0`），运行环境要求 Python 3.10+。
+这些页面对应 0.7 开发版代码（`0.7.0.dev2`），运行环境要求 Python 3.10 或更高版本。
 文档要和代码版本匹配；旧版本可能没有这里介绍的接口。
 如果要打开现有数据库，请先阅读[存储与升级](../docs/STORAGE_AND_UPGRADES.md)。
 

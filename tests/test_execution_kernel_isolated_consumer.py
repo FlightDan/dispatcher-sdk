@@ -185,6 +185,12 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
             self.assertTrue(summary["passed"])
             self.assertEqual(summary["scenarios"], ["success", "failure", "budget", "silence", "cleanup"])
             self.assertTrue(Path(environment_record["sdk_import"]).is_relative_to(virtualenv))
+            if sys.platform == "linux" or os.name == "nt":
+                supervisor_example = public_consumer / "managed_stall_supervisor.py"
+                shutil.copy2(ROOT / "examples" / supervisor_example.name, supervisor_example)
+                self._run([str(interpreter), str(supervisor_example), "--evidence-dir",
+                           str(evidence / "managed-stall-example" / "workspace")], cwd=public_consumer,
+                          timeout=30, evidence_directory=evidence / "managed-stall-example")
 
             installed_suite = root / "installed-suite"
             shutil.copytree(ROOT / "tests", installed_suite / "tests",

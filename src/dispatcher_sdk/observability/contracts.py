@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import math
+import sys
 from typing import Any, ContextManager, Literal, Mapping, Protocol
 
 
@@ -46,6 +47,37 @@ class ObservationOptions:
                 raise ValueError(f"{name} must be a positive integer")
         if self.query_bytes < 4096 or self.batch_bytes < 1024:
             raise ValueError("query_bytes must be at least 4096 and batch_bytes at least 1024")
+
+
+@dataclass(frozen=True)
+class ManagedStallOptions:
+    """Reserved local handler capacity; memory units follow native enforcement.
+
+    ``budget_seconds`` includes queue residence from the original inbox receipt.
+    Windows limits Job private commit; Linux limits worker address space. Neither
+    value is a claim about measured RSS or available host physical memory.
+    """
+
+    memory_limit_bytes: int
+    capacity: int = 1
+    memory_budget_bytes: int | None = None
+    timeout_seconds: float = 30.0
+    budget_seconds: float = 60.0
+    poll_interval: float = .05
+
+    def __post_init__(self) -> None:
+        for name in ("memory_limit_bytes", "capacity"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.memory_limit_bytes > sys.maxsize:
+            raise ValueError("memory_limit_bytes exceeds the native representable limit")
+        if self.memory_budget_bytes is not None and (
+                type(self.memory_budget_bytes) is not int or self.memory_budget_bytes < 1):
+            raise ValueError("memory_budget_bytes must be a positive integer or None")
+        for name in ("timeout_seconds", "budget_seconds", "poll_interval"):
+            positive(getattr(self, name), name)
+        if self.timeout_seconds > self.budget_seconds:
+            raise ValueError("timeout_seconds cannot exceed the original total budget")
 
 
 @dataclass(frozen=True)
@@ -133,5 +165,5 @@ class ExecutionActivity(Protocol):
     def close(self, *, timeout: float = 1.0) -> dict[str, Any]: ...
 
 
-__all__ = ["ObservationOptions", "ObservationIdentity", "StallPolicy", "ProcessState", "ObservationError",
+__all__ = ["ObservationOptions", "ManagedStallOptions", "ObservationIdentity", "StallPolicy", "ProcessState", "ObservationError",
            "ExecutionActivity", "ProcessObservation"]

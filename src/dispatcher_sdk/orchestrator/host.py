@@ -48,7 +48,9 @@ class _Transport:
             resume(limit=min(limit, 20))
         delivered = self.orchestrator.flush(limit=limit)
         self.orchestrator.sync()
-        if self.orchestrator.collect_notifications(limit=limit):
+        collection_ready = getattr(self.orchestrator, '_notification_collection_ready', None)
+        if ((not callable(collection_ready) or collection_ready())
+                and self.orchestrator.collect_notifications(limit=limit)):
             self.wake_notifications.set()
         return _Report(dispatch_deliveries=delivered)
 
@@ -158,12 +160,16 @@ class OrchestratorHost:
         callback = self.callback
         if callback is None:
             return
+        ready = getattr(self.orchestrator, "_notification_delivery_ready", None)
         while not self._stop_event.is_set():
             try:
-                count = self.orchestrator.deliver_notifications(
-                    callback, owner=self.notification_owner,
-                    lease_seconds=self.notification_lease_seconds,
-                    retry_delay=self.notification_retry_delay, limit=1)
+                if callable(ready) and not ready():
+                    count = 0
+                else:
+                    count = self.orchestrator.deliver_notifications(
+                        callback, owner=self.notification_owner,
+                        lease_seconds=self.notification_lease_seconds,
+                        retry_delay=self.notification_retry_delay, limit=1)
                 with self._lock:
                     self._deliveries += count
             except Exception as error:

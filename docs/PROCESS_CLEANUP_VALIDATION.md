@@ -1,5 +1,10 @@
 # Process cleanup validation
 
+This record describes the Linux cleanup change and its 2026-09-07
+measurements. The historical Windows results below cover that earlier candidate.
+Current deadline, cancellation and containment evidence is tracked separately in
+[the observability acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md).
+
 Linux supervisor cleanup now finishes when the kernel reports that the
 supervisor has no children, instead of waiting for a 50 ms quiet interval.
 The parent-side emergency teardown and the non-subreaper fallback retain their

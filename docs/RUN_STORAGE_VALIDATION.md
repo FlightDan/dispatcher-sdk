@@ -1,5 +1,11 @@
 # Run storage growth validation
 
+The tables below record the 2026-09-07 schema-2 fixture. Running the reproduction
+command against current source measures the current layout and may produce
+different values. Current storage contracts are in
+[storage and upgrades](STORAGE_AND_UPGRADES.md); current candidate validation is
+tracked in [the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md).
+
 The schema-v2 fixture shows near-linear retained storage as a single Run grows
 from 100 to 800 small tasks. Command receipts remain historical Run references;
 their payloads are reconstructed from retained item versions when read. The

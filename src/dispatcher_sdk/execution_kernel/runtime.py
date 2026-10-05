@@ -15,10 +15,11 @@ Kernel result or commit an effect after authority is revoked.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 import multiprocessing
 import os
+import sys
 import threading
 import time
 from typing import Any, Mapping, Optional
@@ -28,6 +29,7 @@ from dataclasses import asdict, replace
 import tempfile
 import sqlite3
 import json
+import math
 from pathlib import Path
 
 from ..observability import ActivityRecorder, ObservationIdentity, ObservationJournal, ObservationOptions
@@ -48,6 +50,7 @@ from .contracts import (
     ExecutionResultV2,
 )
 from .errors import (
+    CASConflictError,
     EffectRecoveryRequiredError,
     HandlerContractMismatchError,
     HandlerExecutionError,
@@ -60,6 +63,7 @@ from .errors import (
 )
 from ._registry import Handler, handler_revision, normalize_handlers, registry_revision
 from ._process_runtime import (
+    _KernelBudgetCapture,
     ProcessSupervisorHandle,
     invoke_handler,
     invoke_process_handler,
@@ -72,8 +76,9 @@ from .sandbox import SandboxHandler, SandboxJournal
 from .sandbox_contracts import SandboxOutcomeUnknown
 from ._sandbox_registry import register_journals, journal_paths
 from .cancellation import CancellationJournal, _LocalCancellationDiagnostics
-from .settlement import SettlementJournal, merge_diagnostic_notes
+from .settlement import SettlementJournal, merge_diagnostic_notes, merge_script_output
 from .pending_settlements import PendingSettlements, SettlementAdmission
+from .script_output import ScriptOutputRecovery
 
 
 class _ProcessRegistration(threading.Event):
@@ -111,6 +116,8 @@ class InProcessRuntime:
         observation_options: ObservationOptions | None = None,
         child_capacity: int = 1,
         max_child_depth: int = 1,
+        process_memory_limit_bytes: int | None = None,
+        allow_children: bool = True,
     ) -> None:
         if (cancellation_journal_path is None) != (source_id is None):
             raise ValueError("cancellation_journal_path and source_id must be provided together")
@@ -131,6 +138,15 @@ class InProcessRuntime:
             raise ValueError("process isolation requires POSIX fork or native Windows support")
         if isolation_mode not in {"process", "thread"}:
             raise ValueError("isolation_mode must be auto, process, or thread")
+        if type(allow_children) is not bool:
+            raise ValueError("allow_children must be a boolean")
+        if process_memory_limit_bytes is not None:
+            if type(process_memory_limit_bytes) is not int or not 0 < process_memory_limit_bytes <= sys.maxsize:
+                raise ValueError("process_memory_limit_bytes must be a positive integer at most sys.maxsize")
+            if isolation_mode != "process":
+                raise ValueError("native memory enforcement requires process isolation")
+        self.process_memory_limit_bytes = process_memory_limit_bytes
+        self.allow_children = allow_children
         if isolation_mode != "process" and any(
             getattr(handler, "requires_process_isolation", False)
             for handler in self.handlers.values()
@@ -157,6 +173,11 @@ class InProcessRuntime:
         self._stop_event = threading.Event()
         self._active_runs = 0
         self._process_supervisors: dict[tuple[str, int, int], Any] = {}
+        # Optional SDK composition observer. It receives actual containment
+        # confirmations before transient registration ownership is removed.
+        self._process_cleanup_observer: Any = None
+        # Active and retired observation owners use _lifecycle_condition;
+        # ownership snapshots never wait on the business-control lock.
         self._execution_recorders: dict[tuple[str, int, int], ActivityRecorder] = {}
         self._retired_recorders: list[ActivityRecorder] = []
         self._retired_observation_contexts: list[HandlerContext] = []
@@ -176,6 +197,7 @@ class InProcessRuntime:
         self._thread_authority_by_execution: dict[tuple[str, int, int], threading.Event] = {}
         self._thread_slot_by_authority: dict[threading.Event, threading.BoundedSemaphore] = {}
         self._thread_contexts: dict[tuple[str, int, int], HandlerContext] = {}
+        self._thread_done: set[tuple[str, int, int]] = set()
         self._child_thread_executor: ThreadPoolExecutor | None = None
         self._child_thread_slots = threading.BoundedSemaphore(child_capacity)
         self._child_capacity, self._max_child_depth = child_capacity, max_child_depth
@@ -196,6 +218,8 @@ class InProcessRuntime:
         self._settlement_inflight_lock = threading.Lock()
         self._settlement_inflight: set[tuple[str, int, int]] = set()
         self._pending_settlements = PendingSettlements()
+        self._script_output_recovery: ScriptOutputRecovery | None = None
+        self._script_output_discovery_pending = False
         if isolation_mode == "thread":
             self._thread_executor = ThreadPoolExecutor(
                 max_workers=max_thread_workers,
@@ -239,14 +263,19 @@ class InProcessRuntime:
                     else self.kernel.db_path + ".settlements.sqlite3")
                 self._settlement_journal = SettlementJournal(settlement_path,
                     source_id=self._observation_source_id, kernel_path=self.kernel.db_path)
+                from .scripts import SCRIPT_HANDLER_ID, SCRIPT_HANDLER_VERSION, script_handler
+                if self.handlers.get((SCRIPT_HANDLER_ID, SCRIPT_HANDLER_VERSION)) is script_handler:
+                    self._script_output_recovery = ScriptOutputRecovery(
+                        self.kernel.db_path, self._settlement_journal)
             except Exception as exc:
                 self._settlement_error = f"{type(exc).__name__}: {exc}"
             try:
                 self.observation_journal = ObservationJournal(self._observation_path,
                     kernel_path=self.kernel.db_path, source_id=self._observation_source_id,
                     options=self.observation_options, clock=self.kernel._wall_time)
-                self._child_service = ChildService(self, self.observation_journal,
-                    capacity=child_capacity, max_depth=max_child_depth)
+                if self.allow_children:
+                    self._child_service = ChildService(self, self.observation_journal,
+                        capacity=child_capacity, max_depth=max_child_depth)
                 self._stall_supervisor = StallSupervisor(self.observation_journal, self.kernel)
             except Exception as exc:
                 self._observation_error = f"{type(exc).__name__}: {exc}"
@@ -280,9 +309,9 @@ class InProcessRuntime:
             with self._lifecycle_condition:
                 while self._active_runs:
                     self._lifecycle_condition.wait()
+            self._persist_pending_settlements(time.monotonic() + 1, limit=64)
             observation_pending = self._drain_observation_workers(time.monotonic() + 1.0)
             try:
-                self._persist_pending_settlements(time.monotonic() + 1, limit=64)
                 unresolved = self.recover_sandboxes(all_pages=True)
                 if any(not item["cleanup_confirmed"] for item in unresolved):
                     raise SandboxOutcomeUnknown("remote cleanup remains pending in the sandbox journal")
@@ -291,7 +320,10 @@ class InProcessRuntime:
                 if observation_pending:
                     raise _ObservationCleanupPendingError("runtime storage cleanup remains pending")
             finally:
-                self.kernel.close()
+                # A live Context may still own the exact captured floor and
+                # token. Its bounded factual ACK needs this Kernel on retry.
+                if not observation_pending:
+                    self._close_kernel_storage()
                 if self._temporary_observation is not None and not observation_pending:
                     self._temporary_observation.cleanup()
         except BaseException as exc:
@@ -300,12 +332,22 @@ class InProcessRuntime:
         finally:
             self._close_complete.set()
 
+    def _close_kernel_storage(self) -> None:
+        try:
+            self.kernel.close()
+        except (BudgetClockUnknownError, TimeoutError) as error:
+            if (isinstance(error, TimeoutError)
+                    or str(error) == "budget_clock_cleanup_pending"):
+                raise _ObservationCleanupPendingError("runtime Kernel cleanup remains pending") from error
+            raise
+
     def _retry_close_cleanup(self) -> None:
         observation_pending = False
         if (self._retired_recorders or self._retired_observation_contexts or self._observation_cleanup_pending
                 or isinstance(self._close_error, _ObservationCleanupPendingError)):
             observation_pending = self._drain_observation_workers(time.monotonic() + 1.0)
             if not observation_pending:
+                self._close_kernel_storage()
                 if isinstance(self._close_error, _ObservationCleanupPendingError):
                     self._close_error = None
                 if self._temporary_observation is not None:
@@ -329,7 +371,9 @@ class InProcessRuntime:
 
     @staticmethod
     def _context_observation_pending(context: HandlerContext) -> bool:
-        return (not context._observation_start_done.is_set()
+        return ((context._budget_capture is not None and context._budget_capture._pending is not None)
+                or not context._observation_start_done.is_set()
+                or context._completion_readers_pending()
                 or (isinstance(context.activity, ActivityRecorder) and context.activity._owned_workers_alive()))
 
     def _retain_observation_context(self, context: HandlerContext) -> None:
@@ -340,14 +384,17 @@ class InProcessRuntime:
                 self._retired_observation_contexts.append(context)
 
     def _drain_observation_workers(self, deadline: float) -> bool:
+        self._recover_script_output(min(deadline, time.monotonic() + .1))
         with self._lifecycle_condition:
             recorders = tuple(self._retired_recorders)
             contexts = tuple(self._retired_observation_contexts)
         reports = [recorder._join_owned_workers(deadline) for recorder in recorders]
         for context in contexts:
             context._observation_start_done.wait(max(0.0, deadline - time.monotonic()))
+            completion_pending = context._drain_completion_readers(deadline)
             report = {"kind": "handler_observation_start", "execution_id": context.lease.execution_id,
-                      "initialization_pending": not context._observation_start_done.is_set()}
+                      "initialization_pending": not context._observation_start_done.is_set(),
+                      "completion_reader_pending": completion_pending}
             if isinstance(context.activity, ActivityRecorder):
                 report["recorder"] = context.activity._join_owned_workers(deadline)
             report["state"] = "pending" if self._context_observation_pending(context) else "closed"
@@ -361,12 +408,30 @@ class InProcessRuntime:
                 worker.join(max(0.0, deadline - time.monotonic()))
             reports.append({"kind": "sdk_storage_service", "service": name,
                 "state": "pending" if worker is not None and worker.is_alive() else "closed"})
+        self._release_completed_thread_slots(deadline=deadline)
+        # Includes owners retained before Context creation and after a short
+        # child call's original window expires. These are facts, not new work.
+        budget_pending = self.kernel._drain_budget_samples(deadline)
+        child_pending = False
+        if self._child_service is not None:
+            self._child_service.close(timeout_seconds=max(.000001, deadline - time.monotonic()))
+            child_pending = self._child_service._close_pending()
+        reports.append({"kind": "budget_checkpoint_owners",
+                        "state": "pending" if budget_pending else "closed"})
+        reports.append({"kind": "child_storage_workers",
+                        "state": "pending" if child_pending else "closed"})
+        script_pending = (self._script_output_recovery is not None
+                          and self._script_output_recovery.drain(deadline))
+        script_pending = script_pending or self._script_output_discovery_pending
+        reports.append({"kind": "script_output_fact_owner",
+                        "state": "pending" if script_pending else "closed"})
         with self._lifecycle_condition:
             self._retired_recorders = [recorder for recorder in self._retired_recorders if recorder._owned_workers_alive()]
             self._retired_observation_contexts = [context for context in self._retired_observation_contexts
                 if self._context_observation_pending(context)]
             self._observation_cleanup_report = reports
             self._observation_cleanup_pending = (bool(self._retired_recorders or self._retired_observation_contexts)
+                or budget_pending or child_pending or script_pending
                 or any(worker is not None and worker.is_alive() for _, worker in service_workers))
             return self._observation_cleanup_pending
 
@@ -406,7 +471,7 @@ class InProcessRuntime:
         with self._lifecycle_lock:
             if self._services_started or self._closed:
                 return
-            if self.isolation_mode == "thread":
+            if self.isolation_mode == "thread" and self.allow_children:
                 self._child_thread_executor = ThreadPoolExecutor(max_workers=self._child_capacity,
                     thread_name_prefix="execution-kernel-child")
             if self._child_service is not None:
@@ -421,11 +486,23 @@ class InProcessRuntime:
 
     def _settlement_loop(self) -> None:
         while not self._stop_event.is_set():
+            self._release_completed_thread_slots()
             try:
                 self.recover_completions(timeout_seconds=.25)
             except Exception as exc:
                 self._settlement_error = f"{type(exc).__name__}: {exc}"
             self._stop_event.wait(.25)
+
+    def _recover_script_output(self, deadline: float) -> None:
+        """Publish retained artifact facts without affecting business results."""
+        if self._script_output_recovery is None or time.monotonic() >= deadline:
+            return
+        try:
+            receipt = self._script_output_recovery.recover(deadline)
+            self._script_output_discovery_pending = receipt.get("discovery_pending", False)
+        except Exception as exc:
+            self._script_output_discovery_pending = True
+            self._observation_error = f"{type(exc).__name__}: {exc}"
 
     def _persist_pending_settlements(self, deadline: float, *, limit: int = 50) -> list[dict[str, Any]]:
         """Transfer original local facts to the journal, without running work."""
@@ -449,6 +526,29 @@ class InProcessRuntime:
                 break
         return reports
 
+    @staticmethod
+    def _received_budget_checkpoints(evidence):
+        checkpoint = evidence.get("budget_checkpoint")
+        if type(checkpoint) is not dict:
+            return ()
+        items = ((checkpoint,) if "state" in checkpoint else
+                 (checkpoint.get("parent"), checkpoint.get("supervisor")))
+        return tuple(item for item in items if type(item) is dict
+            and item.get("state") == "unknown" and item.get("captured_envelope") is not None)
+
+    def _finish_received_budget_checkpoints(self, record, deadline: float) -> None:
+        """Publish received facts before resolving their durable obligation."""
+        for checkpoint in self._received_budget_checkpoints(record["evidence"]):
+            token = checkpoint.get("token")
+            if type(token) is not str or not token.strip():
+                raise ValueError("received budget checkpoint lacks its exact token")
+            envelope = BudgetEnvelope.from_dict(checkpoint["captured_envelope"])
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("received budget checkpoint recovery window elapsed")
+            self.kernel._finish_received_budget_sample(token, record["identity"]["execution_id"],
+                envelope, timeout_seconds=remaining)
+
     def recover_completions(self, *, limit: int = 50,
                             timeout_seconds: float = .5) -> tuple[dict[str, Any], ...]:
         """Retry retained result CAS operations, without invoking any handler."""
@@ -461,6 +561,7 @@ class InProcessRuntime:
         reports = []
         try:
             reports.extend(self._persist_pending_settlements(deadline, limit=limit))
+            self._recover_script_output(min(deadline, time.monotonic() + .025))
             if time.monotonic() >= deadline:
                 return tuple(reports)
             records = self._settlement_journal.pending(limit=limit,
@@ -476,11 +577,27 @@ class InProcessRuntime:
                         continue
                 try:
                     lease = ExecutionLease.from_dict(record["lease"])
-                    with self._bounded_lifecycle(min(.1, remaining)):
-                        operation_timeout = min(.1, max(.001, deadline-time.monotonic()))
+                    operation_deadline = min(deadline, time.monotonic() + .1)
+                    self._finish_received_budget_checkpoints(record, operation_deadline)
+                    if (record["deferred"] is not None
+                            and record["deferred"]["kind"] in {
+                                "script_output_recovery", "budget_checkpoint_recovery"}):
+                        # Revoked execution has only a factual cleanup receipt.
+                        # Its immutable winning business state is never touched.
+                        self._settlement_journal.settle(record, "recorded", record["evidence"],
+                            timeout_seconds=min(.1, max(.001, deadline-time.monotonic())))
+                        reports.append({**identity, "state": "recorded", "kind": record["deferred"]["kind"]})
+                        continue
+                    def operation_timeout():
+                        remaining = operation_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("completion recovery operation window elapsed")
+                        return remaining
+
+                    with self._bounded_lifecycle(operation_timeout()):
                         if record["deferred"] is not None:
                             original = record["deferred"]
-                            with self.kernel._control_lock(operation_timeout):
+                            with self.kernel._control_lock(operation_timeout()):
                                 completed = self.kernel.get(lease.execution_id)
                             if (completed.attempt, completed.fence) != (lease.attempt, lease.fence):
                                 raise StaleFenceError("deferred recovery belongs to an old attempt")
@@ -502,7 +619,7 @@ class InProcessRuntime:
                                 raise ValueError("unknown deferred completion kind")
                             if completed.state != "recovery_required":
                                 completed = self.kernel._require_effect_recovery(lease,
-                                    original["outcome"]["effect_id"], timeout_seconds=operation_timeout,
+                                    original["outcome"]["effect_id"], timeout_seconds=operation_timeout(),
                                     settlement=True)
                             result = None
                         else:
@@ -511,7 +628,7 @@ class InProcessRuntime:
                             completed = self.kernel._complete_sdk_result(lease, result,
                                 budget_envelope=(None if retained_budget is None else
                                     BudgetEnvelope.from_dict(retained_budget)),
-                                timeout_seconds=operation_timeout, settlement=True)
+                                timeout_seconds=operation_timeout(), settlement=True)
                     state = "recovery_required" if completed.state == "recovery_required" else "recorded"
                     evidence = {**record["evidence"], "execution_state": completed.state,
                         "execution_revision": completed.revision}
@@ -533,7 +650,8 @@ class InProcessRuntime:
         finally:
             self._settlement_lock.release()
 
-    def _diagnostic_note(self, identity, phase: str, evidence: dict[str, Any]) -> None:
+    def _diagnostic_note(self, identity, phase: str, evidence: dict[str, Any], *,
+                         timeout_seconds: float = .1) -> bool:
         """Retain diagnostics even when the activity writer is unavailable."""
         execution_id = (identity.execution_id if hasattr(identity, "execution_id")
                         else identity["execution_id"])
@@ -542,16 +660,25 @@ class InProcessRuntime:
                 raise RuntimeError(self._settlement_error or "diagnostic journal unavailable")
             key = {"execution_id": execution_id, "attempt": identity.attempt,
                    "fence": identity.fence} if hasattr(identity, "attempt") else identity
-            self._settlement_journal.note(key, phase, evidence, timeout_seconds=.1)
+            self._settlement_journal.note(key, phase, evidence, timeout_seconds=timeout_seconds)
+            return True
         except Exception as exc:
             self._diagnostic_errors[execution_id] = f"{type(exc).__name__}: {exc}"
+            return False
 
     def _service_spec(self, lease: ExecutionLease) -> dict[str, Any]:
+        resources = {"process_memory_limit_bytes": self.process_memory_limit_bytes,
+                     "allow_children": self.allow_children}
+        if not self.allow_children:
+            resources["child_service_error"] = "child execution is disabled for this runtime"
         if self.observation_journal is None:
-            return {"entry_protocol": True,
+            return {"entry_protocol": True, "guard_budget": True,
+                **resources,
                 "child_service_error": self._observation_error or "observation journal unavailable"}
         spec = {"journal_path": self._observation_path, "kernel_path": self.kernel.db_path,
-            "entry_protocol": True,
+            **resources,
+            "entry_protocol": True, "guard_budget": True,
+            "_defer_collector_registration": True,
             "source_id": self._observation_source_id,
             "options": asdict(self.observation_options), "capacity": self._child_capacity,
             "max_depth": self._max_child_depth, "registry_revision": self.registry_revision,
@@ -576,6 +703,15 @@ class InProcessRuntime:
             pass
         return spec
 
+    @property
+    def process_resource_capability(self) -> dict[str, Any]:
+        """Describe native enforcement independently of configured reservation."""
+        from .resources import memory_capability
+        result = memory_capability()
+        if self.isolation_mode != "process":
+            result.update(supported=False, reason="process isolation is disabled")
+        return result
+
     def _observation_identity(self, lease: ExecutionLease) -> ObservationIdentity:
         spec = self._service_spec(lease)
         return ObservationIdentity(lease.execution_id, lease.attempt, lease.fence,
@@ -589,8 +725,10 @@ class InProcessRuntime:
             identity = self._observation_identity(lease)
             recorder = ActivityRecorder(self.observation_journal, identity, options=self.observation_options,
                 source_scope="driver", metric_coverage=("phase_events", "heartbeat"),
-                clock=self.kernel._wall_time, start=True, bind_current=True)
-            self._execution_recorders[(lease.execution_id, lease.attempt, lease.fence)] = recorder
+                clock=self.kernel._wall_time, start=True, bind_current=True,
+                _defer_collector_registration=True)
+            with self._lifecycle_condition:
+                self._execution_recorders[(lease.execution_id, lease.attempt, lease.fence)] = recorder
             recorder.phase("worker_dispatch")
             recorder.heartbeat()
             recorder.observe_process(multiprocessing.current_process(), role="driver", process_id="driver")
@@ -598,7 +736,8 @@ class InProcessRuntime:
             self._observation_error = f"{type(exc).__name__}: {exc}"
 
     def _activity_phase(self, lease: ExecutionLease, phase: str, **details: Any) -> None:
-        recorder = self._execution_recorders.get((lease.execution_id, lease.attempt, lease.fence))
+        with self._lifecycle_condition:
+            recorder = self._execution_recorders.get((lease.execution_id, lease.attempt, lease.fence))
         if recorder is not None:
             recorder.phase(phase, details=details)
 
@@ -702,24 +841,21 @@ class InProcessRuntime:
         duration = self.observation_options.query_timeout if timeout is None else timeout
         from .._inspection import InspectionBudget
         budget = InspectionBudget(duration, None)
-        if self.observation_journal is None:
-            report = {"execution_id": execution_id, "view": "persisted", "complete": False,
-                "unknown_reason": "observation_unavailable", "error": self._observation_error}
-            self._include_local_cancellation_diagnostics(report, execution_id,
-                attempt=attempt, fence=fence, budget=budget)
-            return ObservationJournal._bound_without_storage(report, options=self.observation_options, budget=budget)
         report = {"execution_id": execution_id, "view": "persisted", "complete": False,
             "current": False, "unknown_reason": "observation_query_unavailable"}
         connection = None
         reader = None
         try:
             budget.check()
-            reader = ObservationJournal.open_readonly(self._observation_path,
-                kernel_path=self.kernel.db_path, source_id=self._observation_source_id,
-                options=replace(self.observation_options, query_timeout=max(.001, duration-budget.elapsed_seconds)),
-                clock=self.kernel._wall_time)
-            budget.check()
-            report = reader.inspect(execution_id, timeout=max(.001, duration-budget.elapsed_seconds), attempt=attempt, fence=fence)
+            if self.observation_journal is None:
+                report.update(unknown_reason="observation_unavailable", error=self._observation_error)
+            else:
+                reader = ObservationJournal.open_readonly(self._observation_path,
+                    kernel_path=self.kernel.db_path, source_id=self._observation_source_id,
+                    options=replace(self.observation_options, query_timeout=max(.001, duration-budget.elapsed_seconds)),
+                    clock=self.kernel._wall_time)
+                budget.check()
+                report = reader.inspect(execution_id, timeout=max(.001, duration-budget.elapsed_seconds), attempt=attempt, fence=fence)
             budget.check()
             connection = sqlite3.connect(Path(self.kernel.db_path).resolve().as_uri()+"?mode=ro", uri=True,
                 timeout=budget.sqlite_timeout_seconds)
@@ -787,6 +923,23 @@ class InProcessRuntime:
                     max_bytes=min(256 * 1024, max(1024, self.observation_options.query_bytes // 2)))
                 merge_diagnostic_notes(report, notes, process_freshness=self.observation_options.process_freshness)
                 budget.check()
+                identity = None
+                if attempt is not None and fence is not None:
+                    identity = {"attempt": attempt, "fence": fence}
+                else:
+                    for candidate in (report.get("identity"), report.get("execution")):
+                        if (candidate is not None
+                                and (attempt is None or candidate.get("attempt") == attempt)
+                                and (fence is None or candidate.get("fence") == fence)):
+                            identity = candidate
+                            break
+                if identity is not None and identity.get("attempt", 0) > 0 and identity.get("fence", 0) > 0:
+                    fact = self._settlement_journal.inspect_script_output({
+                        "execution_id": execution_id, "attempt": identity["attempt"], "fence": identity["fence"]},
+                        timeout_seconds=min(.1, max(.001, duration-budget.elapsed_seconds)))
+                    if fact is not None:
+                        merge_script_output(report, fact)
+                    budget.check()
             except Exception as exc:
                 report.update(complete=False,
                     settlement_obligations_error=f"{type(exc).__name__}: {exc}")
@@ -988,16 +1141,26 @@ class InProcessRuntime:
 
         def record(stage, evidence, captured_at=None):
             nonlocal observation_available
+            captured_at = time.time() if captured_at is None else captured_at
+            diagnostic_saved = observation_saved = False
             if cancellation_identity is not None:
-                self._diagnostic_note(cancellation_identity, "cancellation_"+stage,
-                    evidence if captured_at is None else {**evidence, "captured_at": captured_at})
+                remaining = control_deadline - time.monotonic()
+                if remaining > 0:
+                    diagnostic_saved = self._diagnostic_note(cancellation_identity, "cancellation_"+stage,
+                        {**evidence, "captured_at": captured_at}, timeout_seconds=min(.1, remaining))
             if observation_available and self.observation_journal is not None and cancellation_identity is not None:
-                try:
-                    self.observation_journal.phase(cancellation_identity, "cancellation_"+stage,
-                        captured_at=captured_at, details=evidence)
-                except Exception as exc:
-                    observation_available = False
-                    self._observation_error = f"{type(exc).__name__}: {exc}"
+                remaining = control_deadline - time.monotonic()
+                if remaining > 0:
+                    try:
+                        self.observation_journal.phase(cancellation_identity, "cancellation_"+stage,
+                            captured_at=captured_at, details=evidence, timeout_seconds=remaining)
+                        observation_saved = True
+                    except Exception as exc:
+                        observation_available = False
+                        self._observation_error = f"{type(exc).__name__}: {exc}"
+            if cancellation_identity is not None and not (diagnostic_saved or observation_saved):
+                self._local_cancellation_diagnostics.capture(cancellation_identity,
+                    [(stage, evidence, captured_at)], receipt_id)
             if receipt_id is not None and stage != "requested":
                 try:
                     legacy_evidence = ({name: evidence[name] for name in ("phase", "type")}
@@ -1214,6 +1377,7 @@ class InProcessRuntime:
     def _acquire_thread_slot(self, *, child: bool = False) -> bool:
         if self.isolation_mode != "thread":
             return True
+        self._release_completed_thread_slots()
         with self._thread_lock:
             if self._closed or self._thread_slots is None:
                 return False
@@ -1229,17 +1393,59 @@ class InProcessRuntime:
                 slots.release()
 
     def _thread_finished(
-        self, authority: threading.Event, generation: tuple[str, int, int]
+        self, authority: threading.Event, generation: tuple[str, int, int],
+        *, deadline: float | None = None,
     ) -> None:
+        # Mark completion before bounded lock admission so deferred cleanup
+        # retains an identity that the existing settlement loop can revisit.
         with self._thread_lock:
             if authority not in self._thread_authorities:
                 return
-            self._thread_authorities.remove(authority)
-            if self._thread_authority_by_execution.get(generation) is authority:
-                del self._thread_authority_by_execution[generation]
-            slots = self._thread_slot_by_authority.pop(authority, None)
-            if slots is not None:
-                slots.release()
+            self._thread_done.add(generation)
+        deadline = time.monotonic() + .1 if deadline is None else deadline
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._lifecycle_lock.acquire(timeout=remaining):
+            return
+        try:
+            # Follow lifecycle -> thread ordering, matching stop/close.
+            with self._thread_lock:
+                if authority not in self._thread_authorities:
+                    return
+                context = self._thread_contexts.get(generation)
+                if (self._execution_observation_pending(*generation)
+                        or (context is not None and self._context_observation_pending(context))):
+                    return
+                self._thread_done.discard(generation)
+                self._thread_contexts.pop(generation, None)
+                self._thread_authorities.remove(authority)
+                if self._thread_authority_by_execution.get(generation) is authority:
+                    del self._thread_authority_by_execution[generation]
+                slots = self._thread_slot_by_authority.pop(authority, None)
+                if slots is not None:
+                    slots.release()
+        finally:
+            self._lifecycle_lock.release()
+
+    def _release_completed_thread_slots(self, *, deadline: float | None = None) -> None:
+        deadline = time.monotonic() + .1 if deadline is None else deadline
+        with self._thread_lock:
+            done = [(generation, self._thread_authority_by_execution.get(generation))
+                    for generation in self._thread_done]
+        for generation, authority in done:
+            if time.monotonic() >= deadline:
+                return
+            if authority is not None:
+                with self._thread_lock:
+                    context = self._thread_contexts.get(generation)
+                if (context is not None and context._observation_closed
+                        and context._budget_capture is not None and context._budget_capture._pending is not None):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    context._finish_budget_checkpoint(timeout=remaining)
+                self._thread_finished(authority, generation, deadline=deadline)
+        if self.kernel._budget_samples_pending() and time.monotonic() < deadline:
+            self.kernel._drain_budget_samples(deadline)
 
     def _handler_start_timeout(self) -> float:
         return max(5.0, min(self.lease_seconds, 30.0))
@@ -1253,12 +1459,27 @@ class InProcessRuntime:
         deadline = time.monotonic() + self._handler_start_timeout()
         inherited = None
         last_error = None
+        capture = _KernelBudgetCapture(self.kernel, lease.execution_id)
         while not self._stop_event.is_set():
             try:
                 if inherited is None:
-                    inherited = self.kernel.admission_budget(lease,
+                    inherited = self.kernel._prepare_handler_entry(lease,
                         timeout_seconds=min(.1, max(.001, deadline - time.monotonic())))
-                sample = sample_clock(wall_time=self.kernel._wall_time())
+                sample = sample_clock(wall_time=inherited.checkpoint.wall_at)
+                projected = inherited.view(sample=sample)
+                if (projected.clock_status == "trusted" and projected.remaining_work_seconds is not None
+                        and projected.remaining_work_seconds <= 0):
+                    return None, {"kind": "timeout", "phase": "entry_authority",
+                        "limiting_source": projected.limiting_source, "effect_ids": [],
+                        "budget_envelope": inherited.to_dict(), "details": projected.to_dict()}, deadline
+                original_bound = inherited.deadline_monotonic(hard=True, sample=sample)
+                if original_bound is not None:
+                    deadline = min(deadline, original_bound)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                inherited = capture(inherited, timeout_seconds=min(.1, remaining))
+                sample = sample_clock(wall_time=inherited.checkpoint.wall_at)
                 view = inherited.view(sample=sample)
                 if view.clock_status != "trusted":
                     raise BudgetClockUnknownError(view.unknown_reason)
@@ -1273,14 +1494,31 @@ class InProcessRuntime:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                prepared = self.kernel._prepare_handler_entry(lease,
-                    timeout_seconds=min(.1, remaining))
-                checkpoint = inherited.recheckpoint(sample=prepared.checkpoint).checkpoint
-                prepared = prepared.recheckpoint(sample=checkpoint)
-                return prepared, None, deadline
+                return inherited, None, deadline
             except Exception as exc:
+                captured = getattr(exc, "budget_sample_envelope", None)
+                if inherited is not None and captured is not None:
+                    inherited = inherited.with_clock_floor(captured.checkpoint)
                 last_error = exc
-                if not self._storage_contention(exc) and not isinstance(exc, TimeoutError):
+                deadline_fact = exc._budget_deadline if isinstance(exc, CASConflictError) else None
+                if (isinstance(deadline_fact, Mapping) and deadline_fact.get("source") == "run"
+                        and all(type(deadline_fact.get(name)) in (int, float)
+                            for name in ("deadline_at", "observed_at"))):
+                    try:
+                        expired = (math.isfinite(deadline_fact["deadline_at"])
+                            and math.isfinite(deadline_fact["observed_at"])
+                            and deadline_fact["observed_at"] >= deadline_fact["deadline_at"])
+                    except (OverflowError, ValueError):
+                        expired = False
+                    if expired:
+                        return None, {"kind": "timeout", "code": "execution_deadline_exhausted",
+                            "message": str(exc), "control_error": True, "phase": "entry_authority",
+                            "limiting_source": "run", "effect_ids": [],
+                            "details": {**_control_error_details(exc),
+                                "deadline": dict(deadline_fact)}}, deadline
+                competing_sample = (isinstance(exc, BudgetClockUnknownError)
+                                    and str(exc) == "budget_clock_sample_unresolved:sampling")
+                if not competing_sample and not self._storage_contention(exc) and not isinstance(exc, TimeoutError):
                     return None, {"kind": "error", "code": "budget_clock_unknown" if isinstance(
                         exc, BudgetClockUnknownError) else "entry_admission_failed",
                         "message": str(exc), "retryable": False, "control_error": True,
@@ -1339,9 +1577,13 @@ class InProcessRuntime:
         generation = (lease.execution_id, lease.attempt, lease.fence)
         prepared_budget, preparation_error, startup_deadline = self._prepare_handler_admission(lease)
         if preparation_error is not None:
+            self._notify_process_cleanup(lease, state="not_invoked")
+            self._diagnostic_note(lease, "process_cleanup", {
+                "state": "not_invoked", "source": "runtime_admission_denied"})
             return preparation_error
         entry_errors: list[Exception] = []
         entry_ack: dict[str, Any] = {}
+        native_cleanup_confirmed = False
 
         def acknowledge_entry(packet: dict[str, Any]) -> None:
             entry_ack.update(packet)
@@ -1371,7 +1613,8 @@ class InProcessRuntime:
                     reason = "runtime_closed"
                 if reason is None:
                     self._process_supervisors[generation] = supervisor
-                    recorder = self._execution_recorders.get(generation)
+                    with self._lifecycle_condition:
+                        recorder = self._execution_recorders.get(generation)
                     if recorder is not None:
                         recorder.observe_process(supervisor, role="supervisor", process_id="supervisor")
                         recorder.phase("worker_created")
@@ -1390,10 +1633,13 @@ class InProcessRuntime:
                 self._revoked_executions.pop(generation, None)
 
         def cleanup_confirmed() -> None:
+            nonlocal native_cleanup_confirmed
+            native_cleanup_confirmed = True
             with self._lifecycle_lock:
                 registration = self._process_registration_events.get(generation)
                 if registration is not None:
                     registration.cleanup_confirmed = True
+            self._notify_process_cleanup(lease, state="confirmed")
             self._activity_phase(lease, "process_cleanup", state="confirmed", source="runtime_supervisor_reaped")
             self._diagnostic_note(lease, "process_cleanup", {"state": "confirmed", "source": "runtime_supervisor_reaped"})
             if self.observation_journal is not None and entry_ack:
@@ -1422,10 +1668,27 @@ class InProcessRuntime:
             on_finished=unregister,
             on_cleanup_confirmed=cleanup_confirmed,
             budget_envelope=prepared_budget,
+            capture_budget=_KernelBudgetCapture(self.kernel, lease.execution_id),
             service_spec=self._service_spec(lease),
             on_entered=acknowledge_entry,
             on_phase=worker_phase,
         )
+        from .scripts import SCRIPT_HANDLER_ID, SCRIPT_HANDLER_VERSION, script_handler
+        if (handler is script_handler
+                and (command.handler_id, command.handler_contract_version)
+                == (SCRIPT_HANDLER_ID, SCRIPT_HANDLER_VERSION)
+                and native_cleanup_confirmed):
+            try:
+                identity = self._observation_identity(lease).to_dict()
+                marker = {"identity": identity, "cleanup_confirmed": True}
+            except Exception as exc:
+                # Optional observation limits cannot reject a valid business
+                # command after its native outcome has already been observed.
+                error = f"{type(exc).__name__}: {exc}"
+                self._observation_error = error
+                marker = {"identity": None, "cleanup_confirmed": True,
+                          "identity_unknown_reason": error.encode("utf-8")[:512].decode("utf-8", "ignore")}
+            outcome = {**outcome, "script_output_recovery": marker}
         if entry_errors and entry_ack:
             try:
                 self.kernel.confirm_handler_entry(lease, BudgetEnvelope.from_dict(entry_ack["budget_envelope"]))
@@ -1470,6 +1733,17 @@ class InProcessRuntime:
                 return {"kind": "recovery_required", "effect_id": effect_id, "effect_ids": []}
         return outcome
 
+    def _notify_process_cleanup(self, lease: ExecutionLease, *, state: str) -> None:
+        observer = self._process_cleanup_observer
+        if observer is None:
+            return
+        try:
+            observer({"execution_id": lease.execution_id, "attempt": lease.attempt,
+                      "fence": lease.fence, "state": state})
+        except Exception as exc:
+            self._diagnostic_errors[lease.execution_id] = (
+                f"cleanup observer: {type(exc).__name__}: {exc}")
+
     def _invoke_thread(
         self,
         handler: Handler,
@@ -1478,6 +1752,17 @@ class InProcessRuntime:
         *,
         child: bool = False,
     ) -> dict[str, Any]:
+        ownership = [True]
+        try:
+            return self._invoke_thread_owned(handler, command, lease, child=child,
+                                              slot_ownership=ownership)
+        finally:
+            if ownership[0]:
+                self._release_thread_slot(child=child)
+
+    def _invoke_thread_owned(self, handler: Handler, command: ExecutionCommandV2,
+                             lease: ExecutionLease, *, child: bool,
+                             slot_ownership: list[bool]) -> dict[str, Any]:
         generation = (lease.execution_id, lease.attempt, lease.fence)
         active = threading.Event()
         active.set()
@@ -1485,15 +1770,13 @@ class InProcessRuntime:
         prepared_budget, preparation_error, startup_deadline = self._prepare_handler_admission(lease)
         if preparation_error is not None:
             active.clear()
-            self._release_thread_slot(child=child)
             return preparation_error
         context = HandlerContext(command, lease, effects,
             budget_envelope=prepared_budget, service_spec=self._service_spec(lease))
-        admission = context.budget
+        admission = context.budget_envelope.view(sample=context._sample())
         if admission.remaining_work_seconds is not None and admission.remaining_work_seconds <= 0:
             active.clear()
             # No future will own the slot's usual completion callback.
-            self._release_thread_slot(child=child)
             return {"kind": "timeout", "phase": "entry_authority",
                 "limiting_source": admission.limiting_source, "effect_ids": [],
                 "budget_envelope": context.budget_envelope.to_dict(), "details": admission.to_dict()}
@@ -1503,6 +1786,7 @@ class InProcessRuntime:
         started = threading.Event()
         entry_confirmed = threading.Event()
         entered: dict[str, Any] = {}
+        completion: Future[dict[str, Any]] = Future()
 
         def on_entered(ctx: HandlerContext) -> None:
             entered["deadline"] = ctx.budget_envelope.deadline_monotonic(sample=ctx._sample())
@@ -1514,7 +1798,12 @@ class InProcessRuntime:
             while not entry_confirmed.wait(0.01):
                 if not active.is_set() or self._stop_event.is_set():
                     raise RuntimeError("handler entry authority was revoked before confirmation")
-                view = ctx.budget
+                with ctx._budget_lock:
+                    # The durable pending-entry record protects raw samples
+                    # while confirmation is blocked. Once ACK commits, use
+                    # only its accepted floor until user invocation begins.
+                    view = (ctx.budget if not ctx._entry_confirmed else
+                        ctx.budget_envelope.view(sample=ctx._sample()))
                 if view.clock_status == "unknown":
                     raise HandlerExecutionError("budget_clock_unknown",
                         "execution clock continuity cannot be established", details=view.to_dict())
@@ -1540,11 +1829,13 @@ class InProcessRuntime:
             try:
                 result = invoke_handler(handler, command, context, on_entered=on_entered)
                 _capture_completion_time(result, context)
-                completion = {key: result[key] for key in
+                completion_time = {key: result[key] for key in
                     ("completed_at", "completion_time_known", "completion_time_error") if key in result}
-                self._thread_finished(active, generation)
                 if "started_at" in entered:
-                    view = context.budget
+                    # Business completion is captured before storage cleanup.
+                    # Project its retained floor; a new wall observation here
+                    # would charge bookkeeping time to the original outcome.
+                    view = context.budget_envelope.view(sample=context._sample())
                     if view.clock_status == "unknown":
                         result = {"kind": "error", "code": "budget_clock_unknown", "control_error": True,
                             "message": "execution clock continuity cannot be established", "effect_ids": effects.effect_ids,
@@ -1553,19 +1844,28 @@ class InProcessRuntime:
                         result = {"kind": "timeout", "limiting_source": view.limiting_source,
                             "effect_ids": effects.effect_ids, "details": {"business_outcome": result}}
                     result.update(started_at=entered["started_at"], budget_envelope=context.budget_envelope.to_dict())
-                result.update(completion)
+                result.update(completion_time)
+                active.clear()
+                # Publish the validated original outcome before SDK storage
+                # cleanup. The worker still owns its context until finally
+                # exits; a slow final flush cannot consume business work time.
+                completion.set_result(result)
                 return result
+            except BaseException as error:
+                completion.set_exception(error)
+                raise
             finally:
                 started.set()
-                self._thread_finished(active, generation)
                 try:
                     context.close()
+                except BaseException as error:
+                    self._diagnostic_errors[command.execution_id] = (
+                        f"thread observation close: {type(error).__name__}: {error}")
+                    raise
                 finally:
                     self._retain_observation_context(context)
                     if isinstance(context.activity, ActivityRecorder):
                         self._retain_observation_workers(context.activity)
-                    with self._thread_lock:
-                        self._thread_contexts.pop(generation, None)
 
         with self._thread_lock:
             if self._closed:
@@ -1577,6 +1877,7 @@ class InProcessRuntime:
             self._thread_contexts[generation] = context
         try:
             future = executor.submit(invoke_started)
+            slot_ownership[0] = False
         except BaseException:
             with self._thread_lock:
                 self._thread_authorities.discard(active)
@@ -1597,7 +1898,7 @@ class InProcessRuntime:
             if not started.wait(startup):
                 active.clear()
                 future.cancel()
-                view = context.budget
+                view = context.budget_envelope.view(sample=context._sample())
                 if view.remaining_work_seconds is not None and view.remaining_work_seconds <= 0:
                     return {"kind": "timeout", "phase": "entry_authority",
                         "limiting_source": view.limiting_source, "effect_ids": effects.effect_ids,
@@ -1632,8 +1933,8 @@ class InProcessRuntime:
                         "limiting_source": details.get("limiting_source"), "details": details}
                 entry_confirmed.set()
             while True:
-                if future.done():
-                    return future.result()
+                if completion.done():
+                    return completion.result()
                 if self._stop_event.is_set():
                     active.clear()
                     future.cancel()
@@ -1642,24 +1943,32 @@ class InProcessRuntime:
                         "reason": "runtime_closed",
                         "effect_ids": effects.effect_ids,
                     }
-                view = context.budget
+                try:
+                    view = context._monitor_budget()
+                except Exception as error:
+                    waiting_owner = (isinstance(error, BudgetClockUnknownError)
+                                     and str(error) == "budget_clock_sample_unresolved:sampling")
+                    if not (waiting_owner or self._storage_contention(error) or isinstance(error, TimeoutError)):
+                        raise
+                    self._diagnostic_errors[command.execution_id] = (
+                        f"budget sampling pending: {type(error).__name__}: {error}")
+                    view = context._project_budget()
                 if view.clock_status == "unknown":
                     active.clear()
                     return {"kind": "error", "code": "budget_clock_unknown", "control_error": True,
                         "message": "execution clock continuity cannot be established", "effect_ids": effects.effect_ids}
-                current_deadline = context.budget_envelope.deadline_monotonic(sample=context._sample())
-                if current_deadline is not None:
-                    deadline = min(deadline, current_deadline)
+                if view.remaining_work_seconds is not None:
+                    deadline = min(deadline, time.monotonic() + view.remaining_work_seconds)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     active.clear()
                     future.cancel()
-                    view = context.budget
+                    view = context.budget_envelope.view(sample=context._sample())
                     return {"kind": "timeout", "effect_ids": effects.effect_ids,
                         "started_at": entered.get("started_at"), "limiting_source": view.limiting_source,
                         "budget_envelope": context.budget_envelope.to_dict()}
                 try:
-                    return future.result(timeout=min(remaining, 0.05))
+                    return completion.result(timeout=min(remaining, 0.05))
                 except FutureTimeoutError:
                     continue
         except FutureTimeoutError:  # defensive: the loop handles normal expiry
@@ -1768,7 +2077,9 @@ class InProcessRuntime:
                                outcome: dict[str, Any], admission: SettlementAdmission):
         """Retain the original result before a bounded Kernel completion CAS."""
         command = snapshot.command
-        if outcome.get("kind") == "authority_revoked":
+        received_checkpoints = self._received_budget_checkpoints(outcome)
+        if (outcome.get("kind") == "authority_revoked"
+                and "script_output_recovery" not in outcome and not received_checkpoints):
             try:
                 with self.kernel._control_lock(.1):
                     return self.kernel.get(lease.execution_id)
@@ -1786,7 +2097,9 @@ class InProcessRuntime:
         if type(reported) is list and all(type(item) is str for item in reported):
             outcome["effect_ids"] = list(dict.fromkeys(reported + persisted))
         outcome["persisted_effect_ids"] = persisted
-        deferred_kind = ("recovery_required" if outcome.get("kind") == "recovery_required" else
+        deferred_kind = (("script_output_recovery" if "script_output_recovery" in outcome
+                          else "budget_checkpoint_recovery") if outcome.get("kind") == "authority_revoked" else
+            "recovery_required" if outcome.get("kind") == "recovery_required" else
             "completion_time_unknown" if outcome.get("completion_time_known") is False else None)
         deferred = deferred_kind is not None
         result = None if deferred else self._outcome_result(command, lease, snapshot.started_at, outcome)
@@ -1803,7 +2116,11 @@ class InProcessRuntime:
         retained_budget = outcome.get("budget_envelope")
         budget = None if retained_budget is None else BudgetEnvelope.from_dict(retained_budget)
         evidence = {"telemetry_flush": outcome.get("telemetry_flush"), "outcome_kind": outcome.get("kind"),
-                    "budget_envelope": retained_budget}
+                    "budget_envelope": retained_budget,
+                    "budget_checkpoint": outcome.get("budget_checkpoint"),
+                    "budget_capture_error": outcome.get("budget_capture_error")}
+        if "script_output_recovery" in outcome:
+            evidence["script_output_recovery"] = outcome["script_output_recovery"]
         retained_key = self._pending_settlements.retain(admission, lease, payload, evidence)
         record = None
         if self._settlement_journal is not None:
@@ -1815,6 +2132,13 @@ class InProcessRuntime:
                 self._pending_settlements.persisted(retained_key)
             except Exception as exc:
                 self._settlement_error = f"{type(exc).__name__}: {exc}"
+        if record is None and received_checkpoints:
+            # A received owner can disappear with this process. Keep the
+            # bounded local obligation until its exact fact is durable.
+            self._activity_phase(lease, "result_pending", durable_receipt=False,
+                error="received budget checkpoint awaits its settlement receipt",
+                receipt_error=self._settlement_error)
+            return snapshot
         if not self._lifecycle_lock.acquire(timeout=.1):
             self._activity_phase(lease, "result_pending", durable_receipt=record is not None,
                 error="runtime lifecycle busy", receipt_error=self._settlement_error)
@@ -1822,6 +2146,31 @@ class InProcessRuntime:
         try:
             if self._closed:
                 return snapshot
+            operation_deadline = time.monotonic() + .1
+
+            def operation_timeout():
+                remaining = operation_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("completion operation window elapsed")
+                return remaining
+
+            if record is not None:
+                try:
+                    self._finish_received_budget_checkpoints(record, operation_deadline)
+                except Exception as exc:
+                    self._settlement_error = f"{type(exc).__name__}: {exc}"
+                    self._activity_phase(lease, "result_pending", durable_receipt=True,
+                        error=self._settlement_error)
+                    return snapshot
+            if deferred_kind in {"script_output_recovery", "budget_checkpoint_recovery"}:
+                try:
+                    with self.kernel._control_lock(operation_timeout()):
+                        completed = self.kernel.get(lease.execution_id)
+                except (TimeoutError, sqlite3.OperationalError):
+                    return snapshot
+                if record is not None:
+                    self._settlement_journal.settle(record, "recorded", evidence, timeout_seconds=.1)
+                return completed
             if deferred_kind == "completion_time_unknown":
                 self._activity_phase(lease, "result_pending", durable_receipt=record is not None,
                     unknown_reason="completion_time_unknown",
@@ -1832,7 +2181,7 @@ class InProcessRuntime:
                 # invented successful result may replace it.
                 try:
                     completed = self.kernel.require_effect_recovery(lease, outcome.get("effect_id"),
-                        timeout_seconds=.1)
+                        timeout_seconds=operation_timeout())
                     if record is not None:
                         self._settlement_journal.settle(record, "recovery_required",
                             {**record["evidence"], "execution_state": completed.state, "execution_revision": completed.revision},
@@ -1845,7 +2194,7 @@ class InProcessRuntime:
             assert result is not None
             try:
                 completed = self.kernel._complete_sdk_result(lease, result,
-                    budget_envelope=budget, timeout_seconds=.1)
+                    budget_envelope=budget, timeout_seconds=operation_timeout())
             except Exception as exc:
                 if isinstance(exc, (StaleFenceError, InvalidStateTransitionError, ResultConflictError)):
                     # Cancellation/reap may have won while the independent
@@ -1867,14 +2216,43 @@ class InProcessRuntime:
                          "result_id": result.result_id}, timeout_seconds=.1)
                 except Exception as exc:
                     self._settlement_error = f"{type(exc).__name__}: {exc}"
-            elif completed.result is not None and completed.result.result_id == result.result_id:
+            elif (completed.result is not None and completed.result.result_id == result.result_id
+                  and "script_output_recovery" not in evidence):
                 # The authoritative Kernel itself durably owns the exact result.
+                # Script artifact obligations need their independent receipt
+                # even when the business result already committed here.
                 self._pending_settlements.persisted(retained_key)
             self._activity_phase(lease, "result_recorded", state=completed.state,
                 result_id=result.result_id, source="kernel_complete")
             return completed
         finally:
             self._lifecycle_lock.release()
+
+    def _execution_observation_pending(self, execution_id: str, attempt: int, fence: int) -> bool:
+        """Inspect exact execution storage owners before releasing resources."""
+        if self.kernel._budget_samples_pending(execution_id):
+            return True
+        if (self._script_output_recovery is not None
+                and (self._script_output_discovery_pending
+                     or self._script_output_recovery.pending(execution_id, attempt, fence))):
+            return True
+        generation = (execution_id, attempt, fence)
+        if (self._script_output_recovery is not None
+                and any(entry.key == generation and "script_output_recovery" in entry.evidence
+                        for entry in self._pending_settlements.entries(self._pending_settlements.capacity))):
+            return True
+        with self._lifecycle_condition:
+            recorders = tuple(self._retired_recorders)
+            contexts = tuple(self._retired_observation_contexts)
+            active = self._execution_recorders.get(generation)
+        if active is not None:
+            # The driver still owns final close/pop, even if the recorder's
+            # workers have already exited. Keep its resource reservation.
+            return True
+        return any((recorder.identity.execution_id, recorder.identity.attempt, recorder.identity.fence) == generation
+                   and recorder._owned_workers_alive() for recorder in recorders) or any(
+            (context.lease.execution_id, context.lease.attempt, context.lease.fence) == generation
+            and self._context_observation_pending(context) for context in contexts)
 
     def run_once(self, *, execution_id: str | None = None):
         self._start_services()
@@ -1953,6 +2331,9 @@ class InProcessRuntime:
                 if self.isolation_mode == "process":
                     outcome = self._invoke_process(handler, command, running_lease)
                 else:
+                    # The invocation wrapper owns pre-dispatch release; the
+                    # actual future owns release after thread cleanup ends.
+                    thread_slot_owned = False
                     outcome = self._invoke_thread(handler, command, running_lease, child=targeted_child)
                     # The done callback owns the slot from this point.  This
                     # remains true for a timeout: the Python thread may still
@@ -1970,18 +2351,27 @@ class InProcessRuntime:
                     "telemetry_incomplete": isinstance(flush, dict) and flush.get("state") != "confirmed"})
                 return self._settle_outcome(snapshot, running_lease, outcome, admission)
             finally:
+                self._recover_script_output(time.monotonic() + .1)
                 if process_execution_started:
                     # Native invocation has already completed containment.
                     # Final telemetry collection must not keep cancellation
                     # waiting for a process tree that has been reaped.
                     self._finish_process_execution(running_lease)
                 if 'running_lease' in locals() and running_lease is not None:
-                    recorder = self._execution_recorders.pop((running_lease.execution_id, running_lease.attempt, running_lease.fence), None)
+                    generation = (running_lease.execution_id, running_lease.attempt, running_lease.fence)
+                    with self._lifecycle_condition:
+                        recorder = self._execution_recorders.get(generation)
                     if recorder is not None:
                         try:
                             receipt = recorder.close()
                         finally:
                             self._retain_observation_workers(recorder)
+                            # Recorder retirement uses its own ownership lock;
+                            # a busy business-control lock must not block the
+                            # caller after its original result was retained.
+                            with self._lifecycle_condition:
+                                if self._execution_recorders.get(generation) is recorder:
+                                    self._execution_recorders.pop(generation)
                         local = recorder.snapshot()
                         self._diagnostic_note(running_lease, "driver_close", {
                             "receipt": receipt, "dropped_events": local["dropped_events"],
@@ -1989,6 +2379,14 @@ class InProcessRuntime:
                             "telemetry_incomplete": not receipt.get("final_flush_persisted", False)
                                 or not receipt.get("source_closed", False)
                                 or local["dropped_events"] > 0 or local["collection_gaps"] > 0})
+                    # A completed future may have deferred release while this
+                    # driver recorder was still registered. Revisit only that
+                    # exact completed generation after retiring the driver.
+                    with self._thread_lock:
+                        finished_authority = (self._thread_authority_by_execution.get(generation)
+                            if generation in self._thread_done else None)
+                    if finished_authority is not None:
+                        self._thread_finished(finished_authority, generation)
                 if thread_slot_owned:
                     self._release_thread_slot(child=targeted_child)
 

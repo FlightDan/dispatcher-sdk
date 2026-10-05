@@ -32,10 +32,17 @@ class ChildPreentrySettlementTests(unittest.TestCase):
                         handler_id='child', timeout_seconds=2)
         self.kernel.submit_child(child, self.parent_lease, inherited)
         self.lease = self.kernel.claim_and_start('owner', execution_id='child', lease_seconds=90)
+        # This is the original claim timestamp, not inherited parent entry or
+        # proof that a native child handler entered its business body.
+        claimed_snapshot = self.kernel.get('child')
+        self.original_started_at = claimed_snapshot.started_at
         self.inherited = BudgetEnvelope.from_dict(self.kernel.get_execution_limits('child')['envelope'])
         self.assertIsNotNone(self.inherited.started_at)
         self.assertFalse(any(item.origin_id == 'execution:child' for item in self.inherited.constraints))
-        self.evidence = {'root': str(self.root), 'inherited': self.inherited.to_dict()}
+        self.evidence = {'root': str(self.root), 'inherited': self.inherited.to_dict(),
+            'frozen_wall': self.wall[0], 'original_claimed_snapshot': claimed_snapshot.to_dict(),
+            'result_start_source': 'original SQLiteKernel.claim_and_start snapshot',
+            'original_completed_at': 102}
 
     def tearDown(self):
         self.evidence['limits'] = self.kernel.get_execution_limits('child')
@@ -46,7 +53,7 @@ class ChildPreentrySettlementTests(unittest.TestCase):
 
     def original_result(self):
         return ExecutionResultV2('original-result', 'child', 'failed', self.lease.attempt,
-            self.lease.fence, [], 100, 102, 'root', 'parent', None,
+            self.lease.fence, [], self.original_started_at, 102, 'root', 'parent', None,
             ExecutionError('handler_process_start_failure', 'handler supervisor did not reach invocation',
                            retryable=False, details={'exitcode': 0, 'raw': [True, 1, 1.0]}))
 

@@ -402,11 +402,15 @@ for fd in (0, 1, 2):
     def test_publication_between_file_check_and_exit_preserves_deadline_and_revocation(self):
         # Control the OS boundary only. The real invocation loop, file protocol
         # and final outcome selection run on every platform.
-        for disposition in ("success", "timeout", "cancelled"):
+        for disposition in ("success", "timeout", "timeout_finalized", "timeout_pending", "cancelled"):
             with self.subTest(disposition=disposition), tempfile.TemporaryDirectory() as directory:
                 roots = []
                 contained = []
                 expected = {"kind": "ok", "value": "published-on-exit", "effect_ids": []}
+                if disposition == "timeout_finalized":
+                    expected["telemetry_flush"] = {"state": "confirmed"}
+                elif disposition == "timeout_pending":
+                    expected["telemetry_flush"] = {"state": "unknown", "reason": "writer busy"}
 
                 def create(api, arguments):
                     roots.append(Path(arguments[-1]))
@@ -429,6 +433,9 @@ for fd in (0, 1, 2):
                         # The loop has already observed no outcome file.
                         self_test.assertFalse((roots[0] / "outcome.json").exists())
                         windows_runtime._atomic_write(roots[0] / "outcome.json", json.dumps(expected))
+                        if disposition in ("timeout_finalized", "timeout_pending"):
+                            windows_runtime._atomic_write(roots[0] / "returned.json",
+                                json.dumps({"outcome_json": json.dumps(expected)}))
                         if disposition == "cancelled":
                             self.revocation_reason = "execution_cancelled"
                         return True
@@ -447,7 +454,7 @@ for fd in (0, 1, 2):
                         pass
 
                     def business_deadline(self, seconds):
-                        return time.monotonic() + (-1 if disposition == "timeout" else 60)
+                        return time.monotonic() + (-1 if disposition.startswith("timeout") else 60)
 
                     def close(self):
                         pass
@@ -463,7 +470,13 @@ for fd in (0, 1, 2):
                 if disposition == "success":
                     self.assertEqual(outcome, expected)
                 elif disposition == "timeout":
-                    self.assertEqual(outcome, {"kind": "timeout", "effect_ids": []})
+                    self.assertEqual(outcome, {"kind": "timeout", "effect_ids": [],
+                        "telemetry_flush": {"state": "unknown",
+                            "reason": "worker_terminated_without_final_flush_receipt"}})
+                elif disposition.startswith("timeout"):
+                    self.assertEqual(outcome["kind"], "timeout")
+                    self.assertEqual(outcome["telemetry_flush"], expected["telemetry_flush"])
+                    self.assertEqual(outcome["details"]["business_outcome"], expected)
                 else:
                     self.assertEqual(outcome, {"kind": "authority_revoked",
                         "reason": "execution_cancelled", "effect_ids": []})

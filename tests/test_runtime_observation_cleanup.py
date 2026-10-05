@@ -284,25 +284,49 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                 recorder._join_owned_workers(time.monotonic() + 1)
                 runtime.close()
 
-    def test_initializing_context_keeps_actual_connection_storage_pending(self):
-        entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    def test_initial_handler_registration_keeps_actual_connection_storage_pending(self):
+        entered, release, returned, released_connection = (threading.Event() for _ in range(4))
         held, errors, results, calls = [], [], [], []
+        registration = threading.local()
 
         def handler(payload, context):
             calls.append("business")
             return {"original": "completed"}
 
-        handler.__execution_kernel_revision__ = "held-observation-start-fixture-v1"
+        handler.__execution_kernel_revision__ = "held-handler-registration-fixture-v1"
         original_transaction = ObservationJournal._transaction
+        original_registration = ObservationJournal.register_collector
+
+        def register_collector(journal, identity, source_id, **kwargs):
+            registration.handler = (kwargs.get("source_scope") == "handler"
+                and identity.execution_id == "startup")
+            try:
+                return original_registration(journal, identity, source_id, **kwargs)
+            finally:
+                registration.handler = False
 
         @contextmanager
         def transaction(journal, **kwargs):
-            with original_transaction(journal, **kwargs) as current:
-                if threading.current_thread().name.startswith("execution-kernel_") and not held:
-                    held.append(current[0])
-                    entered.set()
-                    release.wait()
-                yield current
+            owned = None
+            try:
+                with original_transaction(journal, **kwargs) as current:
+                    if (getattr(registration, "handler", False)
+                            and threading.current_thread().name == "dispatcher-observation-flush"
+                            and not held):
+                        owned = current[0]
+                        held.append(owned)
+                        entered.set()
+                        release.wait()
+                    yield current
+            finally:
+                if owned is not None:
+                    # Check physical release on the actual owning thread,
+                    # after the original transaction's rollback and close.
+                    try:
+                        owned.execute("SELECT 1")
+                    except sqlite3.ProgrammingError as error:
+                        if "closed database" in str(error):
+                            released_connection.set()
 
         with self.kernel_storage() as temporary:
             observation = tempfile.TemporaryDirectory(dir=self.root)
@@ -321,43 +345,149 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                 finally:
                     returned.set()
 
-            with patch.object(ObservationJournal, "_transaction", transaction):
+            with patch.object(ObservationJournal, "register_collector", register_collector), \
+                    patch.object(ObservationJournal, "_transaction", transaction):
+                runner = threading.Thread(target=run)
+                entry_deadline = time.monotonic() + 3
+                runner.start()
+                try:
+                    entered_on_time = entered.wait(max(0., entry_deadline - time.monotonic()))
+                    if not entered_on_time:
+                        self.storage_evidence.save(phase="handler_registration_entry_wait_expired",
+                            checkpoint={"original_wait": 3, "entered": entered_on_time})
+                    self.assertTrue(entered_on_time)
+                    with runtime._thread_lock:
+                        active = tuple(runtime._thread_contexts.values())
+                    with runtime._lifecycle_condition:
+                        retired = tuple(runtime._retired_observation_contexts)
+                    contexts = list(dict.fromkeys(context for context in (*active, *retired)
+                        if context.command.execution_id == "startup"))
+                    self.assertEqual(len(contexts), 1)
+                    context = contexts[0]
+                    # The flusher can enter just before startup's finally.
+                    # Share admission's original 3s deadline for that handoff.
+                    self.assertTrue(context._observation_start_done.wait(
+                        max(0., entry_deadline - time.monotonic())))
+                    self.assertIsInstance(context.activity, ActivityRecorder)
+                    self.assertTrue(context.activity._owned_workers_alive())
+                    with self.assertRaises(_ObservationCleanupPendingError):
+                        runtime.close()
+                    self.assertTrue(returned.is_set())
+                    self.assertEqual(errors, [])
+                    self.assertTrue(path.exists())
+                    self.assertFalse(released_connection.is_set())
+                    self.assertTrue(context.activity._owned_workers_alive())
+                    self.assertIn(context.activity, runtime._retired_recorders)
+                    self.assertTrue(any(report["state"] == "pending"
+                        for report in runtime._observation_cleanup_report))
+                    original_calls = tuple(calls)
+                    original_results = tuple(None if result is None else result.to_dict()
+                        for result in results)
+                    original_execution = runtime.kernel.get("startup").to_dict()
+                    for result in results:
+                        if result is not None and result.state == "succeeded":
+                            self.assertEqual(result.result.value, {"original": "completed"})
+                    release.set()
+                    physically_released = released_connection.wait(3)
+                    if not physically_released:
+                        self.storage_evidence.save(phase="handler_registration_release_wait_expired",
+                            checkpoint={"original_wait": 3, "physical_close": physically_released})
+                    self.assertTrue(physically_released)
+                    runtime.close()
+                    self.assertFalse(path.exists())
+                    self.assertEqual(runtime._retired_observation_contexts, [])
+                    self.assertEqual(runtime._retired_recorders, [])
+                    self.assertFalse(context.activity._owned_workers_alive())
+                    self.assertEqual(tuple(calls), original_calls)
+                    self.assertEqual(tuple(None if result is None else result.to_dict()
+                        for result in results), original_results)
+                    with SQLiteKernel(Path(temporary) / "runtime.sqlite3") as reader:
+                        self.assertEqual(reader.get("startup").to_dict(), original_execution)
+                finally:
+                    release.set()
+                    runner.join(3)
+                    runtime.close()
+
+    def test_close_before_context_recorder_publication_leaves_no_unowned_worker(self):
+        entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+        constructed, errors, calls = [], [], []
+
+        def handler(payload, context):
+            calls.append("business")
+            return {"original": "completed"}
+
+        handler.__execution_kernel_revision__ = "held-recorder-publication-fixture-v1"
+        original_constructor = ActivityRecorder.__init__
+
+        def constructor(recorder, journal, identity, **kwargs):
+            original_constructor(recorder, journal, identity, **kwargs)
+            if (kwargs.get("source_scope") == "handler" and identity.execution_id == "startup"
+                    and threading.current_thread().name.startswith("execution-kernel_")
+                    and not constructed):
+                # The actual SDK constructor has completed without opening
+                # SQLite; pause only its return to Context publication.
+                constructed.append(recorder)
+                entered.set()
+                release.wait()
+
+        with self.kernel_storage() as temporary:
+            observation = tempfile.TemporaryDirectory(dir=self.root)
+            path = Path(observation.name) / "observations.sqlite3"
+            runtime = Kernel.open_sqlite(Path(temporary) / "runtime.sqlite3", {"work": handler},
+                isolation_mode="thread", lease_seconds=5, observation_path=str(path))
+            runtime._temporary_observation = observation
+            runtime.submit(runtime.command("work", execution_id="startup", idempotency_key="startup",
+                correlation_id="startup", timeout_seconds=.2, payload={}))
+
+            def run():
+                try:
+                    runtime.run_once()
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    returned.set()
+
+            with patch.object(ActivityRecorder, "__init__", constructor):
                 runner = threading.Thread(target=run)
                 runner.start()
                 try:
                     entered_on_time = entered.wait(3)
                     if not entered_on_time:
-                        self.storage_evidence.save(phase="initialization_entry_wait_expired",
+                        self.storage_evidence.save(phase="recorder_publication_entry_wait_expired",
                             checkpoint={"original_wait": 3, "entered": entered_on_time})
                     self.assertTrue(entered_on_time)
-                    contexts = tuple(runtime._thread_contexts.values())
+                    with runtime._thread_lock:
+                        contexts = tuple(runtime._thread_contexts.values())
                     self.assertEqual(len(contexts), 1)
                     context = contexts[0]
+                    recorder = constructed[0]
+                    self.assertIsNone(recorder._thread)
+                    self.assertIsNot(context.activity, recorder)
                     self.assertFalse(context._observation_start_done.is_set())
                     with self.assertRaises(_ObservationCleanupPendingError):
                         runtime.close()
                     self.assertTrue(returned.is_set())
                     self.assertEqual(errors, [])
                     self.assertTrue(path.exists())
+                    self.assertTrue(context._observation_closed)
                     self.assertFalse(context._observation_start_done.is_set())
-                    self.assertTrue(runtime._retired_observation_contexts)
+                    self.assertIn(context, runtime._retired_observation_contexts)
                     self.assertEqual(calls, [])
+                    self.assertIsNone(recorder._thread)
                     release.set()
                     start_done = context._observation_start_done.wait(3)
                     if not start_done:
-                        self.storage_evidence.save(phase="initialization_wait_expired",
+                        self.storage_evidence.save(phase="recorder_publication_release_wait_expired",
                             checkpoint={"original_wait": 3, "start_done": start_done})
                     self.assertTrue(start_done)
                     runtime.close()
-                    self.assertFalse(path.exists())
+                    self.assertIs(context.activity, recorder)
+                    self.assertTrue(recorder._closed)
+                    self.assertFalse(recorder._owned_workers_alive())
                     self.assertEqual(runtime._retired_observation_contexts, [])
+                    self.assertEqual(runtime._retired_recorders, [])
+                    self.assertFalse(path.exists())
                     self.assertEqual(calls, [])
-                    if isinstance(context.activity, ActivityRecorder):
-                        # A collector constructor may have held the original
-                        # SQL operation after the pre-creation close check.
-                        # That losing publication is closed before startdone.
-                        self.assertTrue(context.activity._closed)
-                        self.assertFalse(context.activity._owned_workers_alive())
                 finally:
                     release.set()
                     runner.join(3)

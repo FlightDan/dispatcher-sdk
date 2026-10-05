@@ -23,7 +23,7 @@ from .contracts import ExecutionSnapshot, _json_value
 
 
 class _LocalCancellationDiagnostics:
-    """Bounded facts from raised control operations, with no storage authority."""
+    """Bounded cancellation facts that could not be persisted, without authority."""
 
     def __init__(self, options):
         self._items = min(64, options.queue_items)

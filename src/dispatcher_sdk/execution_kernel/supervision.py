@@ -8,15 +8,342 @@ from __future__ import annotations
 
 import json
 import math
+import time
+import uuid
 from typing import Any
 
 from ._sqlite_base import encode_json
-from .budget import BudgetClockUnknownError, BudgetEnvelope, DeadlineConstraint, sample_clock
+from .budget import BudgetClockUnknownError, BudgetEnvelope, ClockCheckpoint, DeadlineConstraint, sample_clock
 from .contracts import ExecutionCommandV2, ExecutionLease
-from .errors import CASConflictError, StaleFenceError
+from .errors import CASConflictError, StaleFenceError, StorageIsolationError
 
 
 class SupervisionMixin:
+    def _read_budget_floor(self, execution_id: str, *, timeout_seconds: float = .1) -> ClockCheckpoint:
+        """Read guard absence and its canonical floor from one snapshot.
+
+        This imports committed clock facts after failed write admission. It
+        observes no new wall time and cannot admit business or retire a sample.
+        """
+        with self._control_lock(timeout_seconds):
+            connection = self._connection
+            if connection.in_transaction:
+                raise StorageIsolationError("budget floor inspection requires an idle connection")
+            failure = None
+            try:
+                connection.execute("BEGIN")
+                self._assert_budget_clock(connection, execution_id)
+                row = connection.execute(
+                    "SELECT envelope_json FROM kernel_execution_limits WHERE execution_id=?",
+                    (execution_id,)).fetchone()
+                if row is None:
+                    raise BudgetClockUnknownError("canonical budget floor cannot be established")
+                canonical = BudgetEnvelope.from_dict(json.loads(row[0]))
+                if time.monotonic() >= self._control_deadline:
+                    raise TimeoutError("Kernel control admission budget elapsed")
+                return canonical.checkpoint
+            except BaseException as error:
+                failure = error
+                raise
+            finally:
+                if connection.in_transaction:
+                    try:
+                        connection.rollback()
+                    except BaseException as cleanup_error:
+                        if failure is not None:
+                            raise failure from cleanup_error
+                        raise
+
+    def _assert_budget_clock(self, connection, execution_id: str) -> None:
+        """Unacknowledged samples fence entry and descendant admission."""
+        seen = set()
+        while execution_id is not None:
+            if execution_id in seen or len(seen) >= 64:
+                raise BudgetClockUnknownError("budget ancestry cannot be established")
+            seen.add(execution_id)
+            pending = connection.execute(
+                "SELECT reason FROM kernel_budget_samples WHERE execution_id=? LIMIT 1",
+                (execution_id,)).fetchone()
+            if pending is not None:
+                raise BudgetClockUnknownError("budget_clock_sample_unresolved:" + pending[0])
+            parent = connection.execute(
+                "SELECT parent_execution_id FROM kernel_execution_limits WHERE execution_id=?",
+                (execution_id,)).fetchone()
+            execution_id = None if parent is None else parent[0]
+
+    def _budget_sample_status(self, execution_id: str | None = None) -> bool | None:
+        """Inspect owned obligations; unavailable inspection remains unknown."""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            if execution_id is None:
+                return bool(self._budget_sample_owners)
+            return any(owner.execution_id == execution_id
+                       for owner in self._budget_sample_owners.values())
+        finally:
+            self._lock.release()
+
+    def _budget_samples_pending(self, execution_id: str | None = None) -> bool:
+        # Resource release requires positive proof that no exact owner remains.
+        return self._budget_sample_status(execution_id) is not False
+
+    def _drain_budget_samples(self, deadline: float, *,
+                              execution_ids: tuple[str, ...] | None = None) -> bool:
+        """Finish retained facts within one maintenance bound, without sampling."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._lock.acquire(timeout=max(0., remaining)):
+            return True
+        try:
+            # A nonblocking owner admission preserves owner -> Kernel order.
+            # No helper whose original caller still holds it is waited on here.
+            visited = set()
+            while self._budget_sample_owners and time.monotonic() < deadline:
+                item = next(((token, owner) for token, owner in self._budget_sample_owners.items()
+                             if token not in visited and (execution_ids is None
+                                 or owner.execution_id in execution_ids)), None)
+                if item is None:
+                    break
+                token, owner = item
+                visited.add(token)
+                if not owner._lock.acquire(blocking=False):
+                    continue
+                try:
+                    pending = owner._pending
+                    if pending is None and owner._published is not None:
+                        if self._budget_sample_owners.get(token) is owner:
+                            self._budget_sample_owners.pop(token, None)
+                    if pending is not None and pending[0] == token and pending[1] is not None:
+                        try:
+                            owner.finish_pending(pending[1], timeout_seconds=max(
+                                .000001, deadline - time.monotonic()))
+                        except Exception:
+                            # Original causal failure remains with its owner.
+                            pass
+                finally:
+                    owner._lock.release()
+            return any(execution_ids is None or owner.execution_id in execution_ids
+                       for owner in self._budget_sample_owners.values())
+        finally:
+            self._lock.release()
+
+    def _begin_budget_sample(self, execution_id: str, *, timeout_seconds: float = .1,
+                             _owner=None) -> str:
+        token = str(uuid.uuid4())
+        with self._control_lock(timeout_seconds):
+            self._assert_budget_clock(self._connection, execution_id)
+            try:
+                # Arm from committed authority only. A wall sample before this
+                # COMMIT would have no durable crash marker protecting it.
+                with self._transaction(timeout_seconds=timeout_seconds,
+                                       _observe_clock=False) as (connection, _):
+                    self._get_row(connection, execution_id)
+                    self._assert_budget_clock(connection, execution_id)
+                    connection.execute(
+                        "INSERT INTO kernel_budget_samples(token,execution_id,reason) VALUES(?,?,'sampling')",
+                        (token, execution_id))
+                    if _owner is not None:
+                        _owner._armed(token)
+                        self._budget_sample_owners[token] = _owner
+            except BaseException as exc:
+                # Publish ownership before COMMIT, retire only after a proven
+                # rollback. Interrupted/uncertain COMMIT keeps its live owner.
+                try:
+                    marker = self._connection.execute(
+                        "SELECT token FROM kernel_budget_samples WHERE token=?", (token,)).fetchone()
+                except Exception:
+                    marker = True
+                if marker is None:
+                    if self._budget_sample_owners.get(token) is _owner:
+                        self._budget_sample_owners.pop(token, None)
+                    if _owner is not None and _owner._pending is not None and _owner._pending[0] == token:
+                        _owner._pending = None
+                else:
+                    exc.budget_sample_token = token
+                    exc.budget_sample_envelope = None
+                    exc.budget_sample_owner = _owner
+                raise
+        return token
+
+    def _finish_budget_sample(self, token: str, execution_id: str, envelope: BudgetEnvelope,
+                              *, timeout_seconds: float = .1, _owner=None) -> BudgetEnvelope:
+        with self._control_lock(timeout_seconds):
+            with self._transaction(timeout_seconds=timeout_seconds,
+                                   _observe_clock=False) as (connection, _):
+                marker = connection.execute(
+                    "SELECT execution_id,reason FROM kernel_budget_samples WHERE token=?", (token,)).fetchone()
+                limits = connection.execute(
+                    "SELECT envelope_json FROM kernel_execution_limits WHERE execution_id=?",
+                    (execution_id,)).fetchone()
+                if limits is None:
+                    raise BudgetClockUnknownError("budget sampling requires admitted execution limits")
+                canonical = BudgetEnvelope.from_dict(json.loads(limits[0]))
+                if marker is None:
+                    # Only a retained live owner that attempted this exact ACK may
+                    # reconcile interruption after COMMIT. A new Kernel cannot.
+                    if (_owner is None or self._budget_sample_owners.get(token) is not _owner
+                            or _owner._ack_token != token):
+                        raise CASConflictError("budget sampling token has no matching owner")
+                    retained, committed = envelope.checkpoint, canonical.checkpoint
+                    common = ClockCheckpoint(0., max(retained.elapsed_at, committed.elapsed_at),
+                        committed.domain_id, committed.domain_scope, committed.unknown_reason)
+                    committed_floor = committed.effective_time(common)
+                    retained_floor = retained.effective_time(common)
+                    if (committed_floor is None or retained_floor is None
+                            or committed_floor < retained_floor):
+                        raise CASConflictError("committed budget floor does not acknowledge captured fact")
+                else:
+                    if tuple(marker) != (execution_id, "sampling"):
+                        raise CASConflictError("budget sampling token has no matching owner")
+                    canonical = canonical.with_clock_floor(envelope.checkpoint)
+                    connection.execute("UPDATE kernel_execution_limits SET envelope_json=? WHERE execution_id=?",
+                                       (encode_json(canonical.to_dict()), execution_id))
+                    connection.execute("DELETE FROM kernel_budget_samples WHERE token=? AND execution_id=?",
+                                       (token, execution_id))
+                    if _owner is not None:
+                        _owner._ack_token = token
+                # The protected observed floor also governs other executions'
+                # Run and lease authority. Publish it with this exact ACK so
+                # wall rollback cannot reopen time through a sibling command.
+                connection.execute(
+                    "UPDATE kernel_clock SET watermark=MAX(watermark,?) WHERE singleton=1",
+                    (canonical.checkpoint.wall_at,))
+            published = envelope.with_clock_floor(canonical.checkpoint)
+            if _owner is not None:
+                _owner._acknowledged(token, published)
+                if self._budget_sample_owners.get(token) is _owner:
+                    self._budget_sample_owners.pop(token, None)
+            return published
+
+    def _finish_received_budget_sample(self, token: str, execution_id: str,
+                                       envelope: BudgetEnvelope, *,
+                                       timeout_seconds: float = .1) -> BudgetEnvelope:
+        """Finish a positive fact recovered from the bound settlement journal.
+
+        Runtime must retain the received checkpoint before calling this path.
+        A missing marker is replayable only when both committed clock floors
+        already acknowledge that fact. This grants no execution authority.
+        """
+        with self._control_lock(timeout_seconds):
+            def remaining():
+                duration = self._control_deadline - time.monotonic()
+                if duration <= 0:
+                    raise TimeoutError("received budget checkpoint admission elapsed")
+                return duration
+
+            owner = self._budget_sample_owners.get(token)
+            if owner is not None:
+                # Preserve owner -> Kernel lock order: never wait on an owner
+                # whose caller may already be waiting for this Kernel lock.
+                if not owner._lock.acquire(blocking=False):
+                    raise TimeoutError("received budget checkpoint owner is busy")
+                try:
+                    pending = owner._pending
+                    if (owner.execution_id != execution_id or pending is None
+                            or pending[0] != token or pending[1] is None):
+                        raise CASConflictError("received budget checkpoint conflicts with its live owner")
+                    return owner.finish_pending(envelope, timeout_seconds=remaining())
+                finally:
+                    owner._lock.release()
+            try:
+                return self._finish_budget_sample(token, execution_id, envelope,
+                    timeout_seconds=remaining())
+            except CASConflictError:
+                # The original ACK can commit before the independent receipt
+                # state changes. Unlike a live caller, cold recovery has no
+                # in-memory _ack_token; the retained receipt owns this replay.
+                with self._transaction(timeout_seconds=remaining(),
+                                       _observe_clock=False) as (connection, _):
+                    marker = connection.execute(
+                        "SELECT token FROM kernel_budget_samples WHERE token=?", (token,)).fetchone()
+                    if marker is not None:
+                        raise
+                    limits = connection.execute(
+                        "SELECT envelope_json FROM kernel_execution_limits WHERE execution_id=?",
+                        (execution_id,)).fetchone()
+                    if limits is None:
+                        raise
+                    canonical = BudgetEnvelope.from_dict(json.loads(limits[0]))
+                    retained, committed = envelope.checkpoint, canonical.checkpoint
+                    common = ClockCheckpoint(0., max(retained.elapsed_at, committed.elapsed_at),
+                        committed.domain_id, committed.domain_scope, committed.unknown_reason)
+                    committed_floor = committed.effective_time(common)
+                    retained_floor = retained.effective_time(common)
+                    clock = connection.execute(
+                        "SELECT watermark FROM kernel_clock WHERE singleton=1").fetchone()
+                    if (committed_floor is None or retained_floor is None
+                            or committed_floor < retained_floor or clock is None
+                            or clock[0] < retained.wall_at):
+                        raise CASConflictError("committed clock floors do not acknowledge received fact")
+                    return envelope.with_clock_floor(committed)
+
+    def _sample_budget(self, execution_id: str, envelope: BudgetEnvelope, *,
+                       timeout_seconds: float = .1, _owner=None) -> BudgetEnvelope:
+        if _owner is None:
+            from .budget_capture import _KernelBudgetCapture
+            return _KernelBudgetCapture(self, execution_id)(envelope, timeout_seconds=timeout_seconds)
+        deadline = time.monotonic() + timeout_seconds
+        unresolved = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if unresolved is not None:
+                    raise unresolved
+                raise BudgetClockUnknownError("budget_clock_sample_unresolved:sampling")
+            token, sampled = None, None
+            try:
+                with self._control_lock(remaining):
+                    # A previous call may have expired while still owning a
+                    # captured fact. Drain only those exact retained owners.
+                    self._drain_budget_samples(deadline)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Kernel control admission budget elapsed")
+                    self._assert_budget_clock(self._connection, execution_id)
+                    limits = self._connection.execute(
+                        "SELECT envelope_json FROM kernel_execution_limits WHERE execution_id=?",
+                        (execution_id,)).fetchone()
+                    if limits is not None:
+                        canonical = BudgetEnvelope.from_dict(json.loads(limits[0]))
+                        envelope = envelope.with_clock_floor(canonical.checkpoint)
+                        envelope = envelope.recheckpoint(
+                            sample=sample_clock(wall_time=envelope.checkpoint.wall_at))
+                        view = envelope.view(sample=envelope.checkpoint)
+                        if view.remaining_work_seconds is not None and view.remaining_work_seconds <= 0:
+                            return envelope
+                    token = self._begin_budget_sample(execution_id, timeout_seconds=remaining, _owner=_owner)
+                    clock = self._connection.execute(
+                        "SELECT watermark FROM kernel_clock WHERE singleton=1").fetchone()
+                    if clock is None:
+                        raise RuntimeError("kernel logical clock row is missing")
+                    wall = max(self._wall_time(), self._number(clock[0], "clock watermark", minimum=0.0))
+                    sampled = envelope.recheckpoint(sample=sample_clock(wall_time=wall))
+                    _owner._captured(token, sampled)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Kernel control admission budget elapsed")
+                    return self._finish_budget_sample(
+                        token, execution_id, sampled, timeout_seconds=remaining, _owner=_owner)
+            except BaseException as exc:
+                if token is not None:
+                    exc.budget_sample_token = token
+                    exc.budget_sample_envelope = sampled
+                    exc.budget_sample_owner = _owner
+                    raise
+                if (isinstance(exc, TimeoutError) and unresolved is not None
+                        and getattr(exc, "budget_sample_token", None) is None):
+                    # Admission expiry cannot replace uncertainty already
+                    # established by SQL during this same bounded operation.
+                    raise unresolved from exc
+                if (not isinstance(exc, BudgetClockUnknownError)
+                        or str(exc) != "budget_clock_sample_unresolved:sampling"):
+                    raise
+                if unresolved is None:
+                    unresolved = exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise unresolved
+                time.sleep(min(.005, remaining))
+
     def _supervision_row(self, connection, row):
         current = connection.execute(
             "SELECT * FROM kernel_supervision WHERE execution_id=?", (row["execution_id"],)
@@ -163,11 +490,18 @@ class SupervisionMixin:
             ).fetchone()
             if row is None:
                 return None
-            return {**dict(row), "envelope": json.loads(row["envelope_json"])}
+            try:
+                self._assert_budget_clock(self._connection, execution_id)
+                clock_status, reason = "trusted", None
+            except BudgetClockUnknownError as error:
+                clock_status, reason = "unknown", str(error)
+            return {**dict(row), "envelope": json.loads(row["envelope_json"]),
+                    "clock_status": clock_status, "clock_unknown_reason": reason}
 
     def admission_budget(self, lease: ExecutionLease, *, timeout_seconds: float = .1) -> BudgetEnvelope:
         """Return existing cutoffs and the managed Run constraint at admission."""
         with self._control_lock(timeout_seconds):
+            self._assert_budget_clock(self._connection, lease.execution_id)
             row = self._get_row(self._connection, lease.execution_id)
             if (row["attempt"], row["fence"]) != (lease.attempt, lease.fence):
                 raise StaleFenceError("budget admission belongs to a stale execution")
@@ -217,7 +551,9 @@ class SupervisionMixin:
     def _prepare_execution_budget(self, lease: ExecutionLease, *,
                                   timeout_seconds: float, pending: bool = False) -> BudgetEnvelope:
         with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
+            self._assert_budget_clock(connection, lease.execution_id)
             self._assert_lease(connection, lease, timestamp=timestamp, states={"running"})
+            self._assert_child_claim(connection, lease.execution_id, timestamp)
             self._authorize_managed_operation(
                 connection, lease.execution_id, timestamp=timestamp, operation="handler entry admission"
             )
@@ -230,7 +566,7 @@ class SupervisionMixin:
             envelope = (BudgetEnvelope.from_dict(json.loads(existing["envelope_json"]))
                         if existing is not None else BudgetEnvelope((), sample_clock(wall_time=self._wall_time())))
             envelope = self._run_budget(connection, lease.execution_id, envelope).recheckpoint(
-                sample=sample_clock(wall_time=self._wall_time()))
+                sample=sample_clock(wall_time=envelope.checkpoint.wall_at))
             origin = "execution:" + lease.execution_id
             cutoff = next((item for item in envelope.constraints if item.origin_id == origin), None)
             if cutoff is not None and cutoff.source != "execution":
@@ -268,6 +604,9 @@ class SupervisionMixin:
             raise TypeError("budget must be a BudgetEnvelope")
         with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             row = self._assert_lease(connection, lease, timestamp=timestamp, states={"running"})
+            if not pending:
+                self._assert_budget_clock(connection, lease.execution_id)
+                self._assert_child_claim(connection, lease.execution_id, timestamp)
             self._authorize_managed_operation(
                 connection, lease.execution_id, timestamp=timestamp, operation="handler entry confirmation"
             )
@@ -338,7 +677,7 @@ class SupervisionMixin:
             if not math.isclose(cutoff.deadline_at, expected, rel_tol=0, abs_tol=1e-6):
                 raise ValueError("first handler cutoff does not match its actual entry timeout")
         envelope = self._run_budget(connection, lease.execution_id, envelope).recheckpoint(
-            sample=sample_clock(wall_time=self._wall_time()))
+            sample=sample_clock(wall_time=envelope.checkpoint.wall_at))
         return envelope, existing["entry_state"]
 
     def _tighten_completion_budget(self, connection, row, lease: ExecutionLease,
@@ -354,7 +693,7 @@ class SupervisionMixin:
             if envelope.started_at is not None or any(item.origin_id == origin for item in envelope.constraints):
                 raise CASConflictError("handler entry has no matching durable admission")
             envelope = self._run_budget(connection, lease.execution_id, envelope).recheckpoint(
-                sample=sample_clock(wall_time=self._wall_time()))
+                sample=sample_clock(wall_time=envelope.checkpoint.wall_at))
             connection.execute(
                 "INSERT INTO kernel_execution_limits(execution_id,envelope_json,entry_state,entry_attempt,entry_fence) "
                 "VALUES(?,?,'pending',?,?)",
@@ -451,9 +790,13 @@ class SupervisionMixin:
         return 0 if row is None else row[0]
 
     def _bind_child_limits(self, connection, execution_id: str, parent, envelope: BudgetEnvelope, depth: int):
+        self._assert_budget_clock(connection, parent["execution_id"])
+        self._assert_budget_clock(connection, execution_id)
         if execution_id == parent["execution_id"]:
             raise ValueError("execution cannot wait on itself")
-        current_sample = sample_clock(wall_time=self._wall_time())
+        # Binding projects the caller's guarded sample. Reading another wall
+        # clock inside this transaction would lose a new floor on rollback.
+        current_sample = sample_clock(wall_time=envelope.checkpoint.wall_at)
         envelope = envelope.recheckpoint(sample=current_sample)
         parent_limits = connection.execute(
             "SELECT envelope_json FROM kernel_execution_limits WHERE execution_id=?",
@@ -471,7 +814,11 @@ class SupervisionMixin:
             values[item.origin_id] = item if previous is None else DeadlineConstraint(
                 item.origin_id, item.source, min(item.deadline_at, previous.deadline_at),
                 max(item.reserve_seconds, previous.reserve_seconds))
-        envelope = BudgetEnvelope(tuple(values.values()), authority.checkpoint, envelope.started_at)
+        # Both checkpoints were advanced to the same clock sample above.
+        # Parent authority cannot erase a stronger floor captured by the caller.
+        checkpoint = (envelope.checkpoint if envelope.checkpoint.wall_at >= authority.checkpoint.wall_at
+                      else authority.checkpoint)
+        envelope = BudgetEnvelope(tuple(values.values()), checkpoint, envelope.started_at)
         ancestor = parent["execution_id"]
         for _ in range(64):
             if ancestor == execution_id:
@@ -503,8 +850,9 @@ class SupervisionMixin:
                     max(item.reserve_seconds, previous.reserve_seconds))
             child_sample = old.recheckpoint(sample=current_sample).checkpoint
             envelope = BudgetEnvelope(tuple(values.values()),
-                child_sample if child_sample.wall_at >= authority.checkpoint.wall_at else authority.checkpoint,
-                envelope.started_at)
+                child_sample if child_sample.wall_at >= envelope.checkpoint.wall_at else envelope.checkpoint,
+                old.started_at if any(item.origin_id == "execution:" + execution_id
+                                      for item in old.constraints) else envelope.started_at)
             connection.execute(
                 "UPDATE kernel_execution_limits SET envelope_json=? WHERE execution_id=?",
                 (encode_json(envelope.to_dict()), execution_id),

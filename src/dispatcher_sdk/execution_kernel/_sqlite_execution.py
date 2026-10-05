@@ -8,6 +8,7 @@ from typing import Optional
 import os
 from pathlib import Path
 import sqlite3
+import time
 import uuid
 
 from ._sqlite_base import MAX_SQLITE_INTEGER, SQLiteBase, encode_json
@@ -62,6 +63,11 @@ def _next_claim_row(connection, timestamp: float, revisions: Optional[tuple[str,
     else:
         predicate += " AND NOT EXISTS (SELECT 1 FROM kernel_execution_limits l " \
                      "WHERE l.execution_id=k.execution_id AND l.parent_execution_id IS NOT NULL)"
+        # An unresolved root keeps its own admission fence, while unrelated
+        # eligible work remains claimable. Explicit targets retain the normal
+        # authority check and surface their unknown clock instead of skipping.
+        predicate += " AND NOT EXISTS (SELECT 1 FROM kernel_budget_samples s " \
+                     "WHERE s.execution_id=k.execution_id)"
     return connection.execute(
         """SELECT k.* FROM kernel_executions AS k WHERE """ + predicate + """
            AND (
@@ -103,6 +109,7 @@ class SQLiteKernel(
         ).fetchone()
         if limits is None or limits["parent_execution_id"] is None:
             return
+        self._assert_budget_clock(connection, execution_id)
         parent = self._get_row(connection, limits["parent_execution_id"])
         if (parent["state"] != "running"
                 or (parent["attempt"], parent["fence"]) != (limits["parent_attempt"], limits["parent_fence"])
@@ -118,7 +125,10 @@ class SQLiteKernel(
                 or (parent_limits["entry_attempt"], parent_limits["entry_fence"]) != (
                     parent["attempt"], parent["fence"])):
             raise CASConflictError("child claim requires confirmed parent handler entry")
-        sample = sample_clock(wall_time=self._wall_time())
+        parent_envelope = BudgetEnvelope.from_dict(json.loads(parent_limits["envelope_json"]))
+        # Admission consumes committed clock evidence. The invocation wrapper
+        # owns the next guarded wall sample before actual business entry.
+        sample = sample_clock(wall_time=parent_envelope.checkpoint.wall_at)
         for stored in (parent_limits, limits):
             envelope = BudgetEnvelope.from_dict(json.loads(stored["envelope_json"]))
             if not any(item.origin_id == "execution:" + parent["execution_id"]
@@ -249,7 +259,10 @@ class SQLiteKernel(
         if settlement:
             return
         if row[4] <= timestamp:
-            raise CASConflictError("managed Run deadline has elapsed")
+            error = CASConflictError("managed Run deadline has elapsed")
+            error._budget_deadline = {
+                "source": "run", "deadline_at": row[4], "observed_at": timestamp}
+            raise error
         if row[3] == "active" and row[0] == row[2]:
             return
         if (
@@ -447,6 +460,26 @@ class SQLiteKernel(
         self, command: ExecutionCommandV2, *, run_id: str, generation: int
     ) -> ExecutionSnapshot:
         """Atomically register and queue one opted-in managed execution."""
+        return self._submit_managed(command, run_id=run_id, generation=generation)
+
+    def _submit_supervisor(self, command: ExecutionCommandV2, *, run_id: str, generation: int,
+                           parent_lease: ExecutionLease, budget_envelope: BudgetEnvelope,
+                           timeout_seconds: float = .1) -> ExecutionSnapshot:
+        """Bind reserved supervision to its original live source in one commit.
+
+        The supervisor has its own claim allowance and reserved process pool;
+        parent limits and attempt/fence remain authoritative at claim and entry.
+        This private SDK composition does not relax submit_child's Run rules.
+        """
+        if type(parent_lease) is not ExecutionLease or type(budget_envelope) is not BudgetEnvelope:
+            raise TypeError("supervisor admission requires an original parent lease and budget")
+        return self._submit_managed(command, run_id=run_id, generation=generation,
+            parent_lease=parent_lease, budget_envelope=budget_envelope, timeout_seconds=timeout_seconds)
+
+    def _submit_managed(self, command: ExecutionCommandV2, *, run_id: str, generation: int,
+                        parent_lease: ExecutionLease | None = None,
+                        budget_envelope: BudgetEnvelope | None = None,
+                        timeout_seconds: float | None = None) -> ExecutionSnapshot:
 
         if type(command) is not ExecutionCommandV2:
             raise TypeError("submit_managed requires ExecutionCommandV2")
@@ -459,7 +492,7 @@ class SQLiteKernel(
         if command.correlation_id != run_id:
             raise ValueError("managed execution correlation_id must match run_id")
         encoded = encode_json(command.to_dict())
-        with self._transaction() as (connection, timestamp):
+        with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             control = connection.execute(
                 "SELECT generation,state FROM kernel_run_controls WHERE run_id=?",
                 (run_id,),
@@ -489,6 +522,12 @@ class SQLiteKernel(
                     raise IdempotencyConflictError(
                         "existing execution has no matching managed Run registration"
                     )
+                if parent_lease is not None:
+                    binding = connection.execute("SELECT parent_execution_id,parent_attempt,parent_fence "
+                        "FROM kernel_execution_limits WHERE execution_id=?", (command.execution_id,)).fetchone()
+                    if binding is None or tuple(binding) != (
+                            parent_lease.execution_id, parent_lease.attempt, parent_lease.fence):
+                        raise IdempotencyConflictError("existing supervisor has no matching source binding")
                 return self._snapshot(existing)
             if mapping is not None:
                 raise StorageIsolationError(
@@ -512,6 +551,12 @@ class SQLiteKernel(
                 raise IdempotencyConflictError(
                     "execution was accepted without its managed registration"
                 )
+            if parent_lease is not None:
+                parent = self._assert_lease(connection, parent_lease, timestamp=timestamp, states={"running"})
+                self._authorize_managed_operation(connection, parent_lease.execution_id,
+                    timestamp=timestamp, operation="supervisor admission")
+                self._bind_child_limits(connection, command.execution_id, parent, budget_envelope,
+                                        self._child_depth(connection, parent_lease.execution_id) + 1)
             return self._snapshot(row)
 
     def cancel_before_accept(
@@ -781,6 +826,7 @@ class SQLiteKernel(
             row = _next_claim_row(connection, timestamp, revisions)
             if row is None:
                 return None
+            self._assert_budget_clock(connection, row["execution_id"])
             reduce_state(
                 row["state"],
                 "lease",
@@ -865,11 +911,53 @@ class SQLiteKernel(
         safety = self._nonnegative_duration(
             start_safety_seconds, "start_safety_seconds"
         )
+        if execution_id is not None:
+            with self._control_lock(timeout_seconds):
+                deadline = self._control_deadline
+                limits = self._connection.execute(
+                    "SELECT parent_execution_id,envelope_json FROM kernel_execution_limits WHERE execution_id=?",
+                    (execution_id,)).fetchone()
+            if limits is not None and limits[0] is not None:
+                # Sampling waits must release the wrapper lock so an existing
+                # live owner can publish its floor. Admission still rechecks
+                # the parent relationship and lease in its own transaction.
+                from .budget_capture import _KernelBudgetCapture
+
+                envelope = BudgetEnvelope.from_dict(json.loads(limits[1]))
+                projected = envelope.recheckpoint(
+                    sample=sample_clock(wall_time=envelope.checkpoint.wall_at))
+                work = projected.view(sample=projected.checkpoint).remaining_work_seconds
+                if work is None or work > 0:
+                    if work is not None:
+                        work_deadline = time.monotonic() + work
+                        deadline = work_deadline if deadline is None else min(deadline, work_deadline)
+                    remaining = .1 if deadline is None else deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Kernel control admission budget elapsed")
+                    capture = _KernelBudgetCapture(self, limits[0])
+                    try:
+                        capture(projected, timeout_seconds=min(.1, remaining))
+                    except BaseException as exc:
+                        if getattr(exc, "budget_sample_token", None) is not None:
+                            # Transfer this exact live obligation to the caller's
+                            # original retry window; a new sampler cannot own it.
+                            exc.budget_sample_owner = capture
+                        raise
+            if deadline is not None:
+                timeout_seconds = deadline - time.monotonic()
+                if timeout_seconds <= 0:
+                    raise TimeoutError("Kernel control admission budget elapsed")
+        return self._claim_and_start(owner, revisions=revisions, floor=floor, safety=safety,
+            execution_id=execution_id, timeout_seconds=timeout_seconds, child_pool=child_pool)
+
+    def _claim_and_start(self, owner, *, revisions, floor, safety, execution_id,
+                         timeout_seconds, child_pool):
         with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
             self._reap_in_transaction(connection, timestamp)
             row = _next_claim_row(connection, timestamp, revisions, execution_id)
             if row is None:
                 return None
+            self._assert_budget_clock(connection, row["execution_id"])
             if child_pool is not None:
                 relationship = connection.execute(
                     "SELECT parent_execution_id FROM kernel_execution_limits WHERE execution_id=?",
@@ -1001,6 +1089,7 @@ class SQLiteKernel(
                 timestamp=timestamp,
                 operation="start",
             )
+            self._assert_budget_clock(connection, lease.execution_id)
             reduce_state(
                 row["state"],
                 "start",

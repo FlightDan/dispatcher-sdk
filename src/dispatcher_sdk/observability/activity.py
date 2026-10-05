@@ -29,7 +29,8 @@ class ActivityRecorder:
                  source_scope: str | None = None, metric_coverage: tuple[str, ...] | None = None,
                  progress_confirm: Callable[..., Mapping[str, Any]] | None = None,
                  clock=None, monotonic=None, start: bool = False,
-                 bind_current: bool = False) -> None:
+                 bind_current: bool = False,
+                 _defer_collector_registration: bool = False) -> None:
         if type(bind_current) is not bool:
             raise ValueError("bind_current must be a bool")
         self.journal = journal
@@ -76,7 +77,10 @@ class ActivityRecorder:
         self._close_complete = threading.Event()
         self._close_result: dict[str, Any] | None = None
         self._close_deadline: float | None = None
-        if self.source_scope is not None:
+        # Runtime owns one recorder per exact lease and scope. Its first owned
+        # flush can register after binding without delaying handler entry.
+        # Public construction keeps registration order even if flushes reorder.
+        if self.source_scope is not None and not _defer_collector_registration:
             try:
                 self._collector_incarnation = self.journal.register_collector(identity, self.source_id,
                     source_scope=self.source_scope, metric_coverage=self.metric_coverage)
@@ -91,11 +95,18 @@ class ActivityRecorder:
         if self._captured_at is not None and captured_at < self._captured_at:
             self._gaps += 1
         value = self._metrics.setdefault(metric, {"count": 0, "first_at": None, "last_at": None})
+        first_stream_bytes = (metric in ("stdout_bytes", "stderr_bytes")
+                              and value["count"] == 0 and count > 0)
         value["count"] += count
         if value["first_at"] is None:
             value["first_at"] = captured_at
         value["last_at"] = captured_at
         self._captured_at = captured_at
+        if first_stream_bytes:
+            # One early cumulative batch keeps a short-lived stream from
+            # waiting for the periodic tick. Later chunks remain coalesced;
+            # capture never performs SQLite work or flushes per chunk.
+            self._wake.set()
 
     def _wait_failure(self, error: str, captured_at: float, *, gap: bool = True) -> None:
         bounded_error = error.encode("utf-8")[:512].decode("utf-8", errors="ignore")
@@ -477,14 +488,15 @@ class ActivityRecorder:
         return self
 
     def _run(self) -> None:
-        while True:
-            self._wake.wait(self.options.flush_interval)
-            self._wake.clear()
-            if self._stop.is_set():
-                if self._close_deadline is not None:
-                    self._finish_close(self._close_deadline)
-                return
-            self.flush()
+        with self.journal._flush_anchor():
+            while True:
+                self._wake.wait(self.options.flush_interval)
+                self._wake.clear()
+                if self._stop.is_set():
+                    if self._close_deadline is not None:
+                        self._finish_close(self._close_deadline)
+                    return
+                self.flush()
 
     def close(self, *, timeout: float = 1.0) -> dict[str, Any]:
         """Stop collection and persist within one total caller wait budget.
@@ -511,6 +523,12 @@ class ActivityRecorder:
                     self._thread = threading.Thread(target=self._run, name="dispatcher-observation-flush", daemon=True)
                     self._thread.start()
         self._close_complete.wait(max(0.0, deadline - time.monotonic()))
+        # A persisted receipt precedes the flusher's physical anchor release.
+        # Use only this caller's remaining allowance to finish ordinary close;
+        # unresolved workers keep their existing Runtime ownership.
+        worker = self._thread
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(max(0.0, deadline - time.monotonic()))
         return self._close_result or {"state": "pending", "reason": "close_in_progress",
                                       "timed_out": True, "final_flush_persisted": False,
                                       "source_closed": False}

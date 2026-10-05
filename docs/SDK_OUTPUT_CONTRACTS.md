@@ -137,8 +137,11 @@ status_instruction = (
    不能靠增加执行次数或新建 Run 来无限延长返工预算。
 
 `new_attempt` 只创建新的应用 attempt，还需要显式 `dispatch`。它要求旧 attempt
-已结算，且 Run 仍为 `running`。已经 `finish` 的 Run 不能重新开启或追加返工；
-若应用决定重新发起工作，应创建新的 Run，并保留原 Run、失败证据及预算关联。
+已结算，且 Run 仍为 `running`。已经 `finish` 的 Run 不能直接追加返工。
+对满足结算、投递及授权条件的失败或取消
+Run，应用可通过显式 `reopen_run` 恢复同一 Run，并遵守新的 generation；
+成功 Run 不支持该恢复。也可按业务决定创建关联的新 Run，保留失败证据与预算。
+具体条件见 [SDK 恢复接口](SDK.md#reopen-a-failed-run-in-place)。
 存在未决外部副作用时，先遵循[恢复协议](SDK_RECOVERY.md)，不能以格式返工绕过它。
 
 ## 5. 格式通过后再决定业务路由

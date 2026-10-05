@@ -171,6 +171,10 @@ class ManagedGateTests(unittest.TestCase):
             )
             from dispatcher_sdk.execution_kernel._sqlite_schema import upgrade_kernel_schema_v3_to_v4
             upgrade_kernel_schema_v3_to_v4(upgraded)
+            self.assertEqual(upgraded.execute(
+                "SELECT schema_version FROM kernel_schema_meta").fetchone()[0], 4)
+            from dispatcher_sdk.execution_kernel._sqlite_schema import upgrade_kernel_schema_v4_to_v5
+            upgrade_kernel_schema_v4_to_v5(upgraded)
         upgraded_kernel = SQLiteKernel(legacy_path)
         self.addCleanup(upgraded_kernel.close)
         snapshot = upgraded_kernel.get("legacy:one")

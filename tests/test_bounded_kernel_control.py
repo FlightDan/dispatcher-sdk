@@ -110,7 +110,18 @@ class BoundedKernelControlTests(unittest.TestCase):
                 self.assertEqual(kernel.get("bounded").state, "queued")
 
     def test_child_wait_preserves_busy_error_without_revoking_parent(self):
-        with tempfile.TemporaryDirectory() as directory:
+        import json
+        import traceback
+        from tests._acceptance_evidence import retained_directory
+        from tests._storage_evidence import StorageEvidence
+
+        directory = retained_directory("sdk-bounded-child-control-")
+        storage = StorageEvidence(directory, self)
+        storage.start(include_kernel=True)
+        self.addCleanup(storage.stop)
+        evidence = {"test": self.id(), "original_wait_seconds": 1, "attempts": []}
+        self.addCleanup(lambda: storage.save(checkpoint=evidence))
+        try:
             path = Path(directory) / "kernel.sqlite3"
             with Kernel.open_sqlite(path, {"fixture": child_control_handler}, isolation_mode="thread") as runtime:
                 parent = runtime.command("fixture", execution_id="parent", idempotency_key="parent",
@@ -127,13 +138,44 @@ class BoundedKernelControlTests(unittest.TestCase):
                         with closing(sqlite3.connect(path)) as writer, writer:
                             writer.execute("BEGIN IMMEDIATE")
                             began = time.monotonic()
-                            with self.assertRaises(sqlite3.OperationalError) as caught:
-                                children.wait_for("missing-child", request_id="wait", timeout_seconds=1)
+                            with self.assertRaises((sqlite3.OperationalError, TimeoutError)) as caught:
+                                try:
+                                    children.wait_for("missing-child", request_id="wait", timeout_seconds=1)
+                                except Exception as error:
+                                    evidence["attempts"].append({"control_timeout": control_timeout,
+                                        "elapsed": time.monotonic()-began, "type": type(error).__name__,
+                                        "message": str(error), "traceback": traceback.format_exc(),
+                                        "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                                        "sqlite_errorname": getattr(error, "sqlite_errorname", None)})
+                                    raise
+                            if isinstance(caught.exception, sqlite3.OperationalError):
+                                self.assertIn("locked", str(caught.exception))
+                            else:
+                                # A configured admission can expire before
+                                # BEGIN observes the held SQLite writer.
+                                self.assertEqual(type(caught.exception), TimeoutError)
+                                self.assertIn(str(caught.exception), (
+                                    "Kernel control admission budget elapsed",
+                                    "Kernel control lock admission timed out"))
                             self.assertNotIsInstance(caught.exception, ChildExecutionError)
                             self.assertGreater(time.monotonic()-began, .8)
                             self.assertLess(time.monotonic()-began, 1.25)
                             writer.rollback()
                         self.assertEqual(bounded.verify(lease).lease, lease)
+        except BaseException as error:
+            evidence["original_error"] = {"type": type(error).__name__, "message": str(error),
+                                          "traceback": traceback.format_exc()}
+            raise
+        finally:
+            try:
+                storage.save(phase="before-cleanup", checkpoint=evidence)
+                (directory / "evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+            except BaseException as error:
+                evidence["capture_error"] = {"type": type(error).__name__, "message": str(error)}
+                if "original_error" not in evidence:
+                    raise
+                print("bounded_child_control_capture_error=" + repr(error), flush=True)
+            print("bounded_child_control_evidence=" + str(directory / "evidence.json"), flush=True)
 
     def test_invalid_control_bound_fails_before_creating_a_store(self):
         with tempfile.TemporaryDirectory() as directory:

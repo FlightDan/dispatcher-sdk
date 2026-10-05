@@ -11,6 +11,31 @@ from ._sqlite_errors import is_sqlite_contention
 _T = TypeVar("_T")
 
 
+def begin_immediate(connection: sqlite3.Connection) -> None:
+    """Acquire a writer without native busy backoff missing short free slots.
+
+    Keep the connection's existing admission allowance. Only BEGIN retries;
+    the original busy policy is restored before any transaction body or COMMIT.
+    """
+    timeout_ms = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+    if timeout_ms == 0:
+        connection.execute("BEGIN IMMEDIATE")
+        return
+    deadline = time.monotonic() + timeout_ms / 1000
+    connection.execute("PRAGMA busy_timeout=0")
+    try:
+        retry_sqlite_admission(lambda: connection.execute("BEGIN IMMEDIATE"),
+            deadline=deadline, expired=TimeoutError("SQLite writer admission elapsed"))
+    except BaseException as error:
+        try:
+            connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
+        except BaseException as restoration_error:
+            raise error from restoration_error
+        raise
+    else:
+        connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
+
+
 def retry_sqlite_admission(operation: Callable[[], _T], *, deadline: float,
                            expired: Exception,
                            transaction_retained: Callable[[], bool] | None = None) -> _T:

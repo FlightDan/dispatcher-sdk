@@ -49,13 +49,13 @@ adds the pinned OpenSandbox SDK and requires a separately deployed service.
 
 ## Version 0.7 integration guides
 
-- [Execution observability improvement goal](EXECUTION_OBSERVABILITY_GOAL.md): scoped implementation tasks and acceptance criteria for activity, budgets, waits, cleanup and stall notifications; planning complete does not imply implementation acceptance.
-- [0.7.0.dev1 improvement plan](DEV_0_7_0_DEV1_IMPROVEMENT_PLAN.md): proposed managed Run lifecycle and authorization changes, compatibility strategy, implementation tasks and acceptance criteria; not yet implemented.
+- [Execution activity and supervision](EXECUTION_OBSERVABILITY.md): task observations, inherited budgets, bounded child calls and optional stall handling in the current development tree. [Acceptance evidence](EXECUTION_OBSERVABILITY_ACCEPTANCE.md) tracks completed checks and remaining requirements.
+- [0.7.0.dev1 improvement plan](DEV_0_7_0_DEV1_IMPROVEMENT_PLAN.md): managed Run lifecycle and authorization design, partial implementation and remaining acceptance criteria. The complete multi-task pause/revise/resume interface remains unfinished.
 - [Diagnostics and projections](SDK_DIAGNOSTICS_AND_PROJECTIONS.md): deployment identity, durable event consumption, work availability and cancellation reports.
 - [Cancellation evidence](CANCELLATION_EVIDENCE.md): optional journal configuration, cleanup evidence, backup and compatibility.
 - [Task submission](TASK_SUBMISSION.md): `submit_task()` atomically records task, watch and dispatch intent; `Runtime.command()` binds one handler.
 - [Managed application API](MANAGED_APPLICATION.md): unified lifecycle, task submission and durable result consumption.
-- [Storage and upgrades](STORAGE_AND_UPGRADES.md): schema 3 copy upgrades, FULL/NORMAL profiles, preflight, backup, paged reads and `continue_run()`.
+- [Storage and upgrades](STORAGE_AND_UPGRADES.md): explicit copy upgrades to Orchestrator schema 4 and Kernel schema 5, FULL/NORMAL profiles, preflight, backup, paged reads and `continue_run()`.
 - [Local restore activation](LOCAL_RECOVERY.md): authenticated stopped-source handoff and recovery boundaries.
 - [SQLite operations](SQLITE_OPERATIONS.md): backlog diagnostics and multiprocess capacity measurements.
 - [Run storage validation](RUN_STORAGE_VALIDATION.md): incremental historical storage measurements; full snapshot calls still scale with segment size.
@@ -67,7 +67,9 @@ Version 0.7 does not automatically migrate old Orchestrator databases. Preserve
 a backup and follow [storage and upgrades](STORAGE_AND_UPGRADES.md) for either an
 explicit copy upgrade or a clean-store handoff. Do not open a legacy store as a
 current writer.
-Execution command/result contracts and Kernel storage remain version 2.
+Execution command/result contracts remain V2. Current storage uses Kernel schema 5,
+Orchestrator schema 4 and inbox schema 1. Schema versions are independent of the
+package version; ordinary opening never upgrades older stores.
 
 ## Command-driven example
 
@@ -221,9 +223,9 @@ Orchestrator and Kernel databases, this is a recoverable SDK boundary rather
 than one transaction across both databases. Use
 `Orchestrator.upgrade_schema(path)` once to prepare an existing declared
 Orchestrator schema 2 database, then use the explicit `upgrade_storage` copy
-operation to produce a schema 3 destination. The preparation preserves Run
+operation to produce a current-schema destination. The preparation preserves Run
 history and is idempotent; it does not make the schema 2 source directly readable
-by the schema 3 Orchestrator.
+by the current Orchestrator.
 
 ## Decisions, receipts and recovery
 

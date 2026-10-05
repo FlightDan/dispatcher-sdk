@@ -144,7 +144,10 @@ class ChildInspectionRetryTests(unittest.TestCase):
         capability = object.__new__(HandlerChildren)
         capability.kernel = window.kernel
         capability.store = self.store
-        row = {'budget_json': json.dumps(window.envelope.to_dict())}
+        capability.command = SimpleNamespace(execution_id='parent')
+        capability.parent_lease = SimpleNamespace(attempt=1, fence=1)
+        row = {'budget_json': json.dumps(window.envelope.to_dict()), 'parent_execution_id': 'parent',
+               'parent_attempt': 1, 'parent_fence': 1, 'child_execution_id': 'missing-child'}
         proof_error = InspectionBudgetExceeded('bounded completion proof read expired')
         # Keep this protocol check on the exhausted original local window.
         # Reconstructing a different window while injecting its predecessor's

@@ -13,6 +13,7 @@ from ..execution_kernel import (
     ResultOutboxStatusV2, StaleFenceError,
 )
 from .contracts import canonical
+from .._sqlite_admission import begin_immediate
 
 
 def _positive(value, name):
@@ -60,7 +61,7 @@ class ResultsMixin:
     def _results_transaction(self):
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            begin_immediate(connection)
             observed = self._results_now()
             now = max(observed, connection.execute("SELECT value FROM sdk_result_clock WHERE id=1").fetchone()[0])
             connection.execute("UPDATE sdk_result_clock SET value=? WHERE id=1", (now,))

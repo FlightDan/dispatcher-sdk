@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 import math
 import os
@@ -29,6 +30,7 @@ from ._process_runtime import (
     invoke_handler, _serialize_handler_outcome,
     _budget_outcome, _confirmed_entry_packet, _close_context, _capture_completion_time,
     _bootstrap_diagnostic, _observe_phase, _budget_sample, _merge_budget_floor,
+    _BudgetTracker, _control_error_details, _finish_budget_capture,
 )
 from .budget import BudgetClockUnknownError, BudgetEnvelope
 from ._registry import Handler
@@ -159,7 +161,8 @@ class _WinAPI:
         raise RuntimeError("Windows Job process list exceeds its bounded enumeration")
 
 
-def _create_suspended(api: _WinAPI, arguments: list[str]) -> tuple[Any, _ProcessInformation]:
+def _create_suspended(api: _WinAPI, arguments: list[str], *,
+                      memory_limit_bytes: int | None = None) -> tuple[Any, _ProcessInformation]:
     job = api.dll.CreateJobObjectW(None, None)  # Unnamed, non-inheritable.
     api.check(job, "CreateJobObjectW")
     info = _ProcessInformation()
@@ -168,8 +171,13 @@ def _create_suspended(api: _WinAPI, arguments: list[str]) -> tuple[Any, _Process
     try:
         limits = _ExtendedLimits()
         limits.BasicLimitInformation.LimitFlags = _KILL_ON_JOB_CLOSE
+        if memory_limit_bytes is not None:
+            if type(memory_limit_bytes) is not int or not 0 < memory_limit_bytes <= sys.maxsize:
+                raise ValueError("memory_limit_bytes must be a positive integer at most sys.maxsize")
+            limits.BasicLimitInformation.LimitFlags |= 0x00000200  # JOB_OBJECT_LIMIT_JOB_MEMORY
+            limits.JobMemoryLimit = memory_limit_bytes
         api.check(api.dll.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)),
-                  "SetInformationJobObject(KILL_ON_JOB_CLOSE)")
+                  "SetInformationJobObject(extended limits)")
         size = ctypes.c_size_t()
         api.dll.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
         if not size.value:
@@ -365,9 +373,22 @@ class WindowsProcessHandle:
 
 class _Watchdog:
     def __init__(self, handle: WindowsProcessHandle, deadline: float,
-                 envelope: BudgetEnvelope | None = None, now: Any = None) -> None:
+                 envelope: BudgetEnvelope | None = None, now: Any = None,
+                 *, guarded: bool = False) -> None:
         self.handle, self.deadline = handle, deadline
         self.envelope, self.now = envelope, now
+        self.guarded = guarded
+        self._elapsed_clock = time.monotonic
+        if guarded and envelope is not None:
+            anchor = envelope.checkpoint
+            if (anchor.domain_scope == "boot" and anchor.domain_id is not None
+                    and anchor.domain_id.startswith("linux-boot:") and hasattr(time, "CLOCK_BOOTTIME")):
+                self._elapsed_clock = lambda: time.clock_gettime(time.CLOCK_BOOTTIME)
+            elif (anchor.domain_scope == "boot" and anchor.domain_id is not None
+                    and anchor.domain_id.startswith("windows-boot:") and os.name == "nt"):
+                ticks = ctypes.WinDLL("kernel32").GetTickCount64
+                ticks.argtypes, ticks.restype = [], ctypes.c_ulonglong
+                self._elapsed_clock = lambda: ticks() / 1000.
         self.cleanup = False
         self.clock_error: BudgetClockUnknownError | None = None
         self.lock = threading.Lock()
@@ -388,7 +409,24 @@ class _Watchdog:
 
     def _retain_sample_locked(self) -> None:
         if self.envelope is not None:
-            self.envelope = self.envelope.recheckpoint(sample=_budget_sample(self.now))
+            self.envelope = self.envelope.recheckpoint(sample=(
+                replace(self.envelope.checkpoint, elapsed_at=self._elapsed_clock())
+                if self.guarded else _budget_sample(self.now)))
+
+    def retain_capture(self, envelope: BudgetEnvelope) -> None:
+        """Merge a guarded driver sample without putting storage in the timer."""
+        with self.lock:
+            if self.envelope is None:
+                self.envelope = envelope
+            else:
+                self.envelope = _merge_budget_floor(self.envelope, envelope)
+            self._retain_sample_locked()
+            self.deadline = min(self.deadline, self._bound_locked(math.inf, hard=self.cleanup))
+            self.inherited_work_deadline = min(self.inherited_work_deadline,
+                self._bound_locked(math.inf))
+            self.inherited_hard_deadline = min(self.inherited_hard_deadline,
+                self._bound_locked(math.inf, hard=True))
+            self.changed.set()
 
     def _bound_locked(self, deadline: float, *, hard: bool = False) -> float:
         if self.envelope is None:
@@ -545,10 +583,9 @@ def _worker_main(directory: str) -> None:
             _atomic_write(root / "returned.json", json.dumps({"outcome_json": encoded,
                 "completed_monotonic": time.monotonic()}, allow_nan=False))
         receipt = _close_context(context)
-        if receipt["state"] != "confirmed":
-            final = json.loads(encoded)
-            final["telemetry_flush"] = receipt
-            encoded = json.dumps(final, allow_nan=False)
+        final = json.loads(encoded)
+        final["telemetry_flush"] = receipt
+        encoded = json.dumps(final, allow_nan=False)
         context = None
         kernel.close()
         kernel = None
@@ -614,6 +651,7 @@ def invoke_windows_handler(
     service_spec: dict | None = None,
     on_entered: Optional[Callable[[dict[str, Any]], None]] = None,
     on_phase: Optional[Callable[[str, dict[str, Any]], None]] = None,
+    capture_budget: Any = None,
 ) -> dict[str, Any]:
     """Spawn one native Windows worker and publish only after Job containment."""
     profile = validate_durability(durability)
@@ -621,19 +659,23 @@ def invoke_windows_handler(
         raise ValueError("Windows process isolation requires a file-backed SQLite database")
     if type(start_timeout) not in (int, float) or not math.isfinite(start_timeout) or start_timeout <= 0:
         raise ValueError("start_timeout must be finite and positive")
+    guarded = bool((service_spec or {}).get("guard_budget")) or capture_budget is not None
+    tracker = _BudgetTracker(budget_envelope, now, capture_budget, guarded=guarded)
+
+    def publish(outcome, envelope, entry=None):
+        published, checkpoint = _finish_budget_capture(capture_budget, envelope)
+        if checkpoint.get("token") is not None:
+            outcome = {**outcome, "budget_checkpoint": checkpoint}
+        return _budget_outcome(outcome, published, entry)
     try:
-        if budget_envelope is not None:
-            budget_envelope = budget_envelope.recheckpoint(sample=_budget_sample(now))
-            bound = budget_envelope.deadline_monotonic(sample=budget_envelope.checkpoint)
-            start_deadline = min(time.monotonic() + start_timeout,
-                                 math.inf if bound is None else bound)
-        else:
-            start_deadline = time.monotonic() + start_timeout
+        start_deadline = tracker.bound(time.monotonic() + start_timeout)
+        budget_envelope = tracker.envelope
     except BudgetClockUnknownError as exc:
-        return _budget_outcome({"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
-                               "control_error": True, "retryable": False, "effect_ids": []}, budget_envelope)
+        return publish({"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
+                               "control_error": True, "retryable": False, "effect_ids": [],
+                               "details": _control_error_details(exc.__cause__ or exc)}, tracker.envelope)
     if start_deadline <= time.monotonic():
-        return _budget_outcome({"kind": "timeout", "phase": "admission", "effect_ids": []}, budget_envelope)
+        return publish({"kind": "timeout", "phase": "admission", "effect_ids": []}, budget_envelope)
     api = _WinAPI()
     with _worker_directory() as directory:
         root = Path(directory)
@@ -650,7 +692,10 @@ def invoke_windows_handler(
         (root / "request.pickle").write_bytes(pickle.dumps(request, protocol=4))
         # sys.path may be configured by an embedder/test runner without PYTHONPATH.
         bootstrap = "import sys; sys.path[:]=%r; " % list(sys.path) + _BOOTSTRAP
-        job, info = _create_suspended(api, [sys.executable, "-u", "-c", bootstrap, directory])
+        arguments = [sys.executable, "-u", "-c", bootstrap, directory]
+        memory_limit = (service_spec or {}).get("process_memory_limit_bytes")
+        job, info = (_create_suspended(api, arguments) if memory_limit is None else
+                     _create_suspended(api, arguments, memory_limit_bytes=memory_limit))
         handle = WindowsProcessHandle(api, job, info)
         watchdog = None
         registered = False
@@ -663,8 +708,12 @@ def invoke_windows_handler(
         contained_at = None
         returned = False
         telemetry_unknown = None
+        final_telemetry_receipt = None
         try:
-            watchdog = _Watchdog(handle, start_deadline, budget_envelope, now)
+            watchdog = (_Watchdog(handle, start_deadline, budget_envelope, now, guarded=True)
+                        if guarded else _Watchdog(handle, start_deadline, budget_envelope, now))
+            if guarded:
+                tracker.on_capture = watchdog.retain_capture
             if on_started is not None:
                 registered = bool(on_started(handle))
                 if not registered:
@@ -703,6 +752,8 @@ def invoke_windows_handler(
                         budget_envelope = actual
                     deadline = watchdog.business_deadline(command.timeout_seconds, envelope=budget_envelope,
                                                          deadline=entry["deadline_monotonic"])
+                    if budget_envelope is not None:
+                        tracker.entered(budget_envelope)
                     hard_deadline = watchdog.hard_deadline_bound(entry["hard_deadline_monotonic"])
                     if on_entered is not None:
                         try:
@@ -730,18 +781,53 @@ def invoke_windows_handler(
                         break
                 if (root / "outcome.json").exists():
                     outcome = json.loads((root / "outcome.json").read_text(encoding="utf-8"))
+                    if type(outcome) is dict:
+                        final_telemetry_receipt = outcome.get("telemetry_flush")
                     work_expired = not returned and deadline is not None and time.monotonic() >= deadline
                     if deadline is not None and time.monotonic() < deadline and hard_deadline is not None:
                         watchdog.cleanup_deadline(hard_deadline)
                     break
                 if handle.exited():
                     break
+                if guarded:
+                    # The watchdog can enforce the original native deadline
+                    # while the driver waits on SQLite outside its timer lock.
+                    observed = watchdog.snapshot()
+                    if observed is not None:
+                        tracker.entered(observed)
+                    native = watchdog.deadline
+                    tracker.bound(native, hard=watchdog.cleanup)
+                    if tracker.envelope is not None:
+                        budget_envelope = tracker.envelope
+                        watchdog.retain_capture(budget_envelope)
                 time.sleep(_POLL_SECONDS)
         except BudgetClockUnknownError as exc:
-            outcome = {"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
-                       "control_error": True, "retryable": False, "effect_ids": []}
+            # A ready factual result remains collectible even when a later
+            # authority sample cannot be published. It does not admit new work.
+            if outcome is None:
+                for name in ("outcome.json", "returned.json"):
+                    path = root / name
+                    if not path.exists() or path.stat().st_size > 256 * 1024:
+                        continue
+                    try:
+                        available = json.loads(path.read_text(encoding="utf-8"))
+                        available = json.loads(available["outcome_json"]) if name == "returned.json" else available
+                        if type(available) is dict:
+                            outcome = available
+                            break
+                    except (OSError, ValueError, KeyError, TypeError):
+                        continue
+            if outcome is None:
+                outcome = {"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
+                           "control_error": True, "retryable": False, "effect_ids": [],
+                           "details": _control_error_details(exc.__cause__ or exc)}
+            else:
+                outcome["budget_capture_error"] = {"state": "unknown", "error":
+                    _control_error_details(exc.__cause__ or exc)}
             if watchdog is not None:
                 watchdog.clock_error = exc
+                if tracker.envelope is not None:
+                    watchdog.retain_capture(tracker.envelope)
         finally:
             try:
                 if not handle.terminate():
@@ -768,12 +854,19 @@ def invoke_windows_handler(
                 except BudgetClockUnknownError as exc:
                     watchdog.clock_error = exc
         if handle.revocation_reason is not None:
-            return _budget_outcome({"kind": "authority_revoked", "reason": handle.revocation_reason, "effect_ids": []}, budget_envelope, entry)
-        if watchdog is not None and getattr(watchdog, "clock_error", None) is not None:
-            return _budget_outcome({"kind": "error", "code": "budget_clock_unknown",
+            return publish({"kind": "authority_revoked", "reason": handle.revocation_reason, "effect_ids": []}, budget_envelope, entry)
+        known_work_expired = (not returned and budget_envelope is not None and
+            budget_envelope.view(sample=budget_envelope.checkpoint).remaining_work_seconds == 0)
+        if watchdog is not None and getattr(watchdog, "clock_error", None) is not None and not known_work_expired:
+            error = {"kind": "error", "code": "budget_clock_unknown",
                                    "message": str(watchdog.clock_error), "control_error": True,
-                                   "retryable": False, "effect_ids": []}, budget_envelope, entry)
-        if (work_expired or (entry is None and deadline is not None and time.monotonic() >= deadline)
+                                   "retryable": False, "effect_ids": [],
+                                   "details": _control_error_details(watchdog.clock_error.__cause__ or watchdog.clock_error)}
+            if type(outcome) is dict:
+                error["details"]["business_outcome"] = outcome
+                error["effect_ids"] = outcome.get("effect_ids", [])
+            return publish(error, budget_envelope, entry)
+        if (known_work_expired or work_expired or (entry is None and deadline is not None and time.monotonic() >= deadline)
                 or (watchdog is not None and watchdog.expired)
                 or (hard_deadline is not None and (contained_at is None or contained_at >= hard_deadline))):
             capture_unknown = None
@@ -791,10 +884,17 @@ def invoke_windows_handler(
                             captured = json.loads(captured["outcome_json"])
                         if type(captured) is dict:
                             outcome = captured
+                            if name == "outcome.json":
+                                final_telemetry_receipt = captured.get("telemetry_flush")
                             break
                     except (ValueError, KeyError, TypeError, OSError) as exc:
                         capture_unknown = f"{type(exc).__name__}: {exc}"[:2048]
             timeout = {"kind": "timeout", "effect_ids": [] if type(outcome) is not dict else outcome.get("effect_ids", [])}
+            # A Job cutoff can kill the recorder before its final receipt.
+            # A returned business packet alone never proves telemetry flush.
+            timeout["telemetry_flush"] = (final_telemetry_receipt if type(final_telemetry_receipt) is dict else {
+                "state": "unknown", "reason": "worker_terminated_without_final_flush_receipt"}
+            )
             admission_work_expired = (budget_envelope is not None and
                 budget_envelope.view(sample=budget_envelope.checkpoint).remaining_work_seconds == 0)
             if entry is None and deadline is None and not admission_work_expired:
@@ -809,7 +909,10 @@ def invoke_windows_handler(
             elif capture_unknown is not None:
                 timeout["details"] = {**timeout.get("details", {}),
                     "business_outcome_capture": {"state": "unknown", "reason": capture_unknown}}
-            return _budget_outcome(timeout, budget_envelope, entry)
+            if watchdog is not None and getattr(watchdog, "clock_error", None) is not None:
+                timeout["budget_capture_error"] = _control_error_details(
+                    watchdog.clock_error.__cause__ or watchdog.clock_error)
+            return publish(timeout, budget_envelope, entry)
         # The worker can atomically publish between the loop's file check and
         # its exit check. After containment no writer remains, so recover that
         # final publication without weakening cancellation or deadline checks.
@@ -829,8 +932,8 @@ def invoke_windows_handler(
             if (entry is None and outcome.get("code") == "handler_process_start_failure"
                     and type(outcome.get("details")) is dict and outcome["details"].get("exception_type")):
                 _observe_phase(on_phase, "worker_bootstrap_failed", outcome["details"])
-            return _budget_outcome(outcome, budget_envelope, entry)
-        return _budget_outcome({"kind": "error", "code": "handler_process_exit" if deadline else "handler_process_start_failure",
+            return publish(outcome, budget_envelope, entry)
+        return publish({"kind": "error", "code": "handler_process_exit" if deadline else "handler_process_start_failure",
                 "message": "Windows worker exited without a completed outcome",
                 "retryable": False, "details": {"exitcode": handle.exitcode, "stderr_tail": tail},
                 "effect_ids": []}, budget_envelope, entry)

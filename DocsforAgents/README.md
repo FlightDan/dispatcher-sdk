@@ -13,6 +13,7 @@ The SDK does not invoke a model or choose business routing.
 
 | Your task | Read | Runnable reference |
 | --- | --- | --- |
+| Run and observe a managed local task | [Managed application API](../docs/MANAGED_APPLICATION.md), [execution activity](../docs/EXECUTION_OBSERVABILITY.md) | [managed_task.py](../examples/managed_task.py) |
 | Run a Python function and retain queued work across restart | [Integration](INTEGRATION.md), [public API](../docs/PUBLIC_API.md) | [kernel_task.py](../examples/kernel_task.py) |
 | Submit one task with stable replay identity | [Atomic task submission](../docs/TASK_SUBMISSION.md) | Complete example in that guide |
 | Execute a script and wake a conversation | [Scripts and notifications](../docs/SDK_SCRIPT_WAKEUPS.md), [notification inbox](../docs/NOTIFICATION_INBOX.md) | [sdk_script_wakeup.py](../examples/sdk_script_wakeup.py) |
@@ -20,11 +21,14 @@ The SDK does not invoke a model or choose business routing.
 | Recover an interrupted external operation | [Recovery and retry](../docs/SDK_RECOVERY.md) | [effect_recovery.py](../examples/effect_recovery.py) |
 | Persist an audit consumer without losing events | [Integration FAQ](../docs/SDK_INTEGRATION_FAQ.md) (Chinese) | [durable_audit.py](../examples/durable_audit.py) |
 | Bound a trusted task's process lifetime | [Public API and isolation](../docs/PUBLIC_API.md) | [isolation_timeout.py](../examples/isolation_timeout.py) (Linux) |
+| Handle opt-in stall notices with reserved supervisor capacity | [Execution activity and supervision](../docs/EXECUTION_OBSERVABILITY.md) | [managed_stall_supervisor.py](../examples/managed_stall_supervisor.py) |
 | Execute through a remote sandbox | [Sandbox runtime](../docs/SANDBOX_RUNTIME.md), [adapters](../docs/SANDBOX_ADAPTERS.md) | Validation commands in those guides |
 | Upgrade, back up, or grow a persistent deployment | [Storage and upgrades](../docs/STORAGE_AND_UPGRADES.md) | Preflight and backup examples in that guide |
 
 Before submitting an integration, review [contracts and pitfalls](CONTRACTS.md)
 and run the applicable [verification steps](VERIFICATION.md).
+The examples show specific paths. Check the [acceptance index](../docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md)
+for current platform coverage and unfinished verification.
 
 ## Reading and maintenance rules
 
@@ -39,4 +43,3 @@ and run the applicable [verification steps](VERIFICATION.md).
   contract, update its canonical guide and examples, then adjust these links
   and summaries as needed.
 - For changes to the SDK itself, follow [CONTRIBUTING.md](../CONTRIBUTING.md).
-

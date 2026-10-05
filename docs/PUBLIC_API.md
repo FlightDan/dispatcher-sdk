@@ -11,7 +11,11 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 
 | Entry point | Use |
 | --- | --- |
-| `Dispatcher`, `Task` (package root) | Managed lifecycle, replay-safe submission, built-in inbox and result consumption |
+| `Dispatcher`, `Task` (package root) | Managed lifecycle, replay-safe submission, built-in inbox, result consumption and task activity reads |
+| `ExecutionActivity`, `ObservationOptions`, `StallPolicy`, `ManagedStallOptions` (package root or observability package) | Activity reporting, bounded observation storage and optional stall notifications or managed supervisor handling |
+| `BudgetEnvelope`, `ExecutionBudget`, `DeadlineConstraint` (package root or execution package) | Inherited deadline constraints and budget views |
+| `ChildCalls`, `HandlerChildren`, `ChildExecutionError` (execution package) | Bounded child execution and original child failure/result identity |
+| `BudgetClockUnknownError`, `ClockCheckpoint` (execution package) | Explicit unknown clock continuity and retained observed clock floors |
 | `DeploymentMismatchError`, `RecoveryRequiredError` (package root) | Structured startup and effect-recovery boundaries |
 | `SubmissionConflictError` (package root) | Stable submission identity reused with different content |
 | `inspect_diagnostics` (diagnostics module) | Read-only backlog, recovery and file-size observations |
@@ -52,6 +56,11 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 | `inspect_cancellation`, `CancellationRecoveryReport`, `ExecutionCancellationReport`, `CancellationFact` | Read-only phase and generation evidence; also available as an Orchestrator method |
 | `CancellationJournal`, `inspect_cancellation_journal`, `CancellationReceipt` (execution package) | Explicit, separate durable cancellation evidence component and its read-only reader |
 
+See [execution activity and supervision](EXECUTION_OBSERVABILITY.md) for task
+reads, handler activity, child calls and managed stall handlers. These are
+development APIs; [the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md)
+records the current candidate requirements.
+
 See [diagnostics and projections](SDK_DIAGNOSTICS_AND_PROJECTIONS.md) for complete
 signatures, failure semantics, evidence limits and runnable examples.
 See [shutdown, inspection and origin APIs](SDK_RELIABILITY.md) and
@@ -87,7 +96,7 @@ are separate identities:
 
 - Execution command/result contracts use `SCHEMA_VERSION = 2`. Unknown fields,
   invalid JSON values and conflicting identities are rejected.
-- Kernel SQLite storage uses schema 4 with its `kernel_schema_meta` marker.
+- Kernel SQLite storage uses schema 5 with its `kernel_schema_meta` marker.
   The current development tree uses Orchestrator schema 4 and `sdk_*` tables;
   supported earlier schema 2/3 stores require an explicit copy upgrade.
   Older unversioned Orchestrator databases are incompatible and are not migrated
@@ -107,8 +116,9 @@ its registry fingerprint. Opaque state requires an explicit, stable, nonempty
 `__execution_kernel_revision__` deployment revision. Keep that revision tied to
 the deployed implementation. The Kernel contract describes this binding.
 
-The SDK has no general database migration facility. Private modules and table
-layouts are not a compatibility contract across releases.
+The SDK provides explicit copy upgrades for documented source layouts. It has
+no general migration facility for arbitrary or unversioned databases. Private
+modules and table layouts are not a compatibility contract across releases.
 Preserve durable state and the matching deployment when restarting. See
 [storage and upgrades](STORAGE_AND_UPGRADES.md) for read-only preflight, backups,
 FULL/NORMAL durability profiles and the drain-to-new-store upgrade procedure.
@@ -118,8 +128,8 @@ FULL/NORMAL durability profiles and the drain-to-new-store upgrade procedure.
 Python 3.10+ is required. The core has no third-party runtime dependencies.
 The optional `dispatcher-sdk[opensandbox]` extra installs `opensandbox==0.1.16`.
 CI is configured for Linux and Windows on Python 3.10 through 3.13; configuration
-is not evidence of a passing run on every version. Native validation passed on
-Windows 11 x64, build 10.0.26100.9168, with official Python 3.12.10: the full suite
+is not evidence of a passing run on every version. Historical native validation
+passed on 2026-09-07 on Windows 11 x64, build 10.0.26100.9168, with official Python 3.12.10: the full suite
 ran 324 tests in 153.814 seconds with 30 platform-specific skips. This includes
 source-to-sdist-to-wheel packaging and the offline installed-package suite.
 The native runtime module ran 17 tests in 26.529 seconds: 16 passed and only the
@@ -128,7 +138,10 @@ non-Windows refusal test skipped. Storage, Run and sandbox checks passed all
 Five installed examples passed; documentation link checks passed alongside
 both README script examples, with two Linux-only examples skipped. These results
 do not verify every supported Windows/Python combination. macOS is not in the CI
-matrix. See [Windows runtime](WINDOWS_RUNTIME.md) for scope and reproduction.
+matrix. They also predate the current observability candidate and do not
+verify its native Windows paths. See [Windows runtime](WINDOWS_RUNTIME.md) for
+scope and reproduction, and [current acceptance](EXECUTION_OBSERVABILITY_ACCEPTANCE.md)
+for the pending matrix.
 
 `isolation_mode="auto"` selects process isolation on native Windows or when
 POSIX fork is available, and thread isolation otherwise. Explicit process mode

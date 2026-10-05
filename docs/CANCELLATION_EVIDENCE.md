@@ -8,8 +8,9 @@ generation.
 ## Storage design
 
 The optional Runtime cancellation journal uses a separate SQLite file that the
-caller explicitly configures. Current Kernel and Orchestrator storage use schema
-4; existing sandbox storage uses schema 1. Enabling cancellation evidence creates
+caller explicitly configures. Current Kernel storage uses schema 5 and
+Orchestrator storage uses schema 4; existing sandbox storage uses schema 1.
+Enabling cancellation evidence creates
 a separate schema-1 journal without migrating an existing active
 database. Existing SDK APIs keep their default behavior.
 
@@ -32,6 +33,10 @@ execution or replaces revision/fence checks.
   survive Runtime restart. A request receipt, if already persisted, remains
   durable; absent failure receipts do not prove that the control operation made
   no commit. The caller must inspect canonical authority before a new action.
+- Optional cancellation diagnostics share the remaining control allowance. If
+  neither diagnostic store saves a phase, the same bounded local buffer retains
+  its original capture time and marks it unpersisted, even when cancellation
+  succeeds. This does not replace an explicitly configured cancellation journal.
 - Failure to record evidence after cancellation cannot prevent process cleanup.
   The Runtime attempts cleanup and reports the evidence-write failure; callers
   must re-read authority before retrying. Failure to persist the initial request

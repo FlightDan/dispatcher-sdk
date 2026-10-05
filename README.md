@@ -1,17 +1,15 @@
-# Dispatcher SDK: Durable Task Orchestration for AI Agents
+# Dispatcher SDK: local task execution and orchestration
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [Wiki](wiki/Home.md) | [Docs for coding agents](DocsforAgents/README.md) | [API documentation](docs/SDK.md)
 
-Dispatcher uses SQLite to persist execution state and adds process isolation, retries, recovery, and durable notifications.
+Dispatcher runs Python functions and scripts, controls timeouts and cancellation,
+and saves task state, results and notifications in SQLite. An Agent application
+can resume queued work after restart and subscribe to completion or recovery
+notifications.
 
-**The core has no third-party runtime dependencies.**
-
-Dispatcher runs submitted Python functions and scripts locally, and can run scripts
-in remote sandboxes. It controls timeouts and cancellation and saves task state in
-SQLite. For sandbox jobs, it collects bounded output and artifacts and keeps the
-lifecycle state needed for cleanup after an interruption. Task subscriptions notify
-your application when work finishes or needs recovery, so it can continue a
-conversation, schedule another task, or handle an interrupted execution.
+Scripts can also run in remote sandboxes. The SDK collects output and artifacts
+within configured limits and records the resources that still need cleanup after
+an interruption. The core uses only Python's standard library and SQLite.
 
 ## What you can do
 
@@ -24,35 +22,43 @@ conversation, schedule another task, or handle an interrupted execution.
 | External effect recovery | Save receipts for file writes and API calls registered through the Effect interface. When an interruption leaves the outcome uncertain, wait for the application to verify and resolve it. |
 | Multi-step orchestration | Record dependencies, business attempts, and wait conditions. The application decides when to dispatch, rework, or finish. |
 | Results and notifications | Read execution results and script logs, and notify the application so its Agent can continue without repeated LLM progress checks. |
+| Execution observations | Inspect process state, output bytes, model and tool activity, application progress and structured waits. Heartbeats and logs do not count as application progress. |
+| Inherited execution budgets | Carry Run, parent and local deadlines into child work. Recovery retains clock floors and refuses new work while a required clock sample remains unresolved. |
+| Managed stall supervision | Run a registered supervisor handler with reserved capacity, memory limits and an original notice budget. Capacity or memory shortages remain visible; the application decides whether to continue or cancel work. |
 
-Dispatcher is a Python SDK embedded in your application. The core uses only
-the standard library and SQLite, needs no separate queue service, and is not tied
-to a particular model or Agent framework. The optional OpenSandbox adapter
+Dispatcher is a Python SDK embedded in your application. It needs no separate
+queue service and is not tied to a particular model or Agent framework.
+The optional OpenSandbox adapter
 adds the pinned `opensandbox` dependency and requires a separate sandbox service.
 
-## Is it a fit?
+## When to use Dispatcher
 
 Use Dispatcher when your Agent application needs to run tools or scripts, limit
 execution time, retain task state, or organize tasks into a recoverable workflow.
 You can also use it for a single function task without adding notifications or
 multi-step orchestration.
 
-Your application defines task content and business acceptance criteria, then
-decides what happens next. Dispatcher controls execution, records state, and delivers messages
-reliably. Keep the host process running while work executes in the background.
+Your application defines the work and its acceptance criteria, then decides what
+happens next. Dispatcher controls execution, records state and delivers messages.
+Keep the host process running while work executes in the background.
 
 Integration boundaries:
 
 - Process mode contains trusted code with timeouts, cancellation, and process cleanup. It does not provide a filesystem, network, or permission sandbox for untrusted code. Agent-generated code still needs application review or an additional sandbox.
-- Linux process mode uses subreaper cleanup for detached descendants; other POSIX platforms use process-group cleanup. Native Windows process and script execution uses Job Objects and has passed native tests on Windows 11 x64 (build 10.0.26100.9168) with Python 3.12.10. See [Windows runtime](docs/WINDOWS_RUNTIME.md) for scope and results. Thread mode cannot forcibly stop a blocked handler.
+- Linux process mode uses subreaper cleanup for detached descendants; other POSIX platforms use process-group cleanup. Native Windows process and script execution uses Job Objects. Earlier native tests passed on Windows 11 x64 (build 10.0.26100.9168) with Python 3.12.10; see [Windows runtime](docs/WINDOWS_RUNTIME.md) for their scope. The current candidate still needs native matrix validation. Thread mode cannot forcibly stop a blocked handler.
 - Resume with the original database and matching handler deployment. Reopening the database does not reset retry budgets or guarantee that interrupted tasks will automatically rerun.
 - The SDK cannot undo a write or API call that has already happened. Uncertain outcomes require verification before recovery; arbitrary operations are not guaranteed to happen exactly once.
 - `Dispatcher` durably accepts and deduplicates notifications in its built-in inbox. User callbacks remain at-least-once; external calls need idempotency. Use `consume_results` for atomic local SQL and receipt settlement.
 
-Version 0.7 is under development and requires Python 3.10+. The current
-Orchestrator storage layout is schema 3 and does not automatically migrate older
-Orchestrator databases. Read [storage and upgrades](docs/STORAGE_AND_UPGRADES.md)
-and the [compatibility guide](docs/PUBLIC_API.md) before upgrading.
+The current source version is `0.7.0.dev2` and requires Python 3.10+.
+Kernel storage uses schema 5; Orchestrator storage uses schema 4. Older databases
+need an explicit upgrade. Read [storage and upgrades](docs/STORAGE_AND_UPGRADES.md)
+and the [compatibility guide](docs/PUBLIC_API.md) before opening them with this version.
+
+Execution observations and managed supervision are implemented in the working
+tree. Complete installed-package and native matrix validation is still in
+progress. CI is paused while known failures are corrected; current results and
+remaining checks are recorded in the [acceptance index](docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md).
 
 ## Install
 
@@ -123,98 +129,7 @@ See the [0.7 design and migration notes](docs/DEV_0_7.md) and
 
 ## Advanced integration examples
 
-### 1. Generate a report in the background, then continue a conversation
-
-To verify the complete report-generation flow, this demo uses a script that
-only prints `report ready`. Replace it with your own report-generation code when integrating.
-
-1. The application submits a script and registers a conversation identifier for notifications.
-2. Dispatcher runs the script in the background and delivers a notification to the application callback.
-3. The callback writes the notification to the application's SQLite inbox, deduplicating by notification ID.
-4. The example reads the inbox and prints the result. Your application can use this step to continue the conversation or handle the report.
-
-After installing, run from the checkout:
-
-```sh
-python examples/sdk_script_wakeup.py
-```
-
-Expected output:
-
-```text
-Wake conversation-42: succeeded
-report ready
-```
-
-<details>
-<summary>Show the complete Python example: submit a script, receive a notification, read the result</summary>
-
-Save this code as `demo.py` and run `python demo.py` after installing the SDK.
-
-```python
-from contextlib import closing
-from pathlib import Path
-import json
-import sqlite3
-import sys
-import tempfile
-import threading
-
-from dispatcher_sdk.execution_kernel import Kernel, ScriptSpec, script_handlers
-from dispatcher_sdk.orchestrator import Orchestrator, OrchestratorHost
-
-
-def main():
-    with tempfile.TemporaryDirectory(prefix='sdk-wakeup-') as directory:
-        root = Path(directory)
-        inbox = root / 'application-inbox.sqlite3'
-        with closing(sqlite3.connect(inbox)) as connection, connection:
-            connection.execute('CREATE TABLE inbox (notification_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
-        accepted = threading.Event()
-
-        def wake_agent(notification):
-            with closing(sqlite3.connect(inbox)) as connection, connection:
-                connection.execute('INSERT OR IGNORE INTO inbox VALUES(?,?)',
-                                   (notification['notification_id'], json.dumps(notification)))
-            accepted.set()
-
-        runtime = Kernel.open_sqlite(root / 'work.sqlite3', script_handlers(), isolation_mode='process')
-        orch = Orchestrator(root / 'work.sqlite3', runtime.kernel, runtime=runtime)
-        orch.create_run('example', command_id='create')
-        command = ScriptSpec("print('report ready')", (sys.executable, '-u'), root, root / 'logs').command(
-            execution_id='script-1', idempotency_key='script-1', registry_revision=runtime.registry_revision,
-            correlation_id='example', timeout_seconds=10)
-        with OrchestratorHost(orch, wake_agent):
-            orch.apply_operations('example', command_id='submit', expected_revision=0, operations=[
-                {'kind': 'add_task', 'task_id': 'report', 'command': command.to_dict()},
-                {'kind': 'watch_task', 'task_id': 'report', 'watch_id': 'report-wake',
-                 'target': {'conversation_id': 'conversation-42'}},
-                {'kind': 'dispatch', 'task_id': 'report'},
-            ])
-            # Demo process lifetime: wait on a Python event, with no LLM polling.
-            if not accepted.wait(15):
-                raise TimeoutError('demo did not receive its callback')
-        with closing(sqlite3.connect(inbox)) as connection, connection:
-            notification = json.loads(connection.execute('SELECT payload FROM inbox').fetchone()[0])
-        assert notification['state'] == 'succeeded', notification
-        assert notification['result']['value']['stdout']['tail'].strip() == 'report ready'
-        orch.close()
-        print(f"Wake {notification['target']['conversation_id']}: {notification['state']}")
-        print(notification['result']['value']['stdout']['tail'].strip())
-
-
-if __name__ == '__main__':
-    main()
-```
-
-The example uses a temporary directory and removes its databases and logs on exit.
-Use persistent paths in your application and keep `OrchestratorHost` running.
-Return from the callback promptly after durably accepting the notification;
-your application's inbox consumer continues the Agent workflow.
-
-</details>
-
-### 2. Stop a stuck task and its child process on timeout
+### 1. Stop a stuck task and its child process on timeout
 
 Tool calls can block or launch additional child processes. Process mode cleans up
 the supervised process tree after a timeout so the application can run other tasks.
@@ -340,7 +255,7 @@ If an interruption leaves an unresolved external operation, the task may enter
 an Effect, so check recovery state when a script is interrupted.
 See [isolation and lifecycle behavior](docs/PUBLIC_API.md).
 
-### 3. Resume queued work after restart and reconcile interrupted external operations
+### 2. Resume queued work after restart and reconcile interrupted external operations
 
 If your application exits after submission, reopening the same database lets it
 claim work that was already queued. The [persistence example](examples/kernel_task.py)
@@ -372,7 +287,7 @@ Set bounded attempts and backoff according to whether the task is safe to retry.
 Business rework uses explicit new attempts, counted separately from execution
 retries and notification redelivery. See the [recovery and retry guide](docs/SDK_RECOVERY.md).
 
-### 4. Choose the next task based on the previous result
+### 3. Choose the next task based on the previous result
 
 Before continuing, reworking, or waiting in an Agent workflow, your application
 may need to inspect the previous result. Organize task dependencies within a Run
@@ -403,9 +318,12 @@ Choose the entry points you need:
 | Dependencies, waits, and business rework | Create a Run with `Orchestrator`; use `apply_operations` to explicitly submit tasks, dependencies, waits, new attempts, and completion. |
 | Background execution | Use `RuntimeHost` for standalone execution or `OrchestratorHost` to drive execution, synchronization, and notifications for orchestration. |
 | Application notifications | Associate a conversation or business task through `watch_task`'s `target`. Durably accept and deduplicate notifications in the callback; let the inbox consumer continue the workflow. |
+| Activity and child work | Report through `context.activity`, inspect with `task.observe()`, and use `context.budget` and `context.children` for inherited deadlines and child execution. |
+| Stall supervision | Configure `task.watch_stall(...)`, subscribe with `app.subscribe_stalls(...)`, and inspect reserved supervisor execution with `app.stall_supervisor_status(...)`. See the observation guide for callback and managed-handler options. |
 
 ## Further reading
 
+- [Execution observations and supervision](docs/EXECUTION_OBSERVABILITY.md): activity, inherited deadlines, child capacity and reserved supervisor handlers.
 - [Atomic task submission](docs/TASK_SUBMISSION.md): stable request IDs and per-handler command bindings.
 - [Storage and upgrades](docs/STORAGE_AND_UPGRADES.md): durability profiles, preflight, backups, paged Run reads, and linked Run continuation.
 - [Run storage validation](docs/RUN_STORAGE_VALIDATION.md): measured incremental history growth and remaining full-Run costs.

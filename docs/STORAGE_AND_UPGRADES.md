@@ -8,8 +8,9 @@ upgrade to schema 4. See
 [retention and maintenance APIs](STORAGE_RETENTION.md) for explicit copy upgrades.
 Opening an unsupported or damaged orchestration store raises an error instead
 of recreating missing tables. Kernel commands and results remain protocol V2.
-The current Kernel SQLite schema is 4, including managed control and execution
-budget/supervision records; ordinary opening never upgrades older Kernel stores.
+The current Kernel SQLite schema is 5, including managed control, execution
+budget/supervision records and write-ahead clock sampling guards; ordinary
+opening never upgrades older Kernel stores.
 `upgrade_storage` explicitly copies supported standalone Kernel schemas 2/3/4
 and shared stores into the current layout while preserving historical rows.
 The copy does not activate the destination or move/rebind external observation,
@@ -258,6 +259,12 @@ reads to control that work; continuation retains history and does not reclaim
 database space or erase delivery obligations.
 
 ## Validation status
+
+The Windows measurements below belong to the earlier candidate documented in
+[Windows runtime](WINDOWS_RUNTIME.md). Current schema-5, clock-guard and
+observability acceptance is tracked in
+[the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md); the older suite
+does not validate those additions.
 
 The storage and inbox tests cover WAL-backed snapshots, refusal to overwrite,
 legacy SQL export, schema rejection, pending-command binding checks, fencing,

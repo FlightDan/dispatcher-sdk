@@ -1,9 +1,11 @@
 # Execution activity, deadlines and supervision
 
 The `0.7.0.dev2` implementation adds execution observations, inherited deadlines,
-bounded child execution and optional durable stall notifications. Platform and
-application acceptance are tracked separately in
-[the implementation goal](EXECUTION_OBSERVABILITY_GOAL.md).
+bounded child execution and optional durable stall notifications. Current SDK
+and platform acceptance is tracked separately in
+[the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md). The active Goal
+covers SDK functionality, robustness and maintainability; application integration
+and production-provider validation require their own evidence.
 
 ## Read activity through a task
 
@@ -52,6 +54,22 @@ supports an adapter that already counted bytes. Streams and model/tool metrics
 that have not been installed or reported are unknown rather than inferred zero.
 SDK script handlers install their stdout/stderr observers automatically.
 
+After native containment is confirmed, the standard script handler also retains
+a bounded fact about its original stdout/stderr log sizes. `output.stdout` and
+`output.stderr` expose `saved_bytes`, `saved_at`, `saved_path` and
+`count_basis="max_collected_and_saved_bytes"`. Stream counts use the larger of
+the collected count and saved-byte floor, so reconciliation never adds a second
+copy of the same bytes. `script_output_fact` identifies the persisted receipt.
+Missing emission timestamps remain unknown, and this fact does not confirm a
+telemetry flush or progress. It is read even if activity initialization failed.
+
+Artifact publication uses one retained worker with bounded caller waits. If a
+filesystem call blocks or SQLite publication fails, that worker retains its
+original execution identity and captured fact until cleanup completes. Deferred
+facts remain discoverable after the business result settles and after restart;
+maintenance does not invoke the script or extend its deadline. Later unsampled
+durable queue entries can remain after close without a live local storage owner.
+
 Heartbeat, output, model activity, tool activity and application progress have
 separate counters and timestamps. Logs and heartbeats do not reset the progress
 clock. `progress` returns `confirmed` only after the Kernel commits its receipt.
@@ -65,6 +83,13 @@ queued detail, 128 details and 256 KiB per batch. stdout and stderr tails are
 limited to 64 KiB each. Read pages default to 50 records, 256 KiB and three
 seconds. Storage pressure and dropped details are visible; telemetry failure
 does not replace a handler’s business outcome.
+
+The existing recorder flusher holds an idle read-only WAL connection for its
+own lifetime. It retains no transaction or cursor, and each write still uses
+its configured durability and original timeout. Failed setup releases that
+connection before ordinary flushing. Failed physical close retains the same
+connection and worker until release; a persisted final-flush receipt alone
+does not discharge that storage ownership.
 
 ## Use the execution budget
 
@@ -91,6 +116,20 @@ captured cutoff and observed clock floor before calling business code. Temporary
 storage contention may retry that confirmation within the original work window;
 it does not restart the timeout. An interrupted confirmation remains pending.
 Process hard deadlines operate independently of observation persistence.
+Later authoritative budget samples also commit a write-ahead guard before reading
+wall time. Their exact acknowledgement atomically advances the execution floor
+and Kernel clock watermark. A failed publication fences recovered business;
+only its retained live owner can finish the original captured fact. Kernel retains
+that owner after a short child call or pre-handler admission ends. Maintenance
+and repeated close publish facts without sampling again or renewing a deadline.
+An interrupted process leaves its guard unknown; a fresh Kernel cannot guess the
+lost observation. Factual completion can use the exact live owner’s already
+captured token without acknowledging or clearing it. A foreign or uncaptured
+guard remains unknown. `Task.observe` remains read-only; `context.budget` establishes
+an authoritative budget sample and can encounter this bounded control admission.
+Resolving an uncertain Effect does not acknowledge a clock sample or clear its
+guard. The original response remains saved, but a recovered execution stays
+fenced while its clock fact is unknown, even if its Effect recovery target is queued.
 Thread mode can revoke authority and prevent result/effect commits, but cannot
 force an arbitrary Python thread to stop.
 
@@ -122,18 +161,29 @@ worker pool. Durable wait/request records expose incomplete registration and
 recovery rather than claiming a cross-database atomic commit.
 
 The SDK retries short SQLite writer conflicts and SDK-owned per-read timeouts
-within the captured child-call window. It retains the same request, child identity and deadline; applications
-do not need a retry loop. A committed child result survives a failed response
-write, and recovery reconciles that result without invoking the handler again.
-If publication still lags when the call window ends, one bounded authoritative
-read can return a result already completed within that original window. It
-checks the parent authority and child binding; late results and unknown clocks
-do not qualify. This does not acknowledge or release the pending publication.
-Stricter observed clock checkpoints survive rollback through the request or an
-independent receipt. Incomplete checkpoint history remains unknown. A transient
-receipt-read timeout retries inside the same original call window; unread
-checkpoint facts cannot be bypassed by the completed-result read. That proof
-uses read-only lease checks and leaves the durable logical clock unchanged.
+within the captured child-call window, preserving the request, child identity
+and deadline. A committed child result survives a failed response write;
+recovery reconciles it without invoking the handler again. Stricter observed
+clock checkpoints survive rollback through the request or an independent
+receipt. Incomplete checkpoint history remains unknown, and a result read cannot
+bypass an unread checkpoint fact.
+
+If publication still lags when that window ends, the standard file-backed
+`SQLiteKernel` uses an independent read-only connection to prove an already
+committed result within the original 0.1-second factual window. It reads the
+child result once, then takes a fresh snapshot of the parent lease, ancestry,
+child identity and parent/child association. Cancellation or a new unresolved
+guard observed at that final check refuses delivery without replaying the read.
+Late results and unknown clock continuity do not qualify.
+
+This proof projects retained elapsed time and may use the original caller's
+exact local captured token. It does not sample wall time, acknowledge or drain
+pending samples, clear guards, advance the durable clock or release pending
+publication. Initial checks can wait for a foreign live owner to publish its
+own ACK inside the same proof window; the reader cannot publish it. Uncaptured
+or unresolved foreign guards remain unknown. Custom and in-memory Kernels retain
+their existing fallback; the independent SQLite proof applies only to the
+standard file-backed Kernel.
 
 An adapter can report resource or external-service waits without changing
 deadlines:
@@ -208,6 +258,76 @@ captures bounded local diagnostics without opening another diagnostic SQL write
 window. A raised operation can follow a commit; it does not prove that authority
 was unchanged. Re-read the canonical execution before deciding what to do next.
 
+## Reserve capacity for a managed supervisor handler
+
+```python
+from dispatcher_sdk import Dispatcher, ManagedStallOptions
+
+def supervise(notice, context):
+    context.activity.progress("notice-inspected")
+    return {"notification_id": notice["notification_id"],
+            "decision": "continue observing"}
+
+with Dispatcher("tasks.sqlite3", {"work": work},
+        stall_handler=supervise,
+        stall_options=ManagedStallOptions(
+            memory_limit_bytes=512 * 1024 * 1024, capacity=1,
+            memory_budget_bytes=512 * 1024 * 1024,
+            timeout_seconds=10, budget_seconds=30)) as dispatcher:
+    task = dispatcher.submit("work", {}, request_id="original-work", timeout_seconds=60)
+    task.watch_stall(StallPolicy("progress", sample_interval=5, consecutive_windows=2))
+    status = dispatcher.stall_supervisor_status()
+```
+
+The synchronous handler receives the original durable notice and a normal
+`HandlerContext` in a separate process Runtime. Its configured capacity is
+independent of business workers. The original notice ID selects one managed Run
+and execution with one business claim; replay delivers the original result and
+never invokes the handler again. Configure the handler during Dispatcher
+construction when reopening outstanding supervisor commands, so recovery can
+validate its binding before opening execution storage. A callback and managed
+handler are mutually exclusive consumers. `subscribe_stalls(handler=...,
+options=...)` is also available while the Dispatcher is open.
+
+`budget_seconds` includes queue residence from the original notice creation.
+The handler also inherits its source execution's constraints and uses the earlier
+source, notice and handler cutoffs. Transient admission retries consume those
+same bounds. Successful handler completion consumes the notice; the application
+still decides whether to cancel, continue observing or perform another action.
+Its SDK child service is disabled. External effects still need application
+idempotency and the normal fenced effects API.
+
+`memory_limit_bytes` limits each Linux worker's address space or the Windows
+Job's private commit. `memory_budget_bytes` controls how many configured
+reservations may coexist; it defaults to capacity times the per-worker limit.
+These values do not measure host free RAM or aggregate Linux RSS. A native limit
+that cannot be enforced refuses admission. `stall_supervisor_status` exposes
+`capacity_shortage`, `memory_shortage`, `resource_enforcement_unsupported`,
+`cleanup_pending` and actual resource capability. Shortage leaves the notice
+unclaimed and does not reset its original budget. Capacity and memory remain
+charged until original native cleanup, collector ownership and pending clock
+publication are confirmed. Close may report pending cleanup while retaining
+storage; repeat close after the original owner or storage recovers.
+
+`budget_checkpoint_state` reports `clear`, `pending` or `unknown`, including
+facts retained before a handler Context exists. If the registry cannot be
+inspected within the query window, `budget_checkpoint_pending` is `None` and
+the report is incomplete; `budget_checkpoint_known_pending` preserves the
+locally known count. An unavailable inspection cannot release a reservation.
+
+If worker-thread creation fails after executor submission has queued work, the
+unaccepted work cannot enter the handler. The supervisor retires that executor,
+reports `executor_unavailable` with the original error, and stops claiming new
+notices while already accepted workers finish. The original processing receipt
+remains unchanged. Recovery requires reopening the Dispatcher with the same
+bindings; receipt recovery still uses the original notice and source cutoffs.
+
+See [the runnable managed supervisor example](../examples/managed_stall_supervisor.py).
+Linux actual-process checks cover memory denial, capacity shortage, original
+notice/source deadlines and retained cleanup ownership. The current complete
+source, installed-wheel and native-matrix requirements remain tracked in
+[the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md).
+
 ## Independent reads and storage
 
 `runtime.observation_storage` supplies the public sidecar path, Kernel path and
@@ -246,8 +366,9 @@ retained floor constrains future admission without changing that return's cause.
 Kernel completion commits that checkpoint with the result, before releasing a
 retry. A clock rollback cannot restore time already observed as exhausted.
 Recovery tightens the existing budget without confirming an interrupted entry.
-A clock observation lost before any receipt or Kernel write is not a durable
-fact and cannot be reconstructed after process death.
+A captured clock floor lost before its receipt or Kernel acknowledgement cannot
+be reconstructed after process death. Its previously committed sampling guard
+remains unknown and refuses recovered business.
 
 If both receipt persistence and Kernel completion are unavailable, the reserved
 slot keeps the exact original outcome for maintenance. `observe` exposes it as
@@ -258,7 +379,7 @@ the original receipts without reopening business; a fresh Runtime restores
 them through the existing fenced settlement path.
 
 `observe` also returns bounded `diagnostics` pages from this independent store.
-Raised cancellation operations can additionally produce
+Raised cancellation operations and failed optional phase writes can additionally produce
 `local_cancellation_diagnostics`. These notes are separate from persisted phases
 and their event cursor. They carry the known Kernel execution/attempt/fence;
 workflow metadata remains unknown. Default queries select the current identity
@@ -273,8 +394,10 @@ if they still hold storage, it raises `RuntimeError` and retains pending cleanup
 Calling `close()` again advances that cleanup without restarting business or
 changing the original telemetry receipt. Temporary observation storage is removed
 only after its owned workers stop, including observation initialization, the stall
-sampler and the settlement worker. Their cleanup shares one absolute deadline. A late handler cannot register a new process
-collector after its recorder closes.
+sampler and the settlement worker. Their cleanup shares one absolute deadline.
+Recorder close joins its original flusher only within the caller deadline’s remaining time; if physical close
+is blocked, Runtime retains the worker and storage. A late handler cannot
+register a new process collector after its recorder closes.
 
 Available cancellation stages, the actual handler outcome and the driver close
 receipt remain separately queryable when the activity writer is locked. Lost details or an
@@ -282,7 +405,11 @@ unconfirmed final flush make the observation incomplete even after the execution
 becomes terminal. Settlement updates retain the original diagnostic evidence.
 Cancellation retains the original requested/revoked timestamps but writes
 optional diagnostics after local revocation, so writer pressure cannot delay
-process termination. Read admission uses the caller's remaining query budget;
+process termination. Those optional writes share the remaining cancellation
+control allowance; failed or skipped writes retain local, unpersisted facts.
+When independent notes supply a phase, capture time remains separate from
+publication time. Delayed publication does not make an old process observation fresh.
+Read admission uses the caller's remaining query budget;
 exhaustion does not become an empty successful notification page.
 
 For adapters with a finite control deadline, open a public
@@ -300,7 +427,9 @@ wait deadline. A successful late COMMIT retains its actual receipt; it never
 justifies replaying business. Storage still owned by a stopped SDK worker remains
 pending cleanup as described above.
 
-The Kernel layout is version 4. Use the explicit copy-upgrade API for older
+The current development candidate uses Kernel layout version 5. It adds sampling
+guards; copy-upgrading an older open execution with limits records its unprotected
+clock as unknown instead of granting a reconstructed budget. Use the explicit copy-upgrade API for older
 supported layouts; normal opens do not migrate them. Observation journals are
 separate, source-bound files containing windows, waits and notification handoff
 obligations. The independent `*.settlements.sqlite3` journal retains result
@@ -310,7 +439,7 @@ rebind them. Preserve the journal alongside its original Kernel binding when
 resuming these obligations; absent observations do not establish completion.
 
 See [the portable example](../examples/execution_observability.py) for a real
-parent/child execution. Acceptance status and platform evidence remain in the
-implementation goal and its acceptance index.
-The current evidence and outstanding gates are listed in
-[the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md).
+parent/child execution. The
+[implementation goal](EXECUTION_OBSERVABILITY_GOAL.md) defines the SDK scope;
+[the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md) records current
+evidence and outstanding checks.
