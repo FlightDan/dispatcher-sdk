@@ -9,6 +9,91 @@ revised SDK-only A16.
 ## Current status, 2026-10-06
 
 The final acceptance candidate declares `0.7.1`; it is not fully accepted.
+Reviewed candidate `e9780505d93a32ec6e6014e124b1e61123d0fa0d` was pushed after
+all known source, fixture and example corrections passed independent review and
+necessary local installed checks. Its full matrix
+[37397706018](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37397706018)
+started on 2026-10-06 at 01:09:16 UTC and completed with nine successful and seven
+failed matrix environments. All sixteen installed suites ran 1,174 methods
+within their original 900-second allowance. The failed jobs contain twelve
+inner failures/errors. All original matrix logs, artifact ZIPs, extracted
+evidence, admission/history-scan logs and the tested package artifact are
+retained under `/tmp/sdk-ci-e978050/`. No formal Release or default-branch change
+has occurred. This failed run does not establish final 0.7.1 acceptance.
+
+The eight Linux environments and native Windows ARM64 Python 3.12 passed.
+Independent Linux evidence review confirmed the installed `0.7.1` imports,
+native x64/ARM64 mechanisms, seventeen inapplicable Windows skips, five public
+scenarios, six raw restart receipts, types, docs and examples. Public silence
+snapshots retain the descendant's earlier alive observation; actual native tree
+tests independently confirm physical death at cancel return. Cancellation leaves
+a matching pending result outbox; it is not transport/ACK completion. Sandbox
+cleanup recovery preserves the task's `recovery_required` business state.
+
+| New failure | Original evidence and correction scope |
+| --- | --- |
+| Archive cap checks, seven occurrences on Windows x64 3.10/3.11, ARM64 3.11 and ARM host x64 3.10 | Clock-anchor subtraction returned `.10000000000002274` for the original `.1` cap. Three real pre-COMMIT tests already retained correct rollback/pending/original rejection and archive errors, then failed their exact cap assertion. Four writer tests failed that assertion before acquiring the writer, so they never injected SQLite contention. Numerical hardening clamps forwarded timeout to `min(.1, remaining)` while preserving the same operation deadline and exact cap assertions. It only removes an ULP-sized overshoot; it is not evidence of lost results or altered business authority. |
+| Lifecycle native wait minimum, two occurrences on x64/ARM64 3.13 | Native waits returned false after .097278/.095998 seconds for forwarded .097808/.097085 seconds. [Windows wait accuracy](https://learn.microsoft.com/en-us/windows/win32/sync/wait-functions) depends on system-clock ticks and does not promise this minimum high-resolution duration. The fixture retains original-deadline/remaining-argument, actual refusal, receipt, owner and physical-close assertions plus raw measured elapsed; it no longer invents a native minimum. |
+| Guard subtraction, x64 3.11 | `deadline - now` rounded to `7.000000000000057`. Compare absolute native deadlines against `now + 7`, preserving the same seven-second bound without a grace interval. |
+| Provider-failure return, x64 3.10 | The exact return was `running`, before provider-result assertions. The old temporary store was deleted, so the precise pending cause is unknown. The fixture must retain its original result/receipt and retry publication only within the original execution deadline and one API maintenance window; raw provider code/message/status and business assertions remain required. |
+| Worker-entry result, x64 3.12 | The assertion message dereferenced `.result.error` when result was absent, hiding the primary state. Its temporary store was deleted. Preserve original entry/business/return evidence, avoid the masking dereference, and use the same bounded factual publication rule without another dispatch. |
+
+The numerical, native-wait and pending-publication corrections passed independent
+review. Worker/provider fixtures now compare each complete canonical result with
+the first actual captured SDK result for its original execution generation; they
+preserve raw errors and cleanup failures separately. The initial local source
+command ran sixty affected methods in 58.663 seconds: fifty-nine passed and one
+cancel-archive fixture failed its strict return-time assertion. Original evidence
+is under `/tmp/sdk-071-post-e978-corrections310/`.
+
+That final archive COMMIT wrapper began 8.296 milliseconds before the original
+`.5` maintenance cutoff, completed 28.665 milliseconds after it without error,
+and was followed by a 47-microsecond close. This locates the late return inside
+the COMMIT wrapper; it does not distinguish native SQLite durability work from
+instrumentation-lock or scheduler delay. The earlier pending pass contains an
+untraced Kernel/lifecycle interval and remains causally unresolved. The existing
+SQLite admission contract preserves successful COMMIT receipts after late native
+return. The fixture correction enforces the same absolute admission/pre-COMMIT
+deadlines and accepts late return only with an actual successful late COMMIT and
+superseded report, followed by exact original-result, cancellation-winner and
+single-business-call assertions. It adds no grace interval or renewed deadline;
+the affected writer test also retains Kernel SQL evidence.
+
+The correction passed independent review. The source settlement follow-up passed
+nineteen methods in 20.763 seconds. A fresh `0.7.1` wheel rebuilt from the corrected
+sdist passed eighty-eight affected/integration methods in 72.648 seconds outside
+the checkout, including all entry/provider/result, cancellation, reader-lifetime,
+received-checkpoint, observer, host-startup, restart-publication and release-helper
+cases. Public success/failure/budget/silence/cleanup, the managed example and five
+installed type consumers passed. Original commands, SDK import and outputs are
+under `/tmp/sdk-071-post-e978-reviewed310/`.
+
+Checking copied documentation first exposed the excluded CI workflow; checking
+the actual unpacked sdist then exposed four excluded historical JSON measurements.
+The manifest and harness now include both public workflow recipes and all four
+linked original measurement files, without editing those records. These packaging
+changes passed independent review. The final packaging follow-up under
+`/tmp/sdk-071-post-e978-packaging-final310/` validates ordinary package metadata,
+runtime version, license/notice and all six required archive members. Its unpacked
+source archive passed 630 local links and all four README examples, with zero
+skips; the new installed environment also passed five type consumers and all six
+original restart commands with their raw receipts.
+
+A real archive COMMIT followed by deliberately delayed return passed the corrected
+fixture in 1.749 seconds on the installed final packaging follow-up. The actual
+transaction was committed before the original `.5` cutoff; only its return was
+held beyond that cutoff. The exact cancellation winner, original result and
+single business call remained unchanged. This is a receipt-preservation probe,
+not attribution of historical native I/O. Its record and raw SQL are identified
+by `committed-late-return-reviewed-probe.json`. The initial probe applied its delay
+outside the captured callback and to a read COMMIT, so it failed before testing
+archive preservation; its separate source and failed record remain preserved.
+The earlier documentation failures also remain in their original directories.
+
+All known corrections are now reviewed and locally verified. A replacement full
+sixteen-environment matrix is still required for the final committed candidate.
+The previous failed candidate and its package artifact remain preserved and
+ineligible for release.
 The latest completed development run
 [37390861215](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37390861215)
 tested `33482b2` / `0.7.0.dev2`: twelve matrix jobs passed, four failed,

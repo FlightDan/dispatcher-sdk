@@ -20,11 +20,15 @@
 - Cancelled result recovery archives its original obligation within the same
   bounded operation window. Transient archive failures retain both the business
   rejection and archive error, and permanent storage failures keep their cause.
+  Per-record storage timeouts stay at or below the original 0.1-second cap,
+  including when floating-point deadline subtraction rounds upward.
 - The Effect recovery example checks durable result publication after a worker
   returns a pending outcome, within the original execution deadline and without
   repeating the file mutation.
 - Formal GitHub publishing reuses the exact successful candidate's tested wheel
   and source distribution, without repeating the matrix or rebuilding packages.
+  Source distributions include the linked public CI recipes and historical
+  documentation measurements.
 - See [execution activity and supervision](docs/EXECUTION_OBSERVABILITY.md) and
   the [acceptance index](docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md) for behavior,
   validation evidence and remaining gates.

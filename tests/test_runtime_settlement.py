@@ -15,6 +15,7 @@ from dispatcher_sdk.execution_kernel import HandlerExecutionError, Kernel, Retry
 from dispatcher_sdk.execution_kernel.errors import InvalidStateTransitionError
 from dispatcher_sdk.execution_kernel import runtime as runtime_module
 from dispatcher_sdk.execution_kernel import completion_clock as completion_clock_module
+from dispatcher_sdk.execution_kernel import settlement as settlement_module
 from dispatcher_sdk.execution_kernel.context import HandlerContext, HandlerEffects
 from tests._acceptance_evidence import retained_directory
 from tests._storage_evidence import StorageEvidence
@@ -59,7 +60,8 @@ class RuntimeSettlementTests(unittest.TestCase):
     def setUp(self):
         self.root = retained_directory("sdk-runtime-settlement-")
         self.storage_evidence = StorageEvidence(self.root, self)
-        self.storage_evidence.start()
+        self.storage_evidence.start(include_kernel=(self._testMethodName ==
+            "test_cancel_archive_writer_contention_retains_both_errors"))
         self.addCleanup(self.storage_evidence.stop)
         self.addCleanup(self.storage_evidence.save)
 
@@ -168,17 +170,50 @@ class RuntimeSettlementTests(unittest.TestCase):
         return maintenance
 
     def recover_cancellation_once(self, runtime, maintenance):
-        attempted = {}
+        attempted = {"journal_admissions": []}
         maintenance["passes"].append(attempted)
+        original_admission = settlement_module.retry_sqlite_admission
+        caller_thread = threading.current_thread()
+
+        def admission(operation, **options):
+            if threading.current_thread() is not caller_thread:
+                return original_admission(operation, **options)
+            def invoke():
+                event = {"began": time.monotonic(), "deadline": options["deadline"],
+                    "commit": options.get("transaction_retained") is not None}
+                attempted["journal_admissions"].append(event)
+                try:
+                    # Enforce the unchanged absolute admission and pre-COMMIT
+                    # bounds. A successful native COMMIT can return later; its
+                    # established receipt must not be revoked or replayed.
+                    self.assertLessEqual(event["began"], options["deadline"])
+                    self.assertLessEqual(event["began"], maintenance["deadline"])
+                    return operation()
+                except BaseException as error:
+                    event["error"] = {"type": type(error).__name__, "message": str(error)}
+                    raise
+                finally:
+                    event["returned"] = time.monotonic()
+            return original_admission(invoke, **options)
+
         try:
             attempted["began"] = time.monotonic()
             remaining = maintenance["deadline"] - attempted["began"]
             attempted["timeout_seconds"] = remaining
             self.assertGreater(remaining, 0, maintenance)
-            reports = runtime.recover_completions(timeout_seconds=remaining)
+            with patch.object(settlement_module, "retry_sqlite_admission", admission):
+                reports = runtime.recover_completions(timeout_seconds=remaining)
             attempted["reports"] = list(reports)
             attempted["returned"] = time.monotonic()
-            self.assertLessEqual(attempted["returned"], maintenance["deadline"], maintenance)
+            attempted["return_overrun_seconds"] = max(0., attempted["returned"] - maintenance["deadline"])
+            if attempted["return_overrun_seconds"]:
+                late_commits = [event for event in attempted["journal_admissions"]
+                    if event["commit"] and "error" not in event
+                    and event["returned"] > maintenance["deadline"]]
+                self.assertTrue(late_commits, maintenance)
+                self.assertTrue(any(report["state"] == "superseded" for report in reports), maintenance)
+            else:
+                self.assertLessEqual(attempted["returned"], maintenance["deadline"], maintenance)
             return reports
         except BaseException as error:
             attempted["error"] = {"type": type(error).__name__, "message": str(error),

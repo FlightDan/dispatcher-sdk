@@ -92,7 +92,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                              "LICENSE", "NOTICE", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md",
                              "PROVENANCE.md", "SOURCE_MANIFEST.json", "RELEASING.md"):
                 shutil.copy2(ROOT / document, distribution / document)
-            for directory in ("docs", "examples", "tests", "scripts", "wiki", "DocsforAgents"):
+            for directory in ("docs", "examples", "tests", "scripts", "wiki", "DocsforAgents", ".github"):
                 shutil.copytree(ROOT / directory, distribution / directory,
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             self._run([sys.executable, "-c",
@@ -108,7 +108,12 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                 for relative in ("MANIFEST.in", "RELEASING.md", "SOURCE_MANIFEST.json", "README.zh-CN.md",
                                  "docs/EXECUTION_OBSERVABILITY.md", "docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md",
                                  "examples/execution_observability.py", "tests/test_runtime_settlement.py",
-                                 "scripts/release_candidate.py", "wiki/Home.md", "DocsforAgents/README.md"):
+                                 "scripts/release_candidate.py", "wiki/Home.md", "DocsforAgents/README.md",
+                                 ".github/workflows/ci.yml", ".github/workflows/release.yml",
+                                 "docs/validation/sqlite-contention-1-workers.json",
+                                 "docs/validation/sqlite-contention-4-workers.json",
+                                 "docs/validation/sqlite-contention-8-workers.json",
+                                 "docs/validation/storage-state-10000.json"):
                     self.assertIn(f"{source_root}/{relative}", members)
                 for member in archive.getmembers():
                     self.assertFalse(member.issym() or member.islnk())

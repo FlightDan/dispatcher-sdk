@@ -623,7 +623,9 @@ class InProcessRuntime:
                     remaining = operation_deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("completion recovery operation window elapsed")
-                    return remaining
+                    # Subtracting large clock anchors can round above the
+                    # literal cap; never forward more than that original cap.
+                    return min(.1, remaining)
 
                 try:
                     lease = ExecutionLease.from_dict(record["lease"])
@@ -2239,7 +2241,7 @@ class InProcessRuntime:
                 remaining = operation_deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("completion operation window elapsed")
-                return remaining
+                return min(.1, remaining)
 
             if record is not None:
                 try:

@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import traceback
-from contextlib import closing
+from contextlib import closing, contextmanager
 from collections import deque
 from copy import deepcopy
 from types import SimpleNamespace
@@ -29,6 +29,181 @@ import dispatcher_sdk.execution_kernel.runtime as runtime_module
 from dispatcher_sdk.execution_kernel import _process_runtime as process_runtime
 from dispatcher_sdk.execution_kernel import _windows_runtime as windows_runtime
 from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
+
+
+def _fixture_error(error):
+    return {"type": type(error).__name__, "message": str(error),
+        "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+        "traceback": traceback.format_exception(type(error), error, error.__traceback__)}
+
+
+@contextmanager
+def _retained_deadline_runtime(test, root, handlers, mode, evidence):
+    """Keep the actual return and storage facts before Runtime cleanup."""
+    storage = StorageEvidence(root, test)
+    storage.start(include_kernel=True)
+    runtime = None
+    captures = []
+    evidence.update({"root": str(root), "mode": mode, "sdk_import": dispatcher_sdk.__file__,
+        "original_outcomes": [], "original_results": []})
+
+    def secondary(stage, error):
+        evidence.setdefault("secondary_errors", []).append({"stage": stage, **_fixture_error(error)})
+        def report():
+            raise error.with_traceback(error.__traceback__)
+        test.addCleanup(report)
+
+    def capture(phase):
+        facts = {"captured_at": time.monotonic(), "markers": {}, "storage": {}}
+        for name in ("confirming", "release", "business", "attempts"):
+            marker = root / name
+            facts["markers"][name] = {"exists": marker.exists()}
+            if marker.exists():
+                try:
+                    facts["markers"][name]["contents"] = marker.read_text(encoding="utf-8")
+                except OSError as error:
+                    facts["markers"][name]["error"] = _fixture_error(error)
+        stores = {"kernel.db": ("kernel_executions", "kernel_execution_limits", "kernel_events"),
+            "kernel.db.settlements.sqlite3": ("settlement_records", "settlement_notes")}
+        # Read-only diagnostic snapshots are bounded independently; they never
+        # alter an execution, a clock checkpoint, or a retained result.
+        deadline = time.monotonic() + .2
+        for filename, tables in stores.items():
+            database = root / filename
+            snapshot = {"exists": database.exists(), "tables": {}}
+            facts["storage"][filename] = snapshot
+            if not database.exists():
+                continue
+            try:
+                with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0)) as reader:
+                    reader.row_factory = sqlite3.Row
+                    reader.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                    for table in tables:
+                        snapshot["tables"][table] = [dict(row) for row in
+                            reader.execute(f"SELECT * FROM {table} LIMIT 65")]
+            except (sqlite3.Error, OSError) as error:
+                snapshot["error"] = _fixture_error(error)
+        evidence[phase] = facts
+        (root / "evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+        storage.save(phase=phase, checkpoint=evidence)
+
+    try:
+        runtime = Runtime(str(root / "kernel.db"), handlers, isolation_mode=mode)
+        original_settle, original_result = runtime._settle_outcome, runtime._outcome_result
+
+        def settle(snapshot, lease, outcome, admission):
+            evidence["original_outcomes"].append({"snapshot": snapshot.to_dict(),
+                "lease": lease.to_dict(), "outcome": deepcopy(outcome)})
+            return original_settle(snapshot, lease, outcome, admission)
+
+        def result(*args, **kwargs):
+            actual = original_result(*args, **kwargs)
+            evidence["original_results"].append(actual.to_dict())
+            return actual
+
+        for name, wrapper in (("_settle_outcome", settle), ("_outcome_result", result)):
+            current = patch.object(runtime, name, wrapper)
+            current.start()
+            captures.append(current)
+        yield runtime, capture
+    except BaseException as error:
+        evidence["raw_error"] = _fixture_error(error)
+        raise
+    finally:
+        try:
+            capture("before-cleanup")
+        except BaseException as error:
+            secondary("before-cleanup evidence", error)
+        if runtime is not None:
+            try:
+                runtime.close()
+                evidence["runtime_cleanup"] = {"returned": True}
+            except BaseException as error:
+                evidence["runtime_cleanup"] = {"error": _fixture_error(error)}
+                secondary("Runtime.close", error)
+        try:
+            (root / "evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+            storage.save(phase="runtime-cleanup", checkpoint=evidence)
+        except BaseException as error:
+            secondary("runtime-cleanup evidence", error)
+        finally:
+            for current in reversed(captures):
+                current.stop()
+            storage.stop()
+        print("deadline_fixture_evidence=" + str(root / "evidence.json"), flush=True)
+
+
+def _recover_original_publication(runtime, original, evidence):
+    """Publish retained facts within one API window and the committed deadline."""
+    if original is None or original.state != "running":
+        return original
+    began = time.monotonic()
+    maintenance = {"began": began, "api_timeout_seconds": .5, "deadline": began + .5, "passes": []}
+    evidence["publication"] = maintenance
+    deadline, current = maintenance["deadline"], original
+
+    def read(operation):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("original publication window elapsed")
+        with runtime.kernel._control_lock(min(.1, remaining)):
+            value = operation(original.command.execution_id)
+        if time.monotonic() > deadline:
+            raise TimeoutError("original publication read window elapsed")
+        return value
+
+    try:
+        limits = read(runtime.kernel.get_execution_limits)
+        envelope = BudgetEnvelope.from_dict(limits["envelope"])
+        maintenance["original_envelope"] = envelope.to_dict()
+        original_deadline = envelope.deadline_monotonic(sample=sample_clock())
+        maintenance["original_execution_deadline"] = original_deadline
+        # Missing entry confirmation supplies no committed execution deadline.
+        # Keep that uncertainty; do not grant it a fresh execution timeout.
+        if original_deadline is None:
+            maintenance["unavailable"] = "no committed execution deadline"
+            return original
+        deadline = min(deadline, original_deadline)
+        maintenance["deadline"] = deadline
+        while current.state == "running" and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempt = {"began": time.monotonic(), "timeout_seconds": min(.1, remaining)}
+            maintenance["passes"].append(attempt)
+            attempt["reports"] = list(runtime.recover_completions(timeout_seconds=attempt["timeout_seconds"]))
+            attempt["returned_at"] = time.monotonic()
+            if time.monotonic() >= deadline:
+                break
+            current = read(runtime.kernel.get)
+            attempt["snapshot"] = current.to_dict()
+            if current.state == "running":
+                time.sleep(min(.005, max(0., deadline - time.monotonic())))
+        maintenance["canonical_return"] = current.to_dict()
+        return current
+    except BaseException as error:
+        maintenance["raw_error"] = _fixture_error(error)
+        raise
+    finally:
+        maintenance["returned_at"] = time.monotonic()
+
+
+def _assert_original_result(test, original, canonical, evidence):
+    """Compare the full canonical receipt with the first real result generated."""
+    test.assertIsNotNone(original)
+    test.assertIsNotNone(canonical)
+    test.assertEqual((original.execution_id, original.attempt, original.fence),
+        (canonical.execution_id, canonical.attempt, canonical.fence))
+    captured = next((item for item in evidence["original_results"]
+        if (item["execution_id"], item["attempt"], item["fence"]) ==
+        (original.execution_id, original.attempt, original.fence)), None)
+    # A result may first be generated during deferred publication. Capture it
+    # from the real SDK call; never fabricate an expected receipt from the final one.
+    evidence["expected_original_result"] = deepcopy(captured)
+    test.assertIsNotNone(captured, evidence)
+    test.assertIsNotNone(canonical.result, canonical.to_dict())
+    test.assertEqual(captured, canonical.result.to_dict())
 
 
 def command(payload=None, timeout=10):
@@ -161,68 +336,83 @@ class WorkerEntryProbe:
 @unittest.skipUnless(sys.platform.startswith("linux") or os.name == "nt", "requires supported real process containment")
 class WorkerEntryConfirmationTests(unittest.TestCase):
     def execute(self, mode):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        root = retained_directory("sdk-worker-entry-" + mode + "-")
+        evidence = {"bounds": {"command_timeout": 3, "first_entry_wait": 15,
+            "driver_join": 15, "writer_hold": .25}, "variant": mode}
+        with _retained_deadline_runtime(self, root,
+                {"probe": WorkerEntryProbe(str(root), mode)}, "process", evidence) as (runtime, capture):
             results, failures = [], []
-            with Runtime(str(root / "kernel.db"), {"probe": WorkerEntryProbe(temporary, mode)},
-                         isolation_mode="process") as runtime:
-                runtime.submit(runtime.command("probe", execution_id="probe", idempotency_key="probe",
-                    correlation_id="probe", timeout_seconds=3, payload={}))
+            submitted = runtime.command("probe", execution_id="probe", idempotency_key="probe",
+                correlation_id="probe", timeout_seconds=3, payload={})
+            evidence["submitted_command"] = submitted.to_dict()
+            runtime.submit(submitted)
 
-                def drive():
-                    try:
-                        results.append(runtime.run_once())
-                    except Exception as exc:
-                        failures.append(exc)
-
-                driver = threading.Thread(target=drive)
-                driver.start()
+            def drive():
                 try:
-                    end = time.monotonic() + 15
-                    while not (root / "confirming").exists() and driver.is_alive() and time.monotonic() < end:
-                        time.sleep(.01)
-                    self.assertTrue((root / "confirming").exists())
-                    self.assertFalse((root / "business").exists())
-                    # Observe the durable entry barrier without contending for
-                    # the parent's native-preparation control lock.
-                    with closing(sqlite3.connect((root / "kernel.db").as_uri() + "?mode=ro",
-                                                 uri=True, timeout=.1)) as reader:
-                        entry = reader.execute("SELECT entry_state FROM kernel_execution_limits "
-                            "WHERE execution_id = ?", ("probe",)).fetchone()
-                    self.assertEqual(("pending",), entry)
-                    if mode == "lock":
-                        with closing(sqlite3.connect(root / "kernel.db", timeout=.1)) as writer:
-                            with writer:
-                                writer.execute("BEGIN IMMEDIATE")
-                                (root / "release").write_text("released", encoding="ascii")
-                                time.sleep(.25)
-                                self.assertFalse((root / "business").exists())
-                finally:
-                    (root / "release").write_text("released", encoding="ascii")
-                    driver.join(15)
-                self.assertFalse(driver.is_alive())
-                self.assertEqual([], failures)
-                if mode in {"hold", "lock"}:
-                    self.assertEqual("succeeded", results[0].state, results[0].result.error)
-                    self.assertEqual("confirmed", results[0].result.value)
-                    self.assertTrue((root / "business").exists())
-                    if mode == "lock":
-                        attempts = [json.loads(line) for line in (root / "attempts").read_text().splitlines()]
-                        self.assertGreaterEqual(len(attempts), 2)
-                        self.assertTrue(all(item["envelope"]["constraints"] == attempts[0]["envelope"]["constraints"]
-                            and item["envelope"]["started_at"] == attempts[0]["envelope"]["started_at"] for item in attempts))
-                        self.assertTrue(all(0 < item["timeout_seconds"] <= .1 for item in attempts))
-                        persisted = runtime.kernel.get_execution_limits("probe")["envelope"]
-                        self.assertEqual(attempts[0]["envelope"]["started_at"], persisted["started_at"])
-                        self.assertEqual(attempts[0]["envelope"]["constraints"], persisted["constraints"])
-                else:
-                    self.assertEqual("failed", results[0].state)
-                    if mode == "fail":
-                        self.assertEqual("entry_confirmation_unknown", results[0].result.error.code)
-                    self.assertFalse((root / "business").exists())
-                    limits = runtime.kernel.get_execution_limits("probe")
-                    self.assertEqual("pending", limits["entry_state"])
-                    self.assertEqual([], limits["envelope"]["constraints"])
+                    result = runtime.run_once()
+                    results.append(result)
+                    evidence["original_return"] = None if result is None else result.to_dict()
+                except Exception as exc:
+                    failures.append(exc)
+                    evidence["driver_error"] = _fixture_error(exc)
+
+            driver = threading.Thread(target=drive)
+            driver.start()
+            try:
+                end = time.monotonic() + 15
+                while not (root / "confirming").exists() and driver.is_alive() and time.monotonic() < end:
+                    time.sleep(.01)
+                self.assertTrue((root / "confirming").exists())
+                evidence["business_before_release"] = (root / "business").exists()
+                self.assertFalse((root / "business").exists())
+                # Observe the durable entry barrier without contending for
+                # the parent's native-preparation control lock.
+                with closing(sqlite3.connect((root / "kernel.db").as_uri() + "?mode=ro",
+                                             uri=True, timeout=.1)) as reader:
+                    entry = reader.execute("SELECT entry_state FROM kernel_execution_limits "
+                        "WHERE execution_id = ?", ("probe",)).fetchone()
+                evidence["original_pending_entry"] = entry
+                self.assertEqual(("pending",), entry)
+                if mode == "lock":
+                    with closing(sqlite3.connect(root / "kernel.db", timeout=.1)) as writer:
+                        with writer:
+                            writer.execute("BEGIN IMMEDIATE")
+                            (root / "release").write_text("released", encoding="ascii")
+                            time.sleep(.25)
+                            self.assertFalse((root / "business").exists())
+            finally:
+                (root / "release").write_text("released", encoding="ascii")
+                driver.join(15)
+                evidence["driver_join"] = {"alive": driver.is_alive(),
+                    "errors": [_fixture_error(error) for error in failures]}
+            self.assertFalse(driver.is_alive())
+            self.assertEqual([], failures)
+            capture("original-driver-return")
+            result = _recover_original_publication(runtime, results[0], evidence)
+            _assert_original_result(self, results[0], result, evidence)
+            if mode in {"hold", "lock"}:
+                self.assertEqual("succeeded", None if result is None else result.state,
+                    None if result is None else result.to_dict())
+                self.assertEqual("confirmed", result.result.value)
+                self.assertTrue((root / "business").exists())
+                if mode == "lock":
+                    attempts = [json.loads(line) for line in (root / "attempts").read_text().splitlines()]
+                    self.assertGreaterEqual(len(attempts), 2)
+                    self.assertTrue(all(item["envelope"]["constraints"] == attempts[0]["envelope"]["constraints"]
+                        and item["envelope"]["started_at"] == attempts[0]["envelope"]["started_at"] for item in attempts))
+                    self.assertTrue(all(0 < item["timeout_seconds"] <= .1 for item in attempts))
+                    persisted = runtime.kernel.get_execution_limits("probe")["envelope"]
+                    self.assertEqual(attempts[0]["envelope"]["started_at"], persisted["started_at"])
+                    self.assertEqual(attempts[0]["envelope"]["constraints"], persisted["constraints"])
+            else:
+                self.assertEqual("failed", None if result is None else result.state,
+                    None if result is None else result.to_dict())
+                if mode == "fail":
+                    self.assertEqual("entry_confirmation_unknown", result.result.error.code)
+                self.assertFalse((root / "business").exists())
+                limits = runtime.kernel.get_execution_limits("probe")
+                self.assertEqual("pending", limits["entry_state"])
+                self.assertEqual([], limits["envelope"]["constraints"])
 
     def test_worker_requires_durable_confirmation_before_business(self):
         self.execute("hold")
@@ -312,18 +502,34 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
         if sys.platform.startswith("linux") or os.name == "nt":
             modes.append("process")
         for mode in modes:
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
-                with Runtime(str(Path(temporary) / "kernel.db"), {"parent": uncaught_child_parent,
-                        "denied-child": denied_child}, isolation_mode=mode) as runtime:
-                    runtime.submit(runtime.command("parent", execution_id="parent", idempotency_key="parent",
-                        correlation_id="provider-failure", timeout_seconds=12, payload={}))
+            root = retained_directory("sdk-provider-child-failure-" + mode + "-")
+            evidence = {"bounds": {"parent_timeout": 12, "child_timeout": 5}}
+            with self.subTest(mode=mode):
+                with _retained_deadline_runtime(self, root, {"parent": uncaught_child_parent,
+                        "denied-child": denied_child}, mode, evidence) as (runtime, capture):
+                    submitted = runtime.command("parent", execution_id="parent", idempotency_key="parent",
+                        correlation_id="provider-failure", timeout_seconds=12, payload={})
+                    evidence["submitted_command"] = submitted.to_dict()
+                    runtime.submit(submitted)
                     result = runtime.run_once()
-                    self.assertEqual("failed", result.state)
+                    evidence["original_return"] = None if result is None else result.to_dict()
+                    capture("original-run-once-return")
+                    original = result
+                    result = _recover_original_publication(runtime, original, evidence)
+                    _assert_original_result(self, original, result, evidence)
+                    self.assertEqual("failed", None if result is None else result.state,
+                        None if result is None else result.to_dict())
                     details = result.result.error.details
                     child_result = details.get("child_result") if type(details) is dict else None
                     self.assertEqual("provider_denied", result.result.error.code,
                         f"parent_error={result.result.error.to_dict()!r}; child_result={child_result!r}")
                     child_result = details["child_result"]
+                    captured_child = next((item for item in evidence["original_results"]
+                        if (item["execution_id"], item["attempt"], item["fence"]) ==
+                        (child_result["execution_id"], child_result["attempt"], child_result["fence"])), None)
+                    evidence["captured_child_result"] = deepcopy(captured_child)
+                    if captured_child is not None:
+                        self.assertEqual(captured_child, child_result)
                     self.assertEqual(child_result["execution_id"], details["child_execution_id"])
                     self.assertEqual("parent", child_result["causation_id"])
                     self.assertEqual("provider_denied", child_result["error"]["code"])
@@ -828,7 +1034,7 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                   "hard_deadline_monotonic": time.monotonic() + 20}
         guard = process_runtime._DeadlineGuard(time.monotonic() + 30, inherited, None)
         guard.entered(packet)
-        self.assertLessEqual(guard.deadline - time.monotonic(), 7)
+        self.assertLessEqual(guard.deadline, time.monotonic() + 7)
         self.assertGreater(guard.hard_deadline - guard.deadline, 2.9)
         interval_timer = object()
         timer_api = SimpleNamespace(ITIMER_REAL=interval_timer, setitimer=Mock())
