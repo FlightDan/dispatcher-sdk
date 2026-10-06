@@ -8,7 +8,109 @@ revised SDK-only A16.
 
 ## Current status, 2026-10-06
 
-The final acceptance candidate declares `0.7.1`; it is not fully accepted.
+SDK acceptance and formal delivery passed for `0.7.1`. T01–T09, A01–A18 and
+G1–G5 are complete within the revised SDK-only scope.
+The reviewed correction commit is now
+`e2d3cc52e736afaa622619d4c07686c2c13fc1d6`. Its only full matrix
+[37401366407](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37401366407)
+started on 2026-10-06 at 01:52:37 UTC and completed successfully. All sixteen
+matrix jobs and admission/history scanning passed. Each environment ran exactly
+one 1,174-method installed suite within its original 900 seconds, one five-check
+source/rebuild command, five public scenarios, the original 30-second managed
+example and six original restart commands. Actual imports are `0.7.1` from
+external temporary venv `site-packages`. Five type consumers, documentation,
+portable examples and script notification passed in every environment.
+
+All sixteen original job logs and native artifact ZIPs, admission/history logs,
+host run/artifact metadata, timestamped status snapshots and the tested package
+ZIP are retained under `/tmp/sdk-ci-e2d3cc5/`. `complete-matrix-audit.json` records
+each environment's original commands, counts, import and duration. Independent
+Linux and Windows native evidence reviews found no blocker; the primary also
+checked actual native close/flush/capacity/storage facts and original result
+equality. The committed publishing helper's live `find --require` selected run
+`37401366407`, attempt `1`, original package artifact `11385397936`.
+
+Linux suites took 291.958–329.402 seconds and skipped seventeen Windows-specific
+methods. Windows suites took 340.587–671.265 seconds and skipped fifty-eight
+platform/privilege methods; all fifteen applicable native Job tests, nine native
+observability tests and two file-sharing tests passed. Linux README examples were
+four passed/zero skipped; Windows ran two portable examples and explicitly skipped
+two Linux-only examples. Native Windows ARM64 Python 3.11–3.13 all passed; Python
+3.10 on the ARM host is AMD64 emulation, not native ARM64 evidence.
+
+Actual crash/ACK artifacts establish durable floor preservation, empty sampling
+guards and recorded final settlement with the original result. Earlier pending
+receipts remain historical facts. A pending canonical outbox does not establish
+transport ACK. Sandbox cleanup is confirmed for the same sandbox while its task
+correctly remains `recovery_required`. Native close evidence retains physically
+closed collectors, stopped capacity and actual storage release; unknown driver
+observations are not rewritten as exited. Historical causes lacking original
+pre-cleanup evidence remain unknown and are not inferred from this successful run.
+
+Formal delivery completed on 2026-10-06. `release/0.7.1` was created from the
+previous default `release/0.7.0` at `b85b828487548cbac5f6ce6adfd2d4ab3ed46eae`
+and fast-forwarded to the exact accepted commit `e2d3cc52e736afaa622619d4c07686c2c13fc1d6`.
+The annotated tag `v0.7.1` resolves to that same commit. The
+[publishing workflow](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37403409155)
+completed successfully using run `37401366407`, attempt `1`, original artifact
+`11385397936`; its log records that selection. It did not rebuild packages or
+run another matrix. Direct post-publication API reads found only the original
+complete CI and this publishing run for the accepted commit; the new branch
+push did not create an additional CI run.
+
+[Release v0.7.1](https://github.com/FlightDan/dispatcher-sdk/releases/tag/v0.7.1)
+is published, `draft=false`, `prerelease=false`, and the Latest API returns that
+release (ID `404242276`, published at `2026-10-06T02:17:44Z`). Its two assets are
+[wheel](https://github.com/FlightDan/dispatcher-sdk/releases/download/v0.7.1/dispatcher_sdk-0.7.1-py3-none-any.whl)
+(asset `614202079`, 471,445 bytes) and
+[sdist](https://github.com/FlightDan/dispatcher-sdk/releases/download/v0.7.1/dispatcher_sdk-0.7.1.tar.gz)
+(asset `614202078`, 1,157,618 bytes). The actual published downloads passed the
+committed helper's distribution/runtime version and LICENSE/NOTICE checks;
+the sdist retains the public CI recipes and historical JSON documentation files.
+No PyPI publication occurred.
+
+The repository default branch was changed to `release/0.7.1` and read back
+through GitHub. Existing branches, tags and evidence were preserved. Publication
+logs, final Release/default metadata and downloaded assets are under
+`/tmp/sdk-ci-e2d3cc5/`. This post-publication ledger update changes only these
+two evidence documents. The tag and published packages retain the accepted
+`e2d3cc5` commit and its original pre-publication ledger snapshot; the default
+branch receives the later documentation commit, with installed documentation
+checks and without another full matrix. The final installed Python 3.10
+documentation command checked 631 local links and ran four README examples
+with zero skips; its original output is `final-ledger-docs.log` in the same
+evidence directory.
+
+The following current closure supersedes the older candidate-specific status
+tables below, whose original errors, commands and evidence remain preserved.
+
+| Requirement | Status | Current installed/native evidence |
+| --- | --- | --- |
+| T01–T09 | passed | Reviewed SDK/state/ownership changes, complete installed regression, public APIs/types/examples, native Linux/Windows and this evidence index |
+| A01 | passed | Native queue/ready/entry/model-request and real import-failure witnesses |
+| A02 | passed | Actual segmented bytes `[65,255,66,67]`, separate output/heartbeat/progress and duplicate-progress refusal |
+| A03 | passed | Current/old attempt and inaccessible identity regressions; retained unknown collector observations |
+| A04 | passed | Actual inherited parent/child/tool cutoff, original reserves and native stop evidence |
+| A05 | passed | Actual ACK-crash marker, durable floor/empty guards, original typed result and bounded restart/short-wait cases |
+| A06 | passed | Actual managed children return success and original failure within bounded capacity and observed parent memory |
+| A07 | passed | Actual rejection/partial registration/crash recovery preserves original errors and obligations |
+| A08 | passed | Native cancellation/tree containment and physically closed flush/collector/storage/capacity receipts |
+| A09 | passed | Original body/cleanup errors, same-sandbox cleanup without business replay and honest unknown OOM attribution |
+| A10 | passed | Valid-window/stall/unknown/wait exemption/progress-reset regressions |
+| A11 | passed | Managed notices and business budgets/capacity remain separate; original 30-second public example |
+| A12 | passed | Original-bounded native pressure/deadline/cancel/memory/callback cases with explicit degraded telemetry |
+| A13 | passed | Actual writer contention, incomplete reads, dropped events and bounded pages remain visible |
+| A14 | passed | Complete explicit copy-upgrade/old-writer/retained-owner/effect/recovery compatibility regressions |
+| A15 | passed | Actual rebuilt wheel outside checkout, version/import/public exports and six raw restart receipts per environment |
+| A16 | passed | All five SDK public-entry scenarios in all sixteen installed environments; real handlers/processes/local tools/storage |
+| A17 | passed | Native Windows x64 and ARM64 3.11–3.13 Job/process/flush/file-sharing witnesses; 3.10 emulation separately labelled |
+| A18 | passed | Same actual 0.7.1 commit across all sixteen environments, one full installed suite each plus packaging/types/docs/examples/restarts |
+| G1 | passed | T01–T09 and every required applicable A01–A18 witness completed; no current blocker |
+| G2 | passed | Installed public interfaces, five typed consumers, docs, executable examples and public end-to-end consumers |
+| G3 | passed | All current matrix imports/package provenance point to the actual same 0.7.1 candidate; old dev2 passes are not reused |
+| G4 | passed | Original API/state/receipt compatibility and explicit storage upgrades; original facts and unresolved obligations retained |
+| G5 | passed | Independent ownership/concurrency/deadline/cleanup/maintainability review, corrected findings and final Linux/Windows evidence review |
+
 Reviewed candidate `e9780505d93a32ec6e6014e124b1e61123d0fa0d` was pushed after
 all known source, fixture and example corrections passed independent review and
 necessary local installed checks. Its full matrix
@@ -18,8 +120,8 @@ failed matrix environments. All sixteen installed suites ran 1,174 methods
 within their original 900-second allowance. The failed jobs contain twelve
 inner failures/errors. All original matrix logs, artifact ZIPs, extracted
 evidence, admission/history-scan logs and the tested package artifact are
-retained under `/tmp/sdk-ci-e978050/`. No formal Release or default-branch change
-has occurred. This failed run does not establish final 0.7.1 acceptance.
+retained under `/tmp/sdk-ci-e978050/`. At that failed run’s completion, no formal Release or default-branch change
+had occurred. This failed run does not establish final 0.7.1 acceptance.
 
 The eight Linux environments and native Windows ARM64 Python 3.12 passed.
 Independent Linux evidence review confirmed the installed `0.7.1` imports,
