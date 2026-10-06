@@ -45,20 +45,20 @@ Keep the host process running while work executes in the background.
 Integration boundaries:
 
 - Process mode contains trusted code with timeouts, cancellation, and process cleanup. It does not provide a filesystem, network, or permission sandbox for untrusted code. Agent-generated code still needs application review or an additional sandbox.
-- Linux process mode uses subreaper cleanup for detached descendants; other POSIX platforms use process-group cleanup. Native Windows process and script execution uses Job Objects. Earlier native tests passed on Windows 11 x64 (build 10.0.26100.9168) with Python 3.12.10; see [Windows runtime](docs/WINDOWS_RUNTIME.md) for their scope. The current candidate still needs native matrix validation. Thread mode cannot forcibly stop a blocked handler.
+- Linux process mode uses subreaper cleanup for detached descendants; other POSIX platforms use process-group cleanup. Native Windows process and script execution uses Job Objects. Earlier native tests passed on Windows 11 x64 (build 10.0.26100.9168) with Python 3.12.10; see [Windows runtime](docs/WINDOWS_RUNTIME.md) for their scope. The acceptance index records native matrix evidence and its scope. Thread mode cannot forcibly stop a blocked handler.
 - Resume with the original database and matching handler deployment. Reopening the database does not reset retry budgets or guarantee that interrupted tasks will automatically rerun.
 - The SDK cannot undo a write or API call that has already happened. Uncertain outcomes require verification before recovery; arbitrary operations are not guaranteed to happen exactly once.
 - `Dispatcher` durably accepts and deduplicates notifications in its built-in inbox. User callbacks remain at-least-once; external calls need idempotency. Use `consume_results` for atomic local SQL and receipt settlement.
 
-The current source version is `0.7.0.dev2` and requires Python 3.10+.
+The current source version is `0.7.1` and requires Python 3.10+.
 Kernel storage uses schema 5; Orchestrator storage uses schema 4. Older databases
 need an explicit upgrade. Read [storage and upgrades](docs/STORAGE_AND_UPGRADES.md)
 and the [compatibility guide](docs/PUBLIC_API.md) before opening them with this version.
 
-Execution observations and managed supervision are implemented in the working
-tree. Complete installed-package and native matrix validation is still in
-progress. CI is paused while known failures are corrected; current results and
-remaining checks are recorded in the [acceptance index](docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md).
+Execution observations and managed supervision are documented in the
+[execution guide](docs/EXECUTION_OBSERVABILITY.md). The
+[acceptance index](docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md) records installed-package
+and native matrix evidence, applicable skips and validation limits.
 
 ## Install
 

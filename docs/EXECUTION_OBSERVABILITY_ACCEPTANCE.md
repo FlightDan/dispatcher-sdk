@@ -8,7 +8,120 @@ revised SDK-only A16.
 
 ## Current status, 2026-10-06
 
-The candidate declares `0.7.0.dev2`. It is not fully accepted. After the known
+The final acceptance candidate declares `0.7.1`; it is not fully accepted.
+The latest completed development run
+[37390861215](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37390861215)
+tested `33482b2` / `0.7.0.dev2`: twelve matrix jobs passed, four failed,
+and history scanning passed. All sixteen original job logs and artifacts are
+retained in `/tmp/sdk-ci-33482b2/`. Every installed suite completed its original
+900-second allowance; four failing environments contain seven inner failures
+or errors. These results do not establish formal 0.7.1 acceptance.
+
+The revised Goal explicitly authorizes the formal GitHub release, integration
+into `release/0.7.1` and making that branch the default, after all required
+acceptance passes. PyPI publication is excluded. Live discovery found default
+branch `release/0.7.0`, no `release/0.7.1`, no `v0.7.1`, and only historical
+prereleases `v0.7.0.dev0` and `v0.5.1`. All existing history is preserved.
+The formal workflow reuses a fully successful same-commit matrix and its
+original tested wheel and sdist. It neither rebuilds packages nor runs another
+matrix for the tag. Authored SHA256SUMS generation and upload were removed.
+
+### Completed development run and final-candidate preparation
+
+All sixteen original logs and artifacts for `37390861215` are under
+`/tmp/sdk-ci-33482b2/{logs,artifacts}/`; downloads completed before fixes began.
+The sixteen jobs consumed 128.733 observed runner wall minutes including setup
+and post-processing. This is elapsed runner time, not billed credits.
+
+| Failed environment | Original installed-suite failures/errors | Attribution and correction |
+| --- | --- | --- |
+| Windows x64 3.10 | PID-only observer cleanup; lifecycle release (`.02`); startup host recovery; restart publication | Discarded close receipts permitted deleting owned SQLite storage; the fixture now drains both physical workers within the original total two seconds. Release timing incorrectly demanded nominal duration after prior work consumed the same deadline; it now verifies each real acquire's remaining argument and native duration. Restart `run_once()` may legitimately return `running` with an original result pending; the fixture retries only publication, within its original execution budget and one API maintenance allowance. Host success wait and stop both missed their original three seconds; exact historical cause is unresolved. Its unsafe deletion and masking of the primary failure are corrected, with own SQL/worker/health/body/stop evidence and unchanged deadlines. |
+| Windows ARM64 3.11 | Lifecycle release (`.02`) | Same confirmed fixture contract mismatch; native coarse monotonic endpoints cannot impose a performance-clock minimum of the whole nominal capture bound. |
+| Windows ARM64 3.12 | Cancelled result archival | SDK defect: rejection archival renewed a `.1` operation allowance and leaked a transient journal error. Every branch now shares the original record deadline. A failed archive reports pending with both typed rejection and typed archive error; permanent archive errors retain the original rejection as their cause. Original result/budget/cancellation/outbox remain immutable. |
+| Windows ARM64 3.13 | Durable receipt absent after cleanup Future completion | `_thread_done` proves physical Future completion, not journal commit. The fixture publishes the same retained outcome within the existing two-second finish deadline, records raw failures and retains its original token/capacity/close assertions. |
+
+The eight Linux jobs, Windows x64 3.11–3.13 and Windows ARM host 3.10 x64
+passed their complete installed suites and applicable public/native scenarios.
+Linux skips were seventeen inapplicable Windows mechanisms. Windows skips were
+fifty-eight reviewed platform/privilege cases, without a required native Windows
+acceptance skip. Windows ARM host 3.10 uses AMD64 CPython on an ARM64 runner;
+it does not establish native ARM64 CPython support. Individual raw receipts for
+the six restart commands were missing from this development artifact; the final
+harness retains each command, stdout, stderr and original timeout.
+
+SDK/fixture corrections passed independent review. The first final-candidate
+source-focused command passed 54 cases in 36.385 seconds; the older-gh pagination
+correction then passed sixteen release helper cases. Original outputs:
+`/tmp/sdk-071-source-focused-{stdout,stderr}.log` and
+`/tmp/sdk-071-release-helper-followup-{stdout,stderr}.log`.
+Five public type consumers passed. Live GitHub lookup correctly returned no
+eligible candidate for this failed development run; the original unsupported
+`--slurp` error and corrected lookup are retained. Formal 0.7.1 installed and
+native acceptance remains pending.
+
+The local Python 3.10 rebuilt-wheel full run did not pass. Its installed suite
+timed out at the unchanged 900-second limit, after 1,097 completed passes and
+one received-checkpoint failure; the outer five-check command failed after
+941.940 seconds. Original command, stdout/stderr and the actual `0.7.1`
+`site-packages` import remain under `/tmp/sdk-071-local-final310/`. The public
+five-scenario batch and managed example passed before that timeout. No release
+package was exported. The suite's last test name does not establish a hang.
+Retained SQL showed continuing progress near 880 seconds; wrapped COMMIT
+durations were substantially longer than the previous Linux CI. They include
+trace bookkeeping, so native I/O and recorder overhead are not separately
+attributed. Cleanup snapshots showed no accumulating owned-worker leak.
+
+The failed received-checkpoint store preserved the same canonical successful
+result and a pending journal receipt after cleanup. It did not retain the exact
+failing assertion. An unchanged installed reproduction passed in .903 seconds;
+that does not explain the historical failure. The affected fixture now records
+raw errors and SQL before cleanup, and finishes factual publication within one
+original `.5` maintenance window, rather than assuming one recovery pass commits
+both stores. Its original capture/finish `.1`, producer/join two-second bounds,
+ten-second execution constraints and exact result/checkpoint assertions remain.
+A real post-UPDATE/pre-COMMIT expiry regression proves rollback leaves the
+receipt pending after Kernel success, then archives that same result within the
+same maintenance window. Independent review identified and verified fixes for
+native coarse-clock expiry and identifying the actual injected recovery pass.
+
+Necessary installed checks against the diagnostic `0.7.1` wheel outside the
+checkout passed 66 cases in 45.855 seconds, including all prior failing fixtures,
+received-checkpoint cases and sixteen release-helper tests. The reviewed expiry
+correction then passed its two affected installed cases in 1.878 seconds. Five
+public typing consumers also passed using that environment's installed package.
+Commands, original output and raw recovery/SQL evidence are retained under
+`/tmp/sdk-071-received-fact-diag310/`; this diagnostic package is not a release
+artifact. These focused results do not convert the timed-out complete suite into
+a pass. A final committed 0.7.1 candidate still needs the complete sixteen-job
+matrix and all required native acceptance.
+
+The same diagnostic environment passed all six independent restart consumers,
+five public type consumers, 630 documentation links and four README examples
+with zero skips. Each restart command retained its original stdout/stderr,
+timeout and installed import in `restart/` beneath that directory.
+Eleven unchanged portable examples passed. `effect_recovery.py` initially
+failed its final canonical-success assertion; its original temporary store was
+deleted, so that exact execution's state remains unknown. An unchanged retained
+diagnostic passed, without establishing the historical cause. Source review
+confirmed that its worker discarded `run_once()`'s pending return and inferred
+publication from exit zero. The corrected example uses bounded public recovery
+and observation within one `.5` maintenance window further limited by its
+original five-second execution deadline. It keeps both fifteen-second process
+joins and the final canonical-success/single-file-write assertions.
+
+Independent review found and verified a correction for background maintenance
+winning publication before the foreground caller: durable state is read
+independently of that caller's reports. The corrected actual installed example
+passed. A real post-result Kernel writer then forced its initial `running`
+return; after release, the reviewed example observed canonical success with the
+exact original result before its maintenance deadline and wrote the file once.
+Original errors, unchanged diagnostics and reviewed proof are retained in
+`portable-examples/`, `effect-original-diagnostic/` and
+`effect-publication-reviewed-real-writer/` under the same diagnostic directory.
+This corrects the example's unsupported assumption; it does not claim a new SDK
+defect or turn the earlier failed local commands into passes.
+
+After the known
 fixture defects were corrected and reviewed, implementation commit `d5d9741`
 was pushed to the previously authorized work branch. CI run
 [37378483985](https://github.com/FlightDan/dispatcher-sdk/actions/runs/37378483985)
@@ -50,9 +163,9 @@ prerequisite persistence by retrying the same prepared batch within one finite
 one-second maintenance window; each write retains its original 0.03-second
 allowance and captured clocks. The original runtime-overlap failure lacks raw
 ownership evidence; later local success does not establish its historical cause.
-This run cannot satisfy full acceptance. No replacement CI has been triggered.
+This run cannot satisfy full acceptance; its replacement is `37390861215`.
 
-The current uncommitted SDK corrections were rebuilt from sdist and installed
+The SDK corrections now committed as `33482b2` were rebuilt from sdist and installed
 in a clean Python 3.10 virtualenv at `/tmp/sdk-final-authority-recovery310/`.
 Its recorded import is `venv/lib/python3.10/site-packages/dispatcher_sdk/__init__.py`.
 The first targeted command ran 73 cases in 70.282 seconds: 72 passed and one
@@ -88,10 +201,10 @@ to it. These are observed durations, not billed credits. The proposed correction
 keeps all sixteen environments and one complete installed suite in each, with
 outer packaging and isolation checks. Public/native scenarios, types, docs,
 examples, restart checks and artifacts remain required. No individual test
-definition has been removed. The one-line CI selection change is now present
-locally; it has not been pushed or used to trigger CI. At the user's request,
-deduplication was completed and checked before any new CI run. The next run
-will use one complete installed suite per environment, preserving the existing
+definition has been removed. At the user's request, deduplication was completed
+and checked before the next push. The user then explicitly authorized pushing;
+the one-line selection change is included in `33482b2`, and run `37390861215`
+uses one complete installed suite per environment, preserving the existing
 matrix and all unique tests.
 The proposed one-line workflow diff is retained at
 `/tmp/sdk-ci-single-full-suite-review/single-full-suite.patch`. Static inventory
@@ -1937,7 +2050,7 @@ windows before launch and retains raw stages; the original failure is preserved.
 
 ## Candidate and reproducible commands
 
-The source version is `0.7.0.dev2`. Final evidence must identify the Git commit,
+The source version is `0.7.1`. Final evidence must identify the Git commit,
 installed distribution and actual import path, without relying on a version
 string alone. The CI test jobs install the package, run the existing complete
 matrix, and retain native scenario artifacts under

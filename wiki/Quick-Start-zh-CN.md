@@ -2,7 +2,7 @@
 
 [English](Quick-Start.md) | [简体中文](Quick-Start-zh-CN.md) | [首页](Home-zh-CN.md)
 
-使用 0.7.0.dev2 开发版代码，并确保 Python 版本为 3.10 或更高。
+使用 0.7.1 代码，并确保 Python 版本为 3.10 或更高。
 在仓库根目录运行：
 
 ```sh

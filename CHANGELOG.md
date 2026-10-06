@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0.dev2 (in development)
+## 0.7.1
 
 - Kernel storage uses layout schema 5 and Orchestrator storage uses schema 4.
   Kernel execution records retain their public v2 contract.
@@ -15,8 +15,16 @@
 - Optional managed stall supervision reserves independent capacity and enforces
   native memory limits. It preserves the original notice and business budgets
   and reports capacity shortages and pending cleanup. Linux limits worker address
-  space; Windows uses Job committed-memory limits. Native Windows acceptance is
-  still pending.
+  space; Windows uses Job committed-memory limits. Validation results and
+  previous development-version evidence are recorded in the acceptance index.
+- Cancelled result recovery archives its original obligation within the same
+  bounded operation window. Transient archive failures retain both the business
+  rejection and archive error, and permanent storage failures keep their cause.
+- The Effect recovery example checks durable result publication after a worker
+  returns a pending outcome, within the original execution deadline and without
+  repeating the file mutation.
+- Formal GitHub publishing reuses the exact successful candidate's tested wheel
+  and source distribution, without repeating the matrix or rebuilding packages.
 - See [execution activity and supervision](docs/EXECUTION_OBSERVABILITY.md) and
   the [acceptance index](docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md) for behavior,
   validation evidence and remaining gates.

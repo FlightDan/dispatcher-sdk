@@ -7,8 +7,10 @@ import multiprocessing
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 
-from dispatcher_sdk.execution_kernel import ExecutionCommandV2, Kernel, RetryPolicy
+from dispatcher_sdk.execution_kernel import BudgetEnvelope, ExecutionCommandV2, Kernel, RetryPolicy
+from dispatcher_sdk.execution_kernel.budget import sample_clock
 
 
 class DemoClock:
@@ -34,9 +36,44 @@ append_receipt.__execution_kernel_revision__ = "example-append-receipt-v1"
 
 
 def worker(database, clock_value=100.0):
-    with Kernel.open_sqlite(database, {"append": append_receipt}, now=DemoClock(clock_value),
+    clock = DemoClock(clock_value)
+    with Kernel.open_sqlite(database, {"append": append_receipt}, now=clock,
                            isolation_mode="thread") as runtime:
-        runtime.run_once()
+        returned = runtime.run_once()
+        assert returned is not None, 'the original recovery execution was not dispatched'
+        # A returned handler result can still need factual publication. Recover
+        # that receipt without dispatching the business again or renewing its
+        # five-second execution deadline. Share one API maintenance allowance.
+        if returned.state == "running":
+            limits = runtime.kernel.get_execution_limits("invoice-1")
+            envelope = BudgetEnvelope.from_dict(limits["envelope"])
+            original_deadline = envelope.deadline_monotonic(sample=sample_clock(wall_time=clock.value))
+            assert original_deadline is not None, 'original execution clock is unproved'
+            deadline = min(original_deadline, time.monotonic() + .5)
+            reports = []
+            observations = []
+            published = False
+            while not published and time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                reports.extend(runtime.recover_completions(timeout_seconds=min(.1, remaining)))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                observed = runtime.observe("invoice-1", timeout=remaining,
+                    attempt=returned.attempt, fence=returned.fence)
+                observations.append(observed)
+                execution = observed.get("execution", {})
+                result = observed.get("result", {})
+                # Background maintenance can publish before this caller's pass.
+                # Read the durable business state independently of its reports.
+                published = (execution.get("state") == "succeeded"
+                    and (execution.get("attempt"), execution.get("fence")) == (returned.attempt, returned.fence)
+                    and result.get("status") == "succeeded")
+            assert published and time.monotonic() <= deadline, (returned.to_dict(), reports, observations)
+        else:
+            assert returned.state == "succeeded", returned.to_dict()
 
 
 def main():

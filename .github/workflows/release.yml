@@ -1,37 +1,53 @@
-name: SDK prerelease
+name: SDK release
 on:
   push:
     tags: ['v*']
 permissions:
   contents: read
+  actions: read
+concurrency:
+  group: sdk-release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  verify:
-    uses: ./.github/workflows/ci.yml
   release:
-    needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Check tag version
-        run: |
-          python - <<'PY'
-          import os, tomllib
-          with open('pyproject.toml', 'rb') as stream:
-              version = tomllib.load(stream)['project']['version']
-          assert os.environ['GITHUB_REF_NAME'] == f'v{version}'
-          PY
-      - name: Build packages
-        run: |
-          python -m pip install build
-          python -m build
-          cd dist
-          sha256sum *.whl *.tar.gz > SHA256SUMS
-      - name: Publish GitHub prerelease
+      - name: Require a formal version and complete candidate acceptance
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.whl dist/*.tar.gz dist/SHA256SUMS --verify-tag --prerelease --title "Dispatcher SDK $GITHUB_REF_NAME (developer preview)" --notes-file CHANGELOG.md
+        run: |
+          python - <<'PY'
+          import os, re, tomllib
+          with open('pyproject.toml', 'rb') as stream:
+              version = tomllib.load(stream)['project']['version']
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version), 'a formal version is required'
+          assert os.environ['GITHUB_REF_NAME'] == f'v{version}', 'tag and package version differ'
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'RELEASE_VERSION={version}\n')
+          PY
+          python scripts/release_candidate.py find --repository "$GITHUB_REPOSITORY" --commit "$(git rev-parse HEAD)" --require > candidate.json
+      - name: Download the original tested wheel and source distribution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          candidate = json.load(open('candidate.json'))
+          subprocess.run(['python', 'scripts/release_candidate.py', 'download',
+              '--repository', os.environ['GITHUB_REPOSITORY'],
+              '--artifact-id', str(candidate['artifact_id']), '--destination', 'dist',
+              '--version', os.environ['RELEASE_VERSION']], check=True)
+          print(candidate)
+          PY
+      - name: Publish formal GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.whl dist/*.tar.gz --verify-tag --latest --title "Dispatcher SDK $GITHUB_REF_NAME" --notes-file CHANGELOG.md

@@ -440,8 +440,11 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                 event = {"thread": threading.current_thread().name, "called_at": time.monotonic(),
                          "timeout": timeout}
                 records.append(event)
+                began = time.perf_counter()
                 acquired = actual_lock.acquire(*args, **options)
-                event.update(acquired=acquired, returned_at=time.monotonic())
+                finished = time.perf_counter()
+                event.update(acquired=acquired, returned_at=time.monotonic(),
+                    wait_started=began, wait_finished=finished, wait_elapsed=finished - began)
                 return acquired
 
             def release(self):
@@ -473,6 +476,11 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
             # Allow interception/scheduler delay between calculating remaining
             # and forwarding to the native lock, without permitting .1 for .02.
             self.assertAlmostEqual(event["timeout"], remaining, delta=bound / 10)
+            if not event["acquired"]:
+                precision = (math.ulp(event["wait_started"]) + math.ulp(event["wait_finished"])
+                    + time.get_clock_info("perf_counter").resolution)
+                self.assertGreaterEqual(event["wait_elapsed"] + precision, event["timeout"],
+                    "native lock refusal preceded its forwarded remaining timeout")
         self.evidence["records"].append({"phase": "actual_lifecycle_lock_arguments",
             "original_budget": budget, "original_bound": bound, "acquires": calls})
 
@@ -523,18 +531,18 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                     elapsed = finished - began
                     state.phase[0] = "cleanup"
                     bound = .1 if configured is None else configured
-                    representation_error = math.ulp(began) + math.ulp(finished)
-                    self.assertGreaterEqual(elapsed - bound * .8, -representation_error)
+                    self.evidence["records"].append({"phase": "admission_contention", "original_bound": bound,
+                        "elapsed": elapsed, "elapsed_clock": "perf_counter", "capture_budgets": budgets,
+                        "acquires": acquires, "raw_error": self.raw(caught.exception),
+                        "wall_samples": len(state.wall_calls), "opens": opened.call_count})
                     self.assertLess(elapsed, .3)
                     self.assertEqual(len(budgets), 1)
                     self.assert_lifecycle_acquires_use_deadline(acquires, budgets[0], bound, count=1)
+                    self.assertFalse(acquires[-1]["acquired"])
                     self.assertEqual(state.wall_calls, [])
                     opened.assert_not_called()
                     self.assertEqual(state.context._completion_readers, set())
                     self.assertFalse(state.context._completion_readers_pending())
-                    self.evidence["records"].append({"phase": "admission_contention", "original_bound": bound,
-                        "elapsed": elapsed, "elapsed_clock": "perf_counter",
-                        "raw_error": self.raw(caught.exception), "wall_samples": 0, "opens": 0})
                 state.context.close()
                 with patch.object(clock_module, "_connect_readonly", wraps=clock_module._connect_readonly) as opened:
                     state.phase[0] = "capture"
@@ -583,11 +591,19 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                         elapsed = finished - began
                         state.phase[0] = "cleanup"
                         bound = .1 if configured is None else configured
-                        representation_error = math.ulp(began) + math.ulp(finished)
-                        self.assertGreaterEqual(elapsed - bound * .8, -representation_error)
+                        # Native read/close and holder synchronization consume
+                        # this same capture deadline before release admission.
+                        # Its remaining wait has no minimum nominal duration.
+                        self.evidence["records"].append({"phase": "release_contention", "original_bound": bound,
+                            "elapsed": elapsed, "elapsed_clock": "perf_counter",
+                            "completed_at": completed_at, "capture_budgets": deadlines, "acquires": acquires,
+                            "physical_reader_closed": bool(owners and owners[0]._connection is None),
+                            "owner_retained": bool(owners and owners[0] in state.context._completion_readers)})
                         self.assertLess(elapsed, .3)
                         self.assertEqual(deadlines[0]["deadline"], deadlines[0]["started"] + bound)
                         self.assert_lifecycle_acquires_use_deadline(acquires, deadlines[0], bound, count=2)
+                        self.assertTrue(acquires[0]["acquired"])
+                        self.assertFalse(acquires[-1]["acquired"])
                         self.assertGreaterEqual(completed_at, state.context.budget_envelope.checkpoint.wall_at)
                         self.assertEqual(len(owners), 1)
                         self.assertTrue(owners[0]._body_done.is_set())
@@ -595,10 +611,6 @@ class CompletionReaderLifetimeTests(unittest.TestCase):
                         self.assertIsNone(opens[0]._participation)
                         self.assertTrue(state.context._completion_readers_pending())
                         self.assertIn(owners[0], state.context._completion_readers)
-                        self.evidence["records"].append({"phase": "release_contention", "original_bound": bound,
-                            "elapsed": elapsed, "elapsed_clock": "perf_counter",
-                            "completed_at": completed_at, "capture_deadline": deadlines[0],
-                            "physical_reader_closed": True, "owner_retained": True})
                 with patch.object(clock_module, "_connect_readonly", side_effect=opened):
                     self.assertFalse(state.context._drain_completion_readers(time.monotonic() + 1))
                 self.assertEqual(len(opens), 1)

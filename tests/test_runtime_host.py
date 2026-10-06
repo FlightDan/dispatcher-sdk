@@ -395,7 +395,18 @@ class RuntimeHostTests(unittest.TestCase):
 
 
     def test_startup_recovery_reaps_expired_execution_and_keeps_pumping(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        from contextlib import nullcontext
+        from dataclasses import asdict
+        import traceback
+        from tests._acceptance_evidence import retained_directory
+        from tests._storage_evidence import StorageEvidence
+
+        root = retained_directory("sdk-runtime-host-startup-")
+        evidence = StorageEvidence(root, self)
+        evidence.start(include_kernel=True)
+        self.addCleanup(evidence.stop)
+        self.addCleanup(evidence.save)
+        with nullcontext(root) as temp:
             path = Path(temp) / "kernel.sqlite3"
             first = Kernel.open_sqlite(
                 path,
@@ -437,6 +448,30 @@ class RuntimeHostTests(unittest.TestCase):
                 retry_initial=0.01,
                 retry_max=0.05,
             )
+
+            def facts():
+                return {"original_wait_seconds": 3., "original_stop_seconds": 3.,
+                    "original_command": command.to_dict(), "health": asdict(host.health()),
+                    "stop_report": None if host.stop_report is None else host.stop_report.to_dict(),
+                    "runtime_closed": runtime._closed}
+
+            def stop_owned_host():
+                began = time.monotonic()
+                try:
+                    stopped = host.stop(timeout=3.0)
+                    evidence.save(phase="original-stop-return", checkpoint={
+                        "stopped": stopped, "elapsed": time.monotonic() - began, **facts()})
+                    self.assertTrue(stopped)
+                    self.assertTrue(host.join(0.1))
+                except BaseException as error:
+                    evidence.save(phase="original-stop-failure", checkpoint={
+                        "error_chain": traceback.format_exception(type(error), error, error.__traceback__),
+                        "elapsed": time.monotonic() - began, **facts()})
+                    raise
+
+            # Cleanup errors remain separate from the original success-window
+            # failure, and pending SDK ownership never permits deleting storage.
+            self.addCleanup(stop_owned_host)
             try:
                 host.start()
                 wait_until(
@@ -446,9 +481,11 @@ class RuntimeHostTests(unittest.TestCase):
                 self.assertGreaterEqual(bridge.sweep_calls, 1)
                 self.assertGreaterEqual(bridge.pump_calls, 1)
                 self.assertEqual(len(bridge.thread_ids), 1)
-            finally:
-                self.assertTrue(host.stop(timeout=3.0))
-                self.assertTrue(host.join(0.1))
+                evidence.save(phase="original-success", checkpoint=facts())
+            except BaseException as error:
+                evidence.save(phase="original-body-failure", checkpoint={
+                    "error_chain": traceback.format_exception(type(error), error, error.__traceback__), **facts()})
+                raise
 
     def test_worker_exception_is_recorded_and_host_stays_alive(self) -> None:
         class Runtime:

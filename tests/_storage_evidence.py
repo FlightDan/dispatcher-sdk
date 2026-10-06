@@ -164,7 +164,8 @@ class StorageEvidence:
                     "evidence": entry.evidence} for entry in entries]})
         result = getattr(getattr(self.test, "_outcome", None), "result", None)
         errors = [] if result is None else [text for test, text in
-            (*getattr(result, "failures", ()), *getattr(result, "errors", ())) if test is self.test]
+            (*getattr(result, "failures", ()), *getattr(result, "errors", ()))
+            if test is self.test or getattr(test, "test_case", None) is self.test]
         report = {"test": self.test.id(), "interpreter": sys.executable, "imports": self.imports,
                   "phase": phase, "checkpoint": checkpoint, "operations": operations,
                   "retained_sql_operations": events, "workers": workers,

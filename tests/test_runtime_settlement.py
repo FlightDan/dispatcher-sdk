@@ -1,6 +1,6 @@
 """Original real handler outcomes survive bounded Kernel write contention."""
 from pathlib import Path
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 import json
 import sqlite3
@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel import HandlerExecutionError, Kernel, RetryPolicy
+from dispatcher_sdk.execution_kernel.errors import InvalidStateTransitionError
 from dispatcher_sdk.execution_kernel import runtime as runtime_module
 from dispatcher_sdk.execution_kernel import completion_clock as completion_clock_module
 from dispatcher_sdk.execution_kernel.context import HandlerContext, HandlerEffects
@@ -157,6 +158,74 @@ class RuntimeSettlementTests(unittest.TestCase):
         if runtime._settlement_thread is not None:
             runtime._settlement_thread.join(1)
             self.assertFalse(runtime._settlement_thread.is_alive())
+
+    def cancellation_maintenance(self, name):
+        began = time.monotonic()
+        maintenance = {"began": began, "timeout_seconds": .5, "deadline": began + .5,
+                       "passes": []}
+        self.addCleanup(self.storage_evidence.save, phase=name + "-recovery",
+                        checkpoint=maintenance)
+        return maintenance
+
+    def recover_cancellation_once(self, runtime, maintenance):
+        attempted = {}
+        maintenance["passes"].append(attempted)
+        try:
+            attempted["began"] = time.monotonic()
+            remaining = maintenance["deadline"] - attempted["began"]
+            attempted["timeout_seconds"] = remaining
+            self.assertGreater(remaining, 0, maintenance)
+            reports = runtime.recover_completions(timeout_seconds=remaining)
+            attempted["reports"] = list(reports)
+            attempted["returned"] = time.monotonic()
+            self.assertLessEqual(attempted["returned"], maintenance["deadline"], maintenance)
+            return reports
+        except BaseException as error:
+            attempted["error"] = {"type": type(error).__name__, "message": str(error),
+                                  "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                                  "traceback": traceback.format_exc()}
+            raise
+        finally:
+            attempted.setdefault("returned", time.monotonic())
+
+    def archive_cancelled_within_maintenance(self, runtime, name, maintenance):
+        while time.monotonic() < maintenance["deadline"]:
+            reports = self.recover_cancellation_once(runtime, maintenance)
+            if any(report.get("execution_id") == name and report["state"] == "superseded"
+                   for report in reports):
+                return
+            remaining = maintenance["deadline"] - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(.005, remaining))
+        self.fail("cancelled outcome was not archived within its original maintenance window: "
+                  + repr(maintenance))
+
+    def cancelled_retained_outcome(self, name):
+        runtime, writer, calls, original, receipt = self.run_with_result_writer_locked(name)
+        self.stop_maintenance(runtime)
+        writer.rollback()
+        current = runtime.kernel.get(name)
+        cancelled = runtime.cancel(name, expected_revision=current.revision)
+        return runtime, calls, original, receipt, cancelled
+
+    def assert_cancelled_original(self, runtime, name, calls, original, receipt, cancelled,
+                                 state="superseded"):
+        after = runtime.kernel.get(name)
+        self.assertEqual(cancelled.to_dict(), after.to_dict())
+        self.assertEqual("cancelled", after.state)
+        self.assertNotEqual(original["result_id"], after.result.result_id)
+        self.assertEqual([name], calls.read_text().splitlines())
+        retained = runtime._settlement_journal.inspect(name, timeout_seconds=.1)
+        self.assertEqual(1, len(retained))
+        self.assertEqual(original, retained[0]["result"])
+        self.assertEqual(receipt["evidence"]["budget_envelope"],
+                         retained[0]["evidence"]["budget_envelope"])
+        self.assertEqual(state, retained[0]["state"])
+        with closing(sqlite3.connect(Path(runtime.kernel.db_path).as_uri() + "?mode=ro",
+                                     uri=True, timeout=0)) as connection:
+            outbox = connection.execute(
+                "SELECT result_json FROM kernel_result_outbox WHERE execution_id=?", (name,)).fetchall()
+        self.assertEqual([cancelled.result.to_dict()], [json.loads(row[0]) for row in outbox])
 
     def deferred_guarded_handler_outcome(self, name, *, failure=False):
         """Run the actual invocation wrapper, then refuse its original clock read.
@@ -659,18 +728,132 @@ class RuntimeSettlementTests(unittest.TestCase):
         self.assertEqual(1, len(calls.read_text().splitlines()))
 
     def test_cancel_wins_and_archives_original_outcome(self):
-        runtime, writer, calls, original, _ = self.run_with_result_writer_locked("cancel-wins")
-        self.stop_maintenance(runtime)
+        name = "cancel-wins"
+        runtime, calls, original, receipt, cancelled = self.cancelled_retained_outcome(name)
+        maintenance = self.cancellation_maintenance(name)
+        self.archive_cancelled_within_maintenance(runtime, name, maintenance)
+        self.assert_cancelled_original(runtime, name, calls, original, receipt, cancelled)
+
+    def test_cancel_archive_writer_contention_retains_both_errors(self):
+        name = "cancel-archive-writer"
+        runtime, calls, original, receipt, cancelled = self.cancelled_retained_outcome(name)
+        journal = runtime._settlement_journal
+        settle = journal.settle
+        archive_errors, rejections = [], []
+        writer = sqlite3.connect(journal.path, timeout=0)
+        self.addCleanup(writer.close)
+        self.addCleanup(writer.rollback)
+
+        def blocked_archive(record, state, evidence, **kwargs):
+            self.assertEqual("superseded", state)
+            self.assertLessEqual(kwargs["timeout_seconds"], .1)
+            rejections.append(evidence["error"])
+            writer.execute("BEGIN IMMEDIATE")
+            try:
+                return settle(record, state, evidence, **kwargs)
+            except BaseException as error:
+                archive_errors.append(error)
+                raise
+
+        maintenance = self.cancellation_maintenance(name)
+        with patch.object(journal, "settle", side_effect=blocked_archive):
+            reports = self.recover_cancellation_once(runtime, maintenance)
         writer.rollback()
-        current = runtime.kernel.get("cancel-wins")
-        cancelled = runtime.cancel("cancel-wins", expected_revision=current.revision)
-        runtime.recover_completions(timeout_seconds=.5)
-        after = runtime.kernel.get("cancel-wins")
-        self.assertEqual(after.to_dict(), cancelled.to_dict())
-        self.assertEqual(after.state, "cancelled")
-        self.assertNotEqual(after.result.result_id, original["result_id"])
-        self.assertEqual(len(calls.read_text().splitlines()), 1)
-        self.assert_retained(runtime, "cancel-wins", original, "superseded")
+        self.assertEqual(1, len(archive_errors))
+        self.assertIsInstance(archive_errors[0].__cause__, sqlite3.OperationalError)
+        code = getattr(archive_errors[0].__cause__, "sqlite_errorcode", None)
+        if code is not None:
+            self.assertIn(code & 255, {5, 6})
+        self.assertEqual(1, len(reports))
+        self.assertEqual("pending", reports[0]["state"])
+        self.assertEqual(rejections[0], reports[0]["error"])
+        self.assertTrue(reports[0]["error"].startswith("InvalidStateTransitionError:"), reports)
+        self.assertEqual(f"{type(archive_errors[0]).__name__}: {archive_errors[0]}",
+                         reports[0]["archive_error"])
+        self.assertEqual("SettlementBusyError: database is locked", reports[0]["archive_error"])
+        self.assertEqual(receipt, journal.inspect(name, timeout_seconds=.1)[0])
+        self.archive_cancelled_within_maintenance(runtime, name, maintenance)
+        self.assert_cancelled_original(runtime, name, calls, original, receipt, cancelled)
+
+    def test_cancel_archive_precommit_expiry_rolls_back_real_body(self):
+        name = "cancel-archive-precommit"
+        runtime, calls, original, receipt, cancelled = self.cancelled_retained_outcome(name)
+        journal = runtime._settlement_journal
+        connection_context = journal._connection
+        body_work = []
+
+        @contextmanager
+        def late_precommit(timeout_seconds, **kwargs):
+            with connection_context(timeout_seconds, **kwargs) as connection:
+                yield connection
+                if kwargs.get("write"):
+                    # The production UPDATE has run, but its durable receipt
+                    # still depends on the production deadline check and COMMIT.
+                    row = connection.execute(
+                        "SELECT state,revision FROM settlement_records WHERE execution_id=?",
+                        (name,)).fetchone()
+                    body_work.append({"connection": connection.evidence_id,
+                        "state": row["state"], "revision": row["revision"],
+                        "in_transaction": connection.in_transaction,
+                        "timeout_seconds": timeout_seconds})
+                    time.sleep(timeout_seconds + .02)
+
+        maintenance = self.cancellation_maintenance(name)
+        maintenance["precommit_body"] = body_work
+        with patch.object(journal, "_connection", side_effect=late_precommit):
+            reports = self.recover_cancellation_once(runtime, maintenance)
+        self.assertEqual(1, len(body_work))
+        self.assertEqual("superseded", body_work[0]["state"])
+        self.assertEqual(receipt["revision"] + 1, body_work[0]["revision"])
+        self.assertTrue(body_work[0]["in_transaction"])
+        self.assertLessEqual(body_work[0]["timeout_seconds"], .1)
+        self.assertEqual(1, len(reports))
+        self.assertEqual("pending", reports[0]["state"])
+        self.assertTrue(reports[0]["error"].startswith("InvalidStateTransitionError:"), reports)
+        self.assertEqual("SettlementBusyError: settlement journal operation budget elapsed",
+                         reports[0]["archive_error"])
+        with self.storage_evidence._lock:
+            operations = [dict(event) for event in self.storage_evidence.events
+                          if event["connection"] == body_work[0]["connection"]]
+        self.assertTrue(any(event.get("sql", "").startswith("UPDATE settlement_records ")
+                            for event in operations), operations)
+        self.assertFalse(any(event["operation"] == "commit" for event in operations), operations)
+        self.assertTrue(any(event["operation"] == "close" for event in operations), operations)
+        self.assertEqual(receipt, journal.inspect(name, timeout_seconds=.1)[0])
+        self.archive_cancelled_within_maintenance(runtime, name, maintenance)
+        self.assert_cancelled_original(runtime, name, calls, original, receipt, cancelled)
+
+    def test_cancel_archive_permanent_sqlite_error_preserves_rejection_cause(self):
+        name = "cancel-archive-permanent"
+        runtime, calls, original, receipt, cancelled = self.cancelled_retained_outcome(name)
+        journal = runtime._settlement_journal
+        connection_context = journal._connection
+
+        @contextmanager
+        def reject_archive_update(timeout_seconds, **kwargs):
+            with connection_context(timeout_seconds, **kwargs) as connection:
+                if kwargs.get("write"):
+                    # Install after real schema validation, on this connection
+                    # only. The actual archive UPDATE produces the raw error.
+                    connection.execute("CREATE TEMP TRIGGER reject_archive BEFORE UPDATE "
+                        "ON settlement_records BEGIN SELECT RAISE(ABORT, 'archive write rejected'); END")
+                yield connection
+
+        maintenance = self.cancellation_maintenance(name)
+        with patch.object(journal, "_connection", side_effect=reject_archive_update):
+            with self.assertRaises(sqlite3.IntegrityError) as caught:
+                self.recover_cancellation_once(runtime, maintenance)
+        self.assertEqual("archive write rejected", str(caught.exception))
+        code = getattr(caught.exception, "sqlite_errorcode", None)
+        if code is not None:
+            self.assertEqual(1811, code)  # SQLITE_CONSTRAINT_TRIGGER, when Python exposes it.
+        self.assertIsInstance(caught.exception.__cause__, InvalidStateTransitionError)
+        self.assertIn("'cancelled' -> 'succeeded'", str(caught.exception.__cause__))
+        self.assertEqual(receipt, journal.inspect(name, timeout_seconds=.1)[0])
+        self.assert_cancelled_original(runtime, name, calls, original, receipt, cancelled,
+                                      state=receipt["state"])
+        self.archive_cancelled_within_maintenance(runtime, name, maintenance)
+        self.assert_cancelled_original(runtime, name, calls, original, receipt, cancelled)
 
     def test_reap_wins_and_archives_original_outcome(self):
         clock = Clock()

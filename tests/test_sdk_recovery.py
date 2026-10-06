@@ -5,7 +5,9 @@ import multiprocessing
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel import ExecutionCommandV2, Kernel, RetryPolicy
 from dispatcher_sdk.orchestrator import Orchestrator
@@ -78,13 +80,27 @@ def run_worker(path, now):
 
 class SDKRecoveryTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.path = Path(temporary.name) / "recovery.sqlite3"
-        self.marker = Path(temporary.name) / "mutation.txt"
-        self.invocations = Path(temporary.name) / "invocations.txt"
+        if self._testMethodName == "test_restart_waits_for_persisted_lease_then_backoff_without_business_retry":
+            from tests._acceptance_evidence import retained_directory
+            from tests._storage_evidence import StorageEvidence
+            root = retained_directory("sdk-restart-publication-")
+            self.storage_evidence = StorageEvidence(root, self)
+            self.storage_evidence.start(include_kernel=True)
+            self.addCleanup(self.storage_evidence.stop)
+            self.addCleanup(self.storage_evidence.save)
+        else:
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            root = Path(temporary.name)
+        self.path = root / "recovery.sqlite3"
+        self.marker = root / "mutation.txt"
+        self.invocations = root / "invocations.txt"
         self.clock = Clock()
         self.open_stack()
+
+    def tearDown(self):
+        if hasattr(self, "storage_evidence"):
+            self.storage_evidence.save(phase="before_cleanup")
 
     def open_stack(self):
         self.runtime = Kernel.open_sqlite(
@@ -182,7 +198,64 @@ class SDKRecoveryTests(unittest.TestCase):
             self.assertEqual(self.sdk.inspect_execution("execution"), queued)
             self.assert_business_unchanged()
         self.clock.value = queued.next_attempt_at
-        terminal = self.runtime.run_once()
+        from dispatcher_sdk.execution_kernel import runtime as runtime_module
+        from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, sample_clock
+        import json
+        import traceback
+
+        publication = {"original_command": self.original_command, "passes": [], "results": []}
+        original_result = self.runtime._outcome_result
+
+        def retained_result(*args):
+            result = original_result(*args)
+            publication["results"].append(result.to_dict())
+            return result
+
+        # A factual publication retry may return running; it does not permit
+        # another handler call or restart either execution's original budget.
+        with patch.object(runtime_module, "invoke_handler", wraps=runtime_module.invoke_handler) as business, \
+                patch.object(self.runtime, "_outcome_result", side_effect=retained_result):
+            try:
+                terminal = self.runtime.run_once()
+                publication["original_return"] = terminal.to_dict()
+                limits = self.runtime.kernel.get_execution_limits("execution")
+                envelope = BudgetEnvelope.from_dict(limits["envelope"])
+                native_deadline = envelope.deadline_monotonic(
+                    sample=sample_clock(wall_time=self.clock.value))
+                self.assertIsNotNone(native_deadline)
+                publication["original_budget"] = envelope.to_dict()
+                # Share the API's existing .5-second maintenance allowance,
+                # further limited by the original execution's remaining time.
+                deadline = min(native_deadline, time.monotonic() + .5)
+                publication["maintenance_deadline"] = deadline
+                while terminal.state == "running" and time.monotonic() < deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    reports = self.runtime.recover_completions(timeout_seconds=min(.1, remaining))
+                    publication["passes"].append(list(reports))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    with self.runtime.kernel._control_lock(min(.1, remaining)):
+                        terminal = self.runtime.kernel.get("execution")
+                    if terminal.state == "running":
+                        time.sleep(min(.005, max(0., deadline - time.monotonic())))
+                self.assertEqual(business.call_count, 1)
+                self.assertEqual(terminal.state, "succeeded")
+                self.assertEqual(publication["results"], [terminal.result.to_dict()])
+                final_budget = BudgetEnvelope.from_dict(
+                    self.runtime.kernel.get_execution_limits("execution")["envelope"])
+                self.assertEqual(final_budget.constraints, envelope.constraints)
+                self.assertEqual(final_budget.started_at, envelope.started_at)
+                publication["canonical_return"] = terminal.to_dict()
+            except BaseException as error:
+                publication["raw_error"] = traceback.format_exception(type(error), error, error.__traceback__)
+                raise
+            finally:
+                publication["business_calls"] = business.call_count
+                self.storage_evidence.save(phase="original-publication", checkpoint=publication)
+                (self.path.parent / "publication.json").write_text(json.dumps(publication, indent=2))
         self.sdk.sync()
         self.assertEqual(terminal.state, "succeeded")
         self.assertEqual(terminal.attempt, 2)

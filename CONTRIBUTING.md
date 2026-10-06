@@ -42,13 +42,13 @@ export and publication steps.
 
 ```sh
 python -m build
-python -m pip install --force-reinstall --no-deps dist/dispatcher_sdk-0.7.0.dev2-py3-none-any.whl
+python -m pip install --force-reinstall --no-deps dist/dispatcher_sdk-0.7.1-py3-none-any.whl
 ```
 
 The version shown matches this checkout. For a later release, use that release's
-wheel filename. Verify both the wheel and the source archive, run tests and
-examples against the installed candidate, and attach SHA-256 checksums to the
-GitHub prerelease. `RELEASING.md` describes the release workflow.
+wheel filename. Verify both the wheel and the source archive and run tests and
+examples against the installed candidate. Formal GitHub publishing reuses the
+original fully tested packages; see [releasing](RELEASING.md).
 
 Keep changes focused. In the pull request, describe the behavior, tests,
 platform limits and compatibility impact. Add regression coverage for changes

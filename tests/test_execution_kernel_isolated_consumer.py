@@ -88,8 +88,13 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
             distribution.mkdir()
             shutil.copytree(ROOT / "src", distribution / "src",
                             ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"))
-            for document in ("pyproject.toml", "README.md", "LICENSE", "NOTICE"):
+            for document in ("pyproject.toml", "MANIFEST.in", "README.md", "README.zh-CN.md",
+                             "LICENSE", "NOTICE", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md",
+                             "PROVENANCE.md", "SOURCE_MANIFEST.json", "RELEASING.md"):
                 shutil.copy2(ROOT / document, distribution / document)
+            for directory in ("docs", "examples", "tests", "scripts", "wiki", "DocsforAgents"):
+                shutil.copytree(ROOT / directory, distribution / directory,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             self._run([sys.executable, "-c",
                        "from setuptools.build_meta import build_sdist; build_sdist('dist')"],
                       cwd=distribution)
@@ -98,6 +103,13 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
             rebuilt = root / "rebuilt"
             rebuilt.mkdir()
             with tarfile.open(sdists[0]) as archive:
+                source_root = archive.getmembers()[0].name.split("/")[0]
+                members = set(archive.getnames())
+                for relative in ("MANIFEST.in", "RELEASING.md", "SOURCE_MANIFEST.json", "README.zh-CN.md",
+                                 "docs/EXECUTION_OBSERVABILITY.md", "docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md",
+                                 "examples/execution_observability.py", "tests/test_runtime_settlement.py",
+                                 "scripts/release_candidate.py", "wiki/Home.md", "DocsforAgents/README.md"):
+                    self.assertIn(f"{source_root}/{relative}", members)
                 for member in archive.getmembers():
                     self.assertFalse(member.issym() or member.islnk())
                     self.assertTrue((rebuilt / member.name).resolve().is_relative_to(rebuilt.resolve()))
@@ -122,7 +134,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
             )
             wheels = tuple(wheelhouse.glob("*.whl"))
             self.assertEqual(len(wheels), 1)
-            self.assertTrue(wheels[0].name.startswith("dispatcher_sdk-0.7.0.dev2-"))
+            self.assertTrue(wheels[0].name.startswith("dispatcher_sdk-0.7.1-"))
             with zipfile.ZipFile(wheels[0]) as archive:
                 self.assertIn("dispatcher_sdk/py.typed", archive.namelist())
                 packaged_python = {
@@ -132,7 +144,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                                      if name.endswith(".dist-info/METADATA"))
                 metadata = email.message_from_bytes(archive.read(metadata_name))
                 self.assertEqual(metadata["Name"], "dispatcher-sdk")
-                self.assertEqual(metadata["Version"], "0.7.0.dev2")
+                self.assertEqual(metadata["Version"], "0.7.1")
                 requirements = metadata.get_all("Requires-Dist", [])
                 self.assertEqual(len(requirements), 1)
                 self.assertRegex(requirements[0], r'^opensandbox\s*==\s*0\.1\.16\s*;\s*extra == [\"\']opensandbox[\"\']$')
@@ -201,6 +213,8 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
             (installed_suite / "scripts").mkdir()
             shutil.copy2(ROOT / "scripts" / "benchmark_sqlite_contention.py",
                          installed_suite / "scripts" / "benchmark_sqlite_contention.py")
+            shutil.copy2(ROOT / "scripts" / "release_candidate.py",
+                         installed_suite / "scripts" / "release_candidate.py")
             self._run([str(interpreter), "-m", "unittest", "discover", "-s", "tests", "-v"],
                       # This runs the complete installed suite, including SQLite
                       # FULL durability fixtures; it needs its own suite budget.
@@ -221,7 +235,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                     import importlib.util
                     import dispatcher_sdk
                     from importlib.metadata import version
-                    assert version("dispatcher-sdk") == "0.7.0.dev2"
+                    assert version("dispatcher-sdk") == "0.7.1"
                     assert importlib.util.find_spec("agent_dispatcher") is None
                     assert importlib.util.find_spec("agent_dispatcher_sdk") is None
                     assert not any(name.startswith("dispatcher_sdk.")
@@ -369,6 +383,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                 completed = self._run(
                     [str(interpreter), str(consumer), str(database), mode],
                     cwd=root,
+                    evidence_directory=evidence / "restart" / mode,
                 )
                 observations.append(json.loads(completed.stdout))
 
@@ -390,10 +405,20 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
             sdk_observations = []
             for mode in ("sdk-seed", "sdk-resume", "sdk-verify"):
                 completed = self._run(
-                    [str(interpreter), str(consumer), str(root / "sdk.sqlite3"), mode], cwd=root)
+                    [str(interpreter), str(consumer), str(root / "sdk.sqlite3"), mode], cwd=root,
+                    evidence_directory=evidence / "restart" / mode)
                 sdk_observations.append(json.loads(completed.stdout))
             self.assertEqual([item["state"] for item in sdk_observations],
                              ["running", "running", "succeeded"])
+            # Retain the exact sdist and its rebuilt, installed wheel only
+            # after all package, public, full-suite and restart assertions pass.
+            # Release publishing consumes these files without another build.
+            package_export = os.environ.get("SDK_RELEASE_PACKAGE_DIR")
+            if package_export:
+                destination = Path(package_export)
+                destination.mkdir(parents=True, exist_ok=True)
+                for package in (sdists[0], wheels[0]):
+                    shutil.copy2(package, destination / package.name)
 
 
 if __name__ == "__main__":

@@ -4,12 +4,15 @@ These focused Runtime integration cases use a real process producer and SQLite
 writer. They do not replace native-supervisor or public-entry acceptance.
 """
 from dataclasses import replace
+from contextlib import contextmanager
 import json
 import multiprocessing
 import os
 from pathlib import Path
 import sqlite3
+import time
 import unittest
+from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel import Kernel, _process_runtime as native
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, ClockCheckpoint
@@ -18,6 +21,7 @@ from dispatcher_sdk.execution_kernel.contracts import ExecutionLease
 from dispatcher_sdk.execution_kernel.errors import CASConflictError
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
 from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 
 def _value_handler(payload, context):
@@ -109,6 +113,10 @@ def _crash_after_received_ack(path, running_dict, lease_dict, outcome, evidence_
 class ReceivedBudgetCheckpointTests(unittest.TestCase):
     def setUp(self):
         self.root = retained_directory('sdk-received-budget-checkpoint-')
+        self.storage_evidence = StorageEvidence(self.root, self)
+        self.storage_evidence.start(include_kernel=True)
+        self.addCleanup(self.storage_evidence.stop)
+        self.addCleanup(self.storage_evidence.save)
         self.wall = [100.]
         self.runtime = self.open_runtime()
         command = self.runtime.command('handler', execution_id='work', idempotency_key='work',
@@ -128,6 +136,7 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
         return runtime
 
     def tearDown(self):
+        self.storage_evidence.save(phase='before_cleanup', checkpoint=self.evidence)
         path = self.root/'evidence.json'
         path.write_text(json.dumps(self.evidence, indent=2))
         print('received_budget_checkpoint_evidence=' + str(path), flush=True)
@@ -202,8 +211,43 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
         self.assertEqual(self.guards(), [])
         self.assertEqual(self.runtime.kernel._budget_sample_owners, {})
 
-    def test_received_positive_fact_is_retained_then_recovered_after_real_writer(self):
-        """Baseline uses only existing producer and Runtime APIs."""
+    def recover_recorded(self, original):
+        """Finish factual publication within the original .5 maintenance window."""
+        began = time.monotonic()
+        deadline = began + .5
+        maintenance = {'began': began, 'deadline': deadline, 'passes': []}
+        self.evidence['records'].append({'maintenance': maintenance})
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            attempt = {'began': time.monotonic(), 'timeout_seconds': remaining}
+            maintenance['passes'].append(attempt)
+            try:
+                attempt['reports'] = self.runtime.recover_completions(timeout_seconds=remaining)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                with self.runtime.kernel._control_lock(remaining):
+                    current = self.runtime.kernel.get('work')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                records = self.runtime._settlement_journal.inspect('work', timeout_seconds=remaining)
+                attempt['execution'] = current.to_dict()
+                attempt['receipts'] = records
+            except Exception as error:
+                attempt['error'] = {'type': type(error).__name__, 'message': str(error)}
+                if not (self.runtime._storage_contention(error) or isinstance(error, TimeoutError)):
+                    raise
+            finally:
+                attempt['returned'] = time.monotonic()
+            if 'receipts' in attempt and len(records) == 1 and records[0]['state'] == 'recorded':
+                self.assertLessEqual(attempt['returned'], deadline, maintenance)
+                self.assertEqual(records[0]['result'], original['result'])
+                self.assertEqual(current.result.to_dict(), original['result'])
+                return current
+        self.fail('original .5-second received-fact maintenance window elapsed: ' + repr(maintenance))
+
+    def recover_after_real_writer(self, *, expire_archive=False):
         outcome = self.produce()
         writer = sqlite3.connect(self.runtime.kernel.db_path, isolation_level=None, timeout=0.)
         writer.execute('BEGIN IMMEDIATE')
@@ -218,12 +262,56 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
         finally:
             writer.rollback()
             writer.close()
-        self.runtime.recover_completions(timeout_seconds=.5)
+        journal = self.runtime._settlement_journal
+        connection = journal._connection
+        expired_bodies = []
+
+        @contextmanager
+        def expire_first_write(timeout_seconds, **options):
+            with connection(timeout_seconds, **options) as actual:
+                # This is later than production's deadline origin, so crossing
+                # it proves expiry even with a coarse native monotonic clock.
+                expiry = time.monotonic() + timeout_seconds
+                yield actual
+                if options.get('write') and not expired_bodies:
+                    # The real UPDATE has run. Expire its existing pre-COMMIT
+                    # window so the production guard must roll it back.
+                    expired_bodies.append({'timeout_seconds': timeout_seconds,
+                        'pass_index': len(self.evidence['records'][-1]['maintenance']['passes']) - 1,
+                        'transaction_open': actual.in_transaction,
+                        'body_state': actual.execute('SELECT state FROM settlement_records').fetchone()[0]})
+                    while time.monotonic() < expiry:
+                        time.sleep(min(.001, max(0, expiry - time.monotonic())))
+
+        if expire_archive:
+            self.evidence['records'].append({'expired_archive_bodies': expired_bodies})
+            with patch.object(journal, '_connection', side_effect=expire_first_write):
+                settled = self.recover_recorded(receipt)
+            self.assertEqual(len(expired_bodies), 1)
+            self.assertTrue(expired_bodies[0]['transaction_open'])
+            self.assertEqual(expired_bodies[0]['body_state'], 'recorded')
+            passes = self.evidence['records'][-1]['maintenance']['passes']
+            injected = expired_bodies[0]['pass_index']
+            self.assertGreater(len(passes), injected + 1)
+            self.assertEqual(passes[injected]['execution']['state'], 'succeeded')
+            self.assertEqual(passes[injected]['receipts'][0]['state'], 'pending')
+            self.assertEqual(passes[injected]['receipts'][0]['result'], receipt['result'])
+            self.assertTrue(any(report.get('state') == 'pending'
+                and 'SettlementBusyError' in report.get('error', '')
+                for report in passes[injected]['reports']), passes)
+        else:
+            settled = self.recover_recorded(receipt)
         self.assert_published(outcome)
-        settled = self.runtime.kernel.get('work')
         self.assertEqual(settled.state, 'succeeded')
         self.assertEqual(settled.result.value, outcome['value'])
         self.assertEqual(self.receipt()['state'], 'recorded')
+
+    def test_received_positive_fact_is_retained_then_recovered_after_real_writer(self):
+        """Recovery finishes Kernel and receipt within one original .5 window."""
+        self.recover_after_real_writer()
+
+    def test_received_positive_fact_archive_expiry_retries_same_result_within_original_window(self):
+        self.recover_after_real_writer(expire_archive=True)
 
     def test_foreground_received_fact_ack_precedes_recorded_result(self):
         outcome = self.produce()

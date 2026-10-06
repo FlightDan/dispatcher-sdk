@@ -11,10 +11,10 @@ console Python executable, and a file-backed SQLite database. The backend
 uses standard-library `ctypes` and Win32 Job Objects; it adds no Python runtime
 dependency.
 
-The native results in this guide are historical. The current `0.7.0.dev2`
-observability and managed-supervisor candidate still needs native Windows
-acceptance; [the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md) tracks
-that matrix separately.
+The native results in this guide retain their historical scope.
+[The acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md) identifies the
+`0.7.1` observability and managed-supervisor candidate, its native Windows
+matrix evidence and any outstanding checks separately.
 
 ## Containment and startup
 

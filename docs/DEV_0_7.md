@@ -3,7 +3,7 @@
 This document records the `0.7.0.dev0` implementation and its Linux validation
 on `release/0.7.0`. The user approved breaking changes and explicit local
 recovery activation. The measurements below belong to that candidate.
-Current `0.7.0.dev2` contracts and outstanding acceptance checks are described in
+Current `0.7.1` contracts and outstanding acceptance checks are described in
 [execution observability](EXECUTION_OBSERVABILITY.md) and
 [its acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md).
 

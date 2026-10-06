@@ -37,17 +37,17 @@ Dispatcher 在 Python 应用中运行函数和脚本，控制超时与取消，�
 接入边界：
 
 - 进程模式用于约束可信代码，提供超时、取消和进程清理。它不是不可信代码所需的文件、网络或权限沙箱；Agent 生成的代码仍需经过应用审查，或放进额外沙箱。
-- Linux 进程模式通过 subreaper 清理脱离原进程组的后代；其他 POSIX 平台提供进程组清理。Windows 使用 Job Object 执行原生进程和脚本。较早版本已在 Windows 11 x64（build 10.0.26100.9168）、Python 3.12.10 上通过原生测试，范围见 [Windows 运行时](docs/WINDOWS_RUNTIME.md)；当前候选的原生矩阵仍待验证。线程模式不能强制停止阻塞处理器。
+- Linux 进程模式通过 subreaper 清理脱离原进程组的后代；其他 POSIX 平台提供进程组清理。Windows 使用 Job Object 执行原生进程和脚本。较早版本已在 Windows 11 x64（build 10.0.26100.9168）、Python 3.12.10 上通过原生测试，范围见 [Windows 运行时](docs/WINDOWS_RUNTIME.md)；当前原生矩阵证据与范围见验收索引。线程模式不能强制停止阻塞处理器。
 - 恢复时必须使用原数据库和匹配的 handler（任务处理函数）部署。重开数据库不会重置重试次数，也不保证中断的任务一定自动重跑。
 - SDK 不能撤销已经发生的写入或 API 调用。结果不确定时必须先核对再恢复；不能保证任意操作只发生一次。
 - `Dispatcher` 内置收件箱负责通知的持久化接收和去重。业务回调仍为至少一次调用；外部请求需要幂等键。本地业务 SQL 可用 `consume_results` 与消费标记一起提交。
 
-当前源码版本为 `0.7.0.dev2`，要求 Python 3.10+。
+当前源码版本为 `0.7.1`，要求 Python 3.10+。
 Kernel 存储使用 schema 5，Orchestrator 存储使用 schema 4。旧数据库需要显式升级，
 打开前请阅读[存储与升级](docs/STORAGE_AND_UPGRADES.md)和[兼容性说明](docs/PUBLIC_API.md)。
 
-执行观测与受管监管已在工作区实现，完整安装包和原生矩阵验收仍在进行。
-已知失败修正前，CI 保持暂停。当前结果和待完成的检查见[验收索引](docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md)。
+执行观测与受管监管的用法见[执行指南](docs/EXECUTION_OBSERVABILITY.md)。
+[验收索引](docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md)记录安装包与原生矩阵证据、适用的平台跳过项和验证边界。
 可选的 OpenSandbox 适配器需要额外安装固定版本的 `opensandbox` 依赖，并连接独立的沙箱服务。
 
 ## 安装

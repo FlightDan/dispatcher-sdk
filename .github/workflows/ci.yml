@@ -2,12 +2,46 @@ name: SDK CI
 on:
   push:
     branches: ['**']
+    # Post-publishing evidence-ledger updates receive documentation checks.
+    # A changed Git commit still cannot reuse packages for a new release tag.
+    paths-ignore:
+      - docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md
+      - docs/EXECUTION_OBSERVABILITY_GOAL.md
   pull_request:
+  workflow_dispatch:
   workflow_call:
 permissions:
   contents: read
+  actions: read
+concurrency:
+  group: sdk-ci-${{ github.event_name }}-${{ github.sha }}
+  cancel-in-progress: false
 jobs:
+  candidate:
+    # Internal PRs already receive push CI; forks still validate their merge.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      verified_run_id: ${{ steps.find.outputs.verified_run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find existing complete candidate acceptance
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release_candidate.py find --repository "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA" --exclude-run "$GITHUB_RUN_ID" > candidate.json
+          python3 - <<'PY'
+          import json, os
+          candidate = json.load(open('candidate.json'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"verified_run_id={candidate.get('run_id', '')}\n")
+          print(candidate)
+          PY
   test:
+    needs: candidate
+    if: needs.candidate.outputs.verified_run_id == ''
     name: ${{ matrix.os }} / Python ${{ matrix.python-version }} / ${{ matrix.python_arch }}
     strategy:
       fail-fast: false
@@ -65,6 +99,15 @@ jobs:
           PY
       - name: Install candidate and build tools
         run: python -m pip install . build wheel "setuptools>=68" mypy
+      - name: Retain tested release packages
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' && matrix.python_arch == 'x64'
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          destination = Path(os.environ['RUNNER_TEMP']) / 'sdk-release-packages'
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
+              stream.write(f'SDK_RELEASE_PACKAGE_DIR={destination}\n')
       - name: Check typed SDK consumer compatibility
         run: python -m mypy --python-version 3.10 --follow-imports=silent --warn-unused-ignores tests/typing/orchestrator_consumer.py tests/typing/capability_consumer.py tests/typing/reliability_consumer.py tests/typing/application_consumer.py tests/typing/observability_consumer.py
       - name: Run SDK tests, source rebuild and isolated wheel consumers
@@ -86,14 +129,23 @@ jobs:
           python examples/execution_observability.py
       - name: Run script notification example
         run: python examples/sdk_script_wakeup.py
+      - name: Save tested release packages
+        if: success() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' && matrix.python_arch == 'x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-packages-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sdk-release-packages
+          if-no-files-found: error
       - name: Save native acceptance evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: execution-acceptance-${{ matrix.os }}-py${{ matrix.python-version }}-${{ matrix.python_arch }}
+          name: execution-acceptance-${{ matrix.os }}-py${{ matrix.python-version }}-${{ matrix.python_arch }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/sdk-execution-acceptance
           if-no-files-found: warn
   secrets:
+    needs: candidate
+    if: needs.candidate.outputs.verified_run_id == ''
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

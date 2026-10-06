@@ -1,6 +1,6 @@
 # Execution activity, deadlines and supervision
 
-The `0.7.0.dev2` implementation adds execution observations, inherited deadlines,
+The `0.7.1` implementation adds execution observations, inherited deadlines,
 bounded child execution and optional durable stall notifications. Current SDK
 and platform acceptance is tracked separately in
 [the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md). The active Goal
@@ -363,7 +363,13 @@ receipt proves retention, not terminal acceptance. SDK maintenance retries the
 same result during operation and after reopening. `recover_completions` can also
 request a bounded maintenance pass. It never invokes the handler. A cancellation,
 reaper or newer attempt that already won remains authoritative; the original
-receipt is retained as superseded. In-memory storage and unavailable receipt
+receipt is retained as superseded only after its archival transaction commits.
+If bounded archival cannot finish, recovery returns `pending` with the original
+typed rejection in `error` and the typed archival failure in `archive_error`.
+The archive shares the same record operation deadline; retrying it does not
+invoke business work or renew the execution budget. Permanent archival failures
+raise their original storage error with the business rejection as its cause.
+In-memory storage and unavailable receipt
 storage expose unknown retention rather than claiming durability.
 
 The retained obligation also carries the original observed budget checkpoint.

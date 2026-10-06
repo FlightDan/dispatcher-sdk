@@ -119,13 +119,32 @@ class BudgetCaptureCloseLifetimeTests(unittest.TestCase):
             self.assertEqual(retained.constraints, context.budget_envelope.constraints)
 
             cutoff = time.monotonic() + 2
-            while not runtime._thread_done and time.monotonic() < cutoff:
-                time.sleep(.01)
+            receipts_before = []
+            publication = []
+            evidence["completion_publication"] = publication
+            evidence["future_finish_deadline"] = cutoff
+            while time.monotonic() < cutoff:
+                remaining = cutoff - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    receipts_before = runtime._settlement_journal.inspect("original",
+                        timeout_seconds=min(.1, remaining))
+                    if runtime._thread_done and receipts_before:
+                        break
+                    remaining = cutoff - time.monotonic()
+                    if remaining > 0:
+                        publication.append({"reports": runtime.recover_completions(
+                            timeout_seconds=min(.1, remaining))})
+                except (sqlite3.OperationalError, TimeoutError) as error:
+                    publication.append({"error_type": type(error).__name__, "error": str(error)})
+                time.sleep(min(.01, max(0., cutoff - time.monotonic())))
+            evidence["settlement_error_before_close"] = runtime._settlement_error
+            evidence["receipts_before_close"] = receipts_before
             self.assertTrue(runtime._thread_done, "actual Context cleanup Future did not finish")
             self.assertTrue(context._observation_closed)
             self.assertTrue(runtime._context_observation_pending(context))
             self.assertFalse(runtime._thread_slots.acquire(blocking=False), "owned clock fact released capacity early")
-            receipts_before = runtime._settlement_journal.inspect("original")
             self.assertEqual(len(receipts_before), 1)
             self.assertEqual(receipts_before[0]["result"]["value"], {"original_business": 42})
             evidence["original_receipt"] = receipts_before[0]

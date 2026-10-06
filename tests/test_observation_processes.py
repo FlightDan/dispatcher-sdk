@@ -29,14 +29,10 @@ def silent_child(gate):
 
 class ProcessObservationTests(unittest.TestCase):
     def setUp(self):
-        retain_storage = self._testMethodName == "test_storage_failure_and_bounded_close_do_not_change_live_process"
-        if retain_storage:
-            root = retained_directory("sdk-process-observer-close-")
-            self._storage_close_evidence = {"test": self.id(), "cleanup_timeout_seconds": 1}
-        else:
-            temporary = tempfile.TemporaryDirectory()
-            self.addCleanup(temporary.cleanup)
-            root = Path(temporary.name)
+        root = retained_directory("sdk-process-observer-close-")
+        cleanup_timeout = (1 if self._testMethodName ==
+            "test_storage_failure_and_bounded_close_do_not_change_live_process" else 2)
+        self._storage_close_evidence = {"test": self.id(), "cleanup_timeout_seconds": cleanup_timeout}
         self.root = root
         self.options = ObservationOptions(flush_interval=.05, process_freshness=.2)
         self.identity = ObservationIdentity("execution", 1, 1)
@@ -44,17 +40,19 @@ class ProcessObservationTests(unittest.TestCase):
             source_id="test-source", options=self.options)
         self.journal.bind_current(self.identity)
         self.activity = ActivityRecorder(self.journal, self.identity, options=self.options)
-        if not retain_storage:
-            self.addCleanup(self.activity.close)
         self.observer = ProcessObserver(self.activity, poll_interval=.02)
-        self.addCleanup(self._close_retained_storage if retain_storage else self.observer.close)
+        self.addCleanup(self._close_retained_storage)
 
     def _close_retained_storage(self):
-        # Both collectors share the existing one-second cleanup allowance.
+        # Both collectors share the existing total cleanup allowance: one
+        # second for the storage failure test, two for ordinary tests that
+        # previously closed each collector with its own one-second allowance.
         # Pending close never authorizes deleting their storage or rerunning
         # the final flush under a renewed operation deadline.
-        deadline = time.monotonic() + 1
         evidence = self._storage_close_evidence
+        evidence["started_at"] = time.monotonic()
+        deadline = evidence["started_at"] + evidence["cleanup_timeout_seconds"]
+        evidence["deadline"] = deadline
 
         def remaining():
             value = deadline - time.monotonic()
@@ -78,6 +76,7 @@ class ProcessObservationTests(unittest.TestCase):
                 "traceback": traceback.format_exc()}
             raise
         finally:
+            evidence["finished_at"] = time.monotonic()
             evidence["observer_final"] = self.observer.snapshot()
             evidence["activity_final"] = self.activity.snapshot()
             evidence["activity_final_close"] = self.activity._close_result

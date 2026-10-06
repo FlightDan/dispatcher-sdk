@@ -617,9 +617,16 @@ class InProcessRuntime:
                 with self._settlement_inflight_lock:
                     if key in self._settlement_inflight:
                         continue
+                operation_deadline = min(deadline, time.monotonic() + .1)
+
+                def operation_timeout():
+                    remaining = operation_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("completion recovery operation window elapsed")
+                    return remaining
+
                 try:
                     lease = ExecutionLease.from_dict(record["lease"])
-                    operation_deadline = min(deadline, time.monotonic() + .1)
                     self._finish_received_budget_checkpoints(record, operation_deadline)
                     if (record["deferred"] is not None
                             and record["deferred"]["kind"] in {
@@ -627,15 +634,9 @@ class InProcessRuntime:
                         # Revoked execution has only a factual cleanup receipt.
                         # Its immutable winning business state is never touched.
                         self._settlement_journal.settle(record, "recorded", record["evidence"],
-                            timeout_seconds=min(.1, max(.001, deadline-time.monotonic())))
+                            timeout_seconds=operation_timeout())
                         reports.append({**identity, "state": "recorded", "kind": record["deferred"]["kind"]})
                         continue
-                    def operation_timeout():
-                        remaining = operation_deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise TimeoutError("completion recovery operation window elapsed")
-                        return remaining
-
                     with self._bounded_lifecycle(operation_timeout()):
                         if record["deferred"] is not None:
                             original = record["deferred"]
@@ -718,8 +719,19 @@ class InProcessRuntime:
                         break
                     state = "superseded" if isinstance(exc, (StaleFenceError,
                         InvalidStateTransitionError, ResultConflictError)) else "error"
-                    self._settlement_journal.settle(record, state,
-                        {**record["evidence"], "error": error}, timeout_seconds=.1)
+                    try:
+                        self._settlement_journal.settle(record, state,
+                            {**record["evidence"], "error": error}, timeout_seconds=operation_timeout())
+                    except Exception as archive_error:
+                        if (self._storage_contention(archive_error)
+                                or isinstance(archive_error, (TimeoutError, SettlementConflictError))):
+                            # The business rejection is final, but archiving it
+                            # still owns a pending durable receipt. Do not renew
+                            # its deadline or report an uncommitted transition.
+                            reports.append({**identity, "state": "pending", "error": error,
+                                "archive_error": f"{type(archive_error).__name__}: {archive_error}"})
+                            break
+                        raise archive_error from exc
                     reports.append({**identity, "state": state, "error": error})
             return tuple(reports)
         finally:
