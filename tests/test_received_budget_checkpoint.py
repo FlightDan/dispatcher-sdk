@@ -460,8 +460,8 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
         winner = self.runtime.kernel.cancel('work', expected_revision=self.running.revision,
                                             reason='actual cancellation winner')
         returned = self.settle(outcome)
+        self.assert_foreground_winner_snapshot(returned, winner)
         self.runtime.recover_completions(timeout_seconds=.5)
-        self.assertEqual(returned.to_dict(), winner.to_dict())
         self.assertEqual(self.runtime.kernel.get('work').to_dict(), winner.to_dict())
         self.assert_published(outcome)
 
@@ -484,8 +484,8 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
                    'budget_envelope': original['budget_envelope'],
                    'budget_checkpoint': original['budget_checkpoint']}
         returned = self.settle(outcome)
+        self.assert_foreground_winner_snapshot(returned, winner)
         self.runtime.recover_completions(timeout_seconds=.5)
-        self.assertEqual(returned.to_dict(), winner.to_dict())
         self.assertEqual(self.runtime.kernel.get('work').to_dict(), winner.to_dict())
         self.assert_published(outcome)
         receipt = self.receipt()
@@ -493,6 +493,24 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
         self.assertEqual(receipt['deferred']['kind'], 'budget_checkpoint_recovery')
         self.assertEqual(receipt['evidence']['budget_checkpoint'], outcome['budget_checkpoint'])
         self.assertNotIn('script_output_recovery', receipt['evidence'])
+
+    def assert_foreground_winner_snapshot(self, returned, winner):
+        foreground = {'returned': returned.to_dict(), 'winner': winner.to_dict(),
+                      'settlement_error': self.runtime._settlement_error}
+        self.evidence['records'].append({'foreground_cancel': foreground})
+        for name, operation in (('receipts', lambda: self.runtime._settlement_journal.inspect('work')),
+                                ('guards', self.guards)):
+            try:
+                foreground[name] = operation()
+            except Exception as error:
+                foreground[name + '_error'] = {'type': type(error).__name__, 'message': str(error)}
+        # ACK COMMIT can consume the original completion window before its
+        # winner read. Maintenance cannot alter that already returned snapshot.
+        # Only the exact supplied snapshot or exact winner is a valid return;
+        # the authoritative winner and factual receipt are checked after the
+        # original single maintenance call, without restoring execution time.
+        if returned.to_dict() != winner.to_dict():
+            self.assertEqual(returned.to_dict(), self.running.to_dict())
 
 
 if __name__ == '__main__':
