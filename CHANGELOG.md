@@ -13,6 +13,9 @@
   pending even when local process cleanup is confirmed.
 - Active development and GitHub's default branch use `main`. Versions are
   identified by release tags such as `v0.7.2`.
+- The portable process observability example uses finite startup and delivery
+  margins for native Windows, checks the returned child output, and prints its
+  full bounded observation on failure. SDK budget rules remain unchanged.
 
 ## 0.7.1
 
