@@ -182,17 +182,82 @@ class WaitObservationTests(unittest.TestCase):
 
     def test_invalid_details_are_dropped_without_poisoning_future_batches(self):
         recorder = self.recorder()
-        with recorder.wait('memory', resources={'huge': 'x' * 100000}) as receipt:
-            pass
-        self.assertEqual(receipt['state'], 'unknown')
-        recorder.report_bytes('stdout', b'after')
-        self.assertEqual(recorder.flush()['state'], 'persisted')
-        report = self.journal.inspect('work')
-        self.assertEqual(report['waits'], [])
-        self.assertEqual(report['metrics']['stdout_bytes']['count'], 5)
-        self.assertFalse(report['complete'])
-        self.assertLessEqual(len(recorder.snapshot()['error'].encode()), 512)
-        self.assertEqual(recorder.flush()['state'], 'persisted')
+        writes, errors = [], []
+        checkpoint = {'write_timeout_seconds': self.journal.options.write_timeout,
+                      'writes': writes}
+        original = self.journal.write_batch
+
+        def tracked(*args, **kwargs):
+            write = {'sequence': kwargs['sequence'], 'metrics': kwargs['metrics'],
+                     'events': kwargs['events'], 'captured_at': kwargs['captured_at'],
+                     'began': time.monotonic()}
+            writes.append(write)
+            try:
+                result = original(*args, **kwargs)
+                write['returned'] = result
+                return result
+            except BaseException as error:
+                errors.append(error)
+                write['error'] = {'type': type(error).__name__, 'message': str(error),
+                    'rollback_confirmed': getattr(error, 'rollback_confirmed', None),
+                    'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None)}
+                raise
+            finally:
+                write['ended'] = time.monotonic()
+
+        try:
+            with patch.object(self.journal, 'write_batch', side_effect=tracked):
+                with recorder.wait('memory', resources={'huge': 'x' * 100000}) as receipt:
+                    pass
+                self.assertEqual(receipt['state'], 'unknown')
+                recorder.report_bytes('stdout', b'after')
+                checkpoint['first_flush'] = recorder.flush()
+                self.assertEqual(checkpoint['first_flush']['state'], 'persisted')
+                report = self.journal.inspect('work')
+                checkpoint['first_report'] = report
+                self.assertEqual(report['waits'], [])
+                self.assertEqual(report['metrics']['stdout_bytes']['count'], 5)
+                self.assertFalse(report['complete'])
+                self.assertLessEqual(len(recorder.snapshot()['error'].encode()), 512)
+                local = recorder.snapshot()
+                checkpoint['local_before_refresh'] = {key: local[key] for key in
+                    ('metrics', 'captured_at', 'collection_gaps', 'queued_items',
+                     'queued_bytes', 'error', 'wait_error')}
+                refresh = recorder.flush()
+                checkpoint['refresh'] = refresh
+                self.assertEqual(len(writes), 2)
+                self.assertEqual(writes[1]['metrics'], writes[0]['metrics'])
+                self.assertEqual(writes[1]['events'], ())
+                self.assertEqual(writes[1]['sequence'], writes[0]['sequence'] + 1)
+                after = self.journal.inspect('work', timeout=.1)
+                checkpoint['after_refresh'] = after
+                self.assertEqual(after['metrics'], report['metrics'])
+                self.assertEqual(after['waits'], report['waits'])
+                self.assertFalse(after['complete'])
+                if refresh['state'] != 'persisted':
+                    # The first valid batch proves invalid details did not
+                    # poison publication. This quiet refresh still owns only
+                    # .03s; accept solely its confirmed rollback, never a
+                    # payload error, contention or an uncertain write.
+                    self.assertEqual(refresh['state'], 'degraded', refresh)
+                    self.assertEqual(refresh['reason'], 'persistence_failed', refresh)
+                    self.assertIs(refresh.get('retryable'), True, refresh)
+                    self.assertEqual(len(errors), 1, writes)
+                    self.assertIs(type(errors[0]), observability.journal._ObservationWriteBudgetExceeded)
+                    self.assertIs(errors[0].rollback_confirmed, True)
+                    self.assertEqual(after['sources'], report['sources'])
+                    self.assertEqual(recorder.snapshot()['metrics'],
+                                     checkpoint['local_before_refresh']['metrics'])
+                    self.assertEqual(self.clock.now, 100)
+                else:
+                    self.assertEqual(errors, [], writes)
+                    self.assertEqual(after['sources'][0]['sequence'], writes[1]['sequence'])
+        finally:
+            try:
+                self.storage_evidence.save(phase='invalid_details_flushes', checkpoint=checkpoint)
+            except Exception:
+                # Optional diagnostics cannot replace the original assertion.
+                pass
 
     def test_locked_capture_returns_promptly_and_keeps_lost_end_unknown(self):
         recorder = self.recorder()
