@@ -14,7 +14,7 @@ from unittest.mock import patch
 from dispatcher_sdk._inspection import InspectionBudgetExceeded
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope
 from dispatcher_sdk.execution_kernel import child_factual_read as factual
-from dispatcher_sdk.execution_kernel.children import ChildExecutionError, HandlerChildren, _RetryWindow
+from dispatcher_sdk.execution_kernel.children import ChildExecutionError, HandlerChildren, _RetryWindow, _retry
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, ExecutionResultV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.errors import StaleFenceError, StorageIsolationError
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
@@ -50,7 +50,16 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         envelope = self.budget.derive(source='tool', origin_id='original-child-call', timeout_seconds=.5)
         command = replace(self.command, execution_id='child', idempotency_key='child', causation_id='parent')
         self.kernel.submit_child(command, self.lease, envelope)
-        lease = self.kernel.claim_and_start('child-owner', execution_id='child', child_pool=True)
+        # Retry only transient admission within this original child-call window,
+        # preserving ownership of a captured clock fact until its ACK commits.
+        window = _RetryWindow(envelope, self.kernel)
+        original_deadline = window.deadline
+        lease = _retry(window, lambda: self.kernel.claim_and_start(
+            'child-owner', execution_id='child', child_pool=True,
+            timeout_seconds=window.timeout()), kernel=None)
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease.attempt, 1)
+        self.assertLessEqual(window.deadline, original_deadline)
         snapshot = self.kernel.get('child')
         # Guard ACKs promote elapsed floors into the durable logical clock;
         # a frozen raw wall sample can precede this actual claimed snapshot.
@@ -58,7 +67,9 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         record = {'scenario': 'original_child_setup', 'frozen_wall': self.wall[0],
             'claimed_snapshot': snapshot.to_dict(), 'logical_completed_at': completed_at,
             'completion_clock_source': 'SQLiteKernel.current_time',
-            'original_budget': envelope.to_dict()}
+            'original_budget': envelope.to_dict(),
+            'original_native_deadline': original_deadline,
+            'retained_native_deadline': window.deadline}
         self.evidence['records'].append(record)
         result = ExecutionResultV2('original-child-result', 'child', 'succeeded' if failure is None else 'failed',
             lease.attempt, lease.fence, [], snapshot.started_at, completed_at,
@@ -68,7 +79,7 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         row = {'budget_json': json.dumps(envelope.to_dict()), 'parent_execution_id': 'parent',
             'parent_attempt': self.lease.attempt, 'parent_fence': self.lease.fence,
             'child_execution_id': 'child', 'action': 'run'}
-        return row, _RetryWindow(envelope, self.kernel), result
+        return row, window, result
 
     def watermark(self):
         return self.kernel._connection.execute(

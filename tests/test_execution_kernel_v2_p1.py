@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 import multiprocessing
 import os
 from pathlib import Path
@@ -12,6 +13,8 @@ import unittest
 from unittest.mock import patch
 
 import dispatcher_sdk.execution_kernel._sqlite_base as sqlite_base_module
+from dispatcher_sdk._sqlite_errors import is_sqlite_contention
+from dispatcher_sdk.execution_kernel.settlement import SettlementBusyError
 from dispatcher_sdk.execution_kernel import (
     EffectClaimConflictError,
     EffectRecoveryRequiredError,
@@ -450,6 +453,8 @@ class RegistryFingerprintTests(unittest.TestCase):
                         "portable-restart",
                         registry=revision,
                         handler_id="portable",
+                        attempts=1,
+                        timeout=30.0,
                         payload={"value": "durable"},
                     )
                 )
@@ -459,10 +464,55 @@ class RegistryFingerprintTests(unittest.TestCase):
             second = Kernel.open_sqlite(
                 path, {("portable", 1): second_handler}, isolation_mode="thread"
             )
+            maintenance_error = None
             try:
                 self.assertEqual(second.registry_revision, revision)
                 terminal = second.run_once()
+                # A retained result can await bounded publication. Maintenance
+                # settles that same result without invoking the handler again.
+                deadline = time.monotonic() + 5.0
+                while terminal is not None and terminal.state == "running":
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        second.recover_completions(timeout_seconds=min(.1, remaining))
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        with second.kernel._control_lock(min(.1, remaining)):
+                            terminal = second.kernel.get("portable-restart")
+                    except (TimeoutError, sqlite3.OperationalError) as error:
+                        transient = (isinstance(error, SettlementBusyError)
+                            or is_sqlite_contention(error)
+                            or (type(error) is TimeoutError and str(error) in {
+                                "Kernel control lock admission timed out",
+                                "Kernel control admission budget elapsed"}))
+                        if not transient:
+                            raise
+                        maintenance_error = {"type": type(error).__name__, "message": str(error)}
+                    if terminal.state == "running":
+                        time.sleep(min(.01, max(0., deadline - time.monotonic())))
+                self.assertIsNotNone(terminal)
+                self.assertEqual(terminal.state, "succeeded")
+                self.assertIsNotNone(terminal.result)
                 self.assertEqual(terminal.result.value["value"], "durable")
+                self.assertEqual(terminal.result.attempt, 1)
+            except Exception:
+                evidence = {"task_timeout_seconds": 30.0, "settlement_wait_seconds": 5.0}
+                if maintenance_error is not None:
+                    evidence["last_maintenance_error"] = maintenance_error
+                try:
+                    with second.kernel._control_lock(1.0):
+                        evidence["snapshot"] = second.kernel.get("portable-restart").to_dict()
+                        evidence["events"] = [event.to_dict() for event in
+                            second.kernel.events_since(0, limit=50)]
+                    evidence["observation"] = second.observe("portable-restart", timeout=1.0)
+                except Exception as diagnostic_error:
+                    evidence["diagnostic_error"] = {
+                        "type": type(diagnostic_error).__name__, "message": str(diagnostic_error)}
+                print("portable_restart_failure=" + json.dumps(evidence), flush=True)
+                raise
             finally:
                 second.close()
 
