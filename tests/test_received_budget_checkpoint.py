@@ -319,6 +319,15 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
         self.assertEqual(returned.state, 'succeeded')
         self.assertEqual(returned.result.value, outcome['value'])
         self.assert_published(outcome)
+        receipt = self.receipt()
+        self.evidence['records'].append({'foreground': {'execution': returned.to_dict(),
+            'receipt': receipt, 'settlement_error': self.runtime._settlement_error,
+            'guards_after_ack': self.guards()}})
+        # Kernel success and ACK publication precede the bounded archive write.
+        # If that write expires, maintenance archives the same result without
+        # repeating business work or restoring spent execution authority.
+        if receipt['state'] == 'pending':
+            self.recover_recorded(receipt)
         self.assertEqual(self.receipt()['state'], 'recorded')
 
     def test_receipt_writer_contention_keeps_positive_fact_locally_until_durable(self):

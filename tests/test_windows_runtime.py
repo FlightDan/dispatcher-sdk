@@ -256,19 +256,19 @@ class WindowsDescendantContainmentTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "requires real native Windows Job Objects")
     def test_actual_exited_job_descendant_accepts_native_termination_error(self):
         root = retained_directory("sdk-windows-descendant-exit-race-")
-        ready, release, parent_ready = root / "ready", root / "release", root / "parent-ready"
+        ready, parent_ready = root / "ready", root / "parent-ready"
         child = root / "child.py"
         child.write_text(
             "import os,sys,time\nfrom pathlib import Path\n"
-            "ready,release=map(Path,sys.argv[1:])\n"
+            "ready=Path(sys.argv[1])\n"
             "ready.write_text(str(os.getpid()),encoding='ascii')\n"
-            "while not release.exists(): time.sleep(.002)\n", encoding="utf-8")
+            "while True: time.sleep(.002)\n", encoding="utf-8")
         parent = ("import os,subprocess,sys,time; from pathlib import Path; "
                   "Path(sys.argv[1]).write_text(str(os.getpid()),encoding='ascii'); "
                   "subprocess.Popen([sys._base_executable,*sys.argv[2:]]); time.sleep(30)")
         api = _WinAPI()
         job, info = windows_runtime._create_suspended(api,
-            [sys.executable, "-c", parent, str(parent_ready), str(child), str(ready), str(release)])
+            [sys.executable, "-c", parent, str(parent_ready), str(child), str(ready)])
         handle = windows_runtime.WindowsProcessHandle(api, job, info)
         evidence = {"test": self.id(), "python": sys.executable, "termination_calls": []}
         try:
@@ -286,18 +286,34 @@ class WindowsDescendantContainmentTests(unittest.TestCase):
             evidence["descendant_pid"] = descendant_pid
             deadline = time.monotonic() + 1
             terminate = api.dll.TerminateProcess
+            process_id = api.dll.GetProcessId
+            process_id.argtypes, process_id.restype = [wintypes.HANDLE], wintypes.DWORD
+            evidence["other_descendants"] = []
 
             def exit_before_termination(process, code):
                 # The real stop loop has already observed this acquired handle
-                # alive. Force exit before its actual TerminateProcess call.
-                release.write_text("release", encoding="ascii")
+                # alive. A real native stop forces the exit race on that handle.
+                pid = process_id(process)
+                if pid != descendant_pid:
+                    result = terminate(process, code)
+                    error = ctypes.get_last_error()
+                    evidence["other_descendants"].append({"pid": pid, "result": bool(result), "error": error})
+                    ctypes.set_last_error(error)
+                    return result
+                call = {"handle": int(process), "pid": pid, "started_at": time.monotonic(),
+                        "deadline": deadline}
+                evidence["termination_calls"].append(call)
+                first = terminate(process, 0)
+                first_error = ctypes.get_last_error()
+                call.update(first_termination=bool(first), first_error=first_error)
+                self.assertTrue(first, call)
                 wait = api.dll.WaitForSingleObject(process,
                     max(0, int((deadline - time.monotonic()) * 1000)))
-                self.assertEqual(wait, windows_runtime._WAIT_OBJECT_0)
+                call.update(wait_result=wait, wait_finished_at=time.monotonic())
+                self.assertEqual(wait, windows_runtime._WAIT_OBJECT_0, call)
                 result = terminate(process, code)
                 error = ctypes.get_last_error()
-                evidence["termination_calls"].append({
-                    "handle": int(process), "result": bool(result), "error": error})
+                call.update(result=bool(result), error=error)
                 ctypes.set_last_error(error)
                 return result
 
