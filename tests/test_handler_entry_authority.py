@@ -659,36 +659,117 @@ class AdmissionContentionTests(unittest.TestCase):
             print('public_admission_contention_evidence=' + str(path), flush=True)
 
     def test_startup_expiry_classifies_without_business_and_releases_capacity(self):
+        import traceback
+
         runtime, marker = self.runtime(startup=.25)
         ready, held, busy, failures = self.contend(runtime)
         classified = threading.Event()
-        original = runtime._outcome_result
+        evidence = {'test': self.id(), 'interpreter': sys.executable,
+            'task_timeout': 5, 'startup_timeout': .25, 'phases': [],
+            'diagnostic_errors': []}
+        results, errors = [], []
+        driver = healthy = None
+
+        def error_fact(error):
+            return {'type': type(error).__name__, 'message': str(error),
+                'traceback': ''.join(traceback.format_exception(type(error), error, error.__traceback__)),
+                'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None),
+                'sqlite_errorname': getattr(error, 'sqlite_errorname', None)}
+
+        def diagnostic(operation):
+            try:
+                operation()
+            except BaseException as error:
+                try:
+                    evidence['diagnostic_errors'].append(error_fact(error))
+                except BaseException:
+                    pass
+
+        def supplied_fact(value):
+            if hasattr(value, 'to_dict'):
+                return supplied_fact(value.to_dict())
+            if isinstance(value, dict):
+                return {key: supplied_fact(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [supplied_fact(item) for item in value]
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            return {'supplied_type': type(value).__name__,
+                'supplied_module': type(value).__module__}
+
+        def traced(name, call, *args, **kwargs):
+            phase = {'stage': name, 'began': time.monotonic(),
+                'thread': threading.current_thread().name}
+            diagnostic(lambda: phase.update(arguments=supplied_fact(args), options=supplied_fact(kwargs)))
+            diagnostic(lambda: evidence['phases'].append(phase))
+            try:
+                result = call(*args, **kwargs)
+                def returned():
+                    if name == 'prepare_admission':
+                        envelope, error, deadline = result
+                        phase['result'] = {'envelope': None if envelope is None else envelope.to_dict(),
+                            'error': error, 'original_deadline': deadline}
+                    else:
+                        phase['result'] = supplied_fact(result)
+                diagnostic(returned)
+                return result
+            except BaseException as error:
+                diagnostic(lambda: phase.update(error=error_fact(error)))
+                raise
+            finally:
+                diagnostic(lambda: phase.update(returned=time.monotonic()))
+
+        original_outcome = runtime._outcome_result
+        original_admission = runtime._prepare_handler_admission
+        original_sample = runtime.kernel._sample_budget
 
         def outcome(*args):
-            value = original(*args)
+            value = traced('classified_outcome', original_outcome, *args)
             classified.set()
             return value
 
-        runtime._outcome_result = outcome
-        identifier = self.submit(runtime, "expired-admission")
-        driver, results, errors = self.drive(runtime, identifier)
-        self.assertTrue(ready.wait(2))
-        writer = self.writer(runtime.kernel.db_path)
-        held.set()
-        self.assertTrue(busy.wait(1))
-        self.assertTrue(classified.wait(1), "admission retried beyond its original startup window")
-        self.assertFalse(marker.exists())
-        # Durable terminal publication needs the writer; releasing it must
-        # publish the already classified failure, without another admission.
-        writer.rollback()
-        driver.join(2)
-        self.assertFalse(driver.is_alive())
-        self.assertEqual(errors, [])
-        self.assertEqual(results[0].state, "failed")
-        self.assertEqual(results[0].result.error.code, "entry_admission_timeout")
-        healthy = self.submit(runtime, "healthy")
-        self.assertEqual(runtime.run_once(execution_id=healthy).state, "succeeded")
-        self.assertGreaterEqual(len(failures), 1)
+        with patch.object(runtime, '_outcome_result', outcome), \
+                patch.object(runtime, '_prepare_handler_admission',
+                    lambda *args, **kwargs: traced('prepare_admission', original_admission, *args, **kwargs)), \
+                patch.object(runtime.kernel, '_sample_budget',
+                    lambda *args, **kwargs: traced('sample_budget', original_sample, *args, **kwargs)):
+            try:
+                identifier = self.submit(runtime, "expired-admission")
+                driver, results, errors = self.drive(runtime, identifier)
+                self.assertTrue(ready.wait(2))
+                writer = self.writer(runtime.kernel.db_path)
+                held.set()
+                self.assertTrue(busy.wait(1))
+                self.assertTrue(classified.wait(1), "admission retried beyond its original startup window")
+                self.assertFalse(marker.exists())
+                # Durable terminal publication needs the writer; releasing it must
+                # publish the already classified failure, without another admission.
+                writer.rollback()
+                driver.join(2)
+                self.assertFalse(driver.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(results[0].state, "failed")
+                self.assertEqual(results[0].result.error.code, "entry_admission_timeout")
+                healthy = self.submit(runtime, "healthy")
+                successor = traced('healthy_run_once', runtime.run_once, execution_id=healthy)
+                diagnostic(lambda: evidence.update(healthy_result=successor.to_dict()))
+                self.assertEqual(successor.state, "succeeded", evidence.get("healthy_result"))
+                self.assertGreaterEqual(len(failures), 1)
+            except BaseException as error:
+                diagnostic(lambda: evidence.update(original_error=error_fact(error)))
+                raise
+            finally:
+                # Copy already supplied facts after the original calls. No extra
+                # execution-budget sampling or storage work precedes an assertion.
+                diagnostic(lambda: evidence.update(
+                    driver_alive=driver is not None and driver.is_alive(),
+                    original_results=[item.to_dict() for item in results],
+                    original_errors=[error_fact(error) for error in errors],
+                    busy_errors=[error_fact(error) for error in failures],
+                    marker_exists_before_cleanup=marker.exists(),
+                    runtime_closed=runtime._closed, healthy_execution_id=healthy))
+                diagnostic(lambda: (self.root / 'startup-capacity-before-cleanup.json').write_text(
+                    json.dumps(evidence, indent=2), encoding='utf-8'))
 
     def test_forward_jump_then_rollback_preserves_inherited_run_time(self):
         base = time.time()

@@ -1164,33 +1164,230 @@ class RuntimeTests(unittest.TestCase):
         "requires Linux subreaper process isolation",
     )
     def test_timeout_reaps_double_forked_new_session_descendant(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            marker = Path(temp) / "double-fork.txt"
+        from contextlib import closing, ExitStack
+        from copy import deepcopy
+        import sqlite3
+        import traceback
+        from dispatcher_sdk.execution_kernel import runtime as runtime_module
+        from tests._storage_evidence import StorageEvidence
+
+        root = retained_directory("sdk-double-fork-timeout-")
+        marker = root / "double-fork.txt"
+        evidence = {"test": self.id(), "interpreter": sys.executable, "root": str(root),
+            "runtime_import": runtime_module.__file__, "task_timeout": .02,
+            "child_sleep": .15, "handler_sleep": 1.0, "observation_timeout": .25,
+            "native_invocations": [], "foreground_receipts": [], "phases": []}
+        storage = StorageEvidence(root, self)
+        stack = command = None
+        primary_error = None
+        observation_began = observation_deadline = None
+
+        def error_fact(error):
+            return {"type": type(error).__name__, "module": type(error).__module__,
+                "message": str(error), "traceback": "".join(traceback.format_exception(
+                    type(error), error, error.__traceback__)),
+                "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                "sqlite_errorname": getattr(error, "sqlite_errorname", None)}
+
+        def secondary(name, operation):
+            try:
+                return operation()
+            except BaseException as error:
+                try:
+                    evidence.setdefault("diagnostic_errors", []).append({"stage": name, **error_fact(error)})
+                except BaseException:
+                    pass
+
+        def phase(name, operation, **arguments):
+            item = {"stage": name, "began": time.monotonic(), "arguments": arguments}
+            secondary(name + "_entered", lambda: evidence["phases"].append(item))
+            try:
+                result = operation()
+                secondary(name + "_result", lambda: item.update(result=
+                    result.to_dict() if hasattr(result, "to_dict") else result))
+                return result
+            except BaseException as error:
+                secondary(name + "_error", lambda: item.update(error=error_fact(error)))
+                raise
+            finally:
+                secondary(name + "_returned", lambda: item.update(returned=time.monotonic(),
+                    elapsed=time.monotonic() - item["began"]))
+
+        original_invoke = runtime_module.invoke_process_handler
+
+        def invoke(**kwargs):
+            item = {"began": time.monotonic(), "callbacks": []}
+            secondary("native_entered", lambda: evidence["native_invocations"].append(item))
+            secondary("native_arguments", lambda: item.update(
+                command=kwargs["command"].to_dict(), lease=kwargs["lease"].to_dict(),
+                budget_envelope=kwargs["budget_envelope"].to_dict(), start_timeout=kwargs["start_timeout"]))
+            for name in ("on_phase", "on_entered", "on_cleanup_confirmed"):
+                callback = kwargs.get(name)
+                if callback is not None:
+                    def forward(*args, _name=name, _callback=callback, **options):
+                        secondary("native_callback", lambda: item["callbacks"].append(
+                            {"name": _name, "at": time.monotonic(), "arguments": deepcopy(args)}))
+                        return _callback(*args, **options)
+                    kwargs[name] = forward
+            try:
+                outcome = original_invoke(**kwargs)
+                secondary("native_outcome", lambda: item.update(outcome=deepcopy(outcome)))
+                return outcome
+            except BaseException as error:
+                secondary("native_error", lambda: item.update(error=error_fact(error)))
+                raise
+            finally:
+                secondary("native_returned", lambda: item.update(returned=time.monotonic()))
+
+        def capture_before_cleanup():
+            evidence["captured_at"] = time.monotonic()
+            evidence["marker_exists_before_cleanup"] = marker.exists()
+            if not storage._lock.acquire(timeout=.1):
+                raise TimeoutError("fixture SQL evidence admission elapsed")
+            try:
+                sql = {"operations": storage.operations,
+                    "retained_sql_operations": [dict(item) for item in storage.events],
+                    "imports": getattr(storage, "imports", {})}
+            finally:
+                storage._lock.release()
+            evidence["storage"] = deepcopy(sql)
+            if stack is None:
+                return
+            evidence["runtime"] = {"closed": stack._closed, "active_runs": stack._active_runs,
+                "settlement_error": stack._settlement_error, "observation_error": stack._observation_error,
+                "close_error": None if stack._close_error is None else error_fact(stack._close_error)}
+            pending = stack._pending_settlements
+
+            def pending_snapshot():
+                if not pending._lock.acquire(timeout=.1):
+                    raise TimeoutError("fixture pending evidence admission elapsed")
+                try:
+                    return tuple(token._entry for token in list(pending._entries.values())[:50]
+                        if token._entry is not None)
+                finally:
+                    pending._lock.release()
+
+            entries = secondary("pending_state", pending_snapshot)
+            if entries is not None:
+                evidence["runtime"]["pending"] = [{"identity": entry.identity,
+                    "lease": entry.lease.to_dict(), "payload": entry.payload,
+                    "evidence": entry.evidence} for entry in entries]
+
+            def readonly_facts():
+                deadline = time.monotonic() + .1
+                evidence["readonly"] = {"timeout_seconds": .1, "began": time.monotonic()}
+                paths = [("kernel", stack.kernel.db_path, ("kernel_clock", "kernel_executions",
+                    "kernel_execution_limits", "kernel_budget_samples", "kernel_result_outbox"))]
+                if stack._settlement_journal is not None:
+                    paths.append(("settlement", stack._settlement_journal.path,
+                        ("settlement_meta", "settlement_records", "settlement_notes")))
+                for name, path, tables in paths:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("fixture read-only evidence elapsed")
+                    evidence["readonly"][name] = {"path": str(path)}
+                    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro",
+                            uri=True, timeout=0, isolation_level=None)) as connection:
+                        connection.row_factory = sqlite3.Row
+                        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                        for table in tables:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError("fixture read-only evidence elapsed")
+                            args = () if table in ("kernel_clock", "settlement_meta") else ("double-fork",)
+                            sql = "SELECT * FROM " + table + (" WHERE execution_id=?" if args else "")
+                            rows = connection.execute(sql + " LIMIT 50", args).fetchall()
+                            evidence["readonly"][name][table] = [dict(row) for row in rows]
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError("fixture read-only evidence elapsed")
+                evidence["readonly"]["returned"] = time.monotonic()
+
+            secondary("readonly_facts", readonly_facts)
+
+        try:
+            secondary("storage_start", lambda: storage.start(include_kernel=True))
             stack = Kernel.open_sqlite(
-                Path(temp) / "kernel.sqlite3",
+                root / "kernel.sqlite3",
                 {("double-fork", 1): double_fork_late_write},
                 isolation_mode="process",
             )
+            command = make_command(
+                "double-fork",
+                stack.registry_revision,
+                handler_id="double-fork",
+                timeout=0.02,
+                payload={
+                    "path": str(marker),
+                    "child_sleep": 0.15,
+                    "handler_sleep": 1.0,
+                },
+            )
+            secondary("command", lambda: evidence.update(command=command.to_dict()))
+            stack.submit(command)
+
+            def run_original():
+                nonlocal observation_began, observation_deadline
+                original = stack.run_once()
+                observation_began = time.monotonic()
+                observation_deadline = observation_began + .25
+                return original
+
+            with ExitStack() as patches:
+                patches.enter_context(patch.object(runtime_module, "invoke_process_handler", invoke))
+                if stack._settlement_journal is not None:
+                    original_record = stack._settlement_journal.record
+
+                    def record(*args, **kwargs):
+                        receipt = phase("foreground_receipt", lambda: original_record(*args, **kwargs),
+                            timeout_seconds=kwargs.get("timeout_seconds"))
+                        secondary("foreground_receipt_copy", lambda: evidence["foreground_receipts"].append(
+                            deepcopy(receipt)))
+                        return receipt
+
+                    patches.enter_context(patch.object(stack._settlement_journal, "record", record))
+                result = phase("run_once", run_original)
+            secondary("observation_window", lambda: evidence.update(
+                observation_began=observation_began, observation_deadline=observation_deadline,
+                original_snapshot=None if result is None else result.to_dict(),
+                foreground_settlement_error=stack._settlement_error))
+            if result is not None and result.state == "running":
+                remaining = observation_deadline - time.monotonic()
+                if remaining > 0:
+                    phase("recover_completions", lambda: stack.recover_completions(
+                        timeout_seconds=observation_deadline - time.monotonic()), timeout_seconds=remaining)
+                    recovery_returned = time.monotonic()
+                    secondary("recovery_returned", lambda: evidence.update(recovery_returned=recovery_returned))
+                    self.assertLessEqual(recovery_returned, observation_deadline)
+                remaining = observation_deadline - time.monotonic()
+                if remaining > 0:
+                    with stack.kernel._control_lock(min(.1, remaining)):
+                        result = phase("canonical_read", lambda: stack.kernel.get(command.execution_id),
+                            execution_id=command.execution_id, timeout_seconds=min(.1, remaining))
+                    canonical_returned = time.monotonic()
+                    secondary("canonical_returned", lambda: evidence.update(canonical_returned=canonical_returned))
+                    self.assertLessEqual(canonical_returned, observation_deadline)
+            time.sleep(max(0, observation_deadline - time.monotonic()))
+            secondary("observation_returned", lambda: evidence.update(
+                observation_returned=time.monotonic(), final_snapshot=None if result is None else result.to_dict()))
+            self.assertEqual(result.state, "timed_out")
+            self.assertFalse(marker.exists())
+        except BaseException as error:
+            primary_error = error
+            secondary("original_error", lambda: evidence.update(original_error=error_fact(error)))
+            raise
+        finally:
+            secondary("before_cleanup", capture_before_cleanup)
+            secondary("before_cleanup_write", lambda: (root / "before_cleanup.json").write_text(
+                json.dumps(evidence, indent=2), encoding="utf-8"))
             try:
-                stack.submit(
-                    make_command(
-                        "double-fork",
-                        stack.registry_revision,
-                        handler_id="double-fork",
-                        timeout=0.02,
-                        payload={
-                            "path": str(marker),
-                            "child_sleep": 0.15,
-                            "handler_sleep": 1.0,
-                        },
-                    )
-                )
-                result = stack.run_once()
-                self.assertEqual(result.state, "timed_out")
-                time.sleep(0.25)
-                self.assertFalse(marker.exists())
+                if stack is not None:
+                    phase("close", stack.close)
+            except BaseException as error:
+                secondary("cleanup_error", lambda: evidence.update(cleanup_error=error_fact(error)))
+                if primary_error is None:
+                    raise
             finally:
-                stack.close()
+                secondary("final_write", lambda: (root / "evidence.json").write_text(
+                    json.dumps(evidence, indent=2), encoding="utf-8"))
+                secondary("storage_stop", storage.stop)
 
     @unittest.skipUnless(
         os.name == "posix" and "fork" in multiprocessing.get_all_start_methods(),

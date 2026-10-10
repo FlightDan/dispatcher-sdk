@@ -225,6 +225,62 @@ def native_capacity_successor(payload, context):
 
 def segmented_output(payload, context):
     root = Path(payload["root"])
+
+    def progress_once(phase):
+        # Record the original public call's authority operation. Copying the
+        # supplied envelope does not sample the public execution budget.
+        record = {"phase": phase, "sql": [], "diagnostic_errors": []}
+
+        def diagnostic(operation):
+            try:
+                operation()
+            except BaseException as error:
+                try:
+                    record["diagnostic_errors"].append({"type": type(error).__name__, "message": str(error)})
+                except BaseException:
+                    pass
+
+        def traced_sql(sql):
+            def capture():
+                record["sql"].append({"sql": sql, "at": time.monotonic(),
+                    "thread": threading.current_thread().name})
+                if len(record["sql"]) > 64:
+                    del record["sql"][0]
+            diagnostic(capture)
+
+        original = context._kernel.confirm_progress
+
+        def confirm(lease, key, **arguments):
+            diagnostic(lambda: record.update(began=time.monotonic(), identity=lease.to_dict(),
+                key=key, arguments=arguments, interpreter=sys.executable,
+                sdk_import=dispatcher_sdk.__file__,
+                budget=None if context._budget_envelope is None else context._budget_envelope.to_dict()))
+            diagnostic(lambda: context._kernel._connection.set_trace_callback(traced_sql))
+            try:
+                receipt = original(lease, key, **arguments)
+                diagnostic(lambda: record.update(authority_receipt=dict(receipt)))
+                return receipt
+            except BaseException as error:
+                def failed():
+                    record["error"] = {"type": type(error).__name__, "message": str(error),
+                        "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                        "sqlite_errorname": getattr(error, "sqlite_errorname", None),
+                        "traceback": traceback.format_exc()}
+                diagnostic(failed)
+                raise
+            finally:
+                diagnostic(lambda: context._kernel._connection.set_trace_callback(None))
+                diagnostic(lambda: record.update(returned=time.monotonic()))
+
+        context._kernel.confirm_progress = confirm
+        try:
+            receipt = context.activity.progress("one-real-milestone", details={"step": 1})
+            diagnostic(lambda: record.update(public_receipt=dict(receipt)))
+            return receipt
+        finally:
+            context._kernel.confirm_progress = original
+            diagnostic(lambda: write_json(root / ("progress-authority-" + phase + ".json"), record))
+
     context.activity.enable_stream("stdout")
     script = """import os,pathlib,sys,time
 root=pathlib.Path(sys.argv[1]);os.write(1,b'A')
@@ -244,11 +300,11 @@ os.write(1,b'DEF')
         mark(root, "first-segment", child_pid=process.pid)
         wait_file(root / "release-activity", activity=context.activity)
         context.activity.tool("response")
-        new = context.activity.progress("one-real-milestone", details={"step": 1})
+        new = progress_once("new")
         context.activity.flush()
         mark(root, "independent-activity", progress=new)
         wait_file(root / "release-replay", activity=context.activity)
-        replay = context.activity.progress("one-real-milestone", details={"step": 1})
+        replay = progress_once("replay")
         context.activity.flush()
         mark(root, "replayed-progress", progress=replay)
         chunk = process.stdout.read(2)
@@ -757,7 +813,8 @@ class NativeObservabilityAcceptanceTests(unittest.TestCase):
             deadline = time.monotonic() + .1
             facts = {}
             for name, tables in (
-                    ("kernel.sqlite3", ("kernel_executions", "kernel_execution_limits", "kernel_budget_samples")),
+                    ("kernel.sqlite3", ("kernel_executions", "kernel_execution_limits", "kernel_budget_samples",
+                                        "kernel_supervision", "kernel_progress_keys", "kernel_clock")),
                     ("kernel.sqlite3.settlements.sqlite3", ("settlement_records",))):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -790,10 +847,12 @@ class NativeObservabilityAcceptanceTests(unittest.TestCase):
             activity = self.snapshot(runtime, command, "activity-raw-snapshot", lambda report: self.count(report, "tool_responses") == 1 and self.count(report, "progress") == 1)
             self.assertEqual(1, self.count(activity, "stdout_bytes"))
             self.assertGreater(self.count(activity, "heartbeat"), self.count(first, "heartbeat"))
+            self.assertEqual("confirmed", new.get("state"), new)
             self.assertTrue(new["advanced"])
             (self.root / "release-replay").touch()
             replay = self.await_marker("replayed-progress")["progress"]
             repeated = self.snapshot(runtime, command, "replay-raw-snapshot")
+            self.assertEqual("confirmed", replay.get("state"), replay)
             self.assertFalse(replay["advanced"])
             self.assertEqual(new["revision"], replay["revision"])
             self.assertEqual(1, self.count(repeated, "progress"))

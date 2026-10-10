@@ -138,26 +138,93 @@ class BudgetOwnerRegistryTests(unittest.TestCase):
                 owner_retained_after_call_collection=True, same_token_drained=True)
 
     def test_interruption_after_real_ack_commit_reconciles_only_original_live_owner(self):
+        from contextlib import closing
+        from pathlib import Path
+        import sys
+        import traceback
+
         kernel, parent, wall = self.parent()
         capture = _KernelBudgetCapture(kernel, "parent")
         transaction, begin = kernel._transaction, kernel._begin_budget_sample
         tokens, interrupted = [], []
         reader = self.reader(kernel)
         wall[0] += 1
+        diagnostics = {'evidence_phase': 'before_hook_restore_and_close',
+            'calls': [], 'sql': [], 'diagnostic_errors': []}
+        stage = 'original_capture'
+
+        def error_fact(error):
+            return {'type': type(error).__name__, 'message': str(error),
+                'traceback': ''.join(traceback.format_exception(type(error), error, error.__traceback__)),
+                'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None),
+                'sqlite_errorname': getattr(error, 'sqlite_errorname', None)}
+
+        def diagnostic(operation):
+            try:
+                operation()
+            except BaseException as error:
+                try:
+                    diagnostics['diagnostic_errors'].append(error_fact(error))
+                except BaseException:
+                    pass
+
+        def supplied_fact(value):
+            if hasattr(value, 'to_dict'):
+                return supplied_fact(value.to_dict())
+            if isinstance(value, dict):
+                return {key: supplied_fact(item) for key, item in value.items()}
+            if isinstance(value, (tuple, list)):
+                return [supplied_fact(item) for item in value]
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            return {'supplied_type': type(value).__name__,
+                'supplied_module': type(value).__module__, 'is_original_owner': value is capture}
+
+        def sql(statement):
+            diagnostic(lambda: diagnostics['sql'].append({'stage': stage,
+                'at': time.monotonic(), 'statement': statement})
+                if len(diagnostics['sql']) < 128 else None)
+
+        diagnostic(lambda: diagnostics.update(interpreter=sys.executable,
+            sdk_import=sys.modules['dispatcher_sdk'].__file__, original_parent=parent.to_dict(),
+            capture_timeout=.1, foreign_finish_timeout=.1, owner_finish_timeout=.1))
+        diagnostic(lambda: kernel._connection.set_trace_callback(sql))
 
         def count_arm(execution_id, **options):
-            token = begin(execution_id, **options)
-            tokens.append(token)
-            return token
+            call = {'stage': stage, 'operation': 'arm', 'began': time.monotonic()}
+            diagnostic(lambda: call.update(execution_id=execution_id, options=supplied_fact(options)))
+            diagnostic(lambda: diagnostics['calls'].append(call)
+                if len(diagnostics['calls']) < 128 else None)
+            try:
+                token = begin(execution_id, **options)
+                tokens.append(token)
+                diagnostic(lambda: call.update(token=token))
+                return token
+            except BaseException as error:
+                diagnostic(lambda: call.update(error=error_fact(error)))
+                raise
+            finally:
+                diagnostic(lambda: call.update(returned=time.monotonic()))
 
         @contextmanager
         def commit_then_interrupt(**options):
-            with transaction(**options) as current:
-                yield current
-            if capture._ack_token is not None and not interrupted:
-                interrupted.append(capture._ack_token)
-                self.assertIsNone(reader.execute("SELECT token FROM kernel_budget_samples").fetchone())
-                raise KeyboardInterrupt("after real ACK COMMIT before owner retirement")
+            call = {'stage': stage, 'operation': 'transaction', 'began': time.monotonic()}
+            diagnostic(lambda: call.update(options=supplied_fact(options)))
+            diagnostic(lambda: diagnostics['calls'].append(call)
+                if len(diagnostics['calls']) < 128 else None)
+            try:
+                with transaction(**options) as current:
+                    yield current
+                diagnostic(lambda: call.update(actual_commit_returned=time.monotonic()))
+                if capture._ack_token is not None and not interrupted:
+                    interrupted.append(capture._ack_token)
+                    self.assertIsNone(reader.execute("SELECT token FROM kernel_budget_samples").fetchone())
+                    raise KeyboardInterrupt("after real ACK COMMIT before owner retirement")
+            except BaseException as error:
+                diagnostic(lambda: call.update(error=error_fact(error)))
+                raise
+            finally:
+                diagnostic(lambda: call.update(returned=time.monotonic()))
 
         kernel._begin_budget_sample = count_arm
         kernel._transaction = commit_then_interrupt
@@ -172,13 +239,16 @@ class BudgetOwnerRegistryTests(unittest.TestCase):
             committed = BudgetEnvelope.from_dict(kernel.get_execution_limits("parent")["envelope"])
             self.assertGreaterEqual(committed.checkpoint.wall_at, captured.checkpoint.wall_at)
             wall[0] -= 1
+            stage = 'fresh_foreign_finish'
             with SQLiteKernel(kernel.db_path, now=lambda: wall[0]) as fresh:
                 foreign = _KernelBudgetCapture(fresh, "parent")
                 with self.assertRaises(CASConflictError):
                     fresh._finish_budget_sample(token, "parent", captured, timeout_seconds=.1, _owner=foreign)
+            stage = 'same_kernel_foreign_finish'
             foreign = _KernelBudgetCapture(kernel, "parent")
             with self.assertRaises(CASConflictError):
                 kernel._finish_budget_sample(token, "parent", captured, timeout_seconds=.1, _owner=foreign)
+            stage = 'original_owner_finish'
             resumed = capture.finish_pending(parent, timeout_seconds=.1)
             self.assertIsNone(capture._pending)
             self.assertEqual(kernel._budget_sample_owners, {})
@@ -188,7 +258,40 @@ class BudgetOwnerRegistryTests(unittest.TestCase):
             self.evidence.update(raw_error=str(caught.exception), token=token,
                 captured=captured.to_dict(), committed_before_interruption=committed.to_dict(),
                 resumed=resumed.to_dict(), absent_token_reconciled_by_exact_owner=True)
+        except BaseException as error:
+            diagnostic(lambda: diagnostics.update(primary_error=error_fact(error), failed_stage=stage))
+            raise
         finally:
+            diagnostic(lambda: diagnostics.update(tokens=list(tokens), interrupted=list(interrupted),
+                supplied_wall=wall[0], owner_pending=supplied_fact(capture._pending),
+                owner_ack_token=capture._ack_token,
+                registry=[{'token': token, 'is_original_owner': owner is capture}
+                    for token, owner in kernel._budget_sample_owners.items()],
+                kernel_connection_in_transaction=kernel._connection.in_transaction,
+                thread_stacks={str(identifier): ''.join(traceback.format_stack(frame, limit=32))[:16384]
+                    for identifier, frame in list(sys._current_frames().items())[:32]}))
+
+            def readonly_facts():
+                deadline = time.monotonic() + .1
+                with closing(sqlite3.connect(Path(kernel.db_path).resolve().as_uri() + '?mode=ro',
+                        uri=True, timeout=.1)) as observer:
+                    observer.row_factory = sqlite3.Row
+                    observer.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1)
+                    facts = {}
+                    for table in ('kernel_budget_samples', 'kernel_execution_limits',
+                            'kernel_executions', 'kernel_clock'):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError('diagnostic readonly window elapsed')
+                        observer.execute('PRAGMA busy_timeout=' + str(max(0, int(remaining * 1000))))
+                        facts[table] = [dict(row) for row in observer.execute('SELECT * FROM ' + table + ' LIMIT 50')]
+                    diagnostics['readonly'] = facts
+
+            diagnostic(readonly_facts)
+            diagnostic(lambda: self.evidence.update(before_cleanup=diagnostics))
+            diagnostic(lambda: (self.root / 'owner-interruption-before-cleanup.json').write_text(
+                json.dumps(diagnostics, indent=2), encoding='utf-8'))
+            diagnostic(lambda: kernel._connection.set_trace_callback(None))
             kernel._transaction = transaction
             kernel._begin_budget_sample = begin
 
