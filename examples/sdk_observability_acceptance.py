@@ -396,6 +396,151 @@ def parent_child_case(root, mode):
                       'tool containment did not finish within its original cleanup reserve')
 
 
+def _silence_cancel_diagnostics(app, root):
+    """Trace original control work; failure capture never acquires its locks."""
+    from collections import deque
+    from contextlib import contextmanager
+
+    runtime, kernel = app.runtime, app.runtime.kernel
+    ring, active, secondary, hooks = deque(maxlen=128), {}, deque(maxlen=16), []
+    evidence = {'interpreter': sys.executable, 'sdk_import': dispatcher_sdk.__file__,
+        'execution_timeout': 12, 'caller_timeout': 15, 'stall_sample': .2,
+        'stall_windows': 2, 'supervision_default_timeout': .1}
+
+    def error_fact(error):
+        return {'type': type(error).__name__, 'message': str(error)[:4096],
+            'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None),
+            'sqlite_errorname': getattr(error, 'sqlite_errorname', None),
+            'traceback': ''.join(traceback.format_exception(type(error), error, error.__traceback__, limit=32))[:65536]}
+
+    def optional(operation):
+        try:
+            return operation()
+        except BaseException as error:
+            try:
+                secondary.append(error_fact(error))
+            except BaseException:
+                pass
+
+    def supplied(value, depth=0):
+        if depth >= 8:
+            return {'supplied_type': type(value).__name__}
+        if hasattr(value, 'to_dict'):
+            return supplied(value.to_dict(), depth + 1)
+        if isinstance(value, dict):
+            return {str(key): supplied(item, depth + 1) for key, item in list(value.items())[:32]}
+        if isinstance(value, (tuple, list)):
+            return [supplied(item, depth + 1) for item in value[:32]]
+        if isinstance(value, str):
+            return value[:4096]
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return {'supplied_type': type(value).__name__}
+
+    def entry(name, args, kwargs):
+        item = {'operation': name, 'began': time.monotonic(),
+            'thread': threading.get_ident(), 'thread_name': threading.current_thread().name}
+        optional(lambda: item.update(arguments=supplied(args), options=supplied(kwargs)))
+        optional(lambda: ring.append(item))
+        return item
+
+    def traced(name, call, *args, **kwargs):
+        item = entry(name, args, kwargs)
+        try:
+            optional(lambda: item.update(native_began=time.monotonic()))
+            result = call(*args, **kwargs)
+            optional(lambda: item.update(native_returned=time.monotonic()))
+            optional(lambda: item.update(result=supplied(result)))
+            return result
+        except BaseException as error:
+            optional(lambda: item.update(native_returned=time.monotonic()))
+            optional(lambda: item.update(error=error_fact(error)))
+            raise
+        finally:
+            optional(lambda: item.update(returned=time.monotonic()))
+
+    original_control = kernel._control_lock
+
+    @contextmanager
+    def control(*args, **kwargs):
+        item = entry('control_lock', args, kwargs)
+        identifier = threading.get_ident()
+        try:
+            try:
+                optional(lambda: item.update(native_began=time.monotonic()))
+                with original_control(*args, **kwargs) as value:
+                    optional(lambda: item.update(acquired=time.monotonic()))
+                    optional(lambda: active.setdefault(identifier, []).append(item))
+                    yield value
+            finally:
+                # The original manager has completed its release before error
+                # formatting; a departed scope is no longer a live owner.
+                optional(lambda: item.update(native_returned=time.monotonic(), scope_exited=True))
+                optional(lambda: active[identifier].remove(item)
+                    if identifier in active and item in active[identifier] else None)
+        except BaseException as error:
+            optional(lambda: item.update(error=error_fact(error)))
+            raise
+        finally:
+            optional(lambda: item.update(returned=time.monotonic()))
+
+    original_connection = kernel._connection
+
+    class ConnectionTrace:
+        def __getattr__(self, name):
+            return getattr(original_connection, name)
+
+        def execute(self, *args, **kwargs):
+            return traced('sql_execute', original_connection.execute, *args, **kwargs)
+
+        def executemany(self, *args, **kwargs):
+            return traced('sql_executemany', original_connection.executemany, *args, **kwargs)
+
+        def commit(self, *args, **kwargs):
+            return traced('sql_commit', original_connection.commit, *args, **kwargs)
+
+        def rollback(self, *args, **kwargs):
+            return traced('sql_rollback', original_connection.rollback, *args, **kwargs)
+
+    def install(owner, name, value):
+        previous = getattr(owner, name)
+        setattr(owner, name, value)
+        hooks.append((owner, name, previous))
+
+    optional(lambda: install(kernel, '_connection', ConnectionTrace()))
+    optional(lambda: install(kernel, '_control_lock', control))
+    for owner, name in ((kernel, 'supervision_status'), (runtime, 'cancel')):
+        original = getattr(owner, name)
+        optional(lambda owner=owner, name=name, original=original: install(owner, name,
+            lambda *args, **kwargs: traced(name, original, *args, **kwargs)))
+
+    def retain(error):
+        # Save the original error and live owners before observation or cleanup.
+        optional(lambda: evidence.update(error=error_fact(error), failed=time.monotonic(),
+            operations=[supplied(item) for item in list(ring)], active_control=supplied(active)))
+        def stacks():
+            names = {identifier: thread.name for identifier, thread in list(threading._active.items())[:32]}
+            evidence['threads'] = [{'ident': identifier, 'name': names.get(identifier),
+                'stack': ''.join(traceback.format_stack(frame, limit=32))[:16384]}
+                for identifier, frame in list(sys._current_frames().items())[:32]]
+        optional(stacks)
+        def contexts():
+            values = list(runtime._thread_contexts.values())[:16] + list(runtime._retired_observation_contexts)[:16]
+            evidence['supplied_contexts'] = [{'command': supplied(context.command),
+                'envelope': supplied(context._budget_envelope),
+                'pending': supplied(None if context._budget_capture is None else context._budget_capture._pending)}
+                for context in values]
+        optional(contexts)
+        optional(lambda: evidence.update(diagnostic_errors=list(secondary)))
+        optional(lambda: save(Path(root) / 'cancel-control-before-cleanup.json', evidence))
+
+    def restore():
+        for owner, name, previous in reversed(hooks):
+            optional(lambda owner=owner, name=name, previous=previous: setattr(owner, name, previous))
+
+    return traced, retain, optional, restore
+
+
 def silence_cancel_case(root):
     from dataclasses import asdict
 
@@ -407,6 +552,8 @@ def silence_cancel_case(root):
     received = []
     app = Dispatcher(root / 'application.sqlite3', {'silent': silent}, isolation_mode='process',
                      observation_options=OPTIONS)
+    traced, retain, optional, restore = _silence_cancel_diagnostics(app, root)
+    primary_error = None
     try:
         def consume(notice):
             received.append(notice)
@@ -446,15 +593,17 @@ def silence_cancel_case(root):
         save(root / 'before-cancel.json', before)
         save(root / 'windows.json', task.stall_windows())
         try:
-            cancellation = task.cancel_if_stalled(notice)
-        except Exception as error:
-            save(root / 'cancel-error.json', {'type': type(error).__name__, 'message': str(error),
-                'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None), 'traceback': traceback.format_exc()})
+            cancellation = traced('cancel_if_stalled', task.cancel_if_stalled, notice)
+        except BaseException as error:
+            retain(error)
+            optional(lambda: save(root / 'cancel-error.json', {'type': type(error).__name__, 'message': str(error),
+                'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None), 'traceback': traceback.format_exc()}))
             try:
-                save(root / 'uncommitted-cancel-observation.json', task.observe(timeout=.5))
-            except Exception as observation_error:
-                save(root / 'cancel-inspection-error.json', {'type': type(observation_error).__name__,
-                                                           'message': str(observation_error)})
+                observation = task.observe(timeout=.5)
+                optional(lambda: save(root / 'uncommitted-cancel-observation.json', observation))
+            except BaseException as observation_error:
+                optional(lambda: save(root / 'cancel-inspection-error.json', {'type': type(observation_error).__name__,
+                                                           'message': str(observation_error)}))
             raise
         save(root / 'cancel-receipt.json', cancellation.to_dict())
         result = task.wait(timeout=15)
@@ -474,8 +623,18 @@ def silence_cancel_case(root):
         worker = next(item for item in after['processes'] if item['process_id'] == 'worker')
         check(worker['state'] == 'exited' and worker['evidence'].get('cleanup') == 'confirmed',
               'worker containment not confirmed')
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        app.close()
+        restore()
+        try:
+            app.close()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            optional(lambda: save(root / 'cancel-cleanup-error.json',
+                {'type': type(cleanup_error).__name__, 'message': str(cleanup_error)}))
 
 
 @dataclass(frozen=True)
@@ -635,14 +794,23 @@ def main():
                 location.mkdir(parents=True, exist_ok=True)
                 try:
                     cases[name](location)
-                except BaseException:
-                    save(location / 'failure.json', {'traceback': traceback.format_exc()})
+                except BaseException as error:
+                    original_traceback = error.__traceback__
+                    try:
+                        save(location / 'failure.json', {'traceback': ''.join(
+                            traceback.format_exception(type(error), error, original_traceback))})
+                    except BaseException:
+                        pass
                     raise
                 save(location / 'passed.json', {'scenario': name, 'passed': True})
             save(root / 'summary.json', {'passed': True, 'scenarios': list(selected)})
     except BaseException as error:
-        save(root / 'failure.json', {'type': type(error).__name__, 'message': str(error),
-                                   'traceback': traceback.format_exc()})
+        original_traceback = error.__traceback__
+        try:
+            save(root / 'failure.json', {'type': type(error).__name__, 'message': str(error),
+                'traceback': ''.join(traceback.format_exception(type(error), error, original_traceback))})
+        except BaseException:
+            pass
         raise
     print(json.dumps({'evidence_dir': str(root), 'passed': True, 'scenario': arguments.scenario}))
     return 0

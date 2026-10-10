@@ -21,8 +21,10 @@
 - The portable process observability example uses finite startup and delivery
   margins for native Windows, checks the returned child output, and prints its
   full bounded observation on failure. SDK budget rules remain unchanged.
-- The public observability consumer retains raw child-call and progress-call
-  tracebacks, SQLite error codes and supplied budgets without retrying failures.
+- The public observability consumer retains raw child, progress and cancellation
+  failures, SQLite error codes and supplied budgets without retrying failures.
+  Cancellation failures preserve bounded driver stacks and original control-call
+  timings before cleanup; diagnostic and close errors do not replace the cause.
 
 ## 0.7.1
 
