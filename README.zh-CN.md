@@ -42,7 +42,7 @@ Dispatcher 在 Python 应用中运行函数和脚本，控制超时与取消，�
 - SDK 不能撤销已经发生的写入或 API 调用。结果不确定时必须先核对再恢复；不能保证任意操作只发生一次。
 - `Dispatcher` 内置收件箱负责通知的持久化接收和去重。业务回调仍为至少一次调用；外部请求需要幂等键。本地业务 SQL 可用 `consume_results` 与消费标记一起提交。
 
-当前源码版本为 `0.7.1`，要求 Python 3.10+。
+当前源码版本为 `0.7.2`，要求 Python 3.10+。
 Kernel 存储使用 schema 5，Orchestrator 存储使用 schema 4。旧数据库需要显式升级，
 打开前请阅读[存储与升级](docs/STORAGE_AND_UPGRADES.md)和[兼容性说明](docs/PUBLIC_API.md)。
 

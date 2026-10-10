@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.2
+
+- Cancellation reports read the Runtime's durable native process cleanup notes
+  when cancellation receipts lack cleanup proof. Matching execution ID, attempt,
+  fence and Kernel store binding are required, including after restart and without
+  an attached Runtime. Evidence sources and note IDs remain visible separately
+  from cancellation receipt IDs.
+- Cleanup inspection queries the current generation directly, so unrelated
+  diagnostic pages cannot hide its confirmation. Missing, mismatched, oversized
+  or malformed evidence remains unknown; unresolved sandbox cleanup remains
+  pending even when local process cleanup is confirmed.
+- Active development and GitHub's default branch use `main`. Versions are
+  identified by release tags such as `v0.7.2`.
+
 ## 0.7.1
 
 - Kernel storage uses layout schema 5 and Orchestrator storage uses schema 4.

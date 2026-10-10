@@ -346,6 +346,28 @@ class SettlementJournal:
         report["elapsed_seconds"] = time.monotonic() - started
         return report
 
+    def _inspect_process_cleanup(self, identity: Mapping[str, Any], *,
+                                 timeout_seconds: float = .1) -> dict[str, Any] | None:
+        """Read the latest generation's cleanup note without paging unrelated notes."""
+        key = _key(identity, allow_unclaimed=True)
+        with self._connection(timeout_seconds) as connection:
+            row = connection.execute(
+                "SELECT sequence,length(CAST(evidence_json AS BLOB)) AS bytes "
+                "FROM settlement_notes WHERE execution_id=? AND attempt=? AND fence=? "
+                "AND phase='process_cleanup' ORDER BY sequence DESC LIMIT 1", key).fetchone()
+            if row is None:
+                return None
+            if row["bytes"] > 4096:
+                raise ValueError("process cleanup note exceeds inspection byte limit")
+            try:
+                note = _note(connection.execute(
+                    "SELECT * FROM settlement_notes WHERE sequence=?", (row["sequence"],)).fetchone())
+            except RecursionError as exc:
+                raise ValueError("process cleanup evidence nesting exceeds decoder limit") from exc
+            if type(note["evidence"]) is not dict:
+                raise ValueError("process cleanup evidence must be an object")
+            return note
+
     def pending(self, limit: int = 50, *, timeout_seconds: float = .1) -> list[dict[str, Any]]:
         """Return at most ``limit`` obligations eligible for maintenance retry."""
         if type(limit) is not int or not 1 <= limit <= 50:

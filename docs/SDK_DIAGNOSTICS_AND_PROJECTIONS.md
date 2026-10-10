@@ -134,11 +134,18 @@ current attempts and support `limit`/exclusive `after_task_id` paging.
 
 A read-only caller without the original Runtime can supply
 `cancellation_journal_path=` and `source_id=` to the report. Missing, damaged or
-unavailable receipts result in unknown evidence and an issue, never a fabricated
-cleanup confirmation. An external result can be known while cleanup is pending;
+unavailable journals produce an issue; cleanup remains unknown unless another
+bound source supplies matching proof. An external result can be known while cleanup is pending;
 the report identifies known sandbox results even if Effect recovery is unresolved.
 
 Only a matching execution generation's supervisor can prove local cleanup.
+The report also reads the Runtime's persisted `process_cleanup` settlement note
+when cancellation receipts lack local proof. It requires the Kernel store binding,
+matching execution ID/attempt/fence and `runtime_supervisor_reaped / confirmed`.
+This works after restart and without an attached Runtime. Settlement note IDs and
+their source appear in the local cleanup fact's details; cancellation receipt IDs
+remain separate. Missing or malformed settlement evidence remains unknown and is
+never created or repaired by inspection.
 The caller's isolation-mode setting, an absent PID, or successful cancellation
 of a different generation cannot. A recorded local thread invocation can establish
 that process-tree cleanup is not applicable; it does not prove the thread stopped.

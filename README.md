@@ -50,7 +50,7 @@ Integration boundaries:
 - The SDK cannot undo a write or API call that has already happened. Uncertain outcomes require verification before recovery; arbitrary operations are not guaranteed to happen exactly once.
 - `Dispatcher` durably accepts and deduplicates notifications in its built-in inbox. User callbacks remain at-least-once; external calls need idempotency. Use `consume_results` for atomic local SQL and receipt settlement.
 
-The current source version is `0.7.1` and requires Python 3.10+.
+The current source version is `0.7.2` and requires Python 3.10+.
 Kernel storage uses schema 5; Orchestrator storage uses schema 4. Older databases
 need an explicit upgrade. Read [storage and upgrades](docs/STORAGE_AND_UPGRADES.md)
 and the [compatibility guide](docs/PUBLIC_API.md) before opening them with this version.

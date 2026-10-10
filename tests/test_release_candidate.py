@@ -18,7 +18,7 @@ SPEC = importlib.util.spec_from_file_location("release_candidate", SCRIPT)
 release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
 COMMIT = "a" * 40
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 
 
 def run_record(run_id=100, attempt=1):

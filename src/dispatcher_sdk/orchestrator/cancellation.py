@@ -12,6 +12,7 @@ from typing import Any, Literal, TYPE_CHECKING
 from ..execution_kernel.cancellation import inspect_cancellation_journal
 from ..execution_kernel._sandbox_registry import validate_registry
 from ..execution_kernel.sandbox import validate_sandbox_schema
+from ..execution_kernel.settlement import SettlementJournal
 from ..storage import _read_only
 from .contracts import OrchestrationError, TERMINAL, canonical, identifier
 
@@ -111,6 +112,26 @@ def _sandbox_facts(kernel_connection, snapshot):
         except (OSError, sqlite3.Error, ValueError) as exc:
             issues.append("sandbox_evidence_unavailable:" + type(exc).__name__)
     return records, issues
+
+
+def _persisted_process_cleanup(kernel_connection, kernel_path, snapshot):
+    """Use the Runtime's durable native cleanup proof, including after restart."""
+    if kernel_connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='runtime_sandbox_meta'").fetchone() is None:
+        return None
+    source_id = validate_registry(kernel_connection)
+    path = str(kernel_path) + ".settlements.sqlite3"
+    journal = SettlementJournal.open_readonly(path, source_id=source_id, kernel_path=kernel_path)
+    note = journal._inspect_process_cleanup({"execution_id": snapshot.execution_id,
+                                           "attempt": snapshot.attempt, "fence": snapshot.fence})
+    if note is None:
+        return None
+    evidence = note["evidence"]
+    if (evidence.get("state"), evidence.get("source")) != ("confirmed", "runtime_supervisor_reaped"):
+        return None
+    return _fact("confirmed", "runtime_supervisor_reaped", "settlement_journal",
+                 note_id=note["note_id"], identity=note["identity"],
+                 journal_path=journal.path, source_id=source_id, persisted_at=note["created_at"])
 
 
 def inspect_cancellation(
@@ -229,6 +250,14 @@ def inspect_cancellation(
                             local = _fact(proof["state"], proof["code"], "cancellation_journal")
                         if any(phase.get("failure", {}).get("phase") == "process_cleanup" for phase in phases) and proof is None:
                             local = _fact("failed", "process_cleanup_failed", "cancellation_journal")
+                if local.status not in {"confirmed", "not_applicable"}:
+                    try:
+                        persisted = _persisted_process_cleanup(kernel, kernel_path, snapshot)
+                    except (OSError, sqlite3.Error, ValueError, TimeoutError) as exc:
+                        issues.append("process_cleanup_evidence_unavailable:" + type(exc).__name__)
+                    else:
+                        if persisted is not None:
+                            local = persisted
                 records, sandbox_issues = _sandbox_facts(kernel, snapshot)
                 issues.extend(sandbox_issues)
                 if records or sandbox_issues:
@@ -237,10 +266,12 @@ def inspect_cancellation(
                                      coverage="recorded_effects_only", sandbox_records=records)
                     cleanup = _fact("pending" if remote == "pending" else "unknown" if remote == "unknown" or local.status in {"unknown", "failed"}
                                     else "confirmed", "local_and_sandbox_cleanup", "runtime_evidence",
-                                    local=local.status, remote=remote, sandbox_records=records)
+                                    local=local.status, local_evidence=asdict(local),
+                                    remote=remote, sandbox_records=records)
                 else:
-                    cleanup = _fact(local.status, "local_cleanup_only", "cancellation_journal",
-                                    coverage="local_process_and_registered_sandboxes_only")
+                    cleanup = _fact(local.status, "local_cleanup_only", local.source,
+                                    coverage="local_process_and_registered_sandboxes_only",
+                                    local_evidence=asdict(local))
             elif "cancel_reason" in attempt and not attempt["dispatched"]:
                 local = _fact("not_applicable", "execution_not_dispatched", "orchestrator")
                 cleanup = local

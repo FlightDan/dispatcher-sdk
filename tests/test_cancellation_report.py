@@ -328,6 +328,74 @@ class CancellationReportTests(unittest.TestCase):
             self.assertEqual(report.execution_authority_revoked.status, "confirmed")
             self.assertEqual(report.local_process_tree_reaped.status, "unknown")
 
+    def test_settlement_cleanup_requires_matching_generation_and_native_source(self):
+        runtime, sdk = self.stack()
+        with runtime:
+            self.setup_task(runtime, sdk)
+            lease = runtime.kernel.claim("external-worker")
+            runtime.cancel("x", expected_revision=runtime.kernel.get("x").revision)
+            journal = runtime._settlement_journal
+            identity = {"execution_id": "x", "attempt": lease.attempt, "fence": lease.fence}
+            proof = {"state": "confirmed", "source": "runtime_supervisor_reaped"}
+            self.assertEqual(self.report(sdk).cleanup.status, "unknown")
+            for changed in ({**identity, "execution_id": "other"},
+                            {**identity, "attempt": lease.attempt + 1},
+                            {**identity, "fence": lease.fence + 1}):
+                journal.note(changed, "process_cleanup", proof)
+            self.assertEqual(self.report(sdk).cleanup.status, "unknown")
+            for evidence in ({"state": "confirmed", "source": "worker_self_report"},
+                             {"state": "pending", "source": "runtime_supervisor_reaped"},
+                             {"state": "confirmed", "source": "runtime_supervisor_reaped", "large": "x" * 4096}):
+                with self.subTest(evidence=evidence["state"], source=evidence["source"]):
+                    journal.note(identity, "process_cleanup", evidence)
+                    self.assertEqual(self.report(sdk).cleanup.status, "unknown")
+            note = journal.note(identity, "process_cleanup", proof)
+            for invalid in ("{", "[]", '{"state":[],"source":{}}',
+                            '{"nested":' + "[" * 1500 + "0" + "]" * 1500 + "}"):
+                with self.subTest(invalid=invalid):
+                    with closing(sqlite3.connect(journal.path)) as connection, connection:
+                        connection.execute("UPDATE settlement_notes SET evidence_json=? WHERE note_id=?",
+                                           (invalid, note["note_id"]))
+                    self.assertEqual(self.report(sdk).cleanup.status, "unknown")
+            with closing(sqlite3.connect(journal.path)) as connection, connection:
+                connection.execute("UPDATE settlement_notes SET evidence_json=? WHERE note_id=?",
+                                   (json.dumps(proof), note["note_id"]))
+                connection.execute("UPDATE settlement_meta SET source_id='foreign-source'")
+            report = self.report(sdk)
+            self.assertEqual(report.cleanup.status, "unknown")
+            self.assertIn("process_cleanup_evidence_unavailable:SettlementBindingError", report.issues)
+
+    def test_missing_settlement_cleanup_is_not_created_by_inspection(self):
+        runtime, sdk = self.stack()
+        self.setup_task(runtime, sdk)
+        runtime.kernel.claim("external-worker")
+        runtime.cancel("x", expected_revision=runtime.kernel.get("x").revision)
+        path = Path(runtime._settlement_journal.path)
+        runtime.close()
+        path.unlink()
+        reader = Orchestrator(self.root / "app.db", runtime.kernel)
+        report = self.report(reader)
+        self.assertEqual(report.cleanup.status, "unknown")
+        self.assertTrue(report.issues)
+        self.assertFalse(path.exists())
+
+    def test_native_cleanup_before_cancellation_survives_restart(self):
+        runtime, sdk = self.stack(isolation="process")
+        try:
+            self.setup_task(runtime, sdk)
+            self.assertEqual(runtime.run_once().state, "succeeded")
+            sdk.sync_execution("x")
+        finally:
+            runtime.close()
+        reopened, sdk = self.stack(isolation="process")
+        with reopened:
+            self.cancel_task(sdk)
+            sdk.flush()
+            report = self.report(sdk)
+            self.assertEqual(report.local_process_tree_reaped.status, "confirmed")
+            self.assertEqual(report.local_process_tree_reaped.source, "settlement_journal")
+            self.assertEqual(report.cleanup.status, "confirmed")
+
     def test_malformed_phase_evidence_is_unknown_and_not_repaired(self):
         runtime, sdk = self.stack()
         with runtime:
@@ -417,6 +485,11 @@ class CancellationReportTests(unittest.TestCase):
         runtime, sdk = self.stack({"tree": cancellable_process_tree}, "process")
         try:
             self.setup_task(runtime, sdk, "tree", {"root": str(self.root)})
+            # Cleanup must remain visible beyond the first diagnostic page.
+            for _ in range(60):
+                runtime._settlement_journal.note(
+                    {"execution_id": "x", "attempt": 0, "fence": 0},
+                    "diagnostic", {"noise": True})
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(runtime.run_once)
                 try:
@@ -430,12 +503,37 @@ class CancellationReportTests(unittest.TestCase):
                     for pid in pids:
                         with self.assertRaises(ProcessLookupError):
                             os.kill(pid, 0)
-                    self.assertEqual(self.report(sdk).local_process_tree_reaped.status, "unknown")
+                    report = self.report(sdk)
+                    self.assertEqual(report.local_process_tree_reaped.status, "confirmed")
+                    self.assertEqual(report.local_process_tree_reaped.source, "settlement_journal")
+                    self.assertEqual(report.cleanup.status, "confirmed")
+                    note_id = report.local_process_tree_reaped.details["note_id"]
+                    receipt_ids = report.receipt_ids
                 finally:
                     runtime.close()
                 future.result(timeout=10)
         finally:
             runtime.close()
+
+        reader = Orchestrator(self.root / "app.db", runtime.kernel)
+        before = []
+        paths = [self.root / name for name in ("app.db", "kernel.db", "cancel.db")]
+        paths.append(Path(runtime._settlement_journal.path))
+        for path in paths:
+            with closing(sqlite3.connect(path)) as connection:
+                before.append(tuple(connection.iterdump()))
+        reopened_report = self.report(reader, cancellation_journal_path=self.root / "cancel.db",
+                                      source_id="test-source")
+        self.assertEqual(reopened_report.local_process_tree_reaped.status, "confirmed")
+        self.assertEqual(reopened_report.local_process_tree_reaped.details["note_id"], note_id)
+        self.assertEqual(reopened_report.receipt_ids, receipt_ids)
+        self.assertNotIn(note_id, reopened_report.receipt_ids)
+        self.assertEqual(reopened_report.cleanup.source, "settlement_journal")
+        after = []
+        for path in paths:
+            with closing(sqlite3.connect(path)) as connection:
+                after.append(tuple(connection.iterdump()))
+        self.assertEqual(before, after)
 
     def test_process_exit_after_kernel_commit_does_not_fabricate_restart_receipt(self):
         runtime, sdk = self.stack()
@@ -496,6 +594,13 @@ class CancellationReportTests(unittest.TestCase):
             self.assertTrue(records[0]["result_known"])
             self.assertFalse(records[0]["cleanup_confirmed"])
             self.assertNotEqual(report.cleanup.status, "confirmed")
+            runtime._settlement_journal.note(
+                {"execution_id": "x", "attempt": report.kernel_attempt, "fence": report.fence},
+                "process_cleanup", {"state": "confirmed", "source": "runtime_supervisor_reaped"})
+            report = self.report(sdk)
+            self.assertEqual(report.local_process_tree_reaped.status, "confirmed")
+            self.assertEqual(report.cleanup.status, "pending")
+            self.assertFalse(report.cleanup.details["sandbox_records"][0]["cleanup_confirmed"])
         finally:
             (self.root / "reject_cleanup").unlink(missing_ok=True)
             runtime.close()

@@ -42,7 +42,7 @@ export and publication steps.
 
 ```sh
 python -m build
-python -m pip install --force-reinstall --no-deps dist/dispatcher_sdk-0.7.1-py3-none-any.whl
+python -m pip install --force-reinstall --no-deps dist/dispatcher_sdk-0.7.2-py3-none-any.whl
 ```
 
 The version shown matches this checkout. For a later release, use that release's
