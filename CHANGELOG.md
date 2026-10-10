@@ -21,6 +21,8 @@
 - The portable process observability example uses finite startup and delivery
   margins for native Windows, checks the returned child output, and prints its
   full bounded observation on failure. SDK budget rules remain unchanged.
+- The public observability consumer retains raw child-call and progress-call
+  tracebacks, SQLite error codes and supplied budgets without retrying failures.
 
 ## 0.7.1
 

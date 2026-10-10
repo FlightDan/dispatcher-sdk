@@ -36,6 +36,7 @@ def _interrupted_capture(path, sender):
     guard = None
 
     def expire(signum, frame):
+        evidence['alarm_signals'] = evidence.get('alarm_signals', []) + [signum]
         if guard.remaining() <= 0:
             raise process_runtime._DeadlineExpired()
         guard.arm()
@@ -45,15 +46,21 @@ def _interrupted_capture(path, sender):
         token = begin(*args, **kwargs)
         # Establish a real alarm inside the already existing capture bound,
         # after the actual arm COMMIT. No supplied deadline is extended.
-        remaining = kernel._control_deadline - time.monotonic()
-        if remaining <= 0:
-            raise AssertionError('arm consumed the original capture window before alarm setup')
         guard = process_runtime._DeadlineGuard(
             min(kernel._control_deadline, time.monotonic() + .01), envelope, wall, guarded=True)
         evidence.update(token=token, control_deadline=kernel._control_deadline,
             alarm_deadline=guard.deadline, guard_committed=not kernel._connection.in_transaction,
             wall_calls_after_arm=len(calls))
-        guard.arm()
+        remaining = guard.remaining()
+        evidence['alarm_expired_after_arm'] = remaining <= 0
+        evidence['original_expired_after_arm'] = kernel._control_deadline <= time.monotonic()
+        # COMMIT may have consumed the original capture bound. Deliver the
+        # real native alarm at that expired bound instead of extending it or
+        # failing before the intended uncaptured-alarm path is exercised.
+        if remaining <= 0:
+            os.kill(os.getpid(), signal.SIGALRM)
+        else:
+            signal.setitimer(signal.ITIMER_REAL, min(remaining, .05))
         while True:
             signal.pause()
 
@@ -116,6 +123,8 @@ class UncapturedAlarmReceiptTests(unittest.TestCase):
             self.assertTrue(evidence['uncaptured'], evidence)
             self.assertTrue(evidence['same_envelope'], evidence)
             self.assertTrue(evidence['same_pending'], evidence)
+            self.assertTrue(evidence['alarm_signals'], evidence)
+            self.assertEqual(set(evidence['alarm_signals']), {signal.SIGALRM}, evidence)
             self.assertEqual(evidence['finish_sql'], [], evidence)
             self.assertEqual(evidence['wall_calls_after_arm'], evidence['wall_calls_after_receipts'], evidence)
             self.assertEqual(evidence['close_error'], 'budget_clock_cleanup_pending', evidence)

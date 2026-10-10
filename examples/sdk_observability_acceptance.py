@@ -52,6 +52,57 @@ def call(root, phase, **details):
         stream.write(json.dumps({'phase': phase, 'pid': os.getpid(), 'at': time.time(), **details}) + '\n')
 
 
+def handler_call_failure(root, phase, error, context, *, began, request, supplied_budget):
+    """Retain a raw public-call failure without replacing its original error."""
+    try:
+        evidence = {'phase': phase, 'began': began,
+            'failed': {'wall': time.time(), 'monotonic': time.monotonic()},
+            'pid': os.getpid(), 'interpreter': sys.executable,
+            'sdk_import': dispatcher_sdk.__file__, 'request': request,
+            'supplied_budget': supplied_budget,
+            'error': {'type': type(error).__name__, 'message': str(error),
+                'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None),
+                'sqlite_errorname': getattr(error, 'sqlite_errorname', None),
+                'traceback': traceback.format_exception(type(error), error, error.__traceback__)},
+            'diagnostic_errors': {}}
+
+        def optional(name, read):
+            try:
+                evidence[name] = read()
+            except BaseException as secondary:
+                evidence['diagnostic_errors'][name] = {
+                    'type': type(secondary).__name__, 'message': str(secondary)}
+
+        optional('command', lambda: context.command.to_dict())
+        def stacks():
+            frames = sys._current_frames()
+            return [{'name': thread.name, 'ident': thread.ident, 'alive': thread.is_alive(),
+                'stack': traceback.format_stack(frames[thread.ident]) if thread.ident in frames else []}
+                for thread in threading.enumerate()]
+
+        optional('threads', stacks)
+        destination = Path(root) / (phase + '-error.json')
+        # Publish the original failure before optional marker/budget reads.
+        save(destination, evidence)
+        # The public envelope is already supplied to this handler. Project that
+        # envelope locally; context.budget could perform another control ACK.
+        optional('budget_envelope', lambda: context.budget_envelope.to_dict())
+        optional('projected_budget', lambda: context.budget_envelope.view().to_dict())
+        markers = ('configuration', 'child-entered', 'tool-received', 'tool-write-first',
+            'first-reported', 'tool-write-last', 'tool-returned', 'child-progress-call',
+            'child-progress-replay-call')
+        for marker in markers:
+            optional(marker, lambda marker=marker: read_json(Path(root) / (marker + '.json')))
+        save(destination, evidence)
+    except BaseException as secondary:
+        try:
+            print(f'{phase} diagnostic capture failed: {type(secondary).__name__}: {secondary}',
+                  file=sys.stderr)
+            traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
+        except BaseException:
+            pass
+
+
 def await_value(read, predicate=bool, *, seconds=6):
     deadline = time.monotonic() + seconds
     while True:
@@ -199,12 +250,32 @@ def child(payload, context):
                                     details={'returncode': process.returncode, 'input': payload['input']})
     progress_timeout = min(1.0, context.budget.remaining_work_seconds)
     mark(root, 'child-progress-call', timeout=progress_timeout, budget=context.budget.to_dict())
-    receipt = context.activity.progress('child-consumed-tool', timeout=progress_timeout)
+    progress_began = {'wall': time.time(), 'monotonic': time.monotonic()}
+    try:
+        receipt = context.activity.progress('child-consumed-tool', timeout=progress_timeout)
+    except BaseException as error:
+        try:
+            handler_call_failure(root, 'child-progress-call', error, context, began=progress_began,
+                request={'token': 'child-consumed-tool', 'timeout': progress_timeout, 'payload': payload},
+                supplied_budget=tool_budget.to_dict())
+        except BaseException:
+            pass
+        raise
     replay = None
     if receipt.get('state') == 'confirmed':
         replay_timeout = min(1.0, context.budget.remaining_work_seconds)
         mark(root, 'child-progress-replay-call', timeout=replay_timeout, budget=context.budget.to_dict())
-        replay = context.activity.progress('child-consumed-tool', timeout=replay_timeout)
+        replay_began = {'wall': time.time(), 'monotonic': time.monotonic()}
+        try:
+            replay = context.activity.progress('child-consumed-tool', timeout=replay_timeout)
+        except BaseException as error:
+            try:
+                handler_call_failure(root, 'child-progress-replay-call', error, context, began=replay_began,
+                    request={'token': 'child-consumed-tool', 'timeout': replay_timeout, 'payload': payload},
+                    supplied_budget=tool_budget.to_dict())
+            except BaseException:
+                pass
+            raise
     else:
         mark(root, 'child-progress-unverified', receipt=receipt)
     return {'input': payload['input'], 'bytes': list(raw), 'budget': context.budget.to_dict(),
@@ -215,12 +286,22 @@ def parent(payload, context):
     root = Path(payload['root'])
     call(root, 'parent', execution_id=context.command.execution_id)
     before = context.budget.to_dict()
+    child_began = {'wall': time.time(), 'monotonic': time.monotonic()}
     try:
         result = context.children.run('child', payload, request_id='one-original-child',
                                       timeout_seconds=payload['child_timeout'])
     except ChildExecutionError as error:
         return {'child_error': error.result, 'code': error.code, 'before': before,
                 'after': context.budget.to_dict()}
+    except BaseException as error:
+        try:
+            handler_call_failure(root, 'parent-child-run', error, context, began=child_began,
+                request={'handler_id': 'child', 'request_id': 'one-original-child',
+                         'timeout_seconds': payload['child_timeout'], 'payload': payload},
+                supplied_budget=before)
+        except BaseException:
+            pass
+        raise
     progress_timeout = min(1.0, context.budget.remaining_work_seconds)
     mark(root, 'parent-progress-call', timeout=progress_timeout, budget=context.budget.to_dict())
     progress = context.activity.progress('parent-consumed-child', timeout=progress_timeout)

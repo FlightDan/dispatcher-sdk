@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 
 import dispatcher_sdk
@@ -268,8 +269,9 @@ class ObservabilityPressureTests(unittest.TestCase):
             isolation_mode="process", observation_options=ObservationOptions(flush_interval=.1))
         self.addCleanup(runtime.close)
         name = "pressure-cas"
-        runtime.submit(runtime.command("quiet", execution_id=name, idempotency_key=name, correlation_id=name,
-            payload={"root": str(self.root)}, timeout_seconds=10))
+        command = runtime.command("quiet", execution_id=name, idempotency_key=name, correlation_id=name,
+            payload={"root": str(self.root)}, timeout_seconds=10)
+        runtime.submit(command)
         runtime.watch_stall(name, StallPolicy("commit-race", sample_interval=.2, consecutive_windows=3))
         results, errors = [], []
 
@@ -289,6 +291,8 @@ class ObservabilityPressureTests(unittest.TestCase):
         reached = threading.Event()
         permit = threading.Event()
         cancel_errors = []
+        cancel_returns = []
+        cancel_call = {}
 
         def barrier_cancel(*args, **kwargs):
             reached.set()
@@ -300,10 +304,13 @@ class ObservabilityPressureTests(unittest.TestCase):
         self.addCleanup(lambda: setattr(runtime.kernel, "cancel", original_cancel))
 
         def dispose():
+            cancel_call["began"] = {"wall": time.time(), "monotonic": time.monotonic()}
             try:
-                runtime.cancel_if_stalled(notice)
+                cancel_returns.append(runtime.cancel_if_stalled(notice))
             except BaseException as error:
                 cancel_errors.append(error)
+            finally:
+                cancel_call["finished"] = {"wall": time.time(), "monotonic": time.monotonic()}
 
         disposer = threading.Thread(target=dispose)
         disposer.start()
@@ -321,6 +328,56 @@ class ObservabilityPressureTests(unittest.TestCase):
             self.evidence.update({"execution_id": name, "notification": notice,
                 "confirmed_progress": confirmation, "cancel_error": repr(cancel_errors[0]),
                 "after_race": runtime.observe(name), "at": time.time()})
+        except BaseException as failure:
+            try:
+                frames = sys._current_frames()
+                record = {"captured": {"wall": time.time(), "monotonic": time.monotonic()},
+                    "failure": {"type": type(failure).__name__, "message": str(failure),
+                        "traceback": traceback.format_exception(type(failure), failure, failure.__traceback__)},
+                    "command": command.to_dict(), "notification": notice,
+                    "original_waits": {"reached": 3, "permit": 5, "confirmation": 3,
+                        "disposer_join": 3, "disposer_cleanup_join": 5, "driver_cleanup_join": 15},
+                    "reached": reached.is_set(), "permit": permit.is_set(),
+                    "release_exists": (self.root / "release").exists(),
+                    "driver_alive": driver.is_alive(), "disposer_alive": disposer.is_alive(),
+                    "driver_results": [None if value is None else value.to_dict() for value in list(results)],
+                    "driver_errors": list(errors), "cancel_call": dict(cancel_call),
+                    "cancel_returns": [value.to_dict() if callable(getattr(value, "to_dict", None)) else value
+                        for value in list(cancel_returns)],
+                    "cancel_errors": [{"type": type(error).__name__, "message": str(error),
+                        "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                        "sqlite_errorname": getattr(error, "sqlite_errorname", None),
+                        "traceback": traceback.format_exception(type(error), error, error.__traceback__)}
+                        for error in list(cancel_errors)],
+                    "threads": [{"name": thread.name, "ident": thread.ident, "alive": thread.is_alive(),
+                        "stack": traceback.format_stack(frames[thread.ident]) if thread.ident in frames else []}
+                        for thread in threading.enumerate()], "diagnostic_errors": {}}
+                self.evidence["race_failure"] = record
+                destination = self.root / "commit-race-failure.json"
+                write_json(destination, record)
+
+                def optional(name, read):
+                    began = time.monotonic()
+                    try:
+                        record[name] = read()
+                    except BaseException as error:
+                        record["diagnostic_errors"][name] = {
+                            "type": type(error).__name__, "message": str(error)}
+                    record.setdefault("diagnostic_reads", {})[name] = {
+                        "began": began, "returned": time.monotonic()}
+
+                optional("entered", lambda: self.read_json(self.root / "entered.json"))
+                optional("confirmation", lambda: self.read_json(self.root / "confirmed.json"))
+                optional("supervision", lambda: runtime.kernel.supervision_status(name, timeout_seconds=.1))
+                optional("observation", lambda: runtime.observe(name, timeout=.5))
+                write_json(destination, record)
+            except BaseException as error:
+                try:
+                    self.evidence["race_diagnostic_error"] = {
+                        "type": type(error).__name__, "message": str(error)}
+                except BaseException:
+                    pass
+            raise
         finally:
             permit.set()
             disposer.join(5)
