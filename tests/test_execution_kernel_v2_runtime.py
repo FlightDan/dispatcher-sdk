@@ -1432,75 +1432,254 @@ class RuntimeTests(unittest.TestCase):
                 print("native_active_cancel_evidence=" + str(root / "evidence.json"), flush=True)
 
     def test_cancel_racing_terminal_commit_has_one_atomic_winner(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        from contextlib import closing
+        from copy import deepcopy
+        import sqlite3
+        import traceback
+        from tests._storage_evidence import StorageEvidence
+
+        root = retained_directory("sdk-cancel-terminal-race-")
+        evidence = {"test": self.id(), "interpreter": sys.executable, "root": str(root),
+            "isolation_mode": "thread", "task_timeout": 1.0, "readiness_timeout": 1.0,
+            "release_timeout": 1.0, "driver_join_timeout": 1.0, "canceller_join_timeout": 1.0,
+            "cancel_timeout": 1.0, "cancel_control_attempt_max": .1, "phases": []}
+        evidence_lock = threading.RLock()
+        storage = StorageEvidence(root, self)
+        stack = driver = canceller = command = None
+        primary_error = None
+        finalizing = release = None
+        run_outcomes, run_errors, cancel_outcomes, cancel_errors = [], [], [], []
+
+        def error_fact(error):
+            return {"type": type(error).__name__, "module": type(error).__module__,
+                "message": str(error), "traceback": "".join(traceback.format_exception(
+                    type(error), error, error.__traceback__)),
+                "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                "sqlite_errorname": getattr(error, "sqlite_errorname", None)}
+
+        def secondary(name, operation):
+            try:
+                return operation()
+            except BaseException as error:
+                try:
+                    with evidence_lock:
+                        evidence.setdefault("diagnostic_errors", []).append(
+                            {"stage": name, **error_fact(error)})
+                except BaseException:
+                    pass
+
+        def phase(name, operation, **arguments):
+            item = {"stage": name, "thread": threading.current_thread().name,
+                "began": time.monotonic(), "arguments": arguments}
+
+            def update(**facts):
+                with evidence_lock:
+                    item.update(facts)
+
+            def entered():
+                with evidence_lock:
+                    evidence["phases"].append(item)
+
+            secondary(name + "_entered", entered)
+            try:
+                result = operation()
+                secondary(name + "_result", lambda: update(result=
+                    result.to_dict() if hasattr(result, "to_dict") else result))
+                return result
+            except BaseException as error:
+                secondary(name + "_error", lambda: update(error=error_fact(error)))
+                raise
+            finally:
+                secondary(name + "_returned", lambda: update(
+                    returned=time.monotonic(), elapsed=time.monotonic() - item["began"]))
+
+        def write_evidence(filename):
+            if not evidence_lock.acquire(timeout=.1):
+                raise TimeoutError("fixture evidence snapshot admission elapsed")
+            try:
+                snapshot = deepcopy(evidence)
+            finally:
+                evidence_lock.release()
+            (root / filename).write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+
+        def capture_before_cleanup():
+            evidence["captured_at"] = time.monotonic()
+            frames = sys._current_frames()
+            evidence["threads"] = [{"name": thread.name, "ident": thread.ident,
+                "alive": thread.is_alive(), "stack": "".join(traceback.format_stack(
+                    frames[thread.ident], limit=32))[-16384:] if thread.ident in frames else ""}
+                for thread in sorted(threading.enumerate(), key=lambda thread: thread not in (driver, canceller))
+                if thread in (driver, canceller) or thread.name.startswith(
+                    ("execution-kernel", "dispatcher-", "sdk-"))][:32]
+            evidence["driver_alive"] = driver is not None and driver.is_alive()
+            evidence["canceller_alive"] = canceller is not None and canceller.is_alive()
+            evidence["flags"] = {"finalizing": finalizing is not None and finalizing.is_set(),
+                "release": release is not None and release.is_set()}
+            evidence["run_outcomes"] = [None if item is None else item.to_dict() for item in run_outcomes]
+            evidence["run_errors"] = [error_fact(error) for error in run_errors]
+            evidence["cancel_outcomes"] = [item.to_dict() for item in cancel_outcomes]
+            evidence["cancel_errors"] = [error_fact(error) for error in cancel_errors]
+            if stack is not None:
+                evidence["runtime"] = {"closed": stack._closed, "active_runs": stack._active_runs,
+                    "settlement_error": stack._settlement_error,
+                    "close_error": None if stack._close_error is None else error_fact(stack._close_error),
+                    "observation_error": stack._observation_error}
+                deadline = time.monotonic() + .1
+
+                def locked_snapshot(lock, operation):
+                    if not lock.acquire(timeout=max(0, deadline - time.monotonic())):
+                        raise TimeoutError("fixture runtime evidence admission elapsed")
+                    try:
+                        return operation()
+                    finally:
+                        lock.release()
+
+                pending = stack._pending_settlements
+                entries = secondary("pending_state", lambda: locked_snapshot(pending._lock,
+                    lambda: tuple(token._entry for token in list(pending._entries.values())[:50]
+                        if token._entry is not None)))
+                if entries is not None:
+                    evidence["runtime"]["pending"] = [{"identity": entry.identity,
+                        "lease": entry.lease.to_dict(), "payload": entry.payload,
+                        "evidence": entry.evidence} for entry in entries]
+                contexts = secondary("thread_contexts", lambda: locked_snapshot(stack._thread_lock,
+                    lambda: tuple(stack._thread_contexts.items())[:16]))
+                if contexts is not None:
+                    evidence["runtime"]["contexts"] = [{"identity": list(identity),
+                        "entered": context._entered, "entry_confirmed": context._entry_confirmed,
+                        "observation_closed": context._observation_closed,
+                        "budget_envelope": None if context._budget_envelope is None
+                            else context._budget_envelope.to_dict()} for identity, context in contexts]
+
+                def readonly_facts():
+                    deadline = time.monotonic() + .1
+                    evidence["readonly"] = {"timeout_seconds": .1, "began": time.monotonic()}
+                    paths = [("kernel", stack.kernel.db_path, (
+                        "kernel_executions", "kernel_execution_limits", "kernel_budget_samples",
+                        "kernel_result_outbox"))]
+                    journal = stack._settlement_journal
+                    if journal is not None:
+                        paths.append(("settlement", journal.path,
+                            ("settlement_meta", "settlement_records", "settlement_notes")))
+                    for name, path, tables in paths:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("fixture read-only evidence elapsed")
+                        evidence["readonly"][name] = {"path": str(path)}
+                        with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro",
+                                uri=True, timeout=0, isolation_level=None)) as connection:
+                            connection.row_factory = sqlite3.Row
+                            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                            for table in tables:
+                                if time.monotonic() >= deadline:
+                                    raise TimeoutError("fixture read-only evidence elapsed")
+                                sql = "SELECT * FROM " + table
+                                args = () if table == "settlement_meta" else (
+                                    command.execution_id if command is not None else "cancel-finalize-race",)
+                                if args:
+                                    sql += " WHERE execution_id=?"
+                                rows = connection.execute(sql + " LIMIT 50", args).fetchall()
+                                evidence["readonly"][name][table] = [dict(row) for row in rows]
+                                if time.monotonic() >= deadline:
+                                    raise TimeoutError("fixture read-only evidence elapsed")
+                    evidence["readonly"]["returned"] = time.monotonic()
+
+                secondary("readonly_facts", readonly_facts)
+
+            def storage_snapshot():
+                if not storage._lock.acquire(timeout=.1):
+                    raise TimeoutError("fixture SQL evidence admission elapsed")
+                try:
+                    result = {"operations": storage.operations,
+                        "retained_sql_operations": [dict(event) for event in storage.events],
+                        "imports": getattr(storage, "imports", {})}
+                finally:
+                    storage._lock.release()
+                evidence["storage"] = deepcopy(result)
+
+            secondary("storage_snapshot", storage_snapshot)
+
+        try:
+            secondary("storage_start", lambda: storage.start(include_kernel=True))
             stack = Kernel.open_sqlite(
-                Path(temp) / "kernel.sqlite3",
+                root / "kernel.sqlite3",
                 {("echo", 1): echo_handler},
                 isolation_mode="thread",
             )
+            command = make_command(
+                "cancel-finalize-race",
+                stack.registry_revision,
+                payload={"value": "done"},
+            )
+            secondary("command", lambda: evidence.update(command=command.to_dict()))
+            phase("submit", lambda: stack.submit(command))
+            finalizing = threading.Event()
+            release = threading.Event()
+            real_complete = stack.kernel._complete_sdk_result
+
+            def pause_finalization(*args, **kwargs):
+                finalizing.set()
+                self.assertTrue(phase("terminal_release_wait", lambda: release.wait(1.0), timeout=1.0))
+                return phase("terminal_commit", lambda: real_complete(*args, **kwargs))
+
+            def drive():
+                try:
+                    run_outcomes.append(phase("drive", stack.run_once))
+                except BaseException as exc:
+                    run_errors.append(exc)
+
+            def cancel():
+                try:
+                    snapshot = phase("cancel_snapshot", lambda: stack.kernel.get(command.execution_id),
+                        execution_id=command.execution_id)
+                    cancel_outcomes.append(
+                        phase("cancel", lambda: stack.cancel(
+                            command.execution_id,
+                            expected_revision=snapshot.revision,
+                        ), execution_id=command.execution_id, expected_revision=snapshot.revision)
+                    )
+                except BaseException as exc:
+                    cancel_errors.append(exc)
+
+            with patch.object(stack.kernel, "_complete_sdk_result", new=pause_finalization):
+                driver = threading.Thread(target=drive)
+                driver.start()
+                self.assertTrue(phase("readiness", lambda: finalizing.wait(1.0), timeout=1.0))
+                canceller = threading.Thread(target=cancel)
+                canceller.start()
+                time.sleep(0.02)
+                self.assertTrue(canceller.is_alive())
+                phase("release", release.set)
+                phase("driver_join", lambda: driver.join(1.0), timeout=1.0)
+                phase("canceller_join", lambda: canceller.join(1.0), timeout=1.0)
+
+            self.assertFalse(driver.is_alive())
+            self.assertFalse(canceller.is_alive())
+            self.assertEqual(run_errors, [])
+            self.assertEqual(len(run_outcomes), 1)
+            self.assertEqual(run_outcomes[0].state, "succeeded")
+            self.assertEqual(cancel_outcomes, [])
+            self.assertEqual(len(cancel_errors), 1)
+            self.assertEqual(
+                stack.kernel.get(command.execution_id).state, "succeeded"
+            )
+        except BaseException as error:
+            primary_error = error
+            secondary("original_error", lambda: evidence.update(original_error=error_fact(error)))
+            raise
+        finally:
+            secondary("before_cleanup", capture_before_cleanup)
+            secondary("before_cleanup_write", lambda: write_evidence("before_cleanup.json"))
             try:
-                command = make_command(
-                    "cancel-finalize-race",
-                    stack.registry_revision,
-                    payload={"value": "done"},
-                )
-                stack.submit(command)
-                finalizing = threading.Event()
-                release = threading.Event()
-                real_complete = stack.kernel._complete_sdk_result
-
-                def pause_finalization(*args, **kwargs):
-                    finalizing.set()
-                    self.assertTrue(release.wait(1.0))
-                    return real_complete(*args, **kwargs)
-
-                run_outcomes = []
-                run_errors = []
-                cancel_outcomes = []
-                cancel_errors = []
-
-                def drive():
-                    try:
-                        run_outcomes.append(stack.run_once())
-                    except BaseException as exc:
-                        run_errors.append(exc)
-
-                def cancel():
-                    try:
-                        snapshot = stack.kernel.get(command.execution_id)
-                        cancel_outcomes.append(
-                            stack.cancel(
-                                command.execution_id,
-                                expected_revision=snapshot.revision,
-                            )
-                        )
-                    except BaseException as exc:
-                        cancel_errors.append(exc)
-
-                with patch.object(stack.kernel, "_complete_sdk_result", new=pause_finalization):
-                    driver = threading.Thread(target=drive)
-                    driver.start()
-                    self.assertTrue(finalizing.wait(1.0))
-                    canceller = threading.Thread(target=cancel)
-                    canceller.start()
-                    time.sleep(0.02)
-                    self.assertTrue(canceller.is_alive())
-                    release.set()
-                    driver.join(1.0)
-                    canceller.join(1.0)
-
-                self.assertFalse(driver.is_alive())
-                self.assertFalse(canceller.is_alive())
-                self.assertEqual(run_errors, [])
-                self.assertEqual(len(run_outcomes), 1)
-                self.assertEqual(run_outcomes[0].state, "succeeded")
-                self.assertEqual(cancel_outcomes, [])
-                self.assertEqual(len(cancel_errors), 1)
-                self.assertEqual(
-                    stack.kernel.get(command.execution_id).state, "succeeded"
-                )
+                if stack is not None:
+                    phase("close", stack.close)
+            except BaseException as error:
+                secondary("cleanup_error", lambda: evidence.update(cleanup_error=error_fact(error)))
+                if primary_error is None:
+                    raise
             finally:
-                stack.close()
+                secondary("final_write", lambda: write_evidence("evidence.json"))
+                secondary("storage_stop", storage.stop)
 
     def test_thread_cancel_revokes_cooperative_handler_authority(self) -> None:
         import json

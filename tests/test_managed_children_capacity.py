@@ -4,9 +4,11 @@ from contextlib import closing, contextmanager
 import json
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
+import traceback
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -18,6 +20,8 @@ from dispatcher_sdk.execution_kernel.errors import ExecutionNotFoundError
 from dispatcher_sdk.execution_kernel.errors import CASConflictError, StaleFenceError
 from dispatcher_sdk.execution_kernel.runtime import Runtime
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
+from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 
 class RequestJournal:
@@ -79,15 +83,119 @@ class ParentAuthority:
 
 class ManagedChildAdmissionTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.journal = RequestJournal(Path(temporary.name) / "children.sqlite3")
+        self.admission_evidence = None
+        if self._testMethodName in (
+                'test_first_child_waits_for_actual_parent_entry_confirmation',
+                'test_targeted_child_claim_rejects_expired_inherited_work_window'):
+            root = retained_directory('sdk-managed-child-admission-')
+            self.admission_evidence = {'test': self.id(), 'interpreter': sys.executable,
+                                       'stages': [], 'stage_count': 0, 'diagnostic_errors': []}
+            self.admission_storage = StorageEvidence(root, self)
+            self.admission_storage.start(include_kernel=True)
+            self.addCleanup(self.admission_storage.stop)
+            self.addCleanup(self.capture_admission, 'after_cleanup', None)
+        else:
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            root = Path(temporary.name)
+        self.journal = RequestJournal(root / "children.sqlite3")
         self.kernel = ParentAuthority()
         self.command = self.make_command("parent")
         self.lease = ExecutionLease("parent", "parent-lease", "worker", 1, 1, time.time() + 60, 1)
         self.budget = BudgetEnvelope((), sample_clock()).enter_handler(30, origin_id="parent-time", reserve_seconds=2)
         self.spec = {"capacity": 1, "max_depth": 1, "registry_revision": "test-registry"}
         self.children = self.capability()
+
+    def admission_diagnostic(self, operation):
+        try:
+            return operation()
+        except BaseException as error:
+            try:
+                self.admission_evidence['diagnostic_errors'].append(
+                    {'type': type(error).__name__, 'message': str(error)})
+            except BaseException:
+                pass
+
+    def admission_stage(self, name, operation, **facts):
+        stage = {'name': name, 'began': time.monotonic(),
+                 'thread': threading.current_thread().name}
+
+        def entered():
+            stage.update({key: value.to_dict() if hasattr(value, 'to_dict') else value
+                          for key, value in facts.items()})
+            self.admission_evidence['stages'].append(stage)
+            self.admission_evidence['stage_count'] += 1
+            if len(self.admission_evidence['stages']) > 128:
+                del self.admission_evidence['stages'][32]
+
+        self.admission_diagnostic(entered)
+        try:
+            result = operation()
+            self.admission_diagnostic(lambda: stage.update(
+                result=result.to_dict() if hasattr(result, 'to_dict') else result))
+            return result
+        except BaseException as error:
+            def record_error():
+                stage['error'] = {'type': type(error).__name__, 'message': str(error),
+                    'traceback': traceback.format_exc(),
+                    'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None)}
+                for field in ('budget_sample_token', 'budget_sample_envelope'):
+                    value = getattr(error, field, None)
+                    stage['error'][field] = (value.to_dict() if hasattr(value, 'to_dict') else repr(value))
+            self.admission_diagnostic(record_error)
+            raise
+        finally:
+            self.admission_diagnostic(lambda: stage.update(ended=time.monotonic()))
+
+    def record_admission_entry(self, name, context):
+        # Copy the envelope supplied by Runtime; public context.budget performs
+        # guarded sampling and must not be invoked by diagnostic recording.
+        envelope = context._budget_envelope
+        self.admission_diagnostic(lambda: self.admission_evidence.update({name: {
+            'at': time.monotonic(), 'budget': None if envelope is None else envelope.to_dict()}}))
+
+    def capture_admission(self, phase, kernel):
+        evidence = self.admission_evidence
+        try:
+            frames = sys._current_frames()
+            evidence['threads'] = [{
+                'name': thread.name, 'alive': thread.is_alive(),
+                'stack': traceback.format_stack(frames[thread.ident], limit=64) if thread.ident in frames else []
+            } for thread in threading.enumerate()]
+            if kernel is not None:
+                evidence['kernel_path'] = kernel.db_path
+                evidence['tables'] = {}
+                deadline = time.monotonic() + .1
+                paths = [(kernel.db_path, ('kernel_executions', 'kernel_execution_limits',
+                                          'kernel_budget_samples', 'kernel_clock'))]
+                if evidence.get('observation_path'):
+                    paths.append((evidence['observation_path'], ('sdk_child_requests', 'sdk_child_waits')))
+                for path, tables in paths:
+                    with closing(sqlite3.connect(Path(path).as_uri() + '?mode=ro',
+                                                uri=True, timeout=0)) as connection:
+                        connection.row_factory = sqlite3.Row
+                        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                        for table in tables:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError('admission diagnostic read budget elapsed')
+                            evidence['tables'][table] = [dict(row) for row in
+                                connection.execute('SELECT * FROM ' + table + ' LIMIT 16')]
+        except Exception as error:
+            evidence['diagnostic_errors'].append({'phase': phase, 'type': type(error).__name__,
+                                                  'message': str(error)})
+        try:
+            storage = self.admission_storage
+            if not storage._lock.acquire(timeout=.01):
+                raise TimeoutError('admission diagnostic trace lock elapsed')
+            try:
+                evidence['storage'] = {'imports': storage.imports, 'operations': storage.operations,
+                    'retained_sql_operations': [dict(event) for event in storage.events]}
+            finally:
+                storage._lock.release()
+            (storage.root / (phase + '.json')).write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+        except Exception as error:
+            evidence['diagnostic_errors'].append({'phase': phase, 'type': type(error).__name__,
+                                                  'message': str(error)})
 
     @staticmethod
     def make_command(execution_id, payload=None):
@@ -278,18 +386,24 @@ class ManagedChildAdmissionTests(unittest.TestCase):
     def test_first_child_waits_for_actual_parent_entry_confirmation(self):
         entered, waiting, release = threading.Event(), threading.Event(), threading.Event()
         results, errors = [], []
+        self.admission_evidence['budgets'] = {'parent': 3, 'child': 2,
+            'waiting': 2, 'confirmation_release': 3, 'driver_join': 5}
 
         def leaf(payload, context):
+            self.record_admission_entry('child_entry', context)
             return {"child": "executed"}
 
         def parent(payload, context):
             entered.set()
-            return context.children.run("leaf", {}, request_id="first", timeout_seconds=2)
+            self.record_admission_entry('parent_entry', context)
+            return self.admission_stage('child_run', lambda: context.children.run(
+                "leaf", {}, request_id="first", timeout_seconds=2), timeout_seconds=2)
 
         leaf.__execution_kernel_revision__ = "entry-wait-leaf"
         parent.__execution_kernel_revision__ = "entry-wait-parent"
         with Runtime(str(self.journal.path.parent / "runtime.sqlite3"), {"parent": parent, "leaf": leaf},
                      isolation_mode="thread") as runtime:
+            self.admission_evidence['observation_path'] = str(runtime.observation_journal.path)
             confirm = runtime.kernel.confirm_handler_entry
             limits = runtime.kernel.get_execution_limits
 
@@ -298,17 +412,21 @@ class ManagedChildAdmissionTests(unittest.TestCase):
                     waiting.set()
                     if not release.wait(3):
                         raise TimeoutError("test did not release parent confirmation")
-                return confirm(lease, envelope, **kwargs)
+                return self.admission_stage('confirm_handler_entry',
+                    lambda: confirm(lease, envelope, **kwargs),
+                    envelope=envelope, arguments={key: kwargs[key] for key in ('timeout_seconds',)
+                                                  if key in kwargs})
 
             def observed_limits(execution_id):
-                value = limits(execution_id)
+                value = self.admission_stage('get_execution_limits',
+                    lambda: limits(execution_id), execution_id=execution_id)
                 if execution_id == "parent" and value is not None and value["entry_state"] == "pending":
                     waiting.set()
                 return value
 
             def run():
                 try:
-                    results.append(runtime.run_once())
+                    results.append(self.admission_stage('run_once', runtime.run_once))
                 except Exception as exc:
                     errors.append(exc)
 
@@ -327,6 +445,8 @@ class ManagedChildAdmissionTests(unittest.TestCase):
                 finally:
                     release.set()
                     thread.join(5)
+                    self.admission_evidence['driver_alive'] = thread.is_alive()
+                    self.capture_admission('before_cleanup', runtime.kernel)
                 self.assertFalse(thread.is_alive())
             self.assertEqual([], errors)
             self.assertEqual("succeeded", results[0].state, results[0].to_dict())
@@ -352,17 +472,25 @@ class ManagedChildAdmissionTests(unittest.TestCase):
 
     def test_targeted_child_claim_rejects_expired_inherited_work_window(self):
         offset = [0]
+        self.admission_evidence['budgets'] = {'parent': 10, 'child_call': .5,
+                                             'sample_attempt': .1, 'wall_offset': 1}
         with SQLiteKernel(self.journal.path.parent / "deadline.sqlite3", now=lambda: time.time() + offset[0]) as kernel:
-            kernel.submit(self.make_command("parent"))
-            lease = kernel.claim_and_start("parent-owner")
-            budget = kernel.prepare_execution_budget(lease).enter_handler(10, origin_id="execution:parent")
-            kernel.confirm_handler_entry(lease, budget)
-            child_budget = budget.derive(source="tool", origin_id="short-child-call", timeout_seconds=.5)
-            kernel.submit_child(self.make_command("child"), lease, child_budget)
-            offset[0] = 1
-            with self.assertRaises(CASConflictError):
-                kernel.claim_and_start("child-owner", execution_id="child")
-            self.assertEqual(0, kernel.get("child").attempt)
+            try:
+                self.admission_stage('submit_parent', lambda: kernel.submit(self.make_command("parent")))
+                lease = self.admission_stage('claim_parent', lambda: kernel.claim_and_start("parent-owner"))
+                budget = kernel.prepare_execution_budget(lease).enter_handler(10, origin_id="execution:parent")
+                self.admission_stage('confirm_parent', lambda: kernel.confirm_handler_entry(lease, budget))
+                child_budget = budget.derive(source="tool", origin_id="short-child-call", timeout_seconds=.5)
+                self.admission_evidence['child_budget'] = child_budget.to_dict()
+                self.admission_stage('submit_child', lambda: kernel.submit_child(
+                    self.make_command("child"), lease, child_budget))
+                offset[0] = 1
+                with self.assertRaises(CASConflictError):
+                    self.admission_stage('claim_child', lambda: kernel.claim_and_start(
+                        "child-owner", execution_id="child"))
+                self.assertEqual(0, kernel.get("child").attempt)
+            finally:
+                self.capture_admission('before_cleanup', kernel)
 
     def test_recovered_adoption_keeps_capacity_until_running_child_settles(self):
         with SQLiteKernel(self.journal.path.parent / "adoption.sqlite3") as kernel:

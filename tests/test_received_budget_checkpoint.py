@@ -347,7 +347,13 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
         finally:
             writer.rollback()
             writer.close()
-        self.runtime.recover_completions(timeout_seconds=.5)
+        # Archive the original locally retained result within the same .5s
+        # maintenance window; each SDK archive write keeps its original bound.
+        # Kernel publication can precede the pending receipt's final COMMIT.
+        self.evidence['records'].append({'original_local_fact': {
+            'identity': entries[0].identity, 'payload': entries[0].payload,
+            'evidence': entries[0].evidence}})
+        self.recover_recorded({'result': entries[0].payload})
         self.assert_published(outcome)
         self.assertEqual(self.runtime.kernel.get('work').result.value, outcome['value'])
         self.assertEqual(self.receipt()['state'], 'recorded')
