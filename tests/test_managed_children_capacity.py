@@ -188,8 +188,11 @@ class ManagedChildAdmissionTests(unittest.TestCase):
             if not storage._lock.acquire(timeout=.01):
                 raise TimeoutError('admission diagnostic trace lock elapsed')
             try:
+                # Copy the queue before allocating event dictionaries: a
+                # same-thread connection destructor can append under the RLock.
+                snapshots = tuple(storage.events)
                 evidence['storage'] = {'imports': storage.imports, 'operations': storage.operations,
-                    'retained_sql_operations': [dict(event) for event in storage.events]}
+                    'retained_sql_operations': [dict(event) for event in snapshots]}
             finally:
                 storage._lock.release()
             (storage.root / (phase + '.json')).write_text(json.dumps(evidence, indent=2), encoding='utf-8')
