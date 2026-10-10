@@ -736,7 +736,31 @@ class RuntimeSettlementTests(unittest.TestCase):
         self.assertFalse(driver.is_alive())
         self.assertEqual([], errors)
         self.assertEqual(1, len(results))
-        runtime.recover_completions(timeout_seconds=.5)
+        # A pending receipt can retain the resolved timeout before its final
+        # archive. Spend the same original .5s maintenance window on that
+        # retained receipt, without invoking the handler or renewing its lease.
+        maintenance = self.cancellation_maintenance(command.execution_id)
+        while time.monotonic() < maintenance["deadline"]:
+            reports = self.recover_cancellation_once(runtime, maintenance)
+            if any(report.get("execution_id") == command.execution_id
+                   and report["state"] == "superseded" for report in reports):
+                break
+            self.assertTrue(all(report["state"] == "pending" for report in reports), maintenance)
+            remaining = maintenance["deadline"] - time.monotonic()
+            if remaining <= 0:
+                self.fail("expired outcome still pending at the original maintenance cutoff: " + repr(maintenance))
+            # The existing maintainer can finish concurrently with this pass.
+            retained = runtime._settlement_journal.inspect(command.execution_id,
+                timeout_seconds=min(.1, remaining))
+            maintenance["passes"][-1]["retained_states"] = [row["state"] for row in retained]
+            if len(retained) == 1 and retained[0]["state"] == "superseded":
+                break
+            self.assertTrue(retained and all(row["state"] == "pending" for row in retained), maintenance)
+            remaining = maintenance["deadline"] - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(.005, remaining))
+        else:
+            self.fail("expired outcome did not settle within its original maintenance window: " + repr(maintenance))
         current = runtime.kernel.get(command.execution_id)
         self.assertIsNone(current.result)
         self.assertNotEqual("succeeded", current.state)

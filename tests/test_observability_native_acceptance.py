@@ -726,36 +726,142 @@ class NativeObservabilityAcceptanceTests(unittest.TestCase):
                     app.close()
 
     def test_native_segmented_bytes_heartbeat_tool_response_and_progress_replay(self):
-        runtime = self.open(segmented_output)
-        command = self.submit(runtime, timeout=12)
-        driver, results, errors = self.drive(runtime)
-        self.await_marker("first-segment")
-        first = self.snapshot(runtime, command, "first-raw-snapshot", lambda report: self.count(report, "stdout_bytes") == 1)
-        self.assertEqual(0, self.count(first, "tool_responses"))
-        self.assertEqual(0, self.count(first, "progress"))
-        time.sleep(.15)
-        (self.root / "release-activity").touch()
-        new = self.await_marker("independent-activity")["progress"]
-        activity = self.snapshot(runtime, command, "activity-raw-snapshot", lambda report: self.count(report, "tool_responses") == 1 and self.count(report, "progress") == 1)
-        self.assertEqual(1, self.count(activity, "stdout_bytes"))
-        self.assertGreater(self.count(activity, "heartbeat"), self.count(first, "heartbeat"))
-        self.assertTrue(new["advanced"])
-        (self.root / "release-replay").touch()
-        replay = self.await_marker("replayed-progress")["progress"]
-        repeated = self.snapshot(runtime, command, "replay-raw-snapshot")
-        self.assertFalse(replay["advanced"])
-        self.assertEqual(new["revision"], replay["revision"])
-        self.assertEqual(1, self.count(repeated, "progress"))
-        (self.root / "release-chunk").touch()
-        self.await_marker("second-segment")
-        second = self.snapshot(runtime, command, "second-raw-snapshot", lambda report: self.count(report, "stdout_bytes") == 3)
-        self.assertEqual(1, self.count(second, "progress"))
-        (self.root / "release-finish").touch()
-        result = self.finish(driver, results, errors)
-        self.assertEqual("succeeded", result.state)
-        self.assertEqual(b"ABCDEF", (self.root / "raw.stdout").read_bytes())
-        final = self.snapshot(runtime, command, "final-raw-snapshot", lambda report: self.count(report, "stdout_bytes") == 6)
-        self.assertEqual(1, self.count(final, "tool_responses"))
+        from contextlib import closing
+        import sqlite3
+
+        from dispatcher_sdk._sqlite_errors import is_sqlite_contention
+        from dispatcher_sdk.execution_kernel.settlement import SettlementBusyError
+        from tests._storage_evidence import StorageEvidence
+
+        evidence = {"test": self.id(), "maintenance": [], "maintenance_operations": 0, "diagnostic_errors": []}
+        storage = StorageEvidence(self.root, self)
+        storage.start(include_kernel=True)
+        self.addCleanup(storage.stop)
+
+        def error_details(error):
+            try:
+                return {"type": type(error).__name__, "message": str(error),
+                        "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                        "traceback": traceback.format_exception(type(error), error, error.__traceback__)}
+            except BaseException:
+                return {"type": type(error).__name__, "diagnostic_details": "unavailable"}
+
+        def transient(error):
+            return (isinstance(error, SettlementBusyError) or is_sqlite_contention(error)
+                    or type(error) is TimeoutError and str(error) in (
+                        "Kernel control lock admission timed out",
+                        "Kernel control admission budget elapsed",
+                        "completion recovery operation window elapsed"))
+
+        def retained_facts():
+            deadline = time.monotonic() + .1
+            facts = {}
+            for name, tables in (
+                    ("kernel.sqlite3", ("kernel_executions", "kernel_execution_limits", "kernel_budget_samples")),
+                    ("kernel.sqlite3.settlements.sqlite3", ("settlement_records",))):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("fixture retained evidence inspection elapsed")
+                uri = (self.root / name).resolve().as_uri() + "?mode=ro"
+                with closing(sqlite3.connect(uri, uri=True, timeout=remaining)) as connection:
+                    connection.row_factory = sqlite3.Row
+                    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                    facts[name] = {}
+                    for table in tables:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("fixture retained evidence inspection elapsed")
+                        facts[name][table] = [dict(row) for row in connection.execute(
+                            "SELECT * FROM " + table + " LIMIT 10")]
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("fixture retained evidence inspection elapsed")
+            return facts
+
+        try:
+            runtime = self.open(segmented_output)
+            command = self.submit(runtime, timeout=12)
+            driver, results, errors = self.drive(runtime)
+            self.await_marker("first-segment")
+            first = self.snapshot(runtime, command, "first-raw-snapshot", lambda report: self.count(report, "stdout_bytes") == 1)
+            self.assertEqual(0, self.count(first, "tool_responses"))
+            self.assertEqual(0, self.count(first, "progress"))
+            time.sleep(.15)
+            (self.root / "release-activity").touch()
+            new = self.await_marker("independent-activity")["progress"]
+            activity = self.snapshot(runtime, command, "activity-raw-snapshot", lambda report: self.count(report, "tool_responses") == 1 and self.count(report, "progress") == 1)
+            self.assertEqual(1, self.count(activity, "stdout_bytes"))
+            self.assertGreater(self.count(activity, "heartbeat"), self.count(first, "heartbeat"))
+            self.assertTrue(new["advanced"])
+            (self.root / "release-replay").touch()
+            replay = self.await_marker("replayed-progress")["progress"]
+            repeated = self.snapshot(runtime, command, "replay-raw-snapshot")
+            self.assertFalse(replay["advanced"])
+            self.assertEqual(new["revision"], replay["revision"])
+            self.assertEqual(1, self.count(repeated, "progress"))
+            (self.root / "release-chunk").touch()
+            self.await_marker("second-segment")
+            second = self.snapshot(runtime, command, "second-raw-snapshot", lambda report: self.count(report, "stdout_bytes") == 3)
+            self.assertEqual(1, self.count(second, "progress"))
+            (self.root / "release-finish").touch()
+            # Driver exit and original-result publication share the existing
+            # acceptance window. Maintenance never starts another invocation.
+            began = time.monotonic()
+            deadline = began + 15
+            evidence["finish_window"] = {"began": began, "deadline": deadline, "seconds": 15}
+            result = self.finish(driver, results, errors, seconds=max(0., deadline-time.monotonic()))
+            evidence["original_driver_result"] = result.to_dict()
+            original_identity = (result.execution_id, result.attempt, result.fence)
+            while result.state == "running":
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0, evidence)
+                attempt = {"began": time.monotonic(), "deadline": deadline}
+                evidence["maintenance"].append(attempt)
+                evidence["maintenance_operations"] += 1
+                if len(evidence["maintenance"]) > 64:
+                    del evidence["maintenance"][0]
+                try:
+                    attempt["recovery_timeout_seconds"] = min(.1, remaining)
+                    reports = runtime.recover_completions(timeout_seconds=attempt["recovery_timeout_seconds"])
+                    attempt["reports"] = reports
+                    for report in reports:
+                        self.assertNotIn(report.get("state"), ("error", "unknown", "superseded"), report)
+                        self.assertNotIn("archive_error", report, report)
+                    remaining = deadline - time.monotonic()
+                    self.assertGreater(remaining, 0, evidence)
+                    attempt["read_timeout_seconds"] = min(.1, remaining)
+                    with runtime.kernel._control_lock(attempt["read_timeout_seconds"]):
+                        result = runtime.kernel.get(command.execution_id)
+                    attempt["snapshot"] = result.to_dict()
+                    self.assertEqual(original_identity, (result.execution_id, result.attempt, result.fence))
+                except BaseException as error:
+                    attempt["error"] = error_details(error)
+                    if not transient(error):
+                        raise
+                finally:
+                    attempt["returned"] = time.monotonic()
+                if result.state == "running":
+                    time.sleep(min(.01, max(0., deadline-time.monotonic())))
+            evidence["settled_result"] = result.to_dict()
+            self.assertEqual("succeeded", result.state)
+            self.assertEqual({"bytes": 6, "new": new, "replay": replay}, result.result.value)
+            self.assertEqual(b"ABCDEF", (self.root / "raw.stdout").read_bytes())
+            final = self.snapshot(runtime, command, "final-raw-snapshot", lambda report: self.count(report, "stdout_bytes") == 6)
+            self.assertEqual(1, self.count(final, "tool_responses"))
+        except BaseException as error:
+            evidence["original_error"] = error_details(error)
+            raise
+        finally:
+            try:
+                evidence["retained_facts"] = retained_facts()
+            except BaseException as error:
+                evidence["diagnostic_errors"].append(error_details(error))
+            try:
+                storage.save(phase="before_cleanup", checkpoint=evidence)
+            except BaseException as error:
+                evidence["diagnostic_errors"].append(error_details(error))
+            try:
+                write_json(self.root / "segmented-settlement-evidence.json", evidence)
+            except BaseException:
+                pass
 
     def test_native_run_cutoff_and_derived_blocked_tool_use_shortest_budget(self):
         for derive in (False, True):

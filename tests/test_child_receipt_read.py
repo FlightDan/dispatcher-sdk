@@ -81,14 +81,96 @@ class ChildReceiptReadTests(unittest.TestCase):
 
     def test_persistent_receipt_contention_expires_without_completed_result_rescue(self):
         import traceback
+        from contextlib import closing
 
-        row, window = self.short_row(.3)
-        original = BudgetEnvelope.from_dict(json.loads(row['budget_json']))
-        writer = self.exclusive_writer()
+        # Retain producer stages even if setup spends the original call
+        # window before the intended exclusive receipt writer is opened.
         sql_evidence = StorageEvidence(self.root, self)
         sql_evidence.start(include_kernel=True)
         self.addCleanup(sql_evidence.stop)
-        self.addCleanup(sql_evidence.save)
+        preparation = {'scenario': 'persistent_receipt_preparation', 'began': time.monotonic(),
+                       'original_child_seconds': .3, 'stages': [], 'diagnostic_errors': []}
+        self.evidence['records'].append(preparation)
+
+        def save_preparation(phase):
+            try:
+                sql_evidence.save(phase=phase, checkpoint=self.evidence)
+            except BaseException as error:
+                preparation['diagnostic_errors'].append({'phase': phase,
+                    'type': type(error).__name__, 'message': str(error)})
+
+        def retain_disposition():
+            # Run only after preparation failure or the intended wait. These
+            # read-only observations cannot consume the tested live interval.
+            try:
+                deadline = time.monotonic() + .1
+                for name, path, statements in (
+                        ('outbox', self.journal.path, (
+                            ('requests', 'SELECT * FROM sdk_child_requests WHERE source_id=? AND parent_execution_id=? LIMIT 2',
+                             (self.children.store.source_id, self.parent.execution_id)),
+                            ('waits', 'SELECT * FROM sdk_child_waits WHERE source_id=? AND parent_execution_id=? LIMIT 2',
+                             (self.children.store.source_id, self.parent.execution_id)))),
+                        ('kernel', Path(self.kernel.db_path), (
+                            ('child_rows', 'SELECT execution_id,state,attempt FROM kernel_executions WHERE execution_id=?', ('receipt-child',)),
+                            ('markers', 'SELECT token,execution_id,reason FROM kernel_budget_samples LIMIT 2', ()),
+                            ('parent_limits', 'SELECT envelope_json FROM kernel_execution_limits WHERE execution_id=?', ('parent',))))):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('preparation disposition inspection elapsed')
+                    with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True,
+                                                 timeout=remaining)) as connection:
+                        connection.row_factory = sqlite3.Row
+                        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                        preparation[name] = {}
+                        for label, sql, arguments in statements:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError('preparation disposition inspection elapsed')
+                            preparation[name][label] = [dict(row) for row in connection.execute(sql, arguments)]
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError('preparation disposition inspection elapsed')
+            except BaseException as error:
+                preparation['diagnostic_errors'].append({'phase': 'preparation_disposition',
+                    'type': type(error).__name__, 'message': str(error)})
+
+        self.addCleanup(lambda: save_preparation('cleanup'))
+        envelope = self.parent_budget.derive(source='tool', origin_id='receipt-read', timeout_seconds=.3)
+        preparation['original_envelope'] = envelope.to_dict()
+        window = None
+        try:
+            window_entry = {'stage': 'window_init', 'began': time.monotonic()}
+            preparation['stages'].append(window_entry)
+            try:
+                window = _RetryWindow(envelope, self.kernel)
+            finally:
+                window_entry['returned'] = time.monotonic()
+            preparation['original_native_deadline'] = window.deadline
+            entry = {'stage': 'enqueue', 'began': time.monotonic()}
+            preparation['stages'].append(entry)
+            try:
+                # Match the consumer's enclosing producer context. Nested
+                # reads spend the retained floor and the outbox transaction
+                # shares this SAME .3-second window; no fresh sample or retry.
+                with window.project(), self.children.store.bound(window):
+                    row = self.children._enqueue(request_id='receipt-read', child_id='receipt-child', action='run',
+                        child_command=self.command('receipt-child'), envelope=envelope, window=window)
+                entry['row'] = dict(row)
+            finally:
+                entry['returned'] = time.monotonic()
+            preparation['retained_native_deadline'] = window.deadline
+            self.assertLessEqual(window.deadline, preparation['original_native_deadline'])
+            self.assertEqual(window.envelope.constraints, envelope.constraints)
+        except BaseException as error:
+            preparation['original_error'] = {'type': type(error).__name__, 'message': str(error),
+                'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None),
+                'traceback': traceback.format_exception(type(error), error, error.__traceback__)}
+            retain_disposition()
+            save_preparation('preparation_failure')
+            raise
+        finally:
+            preparation['returned'] = time.monotonic()
+            preparation['window_at_return'] = None if window is None else window.envelope.to_dict()
+        original = BudgetEnvelope.from_dict(json.loads(row['budget_json']))
+        writer = self.exclusive_writer()
         steps = deque(maxlen=256)
 
         def traced(stage, operation):
@@ -187,6 +269,8 @@ class ChildReceiptReadTests(unittest.TestCase):
         finally:
             writer.rollback()
             writer.close()
+            retain_disposition()
+            save_preparation('before_cleanup')
 
     def test_terminal_receipt_busy_keeps_original_error_without_resampling(self):
         row, window = self.short_row(.3)

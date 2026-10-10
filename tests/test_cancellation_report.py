@@ -57,6 +57,9 @@ def _crash_after_commit(root):
 
 class CancellationReportTests(unittest.TestCase):
     def setUp(self):
+        if self._testMethodName == "test_reopened_thread_runtime_cannot_prove_externally_claimed_cleanup":
+            self.root = retained_directory("sdk-reopened-cancellation-report-")
+            return
         if self._testMethodName in (
                 "test_settlement_cleanup_requires_matching_generation_and_native_source",
                 "test_collected_remote_result_does_not_imply_cleanup_succeeded"):
@@ -373,16 +376,144 @@ class CancellationReportTests(unittest.TestCase):
             runtime.close()
 
     def test_reopened_thread_runtime_cannot_prove_externally_claimed_cleanup(self):
+        from contextlib import contextmanager
+        import traceback
+
+        evidence = {"test": self.id(), "stages": [], "diagnostic_errors": [],
+                    "runtime_cancel_timeout_seconds": 1, "kernel_control_attempt_max_seconds": .1}
+        storage = StorageEvidence(self.root, self)
+        storage.start(include_kernel=True)
+        self.addCleanup(storage.stop)
+
+        def error_details(error):
+            try:
+                return {"type": type(error).__name__, "message": str(error),
+                        "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                        "traceback": traceback.format_exception(type(error), error, error.__traceback__)}
+            except BaseException:
+                return {"type": type(error).__name__, "diagnostic_details": "unavailable"}
+
+        def save(phase):
+            # Evidence remains secondary to both the original control error
+            # and the cleanup-report assertions.
+            try:
+                storage.save(phase=phase, checkpoint=evidence)
+            except BaseException as error:
+                evidence["diagnostic_errors"].append({"phase": phase, **error_details(error)})
+            try:
+                path = self.root / "evidence.json"
+                path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+                print("reopened_cancellation_report_evidence=" + str(path), flush=True)
+            except BaseException:
+                pass
+
+        def readonly_facts():
+            # One shared inspection bound; no writer constructors or control
+            # calls can change disposition while collecting these facts.
+            deadline = time.monotonic() + .1
+            queries = {
+                "kernel.db": {
+                    "execution": ("SELECT execution_id,state,attempt,fence,revision FROM kernel_executions WHERE execution_id=?", ("x",)),
+                    "limits": ("SELECT execution_id,envelope_json FROM kernel_execution_limits WHERE execution_id=?", ("x",)),
+                    "budget_samples": ("SELECT token,execution_id,reason FROM kernel_budget_samples LIMIT 10", ())},
+                "cancel.db": {
+                    "binding": ("SELECT * FROM cancellation_meta", ()),
+                    "requests": ("SELECT * FROM cancellation_requests WHERE execution_id=? ORDER BY sequence DESC LIMIT 10", ("x",)),
+                    "phases": ("SELECT stage,evidence FROM cancellation_stages WHERE receipt_id IN "
+                        "(SELECT receipt_id FROM cancellation_requests WHERE execution_id=? ORDER BY sequence DESC LIMIT 10)", ("x",))}}
+            facts = {}
+            for name, statements in queries.items():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("fixture read-only evidence budget elapsed")
+                uri = (self.root / name).resolve().as_uri() + "?mode=ro"
+                with closing(sqlite3.connect(uri, uri=True, timeout=remaining)) as connection:
+                    connection.row_factory = sqlite3.Row
+                    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                    facts[name] = {}
+                    for label, (sql, arguments) in statements.items():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("fixture read-only evidence budget elapsed")
+                        facts[name][label] = [dict(row) for row in connection.execute(sql, arguments)]
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("fixture read-only evidence budget elapsed")
+            return facts
+
+        def stage(name, operation, *arguments, **options):
+            entry = {"phase": name, "began": time.monotonic(),
+                     "arguments": [value.to_dict() if hasattr(value, "to_dict") else value for value in arguments],
+                     "options": options}
+            evidence["stages"].append(entry)
+            try:
+                answer = operation(*arguments, **options)
+                entry["result"] = (answer.to_dict() if hasattr(answer, "to_dict") else answer)
+                return answer
+            except BaseException as error:
+                entry["error"] = error_details(error)
+                raise
+            finally:
+                entry["returned"] = time.monotonic()
+                entry["elapsed_seconds"] = entry["returned"] - entry["began"]
+
         runtime, sdk = self.stack()
-        self.setup_task(runtime, sdk)
-        runtime.kernel.claim("external-worker")
-        runtime.close()
+        try:
+            self.setup_task(runtime, sdk)
+            lease = runtime.kernel.claim("external-worker")
+            evidence["external_lease"] = lease.to_dict()
+        finally:
+            runtime.close()
         reopened, sdk = self.stack()
-        with reopened:
-            reopened.cancel("x", expected_revision=reopened.kernel.get("x").revision)
-            report = self.report(sdk)
-            self.assertEqual(report.execution_authority_revoked.status, "confirmed")
-            self.assertEqual(report.local_process_tree_reaped.status, "unknown")
+        lifecycle = reopened._bounded_lifecycle
+
+        @contextmanager
+        def traced_lifecycle(*arguments, **options):
+            entry = {"phase": "lifecycle", "began": time.monotonic(),
+                     "arguments": arguments, "options": options}
+            evidence["stages"].append(entry)
+            try:
+                with lifecycle(*arguments, **options):
+                    entry["entered"] = time.monotonic()
+                    yield
+            except BaseException as error:
+                entry["error"] = error_details(error)
+                raise
+            finally:
+                entry["returned"] = time.monotonic()
+                entry["elapsed_seconds"] = entry["returned"] - entry["began"]
+
+        get = reopened.kernel.get
+        begin = reopened.cancellation_journal._begin
+        cancel = reopened.kernel.cancel
+        primary_error = None
+        try:
+            with patch.object(reopened, "_bounded_lifecycle", traced_lifecycle), \
+                    patch.object(reopened.kernel, "get", lambda *args, **kwargs: stage("kernel_get", get, *args, **kwargs)), \
+                    patch.object(reopened.cancellation_journal, "_begin", lambda *args, **kwargs: stage("receipt_begin", begin, *args, **kwargs)), \
+                    patch.object(reopened.kernel, "cancel", lambda *args, **kwargs: stage("kernel_cancel", cancel, *args, **kwargs)):
+                reopened.cancel("x", expected_revision=reopened.kernel.get("x").revision)
+                report = self.report(sdk)
+                self.assertEqual(report.execution_authority_revoked.status, "confirmed")
+                self.assertEqual(report.local_process_tree_reaped.status, "unknown")
+                evidence["report"] = {"execution_authority_revoked": report.execution_authority_revoked.status,
+                                      "local_process_tree_reaped": report.local_process_tree_reaped.status}
+        except BaseException as error:
+            primary_error = error
+            evidence["original_error"] = error_details(error)
+            raise
+        finally:
+            try:
+                evidence["before_cleanup"] = readonly_facts()
+            except BaseException as error:
+                evidence["diagnostic_errors"].append({"phase": "read_only_facts", **error_details(error)})
+            save("before_cleanup")
+            try:
+                reopened.close()
+            except BaseException as error:
+                evidence["cleanup_error"] = error_details(error)
+                if primary_error is None:
+                    raise
+            finally:
+                save("cleanup")
 
     def test_settlement_cleanup_requires_matching_generation_and_native_source(self):
         runtime, sdk = self.stack()
