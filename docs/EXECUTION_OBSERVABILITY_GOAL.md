@@ -1,9 +1,106 @@
 # SDK 执行可观测性与监管：功能完整性、鲁棒性与可维护性
 
 规划日期：2026-10-03。源码基线：`release/0.7.0dev2`；规划时源码声明版本为 `0.7.0.dev0`。
-最终验收候选声明版本为 `0.7.1`。
+原规划的最终验收候选声明版本为 `0.7.1`；当前交付版本见下方状态。
 
-## 当前实施状态（2026-10-06）
+## 当前 0.7.2 实施与交付状态（2026-10-11）
+
+范围仍为 SDK 自身，ModPort 由应用侧单独适配。`0.7.2` 验收结论：
+**accepted**；T01–T09、A01–A18、G1–G5：
+**passed within current applicable SDK scope; unchanged-layout older-writer experiment is not newly applicable**。已验收提交为 `524e1ff6e270ea0862fda2459270d4b26311e3ef`，
+[原始完整 CI 38093366109](https://github.com/FlightDan/dispatcher-sdk/actions/runs/38093366109)，attempt
+`1`，16 环境结果为 `{"original_matrix_jobs":16,"passed":16,"failed_jobs":[]}`。
+逐环境安装包用例数、耗时、跳过原因、实际导入、原生证据及公开场景／类型／文档／示例／
+六次重启记录见[验收索引](EXECUTION_OBSERVABILITY_ACCEPTANCE.md)。原 900 秒套件窗口不变；
+Windows ARM 主机 Python 3.10 是 x64 模拟，不计为原生 ARM64 CPython 验收。
+本次原始证据的不足与原生见证范围为 `{"material_gaps":[],"delivery_sample_limits":["Current native file-publication denial fixture uses synthetic file/process controls. Actual share-zero returned.json denial is separately retained supplemental installed x64Python3.11 proof covering transient and persistent cases, not native outcome.json or real definite ACL5.","Native ERROR5 termination evidence proves exited same-HANDLE race only. Generic definite ACL5 and non-signalled wait/error negatives are synthetic classifier controls; no arbitrary ACCESS_DENIED recovery claim.","Cancellation saved cleanup-before-cancel/reopen tests pass individually in all16 original installed logs, but their TemporaryDirectory raw stores are gone. Retained native controller-crash/restart notes independently show old exact identity/source cleanup and successor admission denial. Reader negatives have retained synthetic inputs/rawSQL, not individual serialized reports for each negative.","Observer negative responses are synthetic, coupled to real recorder/journal writes and current source SQL assertions. Main/WAL/SHM files were not queried or modified. Physical observer closure records remain separate; unknown process metadata does not become known just because collection is complete.","Windows native close can return SDK running while native processes/collectors are contained; physical cleanup is not canonical business completion.","Windows ARM64 Python3.11,3.12,3.13 are native machineARM64. Windows ARMhostPython3.10 is machineAMD64 x64 emulation.","POSIX heldresponse native success/rawfailure tests are inapplicable on Windows, whose canonical writer-cutoff fixture runs threads with actual SQLite contention.","Concurrent external publisher uses synchronousOFF to prove committed visibility; SDK remainsFULL. This is not a power-loss durability witness.","Passing original named assertions establish comparisons/no-mutation not separately encoded in every retained raw file. Pressure readonly dump equality is test-asserted; retained pages independently expose exact count/size/cursors/timing.","Actual PIDs/entry markers/resident memory establish native process execution/capacity; no remote sandbox disposal or all namespace security properties claimed. Thread isolation retains documented process-local limitations.","Native cleanup receipts/ready markers do not establish unrecorded actual double-fork/setsid entry or reaping. Complementary reviewer owns exact same-HANDLE proof.","Stall bridged outbox and pressure processing/pending inbox are publication/receipt facts, not ACK. Later ACK/replay assertions require their original named passing methods; business success is separate from sampled-clock ACK and delivery.","Permission error handling does not identify historical physical ACL/sharing causes. SQL trace includes admission; physical lock owner/hold duration remains unknown absent witness.","Historical rejected/cancelled evidence supplies no current pass result. Original package eligibility/publication/readback remain primary-owned.","CPython3.13 emitted ResourceWarning unclosed database text in some original method blocks; every affected block ended ok and original suite passed. This review does not attribute each warning or infer a live resource leak from garbage collection output."]}`；测试通过不补全缺失的fork／setsid或回收见证，业务成功不替代交付ACK。
+实际场景覆盖数量与独立审查结论分别记录：覆盖数量 `{"linux_environments":8,"windows_environments":8,"original_matrix_jobs":16,"successful_matrix_jobs":16,"installed_suite_cases_per_environment":1206,"installed_skips_linux":18,"installed_skips_windows":58,"public_scenarios_per_environment":5,"restart_commands_per_environment":6,"canonical_writer_delay_witnesses":16,"native_posix_heldresponse_success_rawfailure_witnesses":16,"native_windows_error5_samehandle_witnesses":8,"native_windows_timeout_samehandle_witnesses":8,"native_windows_cancel_close_witnesses":16,"synthetic_observer_close_receipts":112,"physical_collector_close_records":112,"raw_concurrent_journal_publications":16,"raw_native_controller_cleanup_restart_witnesses":16,"reopened_externalclaim_unknown_reports":16,"pending_platforms":[],"native_scenarios":152,"pressure_scenarios":80}`；
+审查结论 `{"native_contracts":"clean_with_documented_evidence_limits","scenario_scope":"scope_clean"}`。当前实际场景与审查映射：
+`{"A01-A03":"current native startup/entry/output/clock cases","A04-A07":"current execution budget/authority/child/capacity cases","A08-A09":"current exact-generation cleanup/restart/observer contracts","A10-A12":"current stall/evaluator/crash/notification cases with ACK boundaries","A13":"16 original pressure runs:10000 summaries/201 bounded pages each","A14":"current explicit upgrade/history/binding/no implicit mutation regression; layout unchanged from0.7.1","A15-A18":"current public5/types5/docs/examples/restart6/full installed suites","T01-T09/G1-G5":"current applicable regression and independent source/raw reviews; limitations below"}`；保留的私有审查 JSON 路径：
+`["/tmp/sdk-0.7.2-local/raw-review-524e1ff-final.json","/tmp/sdk-0.7.2-local/current-scenario-raw-review-524e1ff.json"]`。原始 CI 与制品证据：
+[当前原始 CI 与制品证据](https://github.com/FlightDan/dispatcher-sdk/actions/runs/38093366109)。
+
+本次 SDK 修正保留精确执行代与 Kernel 存储绑定的本机清理证据，分别呈现 note 与取消回执来源；
+本机清理不替代 sandbox disposal。Windows error5 仅在同一已取得进程句柄被确认 signalled 时
+作为退出竞态；其他错误及存活／未知状态仍失败。线性 note 页编码保留原时间／字节界限、游标及不完整标记。
+
+Windows 原生结果文件持续不可读时，在进程清理后保留原权限错误；已确认的共享拒绝及无 WinError 的歧义 `PermissionError` errno 13 仅在原 watchdog 窗口内处理，且成功前必须重读同一文件。errno 13 本身既不能证明共享冲突，也不能证明 ACL 拒绝；已识别的永久错误立即失败。
+已准入的子结果观测无需 Kernel 写锁，仍检查精确父 lease、祖先时钟 guard 和原截止时间；从未领取的 queued／cancelled 子任务合法零 attempt／fence 保留原等待拒绝，不误报 ancestry 格式错误。
+已提交的 observation batch 重放使用同一个连接读取 sequence 证据；缺少证据仍在原期限内原子写入。
+最终进程采集未完成或失败会传递到 recorder 与原生结果回执；批次写入、source 关闭、业务成功和之后线程退出都不能提升原有的不完整观测回执。
+exit137 夹具在原两秒进程等待期限内共享有界只读证据等待，保留实际注册身份和最终 status／signal／OOM 断言，并保存最后采集及 SQL 证据。
+此前丢失最终写入的原因仍未知。本地原完整安装包测试 1,201 项／868.028 秒，失败一项／平台跳过 18 项，仍为拒绝；修正后定向安装包验证 Linux24／31.866 秒和 Windows34／22.801 秒（一项平台跳过）通过，文档635／四个 README 示例通过。这些本地结果不能替代上述原始16环境验收。
+
+经授权的示例／夹具窗口选择不改变 SDK 预算规则：便携进程示例采用 child30／parent60／caller120；
+路径迁移夹具仅执行一次、timeout30，并在最多 5 秒内发布原结果，不重新派发业务。
+其他修正保留原准入／维护额度、超时反例及原结果／取消赢家断言。README 原代码、wait10、subprocess30，
+公开消费者 parent20／child8／tool4（blocked1.2）／caller25，压力竞态原 3／5／15 秒等待与 task10 均不变。
+闹钟夹具保留原 100ms／2 秒界限，区分 arm COMMIT 已耗尽原窗口与仍可采样的分支。
+慢 arm 夹具只在原 child10 秒约束内重试已证实的采样前准入拒绝；一旦进入、已 arm 或证据不确定，即保留原异常停止。
+目标10ms、fresh拒绝20ms及同 owner100ms确认均不变。等待作用域夹具使用实际已领取身份，注册激活与重放有独立覆盖。
+新增失败证据在清理前记录原错误、调用点、SQLite 代码、线程栈及原预算；诊断失败不替换主异常。
+取消竞争与两项子任务准入夹具保留原调用、等待和断言，预算诊断只复制 Runtime 已提供快照，不新增采样。
+收据写锁夹具在原单次500ms维护期限内发布同一不可变结果，每次归档仍封顶100ms；持续锁与永久错误仍失败，不重跑处理器。
+重开取消调用仍用默认1秒及单次100ms控制窗口，清理前保留原始阶段证据。
+正向 receipt 夹具保留原1秒界限、+0.3秒 stronger-floor 断言和0.25秒 writer hold；它们与 persistent receipt 的单次 enqueue 原300ms窗口及50ms写入上限相互独立，后者不重试准备。
+公开 join／maintenance 夹具保留原3秒窗口，并受 parent12秒／child5秒／proof0.1秒上限约束。并发外部 publisher 仅在 `SDKFULL` 启用，该场景原0.03秒等待不变。
+原生输出join和持久化共享原15秒收尾期限，task12及100ms控制调用不变。
+过期租约原结果归档只使用一次原500ms维护窗口，100ms时钟证明、超时／fence断言及一次调用均保留。
+非法内容夹具保留首次合法写入，且精确调用两次 `write_batch`，每次使用原30ms界限，不重试；第二次空闲刷新仅在精确预算异常、确认回滚和原持久化／本地观测完整保留时允许延后，其他错误仍失败，不新增窗口。
+double-fork 超时夹具的同结果发布与全部运行后观测共享原250ms期限，task20ms／后代sleep150ms／handler1s不变；本地定向证明覆盖未决结果与回调，未证明真实double-fork创建／回收，不能从worker-ready推断。
+分段输出保留两次原progress调用，在读取重放字段前严格要求confirmed，unknown仍使验收失败。
+容量恢复与ACK中断夹具保留原250ms／100ms窗口、健康成功／精确中断／owner／容量断言，只增加清理前原阶段证据；没有现场见证的SQL调度或锁原因保持unknown。
+静默取消消费者在观测和清理前保留有界控制作用域、原SQL耗时和实时驱动线程栈；task12／caller15／stall200ms两窗口／supervision100ms／cancel1秒均不变。监督读取拒绝仍失败，不重试或提交取消；诊断格式化、写入、观测和关闭错误不替换原异常。历史锁持有者仍unknown。
+子任务诊断先取得队列快照再分配事件字典，避免同线程连接清理修改正在遍历的队列；原10ms诊断锁、100ms只读界限和业务调用不变。本地并行验证出现真实的子任务入场前超时，随后一次串行源码／安装包对照在原预算下通过；全部证据保留，物理原因未确认。
+独立公开消费者使用 `--evidence-dir`。业务结果、持久化收尾及采样 ACK 分别判断；
+缺乏原始证据的历史 README／父子调用／压力取消原因继续记为 unknown。
+
+历史测试层的五项 Windows 夹具修正不改变 SDK 运行时代码：在原父截止时间内挂起真实子结果发布并恢复同一结果；按实际保留期限断言只读子任务拒绝，并记录短控制锁在外层期限前的真实过期；收据读取准备绑定原 projected/store 上下文且诊断不新增预算采样；即使报告失败也保留重放读取及并发发布阶段；收尾夹具以单一绝对期限检查 observer 预算份额。observer 仍受原0.4秒 close 截止时间约束，使用其剩余时间的四分之一，不另给新的0.1秒窗口。该历史夹具的公开 join／maintenance 原3秒窗口受 parent12秒／child5秒／proof0.1秒上限约束；并发外部 publisher 仅在 SDKFULL 开启，原0.03秒等待不变。定向历史夹具证据仅限：Linux 9 项／10.910 秒；原生 Windows Python3.13 为 9 项／9.212 秒；原生 Windows Python3.11 初次为 8/9，随后修正后的 public-result 与 journal-replay 夹具为 2/2／5.443 秒。这些结果不证明安装包完整套件或十六环境验收。
+
+当前 524e1ff 候选另含 public marker-reader 修正和精确的 inspection 夹具记录。相关夹具为 test_unstarted_cancelled_child_preserves_original_refusal_without_result_read 与 test_unstarted_queued_child_preserves_original_refusal_without_result_read。在被拒绝的 cc6f20b 运行中，cancelled 场景确已执行；其原始 InspectionBudgetExceeded 在 store.request 处逃出过时的类型断言，因此后续语义断言未执行。当前测试断言保留该原始拒绝。此项与历史五夹具后续分开记录，且不代表 524e1ff 已通过验收。
+
+正式发布事实：`v0.7.2` 指向 `524e1ff6e270ea0862fda2459270d4b26311e3ef`；
+[发布流程 38094704767](https://github.com/FlightDan/dispatcher-sdk/actions/runs/38094704767) 的实际结论和原制品选择为
+`{"conclusion":"success","selected_artifact":{"artifact_id":11684882088,"artifact_name":"release-packages-38093366109-1","run_attempt":1,"run_id":38093366109}}`，复用 run
+`38093366109` attempt `1` 的原始制品
+`11684882088`，无重建或额外矩阵的记录为 `{"run":{"id":38094704767,"html_url":"https://github.com/FlightDan/dispatcher-sdk/actions/runs/38094704767","conclusion":"success","head_sha":"524e1ff6e270ea0862fda2459270d4b26311e3ef"},"selected_artifact":{"artifact_id":11684882088,"artifact_name":"release-packages-38093366109-1","run_attempt":1,"run_id":38093366109},"source_log":"/tmp/sdk-0.7.2-local/publisher-38094704767.log","raw_selection_line":"release\tDownload the original tested wheel and source distribution\t2026-10-10T23:21:00.4782697Z {'artifact_id': 11684882088, 'artifact_name': 'release-packages-38093366109-1', 'run_attempt': 1, 'run_id': 38093366109}","rebuild":false,"matrix_rerun":false}`。
+[Release](https://github.com/FlightDan/dispatcher-sdk/releases/tag/v0.7.2) ID
+`409264867`，发布时间 `2026-10-10T23:21:02Z`；实际 draft／prerelease／Latest
+状态为 `{"draft":false,"prerelease":false,"release_id":409264867,"latest_id":409264867}`。
+wheel 资产 `629237785`／`474762` 字节，sdist 资产
+`629237782`／`1213173` 字节；实际下载与 PyPI 状态见验收索引。
+
+GitHub 默认分支 `main` 的实际回读记录：`{"default_branch":"main","readback":"/tmp/sdk-0.7.2-local/publication-readback-second/publication-readback.json"}`。
+21 页中英文 Wiki 推送提交及公开页面、源码链接、双语导航的实际访问验证：
+`{"commit":"ac261556ade2174fa6f82d144d4d9d9359548332","pages":21,"repository_ref":"524e1ff6e270ea0862fda2459270d4b26311e3ef","page_reads":[{"name":"Home","url":"https://github.com/FlightDan/dispatcher-sdk/wiki","status":200,"final_url":"https://github.com/FlightDan/dispatcher-sdk/wiki","bytes":242754,"published_ref_visible":true,"english_navigation":true,"chinese_navigation":true,"sidebar_visible":true,"api_link_visible":true,"agent_link_visible":true},{"name":"Home-zh-CN","url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Home-zh-CN","status":200,"final_url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Home-zh-CN","bytes":242803,"published_ref_visible":true,"english_navigation":true,"chinese_navigation":true,"sidebar_visible":true,"api_link_visible":true,"agent_link_visible":true},{"name":"Troubleshooting","url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Troubleshooting","status":200,"final_url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Troubleshooting","bytes":244135,"published_ref_visible":true,"english_navigation":true,"chinese_navigation":true,"sidebar_visible":true,"api_link_visible":true,"agent_link_visible":true},{"name":"Troubleshooting-zh-CN","url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Troubleshooting-zh-CN","status":200,"final_url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Troubleshooting-zh-CN","bytes":243923,"published_ref_visible":true,"english_navigation":true,"chinese_navigation":true,"sidebar_visible":true,"api_link_visible":true,"agent_link_visible":true},{"name":"API","url":"https://github.com/FlightDan/dispatcher-sdk/blob/524e1ff6e270ea0862fda2459270d4b26311e3ef/docs/SDK.md","status":503,"error":"HTTP Error 503: Service Unavailable","read_failed":true},{"name":"DocsforAgents","url":"https://github.com/FlightDan/dispatcher-sdk/blob/524e1ff6e270ea0862fda2459270d4b26311e3ef/DocsforAgents/README.md","status":503,"error":"HTTP Error 503: Service Unavailable","read_failed":true}],"earlier_API_HTML_200":"/tmp/sdk-0.7.2-local/publication-readback-first/API.html","DocsforAgents_HTML_status":503,"DocsforAgents_public_content_API":"/tmp/sdk-0.7.2-local/publication-readback-second/DocsforAgents-content-api.json"}`。
+发布后两份台账的实际安装包文档检查：`{"command":["/tmp/sdk-0.7.2-local/published-doc-check-venv/bin/python","scripts/check_docs.py"],"environment":{"PYTHONPATH":"","SDK_ACCEPTANCE_EVIDENCE_DIR":"/tmp/sdk-0.7.2-local/postpublication-doc-evidence"},"returncode":0,"result":"Checked 636 local links; 4 README examples passed, 0 skipped","interpreter":"/tmp/sdk-0.7.2-local/published-doc-check-venv/bin/python","sdk_import":"/tmp/sdk-0.7.2-local/published-doc-check-venv/lib/python3.12/site-packages/dispatcher_sdk/__init__.py","installed_version":"0.7.2","wheel_source":"/tmp/sdk-0.7.2-local/published-downloads-actual/dispatcher_sdk-0.7.2-py3-none-any.whl","log":"/tmp/sdk-0.7.2-local/postpublication-doc-check.log","limits":"Final inert validation-fact text is inserted after this run; no executable block or link changes in that insertion."}`；
+标签和发布包仍保持原验收提交。原 `0.7.1` 交付记录和所有旧证据全部保留。
+此前十七次被拒绝的 `0.7.2` 矩阵（包括下表中的 `b0a62a1` 与 `cc6f20b`）、一次取消的 `38076988858` 均保留为历史记录；当前 `524e1ff` 候选仍按其原始运行状态记录，不预先列为拒绝，
+不替代后续验收；候选、观察到的失败、原始路径及尚未完成的回读均列于下表。
+
+| 候选提交 / 原始 CI | 历史结果与失败边界 | 保留证据 |
+| --- | --- | --- |
+| `bc3e6c06c47ce681017f5be002b596e5b0d43f5e` / `38066968577` | 拒绝，15/16；便携示例子任务等待失败，底层阶段未证实 | `/tmp/sdk-0.7.2-ci-review` |
+| `7ce574a22b75ad331bf414cebb988fbf88fca252` / `38068198876` | 拒绝，14/16；恢复快照与子任务设置断言失败 | `/tmp/sdk-0.7.2-ci-review-corrected` |
+| `980f008db185276ab640301537e77f69198cc813` / `38070879128` | 拒绝，13/16；原生 error 5 与清理前线程／子任务等待失败 | `/tmp/sdk-0.7.2-ci-review-final` |
+| `9f1a89cd288b6f668e974b53a92b63c1df720186` / `38072471150` | 拒绝，8/16；调用 TerminateProcess 前原生就绪失败；绑定／归档断言失败 | `/tmp/sdk-0.7.2-ci-review-windows` |
+| `bc81948b5902f8c62656ad471a49203755123bec` / `38073452663` | 拒绝，14/16；ACK 完成窗口耗尽；合成读取器设置失败 | `/tmp/sdk-0.7.2-ci-review-bounded-native` |
+| `8565879c43da75caf8fc3894817ff17ce2bbd4aa` / `38074669771` | 拒绝，13/16；正向 claim、README 10 秒等待与有界分页检查失败 | `/tmp/sdk-0.7.2-ci-review-reader-inputs` |
+| `9c22aa7dd7717d3f9cfa8336f61d636c8d079c2d` / `38075962705` | 拒绝，14/16；压力屏障／闹钟断言失败；ARM 主机 x64 模拟的 public parent 返回原始 SQLITE_BUSY | `/tmp/sdk-0.7.2-ci-review-linear-notes` |
+| `0bdfbc533a02a0e47e80e8d2edb72afc3b2c623f` / `38077104301` | 拒绝，14/16；原生 ARM 慢 arm tokenless 准入前失败，并假设策略异步激活 | `/tmp/sdk-0.7.2-ci-review-public-diagnostics` |
+| `3890c70acf7f14b30182d1d288bd2140ab80a0fe` / `38078791584` | 拒绝，14/16；取消准备缺阶段证据；收据准备耗时 .3 秒；原生及过期租约 pending 快照被误认为最终状态 | `/tmp/sdk-0.7.2-ci-review-bounded-arm-preparation` |
+| `4c8cfad75bcf4552c1d4c4196ca5fadad74e2bd5` / `38080304386` | 拒绝，15/16；第二次 quiet telemetry 刷新在 .03 秒后回滚；具体错误／物理延迟未知 | `/tmp/sdk-0.7.2-ci-review-retained-settlement-windows` |
+| `d903dd64f019d62f4cf2b0455ed860ccdad20bb5` / `38081411687` | 拒绝，14/16；缺少清理前原子／准入诊断及 pending 收据归档 | `/tmp/sdk-0.7.2-ci-review-quiet-refresh-windows` |
+| `5febea19339b8ee0b299524f937ff11394b0e019` / `38082849962` | 拒绝，13/16；将 unknown 重放当作成功；double-fork 超时快照仍 pending；健康 .25 秒启动准入失败；ACK 后中断夹具 .1 秒采样窗口早于断言耗尽 | `/tmp/sdk-0.7.2-ci-review-admission-and-receipt` |
+| `91234f3b710910e82f980f9cd00bb0eda0451ce0` / `38084242976` | 拒绝，15/16；静默取消在原 100ms supervision 准入窗口内被拒，未调用 Runtime.cancel；历史控制锁持有者未知；一项通过的 ARM3.12 清理前诊断文件因重入 deque 变更而缺失 | `/tmp/sdk-0.7.2-ci-review-progress-and-owner` |
+| `d85a28b84120aebbe25e8318d3b81a39d4bce9a7` / `38085799411` | 拒绝，14/16；x64/Python3.11 超时后重新查 PID，未保留原后代身份；native ARM/Python3.11 将进入前请求拒绝误判为控制体已进入；物理原因未知 | `/root/HDDworkspace/sdk-release-evidence/0.7.2-d85a28b` |
+| `44eeda928d8c4c969eaf40a05cf3468181f663d6` / `38087301356` | 拒绝，12/16；ARM3.12 parent 结果等待在原 8 秒期限内耗于 verify 写入；x64/Python3.10 claim 采样过期；ARM3.13 returned.json PermissionError13 且无 WinError；ARM 主机 Python3.10 x64 模拟旧序列重放在 BEGIN 前过期，保留 committed seq2/count3；物理原因及缺失的原始 owner 未知 | `/root/HDDworkspace/sdk-release-evidence/0.7.2-44eeda9` |
+| `5fad028` / `38076988858` | 发现文档 CLI 不匹配后取消；无验收，也不推断部分通过 | `/tmp/sdk-0.7.2-ci-review-original-errors` |
+| `b0a62a198ecfaca4cec2c8655ac26b69807dd092` / `38090932207`，attempt 1 | 拒绝；原始矩阵已完成：16 个环境中 9 个通过、7 个失败。各环境均报告 1,206 项测试；Linux 环境各跳过 18 项，Windows 环境各跳过 58 项。失败：Windows x64/Python3.11、3.12 的 `test_live_delivery_inherits_original_expired_control_before_response_read`；Windows ARM64/Python3.12 的 `test_actual_receipt_contention_retries_inside_same_window_and_enforces_stronger_floor`；Windows ARM 主机/Python3.10 x64 模拟的 `test_advancing_batch_rechecks_a_concurrent_committed_replay`（ERROR），以及 `test_recorder_close_keeps_source_facts_when_process_observer_is_incomplete` 的 4 个子测试；Windows x64/Python3.10 的 `test_public_child_result_survives_kernel_writer_held_until_wait_cutoff`；Windows ARM64/Python3.13 的 `test_live_delivery_waits_out_foreign_ancestor_guard_without_ack`、`test_unstarted_cancelled_child_preserves_original_refusal_without_result_read`、`test_unstarted_queued_child_preserves_original_refusal_without_result_read`；Windows ARM64/Python3.11 的 `test_recorder_close_keeps_source_facts_when_process_observer_is_incomplete` 的 6 个子测试。原始 run 结论为 failure，发布包不具资格。不推断物理原因。保留全部 18 份日志、16 个原生 bundle 和发布包。 | `/root/HDDworkspace/sdk-release-evidence/0.7.2-b0a62a1`（离线审计：`/tmp/next-candidate-tooling/audit-b0a62a1-final/acceptance-review.json`） |
+| `cc6f20bbf88f9103e2d7a55da86fa2fd8b828ea5` / `38092439819`，attempt 1 | 拒绝；原始矩阵已完成：16 个环境中 14 个通过、2 个失败。其余 14 个通过环境包括 Windows ARM64/Python3.11、3.12 原生运行，以及 Windows ARM 主机/Python3.10 x64 模拟。Windows ARM64/Python3.13：public marker 读取因 `PermissionError` errno 13 且无 WinError 而失败；未运行完整安装套件；外层 consumer 为 5 项测试/31.400 秒。Linux x64/Python3.13：安装套件 1,206 项/311.530 秒/18 项跳过；外层五项 consumer 耗时 329.277 秒。`test_unstarted_cancelled_child_preserves_original_refusal_without_result_read` 场景确已执行，但其原始 `InspectionBudgetExceeded` 在 `store.request` 处逃出过时的类型断言，后续语义断言未执行。原始 run 结论为 failure；不具备验收资格。该失败候选的原始包不能作为发布输入；早先离线审计的精确包资格字段仍为 pending。官方 `release_candidate.py find --require` 退出码为 1；stderr 说明该 run 以 completed/failure 结束且没有完整 CI 验收与保留包，因此原包不具备发布资格。不推断物理原因。保留全部 18 份日志、16 个原生 bundle，以及已下载的包 artifact `11684358692`。 | `/root/HDDworkspace/sdk-release-evidence/0.7.2-cc6f20b`（离线审计：`/tmp/sdk-0.7.2-local/audit-cc6f20b-final/acceptance-review.json`，`acceptance_status=rejected`，raw-contract review rejected） |
+
+
+## 历史 0.7.1 实施状态（2026-10-06）
 
 范围于 2026-10-04 修订为 SDK 自身；ModPort 由应用侧适配。实施与交付已完成。
 
@@ -442,7 +539,7 @@ A16 使用 SDK 仓库自有的独立消费程序，从源码目录外导入已�
 必须跨越操作回合的 Run 使用持久服务托管，验证启动命令返回后仍存活；重启接续同一冻结 Run 和原预算。
 短验收进程可以在有界测试 harness 内完成，不把会话 exec 当作长期部署。
 
-## 执行与交付记录
+## 历史 0.7.1 执行与交付记录
 
 | 阶段 | 当前状态 | 后续必须记录 |
 | --- | --- | --- |

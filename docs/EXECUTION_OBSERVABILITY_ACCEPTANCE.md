@@ -6,7 +6,277 @@ provider requests and changes to other projects have separate acceptance require
 The historical integration records below remain available; they do not satisfy the
 revised SDK-only A16.
 
-## Current status, 2026-10-06
+## Current 0.7.2 status, 2026-10-11
+
+SDK-only `0.7.2` acceptance: **accepted**. T01–T09,
+A01–A18 and G1–G5: **passed within current applicable SDK scope; unchanged-layout older-writer experiment is not newly applicable**. Accepted commit
+`524e1ff6e270ea0862fda2459270d4b26311e3ef`; original full matrix
+[38093366109](https://github.com/FlightDan/dispatcher-sdk/actions/runs/38093366109), attempt `1`,
+started `2026-10-10T22:58:18Z`; its last original job completed
+`2026-10-10T23:14:11Z` (actual job timestamps).
+Admission/history scanning: `candidate and secrets original jobs success; all prior rejected/cancelled candidates preserved and ineligible`.
+All sixteen original environment verdicts: `{"original_matrix_jobs":16,"passed":16,"failed_jobs":[]}`.
+
+The table records actual emitted installed-test counts; no expected count is substituted for original job output.
+Each environment's actual installed suite, import and duration is recorded below;
+its original 900-second suite allowance was not renewed. Original logs,
+metadata, native artifacts and the complete audit are retained at
+`/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff` / `/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/acceptance-review.json`.
+
+| Environment | Actual installed methods | Suite seconds | Actual skips | Actual SDK import |
+| --- | ---: | ---: | --- | --- |
+| Linux x64 / Python 3.10 | 1206 | 313.754 | 18 | `/tmp/tmpoptx7n1e/venv/lib/python3.10/site-packages/dispatcher_sdk/__init__.py` |
+| Linux x64 / Python 3.11 | 1206 | 299.619 | 18 | `/tmp/tmpp4svxzam/venv/lib/python3.11/site-packages/dispatcher_sdk/__init__.py` |
+| Linux x64 / Python 3.12 | 1206 | 309.547 | 18 | `/tmp/tmp5s6yfiem/venv/lib/python3.12/site-packages/dispatcher_sdk/__init__.py` |
+| Linux x64 / Python 3.13 | 1206 | 308.328 | 18 | `/tmp/tmpxfrr131k/venv/lib/python3.13/site-packages/dispatcher_sdk/__init__.py` |
+| Linux ARM64 / Python 3.10 | 1206 | 312.846 | 18 | `/tmp/tmp8iih78y5/venv/lib/python3.10/site-packages/dispatcher_sdk/__init__.py` |
+| Linux ARM64 / Python 3.11 | 1206 | 295.548 | 18 | `/tmp/tmp8ynkjg55/venv/lib/python3.11/site-packages/dispatcher_sdk/__init__.py` |
+| Linux ARM64 / Python 3.12 | 1206 | 300.007 | 18 | `/tmp/tmpnr1p9vkw/venv/lib/python3.12/site-packages/dispatcher_sdk/__init__.py` |
+| Linux ARM64 / Python 3.13 | 1206 | 303.878 | 18 | `/tmp/tmpmvurnbgh/venv/lib/python3.13/site-packages/dispatcher_sdk/__init__.py` |
+| Windows x64 / Python 3.10 | 1206 | 503.856 | 58 | `C:\Users\RUNNER~1\AppData\Local\Temp\tmphcg70shi\venv\lib\site-packages\dispatcher_sdk\__init__.py` |
+| Windows x64 / Python 3.11 | 1206 | 657.825 | 58 | `C:\Users\RUNNER~1\AppData\Local\Temp\tmpknxdvshs\venv\Lib\site-packages\dispatcher_sdk\__init__.py` |
+| Windows x64 / Python 3.12 | 1206 | 581.502 | 58 | `C:\Users\RUNNER~1\AppData\Local\Temp\tmpmik5_gh3\venv\Lib\site-packages\dispatcher_sdk\__init__.py` |
+| Windows x64 / Python 3.13 | 1206 | 349.678 | 58 | `C:\Users\RUNNER~1\AppData\Local\Temp\tmp9fxqxgfh\venv\Lib\site-packages\dispatcher_sdk\__init__.py` |
+| Windows ARM host / Python 3.10 x64 emulation | 1206 | 650.096 | 58 | `C:\Users\RUNNER~1\AppData\Local\Temp\tmp0umyxca6\venv\lib\site-packages\dispatcher_sdk\__init__.py` |
+| Windows ARM64 / Python 3.11 | 1206 | 705.909 | 58 | `C:\Users\RUNNER~1\AppData\Local\Temp\tmp30hfm4gz\venv\Lib\site-packages\dispatcher_sdk\__init__.py` |
+| Windows ARM64 / Python 3.12 | 1206 | 562.621 | 58 | `C:\Users\RUNNER~1\AppData\Local\Temp\tmptxamfcg1\venv\Lib\site-packages\dispatcher_sdk\__init__.py` |
+| Windows ARM64 / Python 3.13 | 1206 | 526.468 | 58 | `C:\Users\RUNNER~1\AppData\Local\Temp\tmpywymcoye\venv\Lib\site-packages\dispatcher_sdk\__init__.py` |
+
+Actual external `site-packages` imports/version: `{"actual_versions":["0.7.2"],"environment_count":16,"actual_paths":"per-environment table; interpreters in original matrix audit"}`.
+Required applicable native-case coverage counts:
+`{"linux_environments":8,"windows_environments":8,"original_matrix_jobs":16,"successful_matrix_jobs":16,"installed_suite_cases_per_environment":1206,"installed_skips_linux":18,"installed_skips_windows":58,"public_scenarios_per_environment":5,"restart_commands_per_environment":6,"canonical_writer_delay_witnesses":16,"native_posix_heldresponse_success_rawfailure_witnesses":16,"native_windows_error5_samehandle_witnesses":8,"native_windows_timeout_samehandle_witnesses":8,"native_windows_cancel_close_witnesses":16,"synthetic_observer_close_receipts":112,"physical_collector_close_records":112,"raw_concurrent_journal_publications":16,"raw_native_controller_cleanup_restart_witnesses":16,"reopened_externalclaim_unknown_reports":16,"pending_platforms":[],"native_scenarios":152,"pressure_scenarios":80}`. Independent evidence-review verdicts:
+`{"native_contracts":"clean_with_documented_evidence_limits","scenario_scope":"scope_clean"}`. Five public scenarios, five typed consumers,
+source/rebuild checks, six restart commands, documentation and examples coverage:
+`{"full_installed_suites":16,"public5_passed":16,"actual_import_version_path_records":16,"six_restart_complete":16,"types_passed":16,"types5_passed":16,"type_source_files_reported":80,"type_emission_count":16,"docs_passed":16,"portable_examples_passed":16,"attempt_matrix_jobs":16,"attempt_execution_artifacts":16,"support_job_logs_expected":2}`.
+Current actual scenario-to-review mapping:
+`{"A01-A03":"current native startup/entry/output/clock cases","A04-A07":"current execution budget/authority/child/capacity cases","A08-A09":"current exact-generation cleanup/restart/observer contracts","A10-A12":"current stall/evaluator/crash/notification cases with ACK boundaries","A13":"16 original pressure runs:10000 summaries/201 bounded pages each","A14":"current explicit upgrade/history/binding/no implicit mutation regression; layout unchanged from0.7.1","A15-A18":"current public5/types5/docs/examples/restart6/full installed suites","T01-T09/G1-G5":"current applicable regression and independent source/raw reviews; limitations below"}`; retained private review JSON paths:
+`["/tmp/sdk-0.7.2-local/raw-review-524e1ff-final.json","/tmp/sdk-0.7.2-local/current-scenario-raw-review-524e1ff.json"]`. Original CI and artifact evidence:
+[current original CI and artifact evidence](https://github.com/FlightDan/dispatcher-sdk/actions/runs/38093366109).
+README output/skip totals and document link counts:
+`{"all_environments_local_links":635,"Linux_README":{"passed":4,"skipped":0},"Windows_README":{"passed":2,"skipped":2,"reason":"two POSIX-marked examples"}}`.
+
+| Environment | Public scenarios | Types | Source/rebuild | Restarts | Docs / README | Portable examples |
+| --- | --- | --- | --- | --- | --- | --- |
+| ubuntu-latest / Python 3.10 / x64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 334.743s | 6/6 returncode=0 | Checked 635 local links; 4 README examples passed, 0 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:04:30.1822990Z Wake conversation-42: succeeded","2026-10-10T23:04:30.1823543Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186250.log"} |
+| ubuntu-latest / Python 3.11 / x64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 319.242s | 6/6 returncode=0 | Checked 635 local links; 4 README examples passed, 0 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:04:10.6046402Z Wake conversation-42: succeeded","2026-10-10T23:04:10.6046831Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186244.log"} |
+| ubuntu-latest / Python 3.12 / x64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 328.482s | 6/6 returncode=0 | Checked 635 local links; 4 README examples passed, 0 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:04:21.5672207Z Wake conversation-42: succeeded","2026-10-10T23:04:21.5672545Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186261.log"} |
+| ubuntu-latest / Python 3.13 / x64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 327.084s | 6/6 returncode=0 | Checked 635 local links; 4 README examples passed, 0 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:04:21.5184900Z Wake conversation-42: succeeded","2026-10-10T23:04:21.5185410Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186297.log"} |
+| ubuntu-24.04-arm / Python 3.10 / arm64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 333.376s | 6/6 returncode=0 | Checked 635 local links; 4 README examples passed, 0 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:04:28.2552920Z Wake conversation-42: succeeded","2026-10-10T23:04:28.2553643Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186290.log"} |
+| ubuntu-24.04-arm / Python 3.11 / arm64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 313.051s | 6/6 returncode=0 | Checked 635 local links; 4 README examples passed, 0 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:04:06.5158245Z Wake conversation-42: succeeded","2026-10-10T23:04:06.5159062Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186319.log"} |
+| ubuntu-24.04-arm / Python 3.12 / arm64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 316.742s | 6/6 returncode=0 | Checked 635 local links; 4 README examples passed, 0 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:04:11.7116894Z Wake conversation-42: succeeded","2026-10-10T23:04:11.7117345Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186426.log"} |
+| ubuntu-24.04-arm / Python 3.13 / arm64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 320.774s | 6/6 returncode=0 | Checked 635 local links; 4 README examples passed, 0 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:04:14.2906171Z Wake conversation-42: succeeded","2026-10-10T23:04:14.2906889Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186310.log"} |
+| windows-latest / Python 3.10 / x64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 538.074s | 6/6 returncode=0 | Checked 635 local links; 2 README examples passed, 2 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:08:29.2808301Z Wake conversation-42: succeeded","2026-10-10T23:08:29.2808748Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186282.log"} |
+| windows-latest / Python 3.11 / x64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 697.296s | 6/6 returncode=0 | Checked 635 local links; 2 README examples passed, 2 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:11:28.5845013Z Wake conversation-42: succeeded","2026-10-10T23:11:28.5845457Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186322.log"} |
+| windows-latest / Python 3.12 / x64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 616.999s | 6/6 returncode=0 | Checked 635 local links; 2 README examples passed, 2 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:10:08.2833466Z Wake conversation-42: succeeded","2026-10-10T23:10:08.2833846Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186269.log"} |
+| windows-latest / Python 3.13 / x64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 371.595s | 6/6 returncode=0 | Checked 635 local links; 2 README examples passed, 2 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:05:36.8698952Z Wake conversation-42: succeeded","2026-10-10T23:05:36.8699236Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186275.log"} |
+| windows-11-arm / Python 3.10 / x64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 705.807s | 6/6 returncode=0 | Checked 635 local links; 2 README examples passed, 2 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:13:10.8163578Z Wake conversation-42: succeeded","2026-10-10T23:13:10.8163878Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186359.log"} |
+| windows-11-arm / Python 3.11 / arm64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 757.000s | 6/6 returncode=0 | Checked 635 local links; 2 README examples passed, 2 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:13:56.1426773Z Wake conversation-42: succeeded","2026-10-10T23:13:56.1427190Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186274.log"} |
+| windows-11-arm / Python 3.12 / arm64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 607.780s | 6/6 returncode=0 | Checked 635 local links; 2 README examples passed, 2 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:09:47.1279494Z Wake conversation-42: succeeded","2026-10-10T23:09:47.1279865Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186324.log"} |
+| windows-11-arm / Python 3.13 / arm64 | 5 / passed=True | Success: no issues found in 5 source files | Ran 5 tests in 566.682s | 6/6 returncode=0 | Checked 635 local links; 2 README examples passed, 2 skipped | {"steps":{"Run portable examples":"success","Run script notification example":"success"},"observability_result":[{"parsed":true,"status":"succeeded","error":null,"child_status":"succeeded","child_byte_count":25}],"script_notification":["2026-10-10T23:08:51.7430744Z Wake conversation-42: succeeded","2026-10-10T23:08:51.7431115Z report ready"],"raw_record":"/root/HDDworkspace/sdk-release-evidence/0.7.2-524e1ff/job-114334186317.log"} |
+
+Reviewed platform/privilege skips: `{"source":"/tmp/sdk-0.7.2-local/current-skips-final-524e1ff.json","named_skip_predicates":"All16 environments matched current method/class predicates; no unmatched reason","families":{"ubuntu":{"per_environment_count":18,"reason_counts":{"'requires real native Windows Job Objects'":16,"'requires real Windows file sharing'":2}},"windows":{"per_environment_count":58,"reason_counts":{"'requires native POSIX process isolation'":1,"'requires Linux subreaper and supervisor processes'":1,"'requires Linux process containment'":2,"'requires native POSIX process containment'":2,"'requires POSIX fork isolation'":14,"'native Windows has process isolation without fork'":1,"'requires Linux subreaper process isolation'":2,"'requires POSIX process containment'":1,"'fork is unavailable'":1,"'process receipt test uses POSIX fork'":1,"'POSIX startup guard'":1,"'requires POSIX native alarm'":1,"'shared cgroup clues are a Linux-specific scenario'":1,"'requires native Linux multiprocessing'":1,"'requires native Linux process identity'":1,"'requires native Linux process identity and pipe select'":1,"'requires native Linux process birth identity'":1,"'requires real POSIX process containment'":6,"'requires Linux subreaper process containment'":6,"'requires Linux clone and subreaper process containment'":2,"'requires actual POSIX process containment'":1,"'requires real POSIX isolation'":2,"'requires Linux suspend-inclusive native clock'":1,"'scripts require POSIX fork process containment'":1,"'requires POSIX fork process supervision'":3,"'symlink creation can require Windows privileges'":1,"'requires native POSIX alarm'":1,"'non-Windows refusal path'":1}}}}`.
+Current original-run evidence limits and native witness review: `{"material_gaps":[],"delivery_sample_limits":["Current native file-publication denial fixture uses synthetic file/process controls. Actual share-zero returned.json denial is separately retained supplemental installed x64Python3.11 proof covering transient and persistent cases, not native outcome.json or real definite ACL5.","Native ERROR5 termination evidence proves exited same-HANDLE race only. Generic definite ACL5 and non-signalled wait/error negatives are synthetic classifier controls; no arbitrary ACCESS_DENIED recovery claim.","Cancellation saved cleanup-before-cancel/reopen tests pass individually in all16 original installed logs, but their TemporaryDirectory raw stores are gone. Retained native controller-crash/restart notes independently show old exact identity/source cleanup and successor admission denial. Reader negatives have retained synthetic inputs/rawSQL, not individual serialized reports for each negative.","Observer negative responses are synthetic, coupled to real recorder/journal writes and current source SQL assertions. Main/WAL/SHM files were not queried or modified. Physical observer closure records remain separate; unknown process metadata does not become known just because collection is complete.","Windows native close can return SDK running while native processes/collectors are contained; physical cleanup is not canonical business completion.","Windows ARM64 Python3.11,3.12,3.13 are native machineARM64. Windows ARMhostPython3.10 is machineAMD64 x64 emulation.","POSIX heldresponse native success/rawfailure tests are inapplicable on Windows, whose canonical writer-cutoff fixture runs threads with actual SQLite contention.","Concurrent external publisher uses synchronousOFF to prove committed visibility; SDK remainsFULL. This is not a power-loss durability witness.","Passing original named assertions establish comparisons/no-mutation not separately encoded in every retained raw file. Pressure readonly dump equality is test-asserted; retained pages independently expose exact count/size/cursors/timing.","Actual PIDs/entry markers/resident memory establish native process execution/capacity; no remote sandbox disposal or all namespace security properties claimed. Thread isolation retains documented process-local limitations.","Native cleanup receipts/ready markers do not establish unrecorded actual double-fork/setsid entry or reaping. Complementary reviewer owns exact same-HANDLE proof.","Stall bridged outbox and pressure processing/pending inbox are publication/receipt facts, not ACK. Later ACK/replay assertions require their original named passing methods; business success is separate from sampled-clock ACK and delivery.","Permission error handling does not identify historical physical ACL/sharing causes. SQL trace includes admission; physical lock owner/hold duration remains unknown absent witness.","Historical rejected/cancelled evidence supplies no current pass result. Original package eligibility/publication/readback remain primary-owned.","CPython3.13 emitted ResourceWarning unclosed database text in some original method blocks; every affected block ended ok and original suite passed. This review does not attribute each warning or infer a live resource leak from garbage collection output."]}`.
+Test outcomes do not establish actual fork/setsid creation or process reaping without
+the corresponding native witness; business success is not delivery ACK proof.
+Windows ARM-host Python 3.10 remains x64 emulation, not native ARM64 CPython evidence;
+Linux-only examples remain explicitly inapplicable on Windows.
+
+The SDK correction reads exact-generation native cleanup notes from the
+Kernel-bound settlement journal, including after restart, with note source/ID
+separate from cancellation receipt identity. Missing, malformed or mismatched
+proof remains unknown; local process cleanup does not establish sandbox disposal.
+Windows termination error 5 establishes an exit race only when the same acquired
+process handle is signalled; live/unknown state and other errors remain failures.
+Settlement-note encoding now performs linear page work while preserving the
+original time/byte caps, cursor and incomplete-evidence rules.
+
+Native Windows result publication preserves the original permission refusal after
+containment if the same result remains unreadable. Recognized sharing refusals and
+ambiguous `PermissionError` errno 13 without WinError stay within the original
+watchdog window, and success requires rereading that same file. Errno 13 alone
+establishes neither sharing nor ACL denial; recognized permanent errors remain
+immediate.
+Admitted child response observation uses a factual parent-authority read without
+a Kernel writer, retaining exact lease/ancestor guards and original deadlines.
+Never-claimed queued/cancelled children with legal zero attempt/fence identities
+preserve the original wait refusal instead of inventing malformed ancestry.
+Committed observation-batch replay uses one connection and a sequence proof;
+missing proof still requires atomic admission under the same original deadline.
+Final process-collector negatives propagate through recorder and native outcome
+receipts. Batch persistence/source closure remain separate factual fields, and
+neither later ownership drain nor business success upgrades incomplete telemetry.
+The exit137 fixture shares its original two-second process-wait allowance with
+bounded read-only durable readiness, retains the exact registration identity and
+unchanged final status/signal/OOM assertions, and saves final collector/SQL evidence.
+Its earlier missing-publication cause remains unknown. The original local installed
+suite (1,201 methods/868.028s, one failure/18 skips) remains rejected; directed final
+installed integration subsequently passed Linux24/31.866s and native Windows34/22.801s
+(one platform skip), with docs635/four README examples. These local checks do not
+replace the original sixteen-environment acceptance recorded above.
+
+Authorized fixture/example choices are separate from SDK budgets. The portable
+process example uses child/parent/caller margins of 30/60/120 seconds. The path
+portability fixture uses one 30-second attempt and at most five seconds to publish
+its original retained result, without another dispatch. Other corrections preserve
+existing admission/maintenance windows, canonical cancellation-winner assertions,
+native readiness/stop bounds and timeout negatives. Synthetic reader inputs are
+seeded separately from the unchanged production note writer. The alarm fixture
+retains its original 100ms capture and two-second process limit, distinguishing
+an arm COMMIT that consumed the original window from a still-live capture.
+The slow-arm fixture records requested begin separately from sticky actual original control-manager entry. It retries only a proven refusal before that entry inside its
+original ten-second child constraint; any entered, rolled-back, armed or uncertain sample
+and every other exception stops unchanged. Its target10ms, refusal20ms and
+same-owner100ms acknowledgement remain unchanged. The wait-owner fixture uses
+the actual claimed identity; policy activation/replay retain independent coverage.
+
+Failure diagnostics retain original errors, SQLite codes, clocks, supplied
+identity/budgets, process/thread stacks and bounded reads before cleanup in the
+README checker, public child/progress consumer, thread, binding and pressure
+fixtures. README snippets, `Task.wait(10)` and subprocess limit 30 remain unchanged;
+the public consumer remains parent20/child8/tool4 (blocked tool1.2)/caller25, and
+the pressure race retains its original 3/5/15-second waits and task10 assertions.
+The standalone consumer is invoked with `--evidence-dir`; the fixture environment
+variable is not its CLI. Reopened cancellation keeps default1s and per-admission100ms, retaining raw stages before cleanup.
+The positive receipt fixture retains its original1s bound, the +0.3s stronger-floor
+assertion and a 0.25s writer hold. Those limits are distinct from the persistent
+receipt fixture's one producer enqueue within its original300ms window and50ms write
+cap; it does not retry preparation.
+The public join/maintenance fixture retains its original3s window, capped by
+parent12s, child5s and proof0.1s. The concurrent external publisher is enabled only
+in `SDKFULL`, whose original0.03s wait is unchanged.
+Segmented native join and retained-result publication share the original15s finish deadline, with12s task and100ms control calls unchanged.
+Expired-lease receipt archiving shares one original500ms maintenance deadline and retains100ms clock proof, timeout/fence assertions and one invocation.
+The invalid-details fixture still requires its first valid publication and makes
+exactly two `write_batch` calls, each under its original30ms bound, with no retry.
+A quiet second refresh may defer only for the exact write-budget exception with
+confirmed rollback and preserved durable/local observations; all other failures
+remain fatal. No new write window is added.
+The double-fork timeout fixture anchors same-result publication and all post-run observation to
+its original 250ms window; execution20ms, descendant sleep150ms and handler1s remain unchanged.
+Directed local probes verify immutable pending-result publication and callbacks; they do not
+establish actual double-fork creation or reaping, which must be assessed from native witnesses.
+The segmented producer retains both original progress calls and requires confirmed state before
+reading replay fields; an unknown confirmation remains an acceptance failure. Startup-capacity
+and post-ACK interruption fixtures retain their original250ms/100ms admission windows,
+healthy success, exact interruption, owner and capacity assertions while recording original
+stages before cleanup. SQL scheduling and physical lock causes without witnesses remain unknown.
+The public silent cancellation consumer now retains bounded control scopes, original SQL
+call timings and live driver thread stacks before observation or cleanup. Its task12s,
+caller15s, stall200ms/two windows, supervision100ms and cancellation1s are unchanged;
+refused supervision still fails without a cancellation call or retry. Primary errors
+survive secondary evidence formatting, writing, inspection and close failures.
+The child-admission diagnostic snapshots its trace queue before dictionary allocation,
+so same-thread connection cleanup cannot mutate an active queue traversal. Its original
+10ms trace admission, 100ms readonly cap and all business calls remain unchanged.
+Local paired verification exposed real child pre-entry timeout failures; one subsequent
+serial source/install comparison passed with unchanged limits. All evidence is retained;
+physical scheduling/storage causes are not established.
+The native timeout fixture acquires the original live Job-member descendant HANDLE before termination and requires that same HANDLE be signalled immediately at return, with no additional grace. Focused installed Windows3.11.9 positive validation passed; a directed live-descendant negative failed at this exact assertion and its own Job then reached active0. Holding the identity witness can prevent PID reuse; historical PID7400 cause remains unknown.
+The atomic race and two child admission fixtures retain original calls, waits and assertions;
+diagnostics copy existing envelopes without sampling. The receipt-writer fixture publishes
+the same original result within its original 500ms maintenance/100ms archive caps.
+No business retry or SDK budget extension was added.
+
+The historical test-only follow-up corrected five Windows-facing fixtures without
+changing SDK runtime behavior: it held the real child-result publisher before its
+transaction and recovered the same result inside the original parent deadline;
+compared child-read refusals with the retained effective deadline and recorded short
+control-lock expiry before the outer deadline; bound receipt-read setup to its
+original projected/store context without diagnostic budget samples; preserved
+replay-read and concurrent publisher-commit phases when reporting failed; and
+compared the recorder observer share with its one absolute close deadline. That
+close remained bounded by the original0.4s, with one quarter of its remaining time
+for the observer and no fresh0.1s allowance. The public join/maintenance fixture
+kept its original3s window, capped by parent12s, child5s and proof0.1s. The
+concurrent external publisher remained off except in `SDKFULL`, whose original
+0.03s wait was unchanged. Focused historical fixture evidence only: Linux 9
+cases/10.910s; native Windows Python 3.13 9 cases/9.212s; native Windows Python
+3.11 initially 8/9, followed by the corrected public-result and journal-replay
+fixtures passing 2/2 in 5.443s. These results do not establish the installed
+full-suite or sixteen-environment acceptance.
+
+The current `524e1ff` candidate additionally carries the public marker-reader
+correction and a precise inspection-fixture record. The inspection fixtures are
+`test_unstarted_cancelled_child_preserves_original_refusal_without_result_read`
+and `test_unstarted_queued_child_preserves_original_refusal_without_result_read`.
+In the rejected `cc6f20b` run, the cancelled scenario did run: its original
+`InspectionBudgetExceeded` escaped the obsolete type assertion at `store.request`,
+so later semantic assertions were not reached. The current test assertion preserves
+that exact refusal. This record is separate from the historical five-fixture
+follow-up and does not establish acceptance for `524e1ff`.
+
+A business result, canonical winner, durable settlement and sampled-clock ACK are
+different facts; one cannot establish the others. Historical causes without
+original witnesses remain unknown, including prior README waits, pressure
+pre-barrier disposition and the raw parent SQLite callsite/lock owner.
+
+### Preserved 0.7.2 rejected and cancelled candidates
+
+| Candidate / original CI | Historical outcome and failure boundary | Retained evidence |
+| --- | --- | --- |
+| `bc3e6c06c47ce681017f5be002b596e5b0d43f5e` / `38066968577` | Rejected, 15/16; portable example child-wait failure, underlying stage unproved | `/tmp/sdk-0.7.2-ci-review` |
+| `7ce574a22b75ad331bf414cebb988fbf88fca252` / `38068198876` | Rejected, 14/16; restore snapshot and child setup assertions | `/tmp/sdk-0.7.2-ci-review-corrected` |
+| `980f008db185276ab640301537e77f69198cc813` / `38070879128` | Rejected, 13/16; native error5 and pre-cleanup thread/child-wait failures | `/tmp/sdk-0.7.2-ci-review-final` |
+| `9f1a89cd288b6f668e974b53a92b63c1df720186` / `38072471150` | Rejected, 8/16; native readiness failed before TerminateProcess; binding/archive assertions | `/tmp/sdk-0.7.2-ci-review-windows` |
+| `bc81948b5902f8c62656ad471a49203755123bec` / `38073452663` | Rejected, 14/16; ACK completion window expired; synthetic reader setup failed | `/tmp/sdk-0.7.2-ci-review-bounded-native` |
+| `8565879c43da75caf8fc3894817ff17ce2bbd4aa` / `38074669771` | Rejected, 13/16; positive claim, README10 wait and bounded page inspection failures | `/tmp/sdk-0.7.2-ci-review-reader-inputs` |
+| `9c22aa7dd7717d3f9cfa8336f61d636c8d079c2d` / `38075962705` | Rejected, 14/16; pressure pre-barrier/alarm assertions; ARM-host x64 public parent raw SQLITE_BUSY | `/tmp/sdk-0.7.2-ci-review-linear-notes` |
+| `0bdfbc533a02a0e47e80e8d2edb72afc3b2c623f` / `38077104301` | Rejected, 14/16; native ARM slow-arm tokenless pre-admission and asynchronous policy-activation assumptions | `/tmp/sdk-0.7.2-ci-review-public-diagnostics` |
+| `3890c70acf7f14b30182d1d288bd2140ab80a0fe` / `38078791584` | Rejected, 14/16; cancellation preparation lacks stage witness; receipt preparation consumed .3; native and expired-lease pending snapshots assumed final | `/tmp/sdk-0.7.2-ci-review-bounded-arm-preparation` |
+| `4c8cfad75bcf4552c1d4c4196ca5fadad74e2bd5` / `38080304386` | Rejected, 15/16; second quiet telemetry refresh rolled back after .03s; exact error/physical delay unknown | `/tmp/sdk-0.7.2-ci-review-retained-settlement-windows` |
+| `d903dd64f019d62f4cf2b0455ed860ccdad20bb5` / `38081411687` | Rejected, 14/16; missing pre-cleanup atomic/admission diagnostics and pending receipt archive | `/tmp/sdk-0.7.2-ci-review-quiet-refresh-windows` |
+| `5febea19339b8ee0b299524f937ff11394b0e019` / `38082849962` | Rejected, 13/16; documented unknown replay dereferenced as success; pending double-fork timeout snapshot; healthy .25 startup admission failure; post-ACK interruption fixture .1 capture expired before intended assertion | `/tmp/sdk-0.7.2-ci-review-admission-and-receipt` |
+| `91234f3b710910e82f980f9cd00bb0eda0451ce0` / `38084242976` | Rejected, 15/16; silent cancellation refused its original100ms supervision admission before Runtime.cancel; historical control-lock holder unknown. One passing native ARM3.12 child diagnostic omitted its before-cleanup file after reentrant deque mutation | `/tmp/sdk-0.7.2-ci-review-progress-and-owner` |
+| `d85a28b84120aebbe25e8318d3b81a39d4bce9a7` / `38085799411` | Rejected, 14/16; x64/Python3.11 used a fresh PID lookup after timeout, with original descendant identity unretained; native ARM/Python3.11 requested begin refused before actual control-body entry and was misclassified as entered. Historical physical causes unknown | `/root/HDDworkspace/sdk-release-evidence/0.7.2-d85a28b` |
+| `44eeda928d8c4c969eaf40a05cf3468181f663d6` / `38087301356` | Rejected, 12/16; ARM3.12 public parent result wait consumed its original8s in writing verify, with child publication outside cutoff; x64Py3.10 targeted claim capture expired before cancellation assertion; ARM3.13 returned.json PermissionError13 without WinError; ARM-hostPy3.10x64 old-sequence telemetry replay expired before BEGIN with committed seq2/count3 retained. Physical causes and missing original owners remain unknown | `/root/HDDworkspace/sdk-release-evidence/0.7.2-44eeda9` |
+| `5fad028` / `38076988858` | Cancelled after discovering the documentation CLI mismatch; no acceptance or inferred partial passes | `/tmp/sdk-0.7.2-ci-review-original-errors` |
+| `b0a62a198ecfaca4cec2c8655ac26b69807dd092` / `38090932207`, attempt 1 | Rejected; completed original matrix: 9/16 environments passed, 7/16 failed. Each reported 1,206 tests; Linux environments reported 18 skips each and Windows environments 58 skips each. Failures: Windows x64/Python 3.11 and 3.12, `test_live_delivery_inherits_original_expired_control_before_response_read`; Windows ARM64/Python 3.12, `test_actual_receipt_contention_retries_inside_same_window_and_enforces_stronger_floor`; Windows ARM-host/Python 3.10 x64 emulation, ERROR `test_advancing_batch_rechecks_a_concurrent_committed_replay` plus four subtest failures in `test_recorder_close_keeps_source_facts_when_process_observer_is_incomplete`; Windows x64/Python 3.10, `test_public_child_result_survives_kernel_writer_held_until_wait_cutoff`; Windows ARM64/Python 3.13, `test_live_delivery_waits_out_foreign_ancestor_guard_without_ack`, `test_unstarted_cancelled_child_preserves_original_refusal_without_result_read`, and `test_unstarted_queued_child_preserves_original_refusal_without_result_read`; Windows ARM64/Python 3.11, six subtest failures in `test_recorder_close_keeps_source_facts_when_process_observer_is_incomplete`. Original run concluded failure; package is ineligible. No physical cause inferred. All 18 logs and 16 native bundles plus package retained. | `/root/HDDworkspace/sdk-release-evidence/0.7.2-b0a62a1` (offline audit: `/tmp/next-candidate-tooling/audit-b0a62a1-final/acceptance-review.json`) |
+| `cc6f20bbf88f9103e2d7a55da86fa2fd8b828ea5` / `38092439819`, attempt 1 | Rejected; completed original matrix: 14/16 environments passed, 2/16 failed. The other 14 include native Windows ARM64/Python 3.11 and 3.12 and Windows ARM-host/Python 3.10 x64 emulation. Windows ARM64/Python 3.13: public marker read failed with `PermissionError` errno 13/no WinError; no full installed suite; outer consumer 5 tests/31.400s. Linux x64/Python 3.13: installed suite 1,206 tests/311.530s/18 skips; outer five-case consumer 329.277s. The `test_unstarted_cancelled_child_preserves_original_refusal_without_result_read` scenario did run, but its original `InspectionBudgetExceeded` escaped the obsolete type assertion at `store.request`; later semantic assertions were not reached. Run conclusion failure; no acceptance. Original package cannot be a release input on this rejected run; the earlier offline audit left exact-package eligibility pending. The official `release_candidate.py find --require` exited 1; stderr reports no complete CI acceptance with retained packages for this completed/failure run, so the package is ineligible. No physical cause inferred. All 18 logs, 16 native bundles, and downloaded package artifact `11684358692` retained. | `/root/HDDworkspace/sdk-release-evidence/0.7.2-cc6f20b` (offline audit: `/tmp/sdk-0.7.2-local/audit-cc6f20b-final/acceptance-review.json`, `acceptance_status=rejected`, raw-contract review rejected) |
+
+All original failed/partial logs and artifacts remain preserved and ineligible;
+package artifact `11679525510` from run `38075962705` is not a release input.
+Cancelled-run metadata: attempt `1`, full head
+`5fad0288cd0a044c57e309bb66c1c020d2914171`, started `2026-10-10T18:44:21Z`, last original job completed
+`2026-10-10T18:45:55Z`, conclusion `cancelled`.
+Partial job/command observations, if retained: `18 original logs and10 partial native artifacts retained; no release package or full-suite acceptance inferred`;
+unexecuted checks and incomplete artifacts remain unknown.
+The cancelled candidate differs from `0bdfbc5` only in the three corrected
+consumer CLI documentation/Wiki lines, not SDK/tests.
+
+### Verified publication
+
+Eligible original tested package: run `38093366109`, attempt
+`1`, artifact `{"id":11684882088,"name":"release-packages-38093366109-1","size_in_bytes":1679445}`;
+selection record `/tmp/sdk-0.7.2-local/candidate-524e1ff.json`.
+Tag `v0.7.2`: `{"target":"524e1ff6e270ea0862fda2459270d4b26311e3ef","accepted_target":true,"kind":"tag","API_readback":"/tmp/sdk-0.7.2-local/publication-readback-second/publication-readback.json"}`.
+Publishing workflow [38094704767](https://github.com/FlightDan/dispatcher-sdk/actions/runs/38094704767):
+`{"conclusion":"success","selected_artifact":{"artifact_id":11684882088,"artifact_name":"release-packages-38093366109-1","run_attempt":1,"run_id":38093366109}}`.
+Original tested wheel/sdist reuse, with no rebuild or additional matrix:
+`{"run":{"id":38094704767,"html_url":"https://github.com/FlightDan/dispatcher-sdk/actions/runs/38094704767","conclusion":"success","head_sha":"524e1ff6e270ea0862fda2459270d4b26311e3ef"},"selected_artifact":{"artifact_id":11684882088,"artifact_name":"release-packages-38093366109-1","run_attempt":1,"run_id":38093366109},"source_log":"/tmp/sdk-0.7.2-local/publisher-38094704767.log","raw_selection_line":"release\tDownload the original tested wheel and source distribution\t2026-10-10T23:21:00.4782697Z {'artifact_id': 11684882088, 'artifact_name': 'release-packages-38093366109-1', 'run_attempt': 1, 'run_id': 38093366109}","rebuild":false,"matrix_rerun":false}`.
+
+[Release v0.7.2](https://github.com/FlightDan/dispatcher-sdk/releases/tag/v0.7.2):
+ID `409264867`, published `2026-10-10T23:21:02Z`, draft/prerelease/Latest
+readback `{"draft":false,"prerelease":false,"release_id":409264867,"latest_id":409264867}`.
+[Wheel](https://github.com/FlightDan/dispatcher-sdk/releases/download/v0.7.2/dispatcher_sdk-0.7.2-py3-none-any.whl):
+asset `629237785`, `474762` bytes.
+[sdist](https://github.com/FlightDan/dispatcher-sdk/releases/download/v0.7.2/dispatcher_sdk-0.7.2.tar.gz):
+asset `629237782`, `1213173` bytes.
+Actual published-download version/LICENSE/NOTICE readback:
+`{"source":"actual published Release downloads, not local dist","packages":[{"name":"dispatcher_sdk-0.7.2-py3-none-any.whl","path":"/tmp/sdk-0.7.2-local/published-downloads-actual/dispatcher_sdk-0.7.2-py3-none-any.whl","bytes":474762,"metadata_version":"0.7.2","runtime_source_version":"0.7.2","LICENSE_NOTICE":"present and nonempty","archive_safety":"passed","check":"existing scripts/release_candidate.py check_wheel/check_sdist"},{"name":"dispatcher_sdk-0.7.2.tar.gz","path":"/tmp/sdk-0.7.2-local/published-downloads-actual/dispatcher_sdk-0.7.2.tar.gz","bytes":1213173,"metadata_version":"0.7.2","runtime_source_version":"0.7.2","LICENSE_NOTICE":"present and nonempty","archive_safety":"passed","check":"existing scripts/release_candidate.py check_wheel/check_sdist"}],"verification":"existing metadata/source-version/LICENSE/NOTICE/archive checks only"}`. PyPI publication: `This task published GitHub Release only; no PyPI upload was performed`.
+
+GitHub default branch readback: `{"default_branch":"main","readback":"/tmp/sdk-0.7.2-local/publication-readback-second/publication-readback.json"}`.
+The 21-page English/Chinese Wiki publication commit and direct public page,
+source-link and bilingual-navigation reads: `{"commit":"ac261556ade2174fa6f82d144d4d9d9359548332","pages":21,"repository_ref":"524e1ff6e270ea0862fda2459270d4b26311e3ef","page_reads":[{"name":"Home","url":"https://github.com/FlightDan/dispatcher-sdk/wiki","status":200,"final_url":"https://github.com/FlightDan/dispatcher-sdk/wiki","bytes":242754,"published_ref_visible":true,"english_navigation":true,"chinese_navigation":true,"sidebar_visible":true,"api_link_visible":true,"agent_link_visible":true},{"name":"Home-zh-CN","url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Home-zh-CN","status":200,"final_url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Home-zh-CN","bytes":242803,"published_ref_visible":true,"english_navigation":true,"chinese_navigation":true,"sidebar_visible":true,"api_link_visible":true,"agent_link_visible":true},{"name":"Troubleshooting","url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Troubleshooting","status":200,"final_url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Troubleshooting","bytes":244135,"published_ref_visible":true,"english_navigation":true,"chinese_navigation":true,"sidebar_visible":true,"api_link_visible":true,"agent_link_visible":true},{"name":"Troubleshooting-zh-CN","url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Troubleshooting-zh-CN","status":200,"final_url":"https://github.com/FlightDan/dispatcher-sdk/wiki/Troubleshooting-zh-CN","bytes":243923,"published_ref_visible":true,"english_navigation":true,"chinese_navigation":true,"sidebar_visible":true,"api_link_visible":true,"agent_link_visible":true},{"name":"API","url":"https://github.com/FlightDan/dispatcher-sdk/blob/524e1ff6e270ea0862fda2459270d4b26311e3ef/docs/SDK.md","status":503,"error":"HTTP Error 503: Service Unavailable","read_failed":true},{"name":"DocsforAgents","url":"https://github.com/FlightDan/dispatcher-sdk/blob/524e1ff6e270ea0862fda2459270d4b26311e3ef/DocsforAgents/README.md","status":503,"error":"HTTP Error 503: Service Unavailable","read_failed":true}],"earlier_API_HTML_200":"/tmp/sdk-0.7.2-local/publication-readback-first/API.html","DocsforAgents_HTML_status":503,"DocsforAgents_public_content_API":"/tmp/sdk-0.7.2-local/publication-readback-second/DocsforAgents-content-api.json"}`.
+Release/default/Wiki metadata and downloaded assets are retained at
+`/tmp/sdk-0.7.2-local`.
+These two ledgers are committed after publication; tag and packages retain the accepted pre-ledger commit. Its installed documentation command:
+`{"command":["/tmp/sdk-0.7.2-local/published-doc-check-venv/bin/python","scripts/check_docs.py"],"environment":{"PYTHONPATH":"","SDK_ACCEPTANCE_EVIDENCE_DIR":"/tmp/sdk-0.7.2-local/postpublication-doc-evidence"},"returncode":0,"result":"Checked 636 local links; 4 README examples passed, 0 skipped","interpreter":"/tmp/sdk-0.7.2-local/published-doc-check-venv/bin/python","sdk_import":"/tmp/sdk-0.7.2-local/published-doc-check-venv/lib/python3.12/site-packages/dispatcher_sdk/__init__.py","installed_version":"0.7.2","wheel_source":"/tmp/sdk-0.7.2-local/published-downloads-actual/dispatcher_sdk-0.7.2-py3-none-any.whl","log":"/tmp/sdk-0.7.2-local/postpublication-doc-check.log","limits":"Final inert validation-fact text is inserted after this run; no executable block or link changes in that insertion."}`.
+All 0.7.1 branches, tags, assets and historical evidence remain preserved;
+active development/default-branch policy is `main`. ModPort adaptation remains
+outside this SDK-only acceptance.
+
+
+## Historical 0.7.1 status, 2026-10-06
 
 SDK acceptance and formal delivery passed for `0.7.1`. T01–T09, A01–A18 and
 G1–G5 are complete within the revised SDK-only scope.
@@ -2235,7 +2505,7 @@ crash-journal subprocess exceeded its original default 0.1-second write window
 before commit. Its crash-survival fixture now declares one-second operation
 windows before launch and retains raw stages; the original failure is preserved.
 
-## Candidate and reproducible commands
+## Historical 0.7.1 candidate and reproducible commands
 
 The source version is `0.7.1`. Final evidence must identify the Git commit,
 installed distribution and actual import path, without relying on a version
