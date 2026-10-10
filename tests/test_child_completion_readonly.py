@@ -152,7 +152,7 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
                     patch.object(factual, 'read_completed_result', side_effect=observe_proof), \
                     patch.object(factual, '_read_child_snapshot', wraps=factual._read_child_snapshot) as read, \
                     patch.object(self.kernel, 'claim_and_start', wraps=self.kernel.claim_and_start) as claim:
-                with self.assertRaises((sqlite3.OperationalError, ChildExecutionError)) as caught:
+                with self.assertRaises((sqlite3.OperationalError, ChildExecutionError, InspectionBudgetExceeded)) as caught:
                     self.children._await(row)
                 read.assert_not_called()
                 claim.assert_not_called()
@@ -167,6 +167,9 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
             self.assertIs(caught.exception, errors[0])
             if isinstance(caught.exception, sqlite3.OperationalError):
                 self.assertTrue(is_sqlite_contention(caught.exception), str(caught.exception))
+            elif isinstance(caught.exception, InspectionBudgetExceeded):
+                self.assertIs(type(caught.exception), InspectionBudgetExceeded)
+                self.assertEqual(str(caught.exception), 'inspection timeout exceeded')
             else:
                 # Preparation can consume the same original half-second
                 # before a capture attempts SQL; preserve that exact expiry.
