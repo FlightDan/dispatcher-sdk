@@ -52,6 +52,11 @@ work and hard deadlines, including reserved cleanup time, are described in
 Cleanup failures raise an error and prevent publication of a successful
 execution result.
 
+Descendant termination can race with normal process exit. An
+`ERROR_ACCESS_DENIED` response from `TerminateProcess` is treated as that exit
+race only when the same acquired process handle is signaled. A live process or
+any other termination error remains a cleanup failure.
+
 Termination cannot roll back external mutations. An unfinished effect may need
 explicit reconciliation after its lease expires. The timeout watcher runs in a
 host thread, not a separate watchdog service. Suspending or stopping the entire host

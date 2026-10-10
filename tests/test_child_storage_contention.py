@@ -80,11 +80,15 @@ class ChildStorageContentionTests(unittest.TestCase):
         self.fail("original bounded fixture window expired")
 
     def witness_readiness(self, event, seconds, runtime, driver, outcomes, errors, **facts):
+        wait_started = time.monotonic()
         reached = event.wait(seconds)
+        wait_finished = time.monotonic()
         record = {"readiness_reached": reached, "driver_alive": driver.is_alive(),
             "outcomes": [item.to_dict() for item in outcomes],
             "driver_errors": [{"type": type(error).__name__, "message": str(error)} for error in errors],
             "original_readiness_timeout": seconds,
+            "wait_started_monotonic": wait_started, "wait_finished_monotonic": wait_finished,
+            "original_readiness_deadline": wait_started + seconds,
             **{key: list(value) if isinstance(value, list) else value for key, value in facts.items()}}
         self.evidence["records"].append(record)
         if not reached:
@@ -92,6 +96,19 @@ class ChildStorageContentionTests(unittest.TestCase):
             record["workers"] = [{"name": thread.name,
                 "stack": traceback.format_stack(frames[thread.ident])[-10:]}
                 for thread in threading.enumerate() if thread.ident in frames][:24]
+            try:
+                if not runtime._thread_lock.acquire(timeout=.1):
+                    raise TimeoutError("fixture thread evidence admission elapsed")
+                try:
+                    record["contexts"] = [{"execution_id": generation[0], "attempt": generation[1],
+                        "fence": generation[2], "authority_active": context.effects._is_active(),
+                        "entered": context._entered, "entry_confirmed": context._entry_confirmed,
+                        "budget_envelope": None if context._budget_envelope is None else context._budget_envelope.to_dict()}
+                        for generation, context in tuple(runtime._thread_contexts.items())[:16]]
+                finally:
+                    runtime._thread_lock.release()
+            except Exception as error:
+                record["context_capture_error"] = {"type": type(error).__name__, "message": str(error)}
             for name, operation in (("parent", lambda: runtime.kernel.get("parent").to_dict()),
                                     ("requests", lambda: self.requests(runtime))):
                 try:
@@ -99,6 +116,7 @@ class ChildStorageContentionTests(unittest.TestCase):
                         record[name] = operation()
                 except Exception as error:
                     record[name + "_error"] = {"type": type(error).__name__, "message": str(error)}
+            record["capture_finished_monotonic"] = time.monotonic()
         self.assertTrue(reached, json.dumps(record, indent=2))
 
     def finish(self, driver, outcomes, errors):

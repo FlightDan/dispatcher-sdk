@@ -29,7 +29,7 @@ discovery, see the [integration engineering principles](Engineering-Principles.m
 
 ## Version and scope
 
-These pages describe the 0.7.1 checkout, which requires Python 3.10 or later.
+These pages describe the 0.7.2 checkout, which requires Python 3.10 or later.
 Read documentation from the same revision as your code. Older releases may lack
 these entry points. Before opening an existing database, read
 [storage and upgrades](../docs/STORAGE_AND_UPGRADES.md).

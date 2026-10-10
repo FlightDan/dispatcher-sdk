@@ -31,6 +31,14 @@ Runtime cancellation evidence can be persisted with explicit
 `cancellation_journal_path` and `source_id` options. Receipts use a separate SQLite
 database with schema version 1. Core stores are not automatically migrated. Local process cleanup requires
 the matching execution generation's Linux subreaper or Windows Job proof.
+Even without that optional cancellation journal, `inspect_cancellation` can read
+a matching `process_cleanup` note from the settlement journal bound to the Kernel
+store. This works after Runtime restart and without an attached Runtime. The
+report confirms it only when the Kernel binding, execution ID, attempt and fence
+match and the note says `confirmed` from `runtime_supervisor_reaped`; its note ID
+and source remain separate from cancellation receipt IDs. Missing, malformed or
+foreign notes stay unknown. Confirmed local process cleanup does not resolve a
+pending sandbox-disposal obligation.
 Stopping a Task does not finish its Run.
 
 See the [API guide](../docs/SDK_DIAGNOSTICS_AND_PROJECTIONS.md),

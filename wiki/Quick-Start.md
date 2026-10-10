@@ -2,7 +2,7 @@
 
 [English](Quick-Start.md) | [简体中文](Quick-Start-zh-CN.md) | [Home](Home.md)
 
-Use the 0.7.1 checkout with Python 3.10 or later. From its root:
+Use the 0.7.2 checkout with Python 3.10 or later. From its root:
 
 ```sh
 python -m venv .venv

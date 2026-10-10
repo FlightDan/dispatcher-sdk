@@ -350,7 +350,13 @@ class WindowsProcessHandle:
                                         "IsProcessInJob descendant")
                         # The acquired handle protects identity across PID reuse.
                         if assigned.value and self._api.dll.WaitForSingleObject(process, 0) == _WAIT_TIMEOUT:
-                            self._api.check(self._api.dll.TerminateProcess(process, 70), "TerminateProcess descendant")
+                            if not self._api.dll.TerminateProcess(process, 70):
+                                error = ctypes.get_last_error()
+                                # A process can exit between the wait and termination.
+                                # ERROR_ACCESS_DENIED alone cannot establish its exit.
+                                if (error != 5 or self._api.dll.WaitForSingleObject(
+                                        process, 0) != _WAIT_OBJECT_0):
+                                    raise OSError(error, f"TerminateProcess descendant: {ctypes.FormatError(error)}")
                     finally:
                         self._api.dll.CloseHandle(process)
                 time.sleep(min(_POLL_SECONDS, max(0, until - time.monotonic())))

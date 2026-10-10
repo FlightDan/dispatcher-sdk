@@ -253,6 +253,116 @@ class UnsupportedWindowsBackendTests(unittest.TestCase):
 
 
 class WindowsDescendantContainmentTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "requires real native Windows Job Objects")
+    def test_actual_exited_job_descendant_accepts_native_termination_error(self):
+        root = retained_directory("sdk-windows-descendant-exit-race-")
+        ready, release, parent_ready = root / "ready", root / "release", root / "parent-ready"
+        child = root / "child.py"
+        child.write_text(
+            "import os,sys,time\nfrom pathlib import Path\n"
+            "ready,release=map(Path,sys.argv[1:])\n"
+            "ready.write_text(str(os.getpid()),encoding='ascii')\n"
+            "while not release.exists(): time.sleep(.002)\n", encoding="utf-8")
+        parent = ("import os,subprocess,sys,time; from pathlib import Path; "
+                  "Path(sys.argv[1]).write_text(str(os.getpid()),encoding='ascii'); "
+                  "subprocess.Popen([sys._base_executable,*sys.argv[2:]]); time.sleep(30)")
+        api = _WinAPI()
+        job, info = windows_runtime._create_suspended(api,
+            [sys.executable, "-c", parent, str(parent_ready), str(child), str(ready), str(release)])
+        handle = windows_runtime.WindowsProcessHandle(api, job, info)
+        evidence = {"test": self.id(), "python": sys.executable, "termination_calls": []}
+        try:
+            handle.resume()
+            ready_deadline = time.monotonic() + 5
+            descendant_pid, parent_pid = _read_pid(ready), _read_pid(parent_ready)
+            while (descendant_pid is None or parent_pid is None) and time.monotonic() < ready_deadline:
+                time.sleep(.01)
+                descendant_pid, parent_pid = _read_pid(ready), _read_pid(parent_ready)
+            self.assertIsNotNone(descendant_pid, "native descendant never reached its release gate")
+            self.assertIsNotNone(parent_pid, "native parent never published its interpreter PID")
+            evidence["launcher_pid"] = handle.pid
+            evidence["parent_pid"] = parent_pid
+            handle.preserve_worker(evidence["parent_pid"])
+            evidence["descendant_pid"] = descendant_pid
+            deadline = time.monotonic() + 1
+            terminate = api.dll.TerminateProcess
+
+            def exit_before_termination(process, code):
+                # The real stop loop has already observed this acquired handle
+                # alive. Force exit before its actual TerminateProcess call.
+                release.write_text("release", encoding="ascii")
+                wait = api.dll.WaitForSingleObject(process,
+                    max(0, int((deadline - time.monotonic()) * 1000)))
+                self.assertEqual(wait, windows_runtime._WAIT_OBJECT_0)
+                result = terminate(process, code)
+                error = ctypes.get_last_error()
+                evidence["termination_calls"].append({
+                    "handle": int(process), "result": bool(result), "error": error})
+                ctypes.set_last_error(error)
+                return result
+
+            with patch.object(api.dll, "TerminateProcess", side_effect=exit_before_termination):
+                evidence["contained"] = handle.stop_descendants(deadline)
+            self.assertTrue(evidence["contained"])
+            self.assertEqual(len(evidence["termination_calls"]), 1)
+            call = evidence["termination_calls"][0]
+            self.assertIs(call["result"], False)
+            self.assertEqual(call["error"], 5)
+        finally:
+            try:
+                handle.close()
+                evidence["job_closed"] = True
+            finally:
+                (root / "evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+                print("windows_descendant_exit_race_evidence=" + str(root / "evidence.json"), flush=True)
+
+    def test_termination_error_requires_signalled_original_handle(self):
+        for termination_error, subsequent_wait, recovered in (
+                (5, 0, True), (5, 258, False), (5, 0xFFFFFFFF, False),
+                (5, 1, False), (6, 0, False)):
+            with self.subTest(error=termination_error, wait=subsequent_wait):
+                opened, waits, closed = [], [], []
+                native_error = [termination_error]
+                members = [7, 8]
+
+                def open_process(rights, inherit, pid):
+                    opened.append(pid)
+                    return 108
+
+                def membership(process, job, assigned):
+                    assigned._obj.value = True
+                    return True
+
+                def wait(process, milliseconds):
+                    waits.append((process, milliseconds))
+                    if len(waits) == 1:
+                        return 258
+                    native_error[0] = 87
+                    if subsequent_wait == 0:
+                        members.remove(8)
+                    return subsequent_wait
+
+                api = SimpleNamespace(dll=SimpleNamespace(OpenProcess=open_process,
+                    IsProcessInJob=membership, WaitForSingleObject=wait,
+                    TerminateProcess=lambda process, code: False, CloseHandle=closed.append),
+                    process_ids=lambda job: tuple(members),
+                    check=lambda result, operation: self.assertTrue(result, operation))
+                handle = windows_runtime.WindowsProcessHandle(api, 99,
+                    SimpleNamespace(dwProcessId=7, hProcess=107, hThread=None))
+                with patch.object(ctypes, "get_last_error", side_effect=lambda: native_error[0], create=True), \
+                        patch.object(ctypes, "FormatError", side_effect=lambda code: f"native error {code}", create=True):
+                    if recovered:
+                        self.assertTrue(handle.stop_descendants(time.monotonic() + 1))
+                    else:
+                        with self.assertRaises(OSError) as caught:
+                            handle.stop_descendants(time.monotonic() + 1)
+                        self.assertEqual(caught.exception.errno, termination_error)
+                        self.assertIn(f"native error {termination_error}", str(caught.exception))
+                self.assertEqual(opened, [8])
+                self.assertTrue(all(process == 108 and duration == 0 for process, duration in waits))
+                self.assertEqual(len(waits), 2 if termination_error == 5 else 1)
+                self.assertEqual(closed, [108])
+
     def test_redirector_worker_handle_survives_flush_and_does_not_preserve_reused_pid(self):
         opened, killed, closed = [], [], []
         members = [7, 8, 9]

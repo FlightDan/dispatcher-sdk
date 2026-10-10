@@ -15,6 +15,7 @@
 | `RevisionConflict` | Read fresh state, recompute the decision and use a new command identity. |
 | Repeated notifications | Delivery is at least once. Durably deduplicate stable identities before acknowledging. |
 | `recovery_required` | Inspect unresolved effects and reconcile external evidence before resolving. |
+| Cancellation report says local cleanup is unknown after restart | Keep the Kernel-bound settlement journal available and check that its `process_cleanup` note matches the execution ID, attempt and fence. Missing or malformed evidence stays unknown. |
 | Old database rejected | Follow the upgrade guide; do not edit schema metadata to bypass compatibility checks. |
 | Restored snapshot is still read-only | Restore and activation are separate. Use the local activation procedure; never delete the marker manually. |
 | Local activation rejects a changed source | The source advanced after the snapshot. Reconcile the newer facts; the SDK will not run the older copy automatically. |

@@ -43,6 +43,14 @@ execution or replaces revision/fence checks.
   stops the journal-enabled operation before Kernel cancellation.
 - Receipt identity includes the original fence. Old-generation cleanup evidence
   cannot establish cleanup for a newly claimed execution.
+- Cancellation reports can supplement cancellation receipts with a read-only
+  `process_cleanup` settlement note from the Kernel-bound Runtime journal. This
+  works after Runtime restart and without an attached Runtime. The report accepts
+  only a note bound to the same Kernel store and matching execution ID, attempt
+  and fence, with state `confirmed` and source `runtime_supervisor_reaped`. It
+  exposes the settlement note ID and source separately from cancellation receipt
+  IDs. Missing, malformed or foreign notes remain unknown; this evidence does
+  not resolve pending sandbox disposal or external effects.
 - Journal readers use a read-only connection and do not initialize a file,
   synchronize the Run, reap leases, or contact providers.
 

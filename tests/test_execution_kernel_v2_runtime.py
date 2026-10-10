@@ -410,6 +410,54 @@ class RuntimeTests(unittest.TestCase):
                     print("runtime_case_capture_error=" + repr(error), flush=True)
                 print("runtime_case_evidence=" + str(root / "evidence.json"), flush=True)
 
+    def capture_thread_timeout_failure(self, root, evidence, stack, driver, execution_id,
+                                       *, flags, outcomes, errors, denied=()):
+        """Retain the original failure before fixture cleanup releases user code."""
+        import traceback
+
+        failure = {"captured_at": time.monotonic(), "driver_alive": driver.is_alive(),
+                   "flags": {name: event.is_set() for name, event in flags.items()},
+                   "outcomes": [None if outcome is None else outcome.to_dict() for outcome in outcomes],
+                   "errors": [{"type": type(error).__name__, "message": str(error)} for error in errors],
+                   "denied": [{"type": type(error).__name__, "message": str(error)} for error in denied]}
+        evidence["failure_before_release"] = failure
+        frames = sys._current_frames()
+        failure["threads"] = [{"name": thread.name, "ident": thread.ident, "alive": thread.is_alive(),
+            "stack": "".join(traceback.format_stack(frames[thread.ident], limit=24))[-16384:]
+                if thread.ident in frames else ""}
+            for thread in threading.enumerate()
+            if thread is driver or thread.name.startswith(("execution-kernel", "dispatcher-", "sdk-"))][:32]
+        try:
+            if not stack._thread_lock.acquire(timeout=.1):
+                raise TimeoutError("fixture thread evidence admission elapsed")
+            try:
+                failure["contexts"] = [{"execution_id": generation[0], "attempt": generation[1],
+                    "fence": generation[2], "authority_active": context.effects._is_active(),
+                    "entered": context._entered, "entry_confirmed": context._entry_confirmed,
+                    "observation_closed": context._observation_closed,
+                    "budget_envelope": None if context._budget_envelope is None else context._budget_envelope.to_dict()}
+                    for generation, context in tuple(stack._thread_contexts.items())[:16]]
+                failure["finished_generations"] = list(stack._thread_done)[:16]
+            finally:
+                stack._thread_lock.release()
+        except Exception as error:
+            failure["context_capture_error"] = {"type": type(error).__name__, "message": str(error)}
+        try:
+            with stack.kernel._control_lock(.1):
+                failure["snapshot"] = stack.kernel.get(execution_id).to_dict()
+                failure["events"] = [event.to_dict() for event in stack.kernel.events_since(0, limit=50)]
+        except Exception as error:
+            failure["kernel_capture_error"] = {"type": type(error).__name__, "message": str(error)}
+        try:
+            failure["observation"] = stack.observe(execution_id, timeout=.5)
+        except Exception as error:
+            failure["observation_capture_error"] = {"type": type(error).__name__, "message": str(error)}
+        failure["capture_finished_at"] = time.monotonic()
+        try:
+            (root / "failure-before-release.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+        except Exception as error:
+            failure["write_error"] = {"type": type(error).__name__, "message": str(error)}
+
     def test_runtime_exposes_revision_cas_cancellation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stack = Kernel.open_sqlite(
@@ -1563,7 +1611,10 @@ class RuntimeTests(unittest.TestCase):
                 stack.close()
 
     def test_thread_fallback_revokes_late_effect_authority(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        with self.runtime_case_evidence("sdk-thread-timeout-authority-") as (root, evidence):
+            evidence.update(timeout_seconds=5, clock_advance_seconds=6, entry_wait_seconds=2,
+                            driver_join_seconds=2, handler_release_wait_seconds=5, timestamps={})
+            timestamps = evidence["timestamps"]
             clock = Clock(time.time())
             entered = threading.Event()
             release = threading.Event()
@@ -1591,7 +1642,7 @@ class RuntimeTests(unittest.TestCase):
             late_effect.__execution_kernel_revision__ = "thread-timeout-test-v1"
 
             stack = Kernel.open_sqlite(
-                Path(temp) / "kernel.sqlite3",
+                root / "kernel.sqlite3",
                 {("late-effect", 1): late_effect},
                 isolation_mode="thread",
                 now=clock,
@@ -1601,9 +1652,12 @@ class RuntimeTests(unittest.TestCase):
 
             def drive():
                 try:
+                    timestamps["driver_started"] = time.monotonic()
                     outcomes.append(stack.run_once())
                 except BaseException as exc:
                     errors.append(exc)
+                finally:
+                    timestamps["driver_returned"] = time.monotonic()
 
             driver = threading.Thread(target=drive)
             try:
@@ -1617,10 +1671,15 @@ class RuntimeTests(unittest.TestCase):
                 )
                 driver.start()
                 self.assertTrue(entered.wait(2))
+                timestamps["handler_entry_observed"] = time.monotonic()
                 # Entry is downstream of the durable ACK. Expire that already
                 # running execution while its actual Python call remains blocked.
+                timestamps["clock_before_advance"] = clock()
                 clock.advance(6)
+                timestamps["clock_advanced"] = time.monotonic()
+                timestamps["clock_after_advance"] = clock()
                 driver.join(2)
+                timestamps["driver_join_returned"] = time.monotonic()
                 self.assertFalse(driver.is_alive())
                 self.assertEqual(errors, [])
                 self.assertEqual(len(outcomes), 1)
@@ -1632,6 +1691,15 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(type(denied[0]).__name__, "StaleFenceError")
                 with self.assertRaises(KeyError):
                     stack.kernel.get_effect("late-effect")
+            except BaseException:
+                try:
+                    self.capture_thread_timeout_failure(root, evidence, stack, driver, "thread-timeout",
+                        flags={"entered": entered, "release": release, "attempted": attempted,
+                               "performed": performed}, outcomes=outcomes, errors=errors, denied=denied)
+                except Exception as diagnostic_error:
+                    evidence["diagnostic_error"] = {"type": type(diagnostic_error).__name__,
+                                                    "message": str(diagnostic_error)}
+                raise
             finally:
                 release.set()
                 if driver.ident is not None:
@@ -1791,7 +1859,10 @@ class RuntimeTests(unittest.TestCase):
                 stack.close()
 
     def test_thread_timeout_releases_slot_after_underlying_call_exits(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        with self.runtime_case_evidence("sdk-thread-timeout-slot-") as (root, evidence):
+            evidence.update(timeout_seconds=5, clock_advance_seconds=6, entry_wait_seconds=2,
+                            driver_join_seconds=2, handler_release_wait_seconds=5, timestamps={})
+            timestamps = evidence["timestamps"]
             clock = Clock(time.time())
             entered = threading.Event()
             release = threading.Event()
@@ -1805,7 +1876,7 @@ class RuntimeTests(unittest.TestCase):
 
             blocked.__execution_kernel_revision__ = "bounded-thread-release-test-v1"
             stack = Kernel.open_sqlite(
-                Path(temp) / "kernel.sqlite3",
+                root / "kernel.sqlite3",
                 {("blocked", 1): blocked},
                 isolation_mode="thread",
                 max_thread_workers=1,
@@ -1816,9 +1887,12 @@ class RuntimeTests(unittest.TestCase):
 
             def drive():
                 try:
+                    timestamps["driver_started"] = time.monotonic()
                     outcomes.append(stack.run_once())
                 except BaseException as exc:
                     errors.append(exc)
+                finally:
+                    timestamps["driver_returned"] = time.monotonic()
 
             driver = threading.Thread(target=drive)
             try:
@@ -1838,8 +1912,13 @@ class RuntimeTests(unittest.TestCase):
                 stack.submit(second)
                 driver.start()
                 self.assertTrue(entered.wait(2))
+                timestamps["handler_entry_observed"] = time.monotonic()
+                timestamps["clock_before_advance"] = clock()
                 clock.advance(6)
+                timestamps["clock_advanced"] = time.monotonic()
+                timestamps["clock_after_advance"] = clock()
                 driver.join(2)
+                timestamps["driver_join_returned"] = time.monotonic()
                 self.assertFalse(driver.is_alive())
                 self.assertEqual(errors, [])
                 self.assertEqual(len(outcomes), 1)
@@ -1861,6 +1940,15 @@ class RuntimeTests(unittest.TestCase):
                         time.sleep(.01)
                 self.assertIsNotNone(recovered)
                 self.assertEqual(recovered.state, "succeeded")
+            except BaseException:
+                try:
+                    self.capture_thread_timeout_failure(root, evidence, stack, driver, "release-1",
+                        flags={"entered": entered, "release": release, "finished": finished},
+                        outcomes=outcomes, errors=errors)
+                except Exception as diagnostic_error:
+                    evidence["diagnostic_error"] = {"type": type(diagnostic_error).__name__,
+                                                    "message": str(diagnostic_error)}
+                raise
             finally:
                 release.set()
                 if driver.ident is not None:

@@ -29,6 +29,12 @@
 回执存放在独立的 schema 1（数据结构版本 1）数据库中，核心存储不会自动迁移。
 只有同一执行代际（相同的 attempt/fence）留下的 Linux subreaper 或 Windows Job 清理记录，
 才能证明本地进程树已经清理。
+即使没有配置这个可选的取消 journal，`inspect_cancellation` 也可以从与 Kernel 存储绑定的
+settlement journal 只读读取匹配的 `process_cleanup` note。Runtime 重启后、没有活动 Runtime
+时也能读取。只有 Kernel 绑定、execution ID、attempt 和 fence 都匹配，且 note 为
+`confirmed`、来源为 `runtime_supervisor_reaped`，才会确认清理；note ID 和来源会与取消回执
+ID 分开显示。缺失、格式错误或来自其他执行身份的 note 仍为 unknown。本地进程清理已确认，
+也不会结清仍待处理的沙箱销毁义务。
 取消 Task 不会自动结束 Run。
 
 完整说明见 [API 指南](../docs/SDK_DIAGNOSTICS_AND_PROJECTIONS.md)、[回执存储设计](../docs/CANCELLATION_EVIDENCE.md)、[投影示例](../examples/projection_consumer.py)和[诊断示例](../examples/capability_diagnostics.py)。
