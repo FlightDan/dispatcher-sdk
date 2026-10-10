@@ -288,6 +288,7 @@ class SettlementJournal:
         if len(execution_id) > max_bytes or len(json.dumps(execution_id, ensure_ascii=False).encode("utf-8")) + 768 > max_bytes:
             raise ValueError("execution_id exceeds the settlement inspection byte budget")
         report: dict[str, Any] = {"notes": [], "cursor": after, "has_more": False, "complete": True}
+        encoded_note_bytes = 0
 
         def check():
             if time.monotonic() >= deadline:
@@ -304,6 +305,12 @@ class SettlementJournal:
             check()
             return length
 
+        def report_size():
+            # Only the small page metadata changes as immutable notes append.
+            # Re-encoding every prior note would make a bounded page quadratic.
+            metadata = {**report, "notes": []}
+            return size(metadata) + encoded_note_bytes + max(0, len(report["notes"]) - 1)
+
         try:
             check()
             with self._connection(max(.000001, deadline-time.monotonic())) as connection:
@@ -319,11 +326,13 @@ class SettlementJournal:
                         "identity": {"execution_id": execution_id, "attempt": row["attempt"], "fence": row["fence"]},
                         "phase": row["phase"], "created_at": row["created_at"], "evidence": None,
                         "truncated": True, "unknown_reason": "settlement_notes_inspection_byte_limit"}
-                    used = size(report) + 256
-                    phase_truncated = size(marker) + used > max_bytes
+                    used = report_size() + 256
+                    marker_bytes = size(marker)
+                    phase_truncated = marker_bytes + used > max_bytes
                     if phase_truncated:
                         marker["phase"] = None
-                    if phase_truncated or row["bytes"] + size(marker) + used > max_bytes:
+                        marker_bytes = size(marker)
+                    if phase_truncated or row["bytes"] + marker_bytes + used > max_bytes:
                         note = marker
                     else:
                         full = connection.execute("SELECT * FROM settlement_notes WHERE sequence=?", (row["sequence"],)).fetchone()
@@ -331,7 +340,10 @@ class SettlementJournal:
                         check()
                     report["notes"].append(note)
                     report["cursor"] = row["sequence"]
-                    if size(report) + 256 > max_bytes:
+                    note_bytes = marker_bytes if note is marker else size(note)
+                    encoded_note_bytes += note_bytes
+                    if report_size() + 256 > max_bytes:
+                        encoded_note_bytes -= note_bytes
                         report["notes"].pop()
                         report["cursor"] = report["notes"][-1]["sequence"] if report["notes"] else after
                         report.update(complete=False, truncated=True, has_more=True,

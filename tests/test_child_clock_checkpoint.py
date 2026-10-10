@@ -8,6 +8,7 @@ import sys
 import time
 from types import SimpleNamespace
 from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 import unittest
 
 from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError, BudgetEnvelope, sample_clock
@@ -22,6 +23,10 @@ from dispatcher_sdk.observability import ObservationJournal, ObservationOptions
 class ChildClockCheckpointTests(unittest.TestCase):
     def setUp(self):
         self.root = retained_directory("sdk-child-clock-checkpoint-")
+        if self._testMethodName == 'test_more_than_one_note_page_cannot_hide_a_stricter_checkpoint':
+            self.storage_evidence = StorageEvidence(self.root, self)
+            self.storage_evidence.start(include_kernel=True)
+            self.addCleanup(self.storage_evidence.stop)
         self.wall = [time.time()]
         self.kernel = SQLiteKernel(self.root / "kernel.sqlite3", now=lambda: self.wall[0],
                                    default_lease_seconds=90)
@@ -43,6 +48,11 @@ class ChildClockCheckpointTests(unittest.TestCase):
             "kernel_path": self.kernel.db_path, "parent_lease": self.lease.to_dict(), "records": []}
 
     def tearDown(self):
+        if hasattr(self, 'storage_evidence'):
+            try:
+                self.storage_evidence.save(phase='before_cleanup', checkpoint=self.evidence)
+            except Exception as error:
+                self.evidence['diagnostic_error'] = {'type': type(error).__name__, 'message': str(error)}
         path = self.root / "evidence.json"
         path.write_text(json.dumps(self.evidence, indent=2), encoding="utf-8")
         print("child_clock_checkpoint_evidence=" + str(path), flush=True)
@@ -556,9 +566,22 @@ class ChildClockCheckpointTests(unittest.TestCase):
         self.assertNotIn(last["note_id"], [note["note_id"] for note in page["notes"]])
         reopened = ChildService(SimpleNamespace(kernel=self.kernel), self.journal)
         restored = _RetryWindow(BudgetEnvelope.from_dict(json.loads(row["budget_json"])), self.kernel)
-        self.evidence["records"].append({"first_page": page, "stricter_next_page_note": last})
-        with self.assertRaises(BudgetClockUnknownError):
-            reopened.store.attach(row, restored)
+        attachment = {"first_page": page, "stricter_next_page_note": last,
+            "original_window": window.envelope.to_dict(), "restored_window": restored.envelope.to_dict(),
+            "original_native_deadline": window.deadline, "restored_native_deadline": restored.deadline,
+            "began": time.monotonic()}
+        self.evidence["records"].append(attachment)
+        try:
+            with self.assertRaises(BudgetClockUnknownError) as caught:
+                reopened.store.attach(row, restored)
+            attachment['refusal'] = {'type': type(caught.exception).__name__, 'message': str(caught.exception)}
+        except Exception as error:
+            attachment['error'] = {'type': type(error).__name__, 'message': str(error)}
+            raise
+        finally:
+            attachment['returned'] = time.monotonic()
+            attachment['final_native_deadline'] = restored.deadline
+            attachment['final_window'] = restored.envelope.to_dict()
 
 
 if __name__ == "__main__":

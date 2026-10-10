@@ -14,6 +14,8 @@
 - Native Windows descendant cleanup treats `ERROR_ACCESS_DENIED` as an exit race
   only when the same acquired process handle is signaled. A live process or any
   other termination error remains a cleanup failure.
+- Settlement-note pages avoid repeatedly encoding earlier notes. Inspection
+  retains its original time and byte limits, cursors and incomplete evidence rules.
 - Active development and GitHub's default branch use `main`. Versions are
   identified by release tags such as `v0.7.2`.
 - The portable process observability example uses finite startup and delivery
