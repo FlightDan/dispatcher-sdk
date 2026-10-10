@@ -743,9 +743,12 @@ class WindowsDirectoryCleanupTests(unittest.TestCase):
 @unittest.skipUnless(os.name == "nt", "requires real native Windows Job Objects")
 class WindowsRuntimeTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        if self._testMethodName == 'test_timeout_cleans_descendant_before_return':
+            self.root = retained_directory('sdk-windows-timeout-cleanup-')
+        else:
+            self.temp = tempfile.TemporaryDirectory()
+            self.addCleanup(self.temp.cleanup)
+            self.root = Path(self.temp.name)
         self.path = self.root / "kernel.db"
         self.kernel = SQLiteKernel(self.path)
         self.addCleanup(self.kernel.close)
@@ -782,10 +785,108 @@ class WindowsRuntimeTests(unittest.TestCase):
 
     def test_timeout_cleans_descendant_before_return(self):
         pidfile = self.root / "child.pid"
-        outcome = self.invoke(_tree, {"pidfile": str(pidfile), "block": True}, timeout=3)
-        self.assertEqual(outcome["kind"], "timeout", outcome)
-        self.assertTrue(pidfile.exists(), outcome)
-        self.assertProcessGone(_wait_pid(pidfile))
+        evidence = {'test': self.id(), 'interpreter': sys.executable,
+            'sdk_import': windows_runtime.__file__, 'task_seconds': 3,
+            'startup_seconds': 30, 'lease_seconds': 60,
+            'cleanup_seconds': windows_runtime._CLEANUP_SECONDS,
+            'terminate_calls': [], 'diagnostic_errors': []}
+        terminate = windows_runtime.WindowsProcessHandle.terminate
+        descendant = []
+        acquisition_started = False
+
+        def error_details(error):
+            try:
+                message = str(error)
+            except BaseException:
+                message = '<error message unavailable>'
+            return {'type': type(error).__name__, 'message': message}
+
+        def diagnostic(stage, operation):
+            try:
+                return operation()
+            except BaseException as error:
+                evidence['diagnostic_errors'].append({'stage': stage, **error_details(error)})
+
+        def save(phase):
+            diagnostic('write_' + phase, lambda: (self.root / (phase + '.json')).write_text(
+                json.dumps(evidence, indent=2), encoding='utf-8'))
+
+        def observe_termination(handle):
+            nonlocal acquisition_started
+            with handle._lock:
+                call = {'began': time.monotonic(), 'thread': threading.current_thread().name,
+                    'closed_before': handle._closed, 'contained_before': handle._contained}
+                if len(evidence['terminate_calls']) < 64:
+                    evidence['terminate_calls'].append(call)
+                if not acquisition_started and not handle._closed and not handle._contained:
+                    acquisition_started = True
+
+                    def acquire_descendant():
+                        # Acquire the published child before the original Job
+                        # termination; a later PID lookup can identify a reuse.
+                        pid = _read_pid(pidfile)
+                        call['published_pid'] = pid
+                        call['job_process_ids'] = handle._api.process_ids(handle._job)
+                        if pid is None:
+                            return
+                        api = handle._api
+                        process = api.dll.OpenProcess(0x00101000, False, pid)
+                        api.check(process, 'OpenProcess timeout descendant witness')
+                        descendant.append((api, process))
+                        assigned = wintypes.BOOL()
+                        api.check(api.dll.IsProcessInJob(process, handle._job, ctypes.byref(assigned)),
+                            'IsProcessInJob timeout descendant witness')
+                        times = [wintypes.FILETIME() for _ in range(4)]
+                        api.dll.GetProcessTimes.argtypes = [wintypes.HANDLE,
+                            *([ctypes.POINTER(wintypes.FILETIME)] * 4)]
+                        api.dll.GetProcessTimes.restype = wintypes.BOOL
+                        api.check(api.dll.GetProcessTimes(process, *(ctypes.byref(t) for t in times)),
+                            'GetProcessTimes timeout descendant witness')
+                        evidence['descendant'] = {'pid': pid, 'handle': int(process),
+                            'job_member': bool(assigned.value),
+                            'creation_filetime': times[0].dwLowDateTime + (times[0].dwHighDateTime << 32),
+                            'before_wait': int(api.dll.WaitForSingleObject(process, 0))}
+
+                    diagnostic('acquire_descendant', acquire_descendant)
+                try:
+                    result = terminate(handle)
+                    call['returned'] = time.monotonic()
+                    call['result'] = result
+                    call['contained_after'] = handle._contained
+                    if not handle._closed:
+                        call['active_after'] = diagnostic('active_after', lambda: handle._api.active(handle._job))
+                    return result
+                except BaseException as error:
+                    call['returned'] = time.monotonic()
+                    call['error'] = error_details(error)
+                    raise
+
+        try:
+            with patch.object(windows_runtime.WindowsProcessHandle, 'terminate', observe_termination):
+                evidence['invoke_began'] = time.monotonic()
+                outcome = self.invoke(_tree, {'pidfile': str(pidfile), 'block': True}, timeout=3)
+                evidence['invoke_returned'] = time.monotonic()
+                # No post-return grace period: check the same acquired process
+                # immediately, before reading or formatting any diagnostic page.
+                if descendant:
+                    api, process = descendant[0]
+                    evidence['return_wait'] = int(api.dll.WaitForSingleObject(process, 0))
+                    evidence['return_wait_observed'] = time.monotonic()
+                evidence['outcome'] = outcome
+                self.assertEqual(outcome['kind'], 'timeout', outcome)
+                self.assertTrue(pidfile.exists(), outcome)
+                self.assertTrue(evidence.get('descendant', {}).get('job_member'), evidence)
+                self.assertEqual(evidence['descendant']['before_wait'], 258, evidence)
+                self.assertEqual(evidence.get('return_wait'), 0, evidence)
+        except BaseException as error:
+            evidence['primary_error'] = error_details(error)
+            raise
+        finally:
+            save('before_cleanup')
+            for api, process in descendant:
+                diagnostic('CloseHandle witness', lambda api=api, process=process:
+                    api.check(api.dll.CloseHandle(process), 'CloseHandle timeout descendant witness'))
+            save('after_cleanup')
 
     def test_cancel_before_resume_never_unpickles(self):
         marker = self.root / "must-not-exist"

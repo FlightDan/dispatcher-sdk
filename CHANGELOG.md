@@ -25,6 +25,10 @@
   failures, SQLite error codes and supplied budgets without retrying failures.
   Cancellation failures preserve bounded driver stacks and original control-call
   timings before cleanup; diagnostic and close errors do not replace the cause.
+- Native cleanup acceptance checks the original Job descendant's acquired
+  process handle at return. Sampling preparation distinguishes refusal before
+  control entry from an entered or rolled-back operation; existing execution
+  and inspection budgets remain unchanged.
 
 ## 0.7.1
 

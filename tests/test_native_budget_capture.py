@@ -239,6 +239,7 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                 print('targeted_claim_capture_evidence_error=' + repr(error), flush=True)
 
     def test_slow_real_guard_arm_return_retains_forward_sample_before_timeout(self):
+        from contextlib import contextmanager
         import traceback
 
         root = retained_directory('sdk-slow-budget-arm-')
@@ -265,16 +266,21 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                 original_deadline = window.deadline
                 owner = _KernelBudgetCapture(kernel, 'parent')
                 begin = kernel._begin_budget_sample
+                control = kernel._control_lock
                 observer = sqlite3.connect(kernel.db_path, timeout=.1)
                 tokens = []
+                callback_requested = False
                 callback_entered = False
+                begin_inflight = False
+                begin_control_entered = False
                 canonical_before = [tuple(row) for row in kernel._connection.execute(
                     'SELECT execution_id,envelope_json FROM kernel_execution_limits ORDER BY execution_id')]
                 evidence.update(original_child_budget=child.to_dict(), original_parent_budget=parent.to_dict(),
                     original_native_deadline=original_deadline, canonical_before=canonical_before)
 
                 def facts():
-                    return {'tokens': list(tokens), 'callback_entered': callback_entered,
+                    return {'tokens': list(tokens), 'callback_requested': callback_requested,
+                        'callback_entered': callback_entered, 'begin_control_entered': begin_control_entered,
                         'wall': wall[0], 'owner_pending': None if owner._pending is None else {
                             'token': owner._pending[0], 'envelope': None if owner._pending[1] is None
                             else owner._pending[1].to_dict()},
@@ -286,10 +292,23 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                         'canonical': [tuple(row) for row in kernel._connection.execute(
                             'SELECT execution_id,envelope_json FROM kernel_execution_limits ORDER BY execution_id')]}
 
+                @contextmanager
+                def original_control_entry(*arguments, **options):
+                    nonlocal begin_control_entered
+                    with control(*arguments, **options) as admitted:
+                        if begin_inflight:
+                            begin_control_entered = True
+                        yield admitted
+
                 def slow_committed_arm(execution_id, **options):
-                    nonlocal callback_entered
+                    nonlocal callback_requested, callback_entered, begin_inflight
+                    callback_requested = True
+                    begin_inflight = True
+                    try:
+                        token = begin(execution_id, **options)
+                    finally:
+                        begin_inflight = False
                     callback_entered = True
-                    token = begin(execution_id, **options)
                     tokens.append(token)
                     self.assertEqual(observer.execute('SELECT token FROM kernel_budget_samples').fetchone()[0], token)
                     wall[0] = baseline + 4
@@ -314,13 +333,14 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                         attempt['error'] = {'type': type(error).__name__, 'message': str(error),
                             'traceback': traceback.format_exception(type(error), error, error.__traceback__),
                             'budget_sample_token': getattr(error, 'budget_sample_token', None)}
-                        # Only refusal before any callback/arm can retry. Once
-                        # the target starts, return its exact error so _retry
-                        # cannot replay the deliberately expired capture.
+                        # A requested begin can refuse before its original
+                        # control manager yields. Any actual begin-body entry
+                        # remains sticky, including an arm later rolled back.
                         if (type(error) is TimeoutError
                                 and str(error) == 'Kernel control admission budget elapsed'
                                 and getattr(error, 'budget_sample_token', None) is None
-                                and not callback_entered and not tokens and owner._pending is None):
+                                and not begin_control_entered and not callback_entered
+                                and not tokens and owner._pending is None):
                             retry_preparation = False
                             try:
                                 with window.project():
@@ -331,7 +351,8 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                                     attempt['preparation_proof'] = proof
                                     with window.project():
                                         live = window.remaining() > 0
-                                    if (live and not proof['callback_entered'] and not proof['tokens']
+                                    if (live and not proof['begin_control_entered']
+                                            and not proof['callback_entered'] and not proof['tokens']
                                             and proof['owner_pending'] is None and not proof['registered_owners']
                                             and not proof['markers'] and proof['canonical'] == canonical_before
                                             and proof['wall'] == baseline):
@@ -355,6 +376,7 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                         attempt['returned'] = time.monotonic()
 
                 kernel._begin_budget_sample = slow_committed_arm
+                kernel._control_lock = original_control_entry
                 try:
                     with self.assertRaises(TimeoutError) as caught:
                         # Exercise the parent's guarded sampling directly. A
@@ -377,6 +399,8 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                     self.assertIs(kernel._budget_sample_owners[tokens[0]], error.budget_sample_owner)
                     self.assertIs(error.budget_sample_owner._pending[1], retained)
                 finally:
+                    kernel._begin_budget_sample = begin
+                    kernel._control_lock = control
                     try:
                         evidence['before_cleanup'] = facts()
                         evidence['retained_native_deadline'] = window.deadline
@@ -386,7 +410,6 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                     save_storage('before_cleanup')
                     observer.close()
                     wall[0] = baseline
-                    kernel._begin_budget_sample = begin
                 with SQLiteKernel(kernel.db_path, now=lambda: wall[0]) as fresh:
                     with self.assertRaisesRegex(BudgetClockUnknownError, 'budget_clock_sample_unresolved'):
                         fresh._sample_budget('parent', child, timeout_seconds=.02)
