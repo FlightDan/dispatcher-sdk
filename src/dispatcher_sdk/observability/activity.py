@@ -605,6 +605,17 @@ class ActivityRecorder:
                 result.update(state="pending", reason="flusher_still_active")
             if observer_result is not None:
                 result["process_observer"] = observer_result
+                unfinished = observer_result.get("collector_alive") or observer_result.get("unfinished_collector")
+                reports = observer_result.get("processes", ())
+                collection_failed = isinstance(reports, (list, tuple)) and any(
+                    type(report) is dict and report.get("collection_error") is not None
+                    for report in reports[:32])
+                incomplete = observer_result.get("complete") is False or observer_result.get("error") is not None or collection_failed
+                if result["state"] == "persisted" and (unfinished or incomplete):
+                    # Source closure and final persistence are separate facts
+                    # from completion of the owned process collector.
+                    result["reason"] = "process_observer_still_active" if unfinished else "process_observer_incomplete"
+                    result["state"] = "pending" if unfinished else "degraded"
         except Exception as error:
             result.update(state="degraded", reason="close_failed", error=f"{type(error).__name__}: {error}")
         finally:

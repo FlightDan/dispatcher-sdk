@@ -28,6 +28,7 @@ from dispatcher_sdk.execution_kernel.errors import HandlerExecutionError
 import dispatcher_sdk.execution_kernel.runtime as runtime_module
 from dispatcher_sdk.execution_kernel import _process_runtime as process_runtime
 from dispatcher_sdk.execution_kernel import _windows_runtime as windows_runtime
+from dispatcher_sdk.observability import ActivityRecorder, ObservationIdentity, ObservationJournal, ObservationOptions
 from tests._acceptance_evidence import retained_directory
 from tests._storage_evidence import StorageEvidence
 
@@ -496,6 +497,104 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 closed = process_runtime._close_context(context)
                 self.assertEqual("unknown", closed["state"])
                 self.assertEqual(receipt, closed["receipt"])
+
+    def test_recorder_close_keeps_source_facts_when_process_observer_is_incomplete(self):
+        root = retained_directory("sdk-observer-close-receipt-")
+        identity = ObservationIdentity("observer-close", 1, 1)
+        journal = ObservationJournal(root / "observations.sqlite3", kernel_path=root / "kernel.sqlite3",
+            source_id="observer-receipt-store", options=ObservationOptions(write_timeout=.1))
+        journal.bind_current(identity)
+        cases = [
+            ({"complete": True, "collector_alive": True}, "pending"),
+            ({"unfinished_collector": True}, "pending"),
+            ({"complete": False, "collector_alive": False}, "degraded"),
+            ({"complete": True, "error": "collector failed"}, "degraded"),
+            ({"complete": True, "processes": [{"collection_error": "process write failed"}]}, "degraded"),
+            ({"complete": True, "collector_alive": False, "unfinished_collector": False, "error": None,
+              "processes": [{"state": "unknown", "unknown_reason": "birth metadata inaccessible", "collection_error": None}]}, "persisted"),
+        ]
+        receipts = []
+        for report, expected in cases:
+            with self.subTest(report=report):
+                recorder = ActivityRecorder(journal, identity)
+                observer = SimpleNamespace(_stop=threading.Event(), _wake=threading.Event(), _thread=None,
+                    close=Mock(return_value=report))
+                recorder._process_observer = observer
+                recorder.report_bytes("stdout", b"final")
+                receipt = recorder.close(timeout=.4)
+                receipts.append(receipt)
+                self.assertEqual(expected, receipt["state"], receipt)
+                self.assertTrue(receipt["final_flush_persisted"], receipt)
+                self.assertTrue(receipt["source_closed"], receipt)
+                self.assertEqual(report, receipt["process_observer"])
+                self.assertTrue(observer._stop.is_set())
+                observer.close.assert_called_once()
+                self.assertLessEqual(observer.close.call_args.kwargs["timeout"], .1)
+                with closing(sqlite3.connect(journal.path)) as connection:
+                    row = connection.execute("SELECT state,metrics_json FROM obs_sources WHERE source_id=?",
+                        (recorder.source_id,)).fetchone()
+                self.assertEqual("closed", row[0])
+                self.assertEqual(5, json.loads(row[1])["stdout_bytes"]["count"])
+                context = Mock()
+                context.close.return_value = receipt
+                closed = process_runtime._close_context(context)
+                self.assertEqual("confirmed" if expected == "persisted" else "unknown", closed["state"])
+        recorder = ActivityRecorder(journal, identity)
+        recorder._process_observer = SimpleNamespace(_stop=threading.Event(), _wake=threading.Event(), _thread=None,
+            close=Mock(return_value={"unfinished_collector": True}))
+        with patch.object(journal, "close_source", side_effect=RuntimeError("original source close failure")):
+            receipt = recorder.close(timeout=.4)
+        receipts.append(receipt)
+        self.assertEqual("degraded", receipt["state"], receipt)
+        self.assertEqual("source_close_failed", receipt["reason"], receipt)
+        self.assertEqual("original source close failure", receipt["error"])
+        self.assertTrue(receipt["final_flush_persisted"])
+        self.assertFalse(receipt["source_closed"])
+        self.assertTrue(receipt["process_observer"]["unfinished_collector"])
+        (root / "receipts.json").write_text(json.dumps(receipts, indent=2), encoding="utf-8")
+
+    def test_worker_close_refuses_negative_nested_receipts_and_bounds_the_summary(self):
+        reports = [
+            {"complete": True, "collector_alive": True},
+            {"unfinished_collector": True},
+            {"complete": False},
+            {"complete": True, "error": "x" * 10000},
+            {"complete": True, "processes": [{"collection_error": "y" * 10000,
+                "arbitrary_snapshot": "z" * 10000} for _ in range(100)]},
+        ]
+        for report in reports:
+            for state in ("persisted", "pending", "degraded"):
+                with self.subTest(report=report.keys(), state=state):
+                    receipt = {"state": state, "final_flush_persisted": True, "source_closed": True,
+                        "process_observer": report}
+                    if state != "persisted":
+                        receipt["reason"] = "original source failure"
+                    context = Mock()
+                    context.close.return_value = receipt
+                    closed = process_runtime._close_context(context)
+                    self.assertEqual("unknown", closed["state"], closed)
+                    self.assertEqual("process_observer_incomplete" if state == "persisted" else "original source failure",
+                        closed["reason"])
+                    summary = closed["receipt"]["process_observer"]
+                    self.assertNotIn("processes", summary)
+                    self.assertLessEqual(len(summary.get("error", "")), 2048)
+                    errors = summary.get("process_collection_errors", [])
+                    self.assertLessEqual(len(errors), 32)
+                    self.assertLessEqual(sum(map(len, errors)), 2048)
+                    self.assertTrue(closed["receipt"]["source_closed"])
+                    self.assertTrue(closed["receipt"]["final_flush_persisted"])
+                    context.close.assert_called_once_with()
+        context.close.return_value = {"state": "persisted", "process_observer": {
+            "complete": True, "collector_alive": False, "unfinished_collector": False, "error": None,
+            "processes": [{"state": "unknown", "unknown_reason": "inaccessible", "collection_error": None}]}}
+        self.assertEqual({"state": "confirmed"}, process_runtime._close_context(context))
+        context._budget_capture._pending = None
+        context.close.return_value = {"state": "persisted", "budget_checkpoint": {"state": "unknown"},
+            "process_observer": {"complete": False}}
+        closed = process_runtime._close_context(context)
+        self.assertEqual("unknown", closed["state"])
+        self.assertEqual("owned budget checkpoint remains pending", closed["reason"])
+        self.assertEqual({"complete": False}, closed["receipt"]["process_observer"])
 
     def test_uncaught_child_failure_preserves_original_provider_result(self):
         modes = ["thread"]

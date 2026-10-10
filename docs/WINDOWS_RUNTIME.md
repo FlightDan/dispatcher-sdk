@@ -57,6 +57,16 @@ Descendant termination can race with normal process exit. An
 race only when the same acquired process handle is signaled. A live process or
 any other termination error remains a cleanup failure.
 
+Result-file reads can temporarily fail while another process holds the file.
+Sharing or lock refusals, and an `errno=13` refusal without a Windows error code,
+are retried through the existing polling loop and original watchdog deadlines.
+The missing Windows code does not establish the cause. The same file must become
+readable before success; an unresolved refusal remains an error after mandatory
+containment. A definite `ERROR_ACCESS_DENIED` file-read error still fails
+immediately. Primary invocation errors, including malformed result packets,
+retain their native and directory cleanup causes. A cleanup failure after a
+successful invocation still prevents success.
+
 Termination cannot roll back external mutations. An unfinished effect may need
 explicit reconciliation after its lease expires. The timeout watcher runs in a
 host thread, not a separate watchdog service. Suspending or stopping the entire host

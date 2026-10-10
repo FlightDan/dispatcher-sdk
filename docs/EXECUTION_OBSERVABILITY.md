@@ -91,6 +91,13 @@ connection before ordinary flushing. Failed physical close retains the same
 connection and worker until release; a persisted final-flush receipt alone
 does not discharge that storage ownership.
 
+`ObservationJournal.write_batch()` validates the input before reading a committed
+batch sequence. A matching equal or newer sequence proves a replay and returns
+`False` without a writer, wall-clock sample or collector activation. The read and
+any necessary atomic write reuse one connection and share the original write deadline; missing or
+unreadable evidence never proves replay. New batches retain their configured
+durability, and permanent storage or binding errors remain errors.
+
 ## Use the execution budget
 
 ```python
@@ -443,6 +450,13 @@ another attempt. Native filesystem durability I/O cannot be preempted by a Pytho
 wait deadline. A successful late COMMIT retains its actual receipt; it never
 justifies replaying business. Storage still owned by a stopped SDK worker remains
 pending cleanup as described above.
+
+A final activity batch and a closed source do not certify that process collection
+finished. Close receipts retain the process observer's completion and worker state;
+unfinished collection remains pending, and failed collection remains degraded.
+Native outcome packets carry bounded collector diagnostics and mark such telemetry
+unknown while preserving the original handler outcome. Later ownership drain does
+not upgrade the original telemetry receipt.
 
 The current development candidate uses Kernel layout version 5. It adds sampling
 guards; copy-upgrading an older open execution with limits records its unprotected

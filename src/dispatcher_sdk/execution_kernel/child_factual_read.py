@@ -186,9 +186,18 @@ def read_completed_result(capability, row: Mapping[str, Any], window) -> dict[st
                 # current child pair supplies strict ancestry, not a lease.
                 checking_parent = False
                 identity = connection.execute(
-                    "SELECT execution_id,attempt,fence FROM kernel_executions WHERE execution_id=?",
+                    "SELECT execution_id,attempt,fence,state FROM kernel_executions WHERE execution_id=?",
                     (row["child_execution_id"],)).fetchone()
-                if identity is None or not child_proof(connection, tokens, tuple(identity)):
+                if identity is None:
+                    return None
+                # An admitted child can be cancelled before its first claim.
+                # Its legal zero pair proves no started result to deliver;
+                # malformed pairs still reach the strict ancestry validator.
+                if (identity["state"] in {"queued", "cancelled"}
+                        and type(identity["attempt"]) is int and identity["attempt"] == 0
+                        and type(identity["fence"]) is int and identity["fence"] == 0):
+                    return None
+                if not child_proof(connection, tokens, tuple(identity[:3])):
                     return None
                 break
             except (sqlite3.OperationalError, BudgetClockUnknownError) as error:

@@ -20,6 +20,11 @@
 | Restored snapshot is still read-only | Restore and activation are separate. Use the local activation procedure; never delete the marker manually. |
 | Local activation rejects a changed source | The source advanced after the snapshot. Reconcile the newer facts; the SDK will not run the older copy automatically. |
 | Sandbox create/start result is unknown | Reconcile the operation key and provider records. Do not blindly create or start again. |
+| Windows result publication reports `PermissionError` | Temporary sharing refusals use the original watchdog deadline. A definite access denial fails immediately; persistent unreadability retains the original error after containment. |
+| An admitted child wait encounters a Kernel writer | Inspect the original deadline, parent lease and clock guards. Result observation uses a factual reader; pending publication remains a separate recovery obligation. Do not reinvoke either handler to publish its result. |
+| An expired wait sees a cancelled child with `attempt=0` / `fence=0` | This legal pair means the child was never claimed. Factual fallback declines delivery and preserves the original wait refusal; it does not establish malformed ancestry. |
+| An observation batch is replayed | A matching committed equal or newer sequence returns `False` without a writer. Missing proof still needs atomic admission within the original deadline; permanent storage errors remain errors. |
+| Final activity is persisted but process telemetry is incomplete | Inspect the close receipt's process observer completion, worker state and collection error. A persisted batch or closed source does not certify process collection; later ownership drain cannot upgrade that receipt. |
 | Sandbox cleanup remains pending | Inspect the journal and provider, then run bounded recovery. Disposal does not settle external business effects. |
 
 See [submission](../docs/TASK_SUBMISSION.md), [recovery](../docs/SDK_RECOVERY.md),

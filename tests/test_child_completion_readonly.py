@@ -12,7 +12,8 @@ import unittest
 from unittest.mock import patch
 
 from dispatcher_sdk._inspection import InspectionBudgetExceeded
-from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope
+from dispatcher_sdk._sqlite_errors import is_sqlite_contention
+from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError, BudgetEnvelope
 from dispatcher_sdk.execution_kernel import child_factual_read as factual
 from dispatcher_sdk.execution_kernel.children import ChildExecutionError, HandlerChildren, _RetryWindow, _retry
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, ExecutionResultV2, RetryPolicy
@@ -48,7 +49,8 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
 
     def completed_child(self, *, failure=None):
         envelope = self.budget.derive(source='tool', origin_id='original-child-call', timeout_seconds=.5)
-        command = replace(self.command, execution_id='child', idempotency_key='child', causation_id='parent')
+        command = replace(self.command, execution_id='child', idempotency_key='child',
+            causation_id=self.command.execution_id)
         self.kernel.submit_child(command, self.lease, envelope)
         # Retry only transient admission within this original child-call window,
         # preserving ownership of a captured clock fact until its ACK commits.
@@ -73,10 +75,10 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         self.evidence['records'].append(record)
         result = ExecutionResultV2('original-child-result', 'child', 'succeeded' if failure is None else 'failed',
             lease.attempt, lease.fence, [], snapshot.started_at, completed_at,
-            'root', 'parent', {'original': 42} if failure is None else None, failure)
+            'root', self.command.execution_id, {'original': 42} if failure is None else None, failure)
         record['original_result'] = result.to_dict()
         self.kernel.complete(lease, result)
-        row = {'budget_json': json.dumps(envelope.to_dict()), 'parent_execution_id': 'parent',
+        row = {'budget_json': json.dumps(envelope.to_dict()), 'parent_execution_id': self.command.execution_id,
             'parent_attempt': self.lease.attempt, 'parent_fence': self.lease.fence,
             'child_execution_id': 'child', 'action': 'run'}
         return row, window, result
@@ -84,6 +86,414 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
     def watermark(self):
         return self.kernel._connection.execute(
             'SELECT watermark FROM kernel_clock WHERE singleton=1').fetchone()[0]
+
+    def unstarted_child(self):
+        envelope = self.budget.derive(source='tool', origin_id='original-unstarted-child', timeout_seconds=.5)
+        command = replace(self.command, execution_id='unstarted-child', idempotency_key='unstarted-child',
+            causation_id=self.command.execution_id)
+        snapshot = self.kernel.submit_child(command, self.lease, envelope)
+        window = _RetryWindow(envelope, self.kernel, execution_id=self.command.execution_id)
+        row = self.children._enqueue(request_id='unstarted-response', child_id=command.execution_id,
+            action='run', child_command=command, envelope=window.envelope, window=window)
+        self.assertEqual((snapshot.state, snapshot.attempt, snapshot.fence), ('queued', 0, 0))
+        self.assertIsNone(snapshot.lease)
+        self.assertIsNone(snapshot.result)
+        return row, window, snapshot
+
+    def unstarted_child_preserves_original_refusal(self, *, cancelled):
+        row, window, snapshot = self.unstarted_child()
+        if cancelled:
+            snapshot = self.kernel.cancel(snapshot.execution_id, expected_revision=snapshot.revision,
+                reason='cancel before first claim', timeout_seconds=.1)
+        original_deadline = window.deadline
+        original_constraints = window.envelope.constraints
+        canonical_before = self.kernel.get_execution_limits(snapshot.execution_id)['envelope']
+        watermark_before = self.watermark()
+        writer = sqlite3.connect(self.kernel.db_path, timeout=.1)
+        errors, reader_statements, proof_deadlines = [], [], []
+        attach, await_window = self.children.store.attach, self.children._await_window
+        connect, completed = factual._connect_readonly, factual.read_completed_result
+        record = {'scenario': 'unstarted_cancelled' if cancelled else 'unstarted_queued',
+            'original_work_seconds': .5, 'original_proof_seconds': .1,
+            'original_native_deadline': original_deadline, 'child': snapshot.to_dict(),
+            'original_budget': window.envelope.to_dict(), 'factual_module': factual.__file__}
+        self.evidence['records'].append(record)
+
+        def attach_and_hold(*args):
+            attach(*args)
+            writer.execute('BEGIN IMMEDIATE')
+            record['writer_acquired'] = time.monotonic()
+
+        def retain_original_refusal(*args):
+            try:
+                return await_window(*args)
+            except Exception as error:
+                errors.append(error)
+                record['original_refusal'] = {'type': type(error).__name__, 'message': str(error),
+                    'code': getattr(error, 'code', None), 'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None)}
+                record['original_refusal_at'] = time.monotonic()
+                raise
+
+        def observe_connection(*args, **kwargs):
+            connection = connect(*args, **kwargs)
+            connection.set_trace_callback(reader_statements.append)
+            return connection
+
+        def observe_proof(*args):
+            proof_deadlines.append(window._delivery_deadline)
+            record['proof_started'] = time.monotonic()
+            return completed(*args)
+
+        try:
+            with patch('dispatcher_sdk.execution_kernel.children._RetryWindow', return_value=window), \
+                    patch.object(self.children.store, 'attach', side_effect=attach_and_hold), \
+                    patch.object(self.children, '_await_window', side_effect=retain_original_refusal), \
+                    patch.object(factual, '_connect_readonly', side_effect=observe_connection), \
+                    patch.object(factual, 'read_completed_result', side_effect=observe_proof), \
+                    patch.object(factual, '_read_child_snapshot', wraps=factual._read_child_snapshot) as read, \
+                    patch.object(self.kernel, 'claim_and_start', wraps=self.kernel.claim_and_start) as claim:
+                with self.assertRaises((sqlite3.OperationalError, ChildExecutionError)) as caught:
+                    self.children._await(row)
+                read.assert_not_called()
+                claim.assert_not_called()
+            self.assertEqual(len(errors), 1)
+            self.assertIs(caught.exception, errors[0])
+            if isinstance(caught.exception, sqlite3.OperationalError):
+                self.assertTrue(is_sqlite_contention(caught.exception), str(caught.exception))
+            else:
+                # Preparation can consume the same original half-second
+                # before a capture attempts SQL; preserve that exact expiry.
+                self.assertEqual(caught.exception.code, 'child_wait_timeout')
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertGreaterEqual(time.monotonic(), original_deadline)
+            self.assertLessEqual(window.deadline, original_deadline)
+            self.assertEqual(window.envelope.constraints, original_constraints)
+            self.assertIsNone(window._delivery_deadline)
+            self.assertEqual(len(proof_deadlines), 1)
+            self.assertLessEqual(proof_deadlines[0], record['proof_started'] + .1)
+            self.assertEqual(self.watermark(), watermark_before)
+            self.assertEqual(self.kernel.get_execution_limits(snapshot.execution_id)['envelope'], canonical_before)
+            self.assertEqual(self.kernel._connection.execute('SELECT token FROM kernel_budget_samples').fetchall(), [])
+            current = self.kernel.get(snapshot.execution_id)
+            self.assertEqual((current.state, current.attempt, current.fence),
+                ('cancelled' if cancelled else 'queued', 0, 0))
+            self.assertIsNone(current.lease)
+            self.assertEqual(current.to_dict(), snapshot.to_dict())
+            self.assertFalse(any(sql.lstrip().upper().startswith(('BEGIN', 'UPDATE', 'INSERT', 'DELETE'))
+                for sql in reader_statements), reader_statements)
+            record.update(returned_refusal_at=time.monotonic(),
+                retained_native_deadline=window.deadline, proof_deadline=proof_deadlines[0],
+                readonly_statements=reader_statements, child_after=current.to_dict(),
+                result_reads=read.call_count, child_claims=claim.call_count,
+                watermark_before=watermark_before, watermark_after=self.watermark())
+        finally:
+            writer.rollback()
+            writer.close()
+
+    def test_unstarted_queued_child_preserves_original_refusal_without_result_read(self):
+        self.unstarted_child_preserves_original_refusal(cancelled=False)
+
+    def test_unstarted_cancelled_child_preserves_original_refusal_without_result_read(self):
+        self.unstarted_child_preserves_original_refusal(cancelled=True)
+
+    def test_unstarted_boundary_keeps_malformed_child_identity_raw(self):
+        row, window, _ = self.unstarted_child()
+        with sqlite3.connect(self.kernel.db_path, timeout=.1) as corrupt:
+            # Only this corruption fixture bypasses schema CHECKs; production
+            # readers must still reject these malformed persisted identities.
+            corrupt.execute('PRAGMA ignore_check_constraints=ON')
+            for state, attempt, fence in (('queued', 0, 1), ('cancelled', 1, 0),
+                    ('succeeded', 0, 0), ('failed', 1.5, 1), ('cancelled', b'0', 0)):
+                with self.subTest(state=state, attempt=attempt, fence=fence):
+                    corrupt.execute('UPDATE kernel_executions SET state=?,attempt=?,fence=? WHERE execution_id=?',
+                        (state, attempt, fence, row['child_execution_id']))
+                    corrupt.commit()
+                    window._delivery_deadline = time.monotonic() + .1
+                    try:
+                        with patch.object(factual, '_read_child_snapshot', wraps=factual._read_child_snapshot) as read:
+                            with self.assertRaises(StorageIsolationError) as caught:
+                                self.children._completed_result(row, window)
+                            read.assert_not_called()
+                        self.assertEqual(str(caught.exception), 'child result ancestry identity is malformed')
+                        self.assertIsNone(caught.exception.__cause__)
+                        self.evidence['records'].append({'scenario': 'malformed_unstarted_identity',
+                            'state': state, 'attempt': repr(attempt), 'fence': fence,
+                            'refusal': str(caught.exception), 'proof_deadline': window._delivery_deadline,
+                            'result_reads': read.call_count})
+                    finally:
+                        window._delivery_deadline = None
+
+    def test_live_completed_response_does_not_require_kernel_writer(self):
+        record = {'scenario': 'live_completed_response', 'stage': 'prepare_original_child'}
+        self.evidence['records'].append(record)
+        row, window, result = self.completed_child()
+        row = self.children._enqueue(request_id='one-completed-response', child_id='child',
+            action='observe', child_command=None, envelope=window.envelope, window=window)
+        self.children.store.finish(row, 'completed', result=result.to_dict())
+        self.children.store.attach(row, window)
+        record.update(stage='response_committed', original_native_deadline=window.deadline,
+            original_result=result.to_dict(), budget=window.envelope.to_dict())
+        writer = sqlite3.connect(self.kernel.db_path, timeout=.1)
+        statements = []
+        try:
+            writer.execute('BEGIN IMMEDIATE')
+            before = self.watermark()
+            self.kernel._connection.set_trace_callback(statements.append)
+            started = time.monotonic()
+            record.update(stage='original_writer_held', began=started)
+            delivered = self.children._await_window(row, window)
+            returned = time.monotonic()
+            after = self.watermark()
+            record.update(stage='delivered_while_writer_held', returned=returned,
+                watermark_before=before, watermark_after=after, statements=statements,
+                retained_native_deadline=window.deadline, delivered=delivered)
+            self.assertEqual(delivered, result.to_dict())
+            self.assertLess(returned, window.deadline)
+            self.assertLessEqual(window.deadline, record['original_native_deadline'])
+            self.assertEqual(before, after)
+            self.assertFalse(any(sql.lstrip().upper().startswith(
+                ('BEGIN', 'UPDATE', 'INSERT', 'DELETE')) for sql in statements), statements)
+        finally:
+            self.kernel._connection.set_trace_callback(None)
+            writer.rollback()
+            writer.close()
+
+    def test_live_delivery_refuses_stale_parent_before_response_read(self):
+        row, window, _ = self.completed_child()
+        for field, value in (('lease_id', 'other-lease'), ('owner', 'other-owner'),
+                ('revision', self.lease.revision + 1), ('attempt', self.lease.attempt + 1),
+                ('fence', self.lease.fence + 1), ('expires_at', self.lease.expires_at + 1)):
+            with self.subTest(field=field):
+                self.children.parent_lease = replace(self.lease, **{field: value})
+                with patch.object(self.children.store, 'request', wraps=self.children.store.request) as read:
+                    with self.assertRaises(ChildExecutionError) as caught:
+                        self.children._await_window(row, window)
+                    self.assertEqual(caught.exception.code, 'parent_authority_revoked')
+                    read.assert_not_called()
+                self.evidence['records'].append({'scenario': 'stale_parent_before_response',
+                    'field': field, 'code': caught.exception.code})
+
+    def live_completed_response(self):
+        _, window, result = self.completed_child()
+        row = self.children._enqueue(request_id='live-negative-response', child_id='child',
+            action='observe', child_command=None, envelope=window.envelope, window=window)
+        self.children.store.finish(row, 'completed', result=result.to_dict())
+        self.children.store.attach(row, window)
+        self.evidence['records'].append({'scenario': 'committed_live_response',
+            'result': result.to_dict(), 'original_native_deadline': window.deadline,
+            'budget': window.envelope.to_dict()})
+        return row, window, result
+
+    def test_live_delivery_rejects_actual_parent_cancellation_before_response_read(self):
+        row, window, _ = self.live_completed_response()
+        winner = self.kernel.cancel('parent', lease=self.lease, timeout_seconds=.1)
+        with patch.object(self.children.store, 'request', wraps=self.children.store.request) as read:
+            with self.assertRaises(ChildExecutionError) as caught:
+                self.children._await_window(row, window)
+            self.assertEqual(caught.exception.code, 'parent_authority_revoked')
+            read.assert_not_called()
+        self.evidence['records'].append({'scenario': 'live_actual_cancellation',
+            'winner': winner.to_dict(), 'refusal': caught.exception.code})
+
+    def test_live_delivery_expiry_uses_committed_watermark_after_wall_rollback(self):
+        row, window, _ = self.live_completed_response()
+        original_deadline = window.deadline
+        baseline = self.wall[0]
+        self.wall[0] = self.lease.expires_at + 1
+        with self.kernel._control_lock(.1):
+            with self.assertRaises(StaleFenceError):
+                self.kernel.verify(self.lease)
+        advanced = self.watermark()
+        self.wall[0] = baseline
+        with patch.object(self.children.store, 'request', wraps=self.children.store.request) as read:
+            with self.assertRaises(ChildExecutionError) as caught:
+                self.children._await_window(row, window)
+            self.assertEqual(caught.exception.code, 'parent_authority_revoked')
+            read.assert_not_called()
+        self.assertGreaterEqual(advanced, self.lease.expires_at + 1)
+        self.assertEqual(self.watermark(), advanced)
+        self.assertLessEqual(window.deadline, original_deadline)
+        self.evidence['records'].append({'scenario': 'live_expiry_after_wall_rollback',
+            'watermark': advanced, 'wall': self.wall[0], 'refusal': caught.exception.code})
+
+    def foreign_guard_blocks_live_response(self, *, ancestor):
+        guarded_id = 'parent'
+        if ancestor:
+            # Admit a real second-generation parent rather than inventing an
+            # ancestry row; the original parent now owns the foreign guard.
+            command = replace(self.command, execution_id='nested-parent',
+                idempotency_key='nested-parent', causation_id='parent')
+            self.kernel.submit_child(command, self.lease, self.budget, timeout_seconds=.1)
+            lease = self.kernel.claim_and_start('nested-owner', execution_id='nested-parent',
+                child_pool=True, timeout_seconds=.1)
+            budget = self.kernel.prepare_execution_budget(lease).enter_handler(
+                5, origin_id='execution:nested-parent')
+            budget = self.kernel.confirm_handler_entry(lease, budget)
+            self.command, self.lease, self.budget = command, lease, budget
+            self.children = HandlerChildren(self.kernel, command, lease, budget,
+                {'capacity': 1, 'max_depth': 2}, journal=self.children.store.journal)
+        row, window, _ = self.live_completed_response()
+        original_deadline = window.deadline
+        token = self.kernel._begin_budget_sample(guarded_id, timeout_seconds=.1)
+        before = self.watermark()
+        canonical = self.kernel._connection.execute(
+            'SELECT execution_id,envelope_json FROM kernel_execution_limits ORDER BY execution_id').fetchall()
+        with patch.object(self.children.store, 'request', wraps=self.children.store.request) as read, \
+                patch.object(self.kernel, '_finish_budget_sample', wraps=self.kernel._finish_budget_sample) as ack, \
+                patch.object(self.kernel, '_begin_budget_sample', wraps=self.kernel._begin_budget_sample) as arm:
+            with self.assertRaises(BudgetClockUnknownError) as caught:
+                self.children._await_window(row, window)
+            self.assertIn('budget_clock_sample_unresolved', str(caught.exception))
+            read.assert_not_called()
+            ack.assert_not_called()
+            arm.assert_not_called()
+        self.assertLessEqual(window.deadline, original_deadline)
+        self.assertGreaterEqual(time.monotonic(), original_deadline)
+        self.assertEqual(self.watermark(), before)
+        self.assertEqual(self.kernel._connection.execute(
+            'SELECT execution_id,envelope_json FROM kernel_execution_limits ORDER BY execution_id').fetchall(), canonical)
+        markers = self.kernel._connection.execute(
+            'SELECT token,execution_id,reason FROM kernel_budget_samples').fetchall()
+        self.assertEqual([tuple(marker) for marker in markers], [(token, guarded_id, 'sampling')])
+        self.evidence['records'].append({'scenario': 'live_foreign_ancestor' if ancestor else 'live_foreign_parent',
+            'token': token, 'markers': [tuple(marker) for marker in markers],
+            'original_native_deadline': original_deadline, 'retained_native_deadline': window.deadline,
+            'refusal': str(caught.exception), 'watermark': before})
+
+    def test_live_delivery_waits_out_foreign_parent_guard_without_ack(self):
+        self.foreign_guard_blocks_live_response(ancestor=False)
+
+    def test_live_delivery_waits_out_foreign_ancestor_guard_without_ack(self):
+        self.foreign_guard_blocks_live_response(ancestor=True)
+
+    def test_live_delivery_resumes_exact_pending_owner_within_original_window(self):
+        row, window, result = self.live_completed_response()
+        original_deadline = window.deadline
+        writer = sqlite3.connect(self.kernel.db_path, timeout=.1)
+        original_begin = self.kernel._begin_budget_sample
+        def retain_writer_after_arm(*args, **kwargs):
+            token = original_begin(*args, **kwargs)
+            writer.execute('BEGIN IMMEDIATE')
+            return token
+        try:
+            with patch.object(self.kernel, '_begin_budget_sample', side_effect=retain_writer_after_arm):
+                with self.assertRaises(sqlite3.OperationalError) as caught:
+                    window._capture(window.envelope, timeout_seconds=.1)
+            error = caught.exception
+            self.assertTrue(is_sqlite_contention(error), str(error))
+            owner = error.budget_sample_owner
+            token = error.budget_sample_token
+            self.assertIs(owner, window._capture)
+            self.assertIs(self.kernel._budget_sample_owners[token], owner)
+            self.assertIsNotNone(owner._pending[1])
+            window._adopt_sample_owner(error)
+            writer.rollback()
+            with patch.object(self.kernel, '_finish_budget_sample', wraps=self.kernel._finish_budget_sample) as ack, \
+                    patch.object(self.kernel, '_begin_budget_sample', wraps=self.kernel._begin_budget_sample) as arm:
+                delivered = self.children._await_window(row, window)
+                self.assertEqual(delivered, result.to_dict())
+                self.assertTrue(ack.called)
+                self.assertTrue(all(call.args[0] == token for call in ack.call_args_list))
+                arm.assert_not_called()
+            self.assertLess(time.monotonic(), original_deadline)
+            self.assertLessEqual(window.deadline, original_deadline)
+            self.assertIsNone(owner._pending)
+            self.assertNotIn(token, self.kernel._budget_sample_owners)
+            self.assertEqual(self.kernel._connection.execute('SELECT token FROM kernel_budget_samples').fetchall(), [])
+            self.evidence['records'].append({'scenario': 'live_exact_owner_ack',
+                'token': token, 'original_native_deadline': original_deadline,
+                'retained_native_deadline': window.deadline, 'delivered': delivered})
+        finally:
+            writer.rollback()
+            writer.close()
+
+    def test_live_delivery_custom_and_memory_kernels_keep_writing_verify(self):
+        class CustomSQLiteKernel(SQLiteKernel):
+            pass
+        _, window, _ = self.completed_child()
+        original_deadline = window.deadline
+        for kind in ('custom', 'memory'):
+            with self.subTest(kind=kind):
+                kernel = (CustomSQLiteKernel(self.kernel.db_path, now=lambda: self.wall[0])
+                    if kind == 'custom' else SQLiteKernel(':memory:', now=lambda: self.wall[0]))
+                try:
+                    lease = self.lease
+                    if kind == 'memory':
+                        kernel.submit(self.command)
+                        lease = kernel.claim_and_start('memory-owner', execution_id='parent', timeout_seconds=.1)
+                    capability = HandlerChildren(kernel, self.command, lease, self.budget,
+                        {'capacity': 1, 'max_depth': 1}, journal=self.children.store.journal)
+                    statements = []
+                    kernel._connection.set_trace_callback(statements.append)
+                    with patch.object(kernel, 'verify', wraps=kernel.verify) as verify, \
+                            patch.object(kernel, '_verify_active_lease_readonly', wraps=kernel._verify_active_lease_readonly) as inspect:
+                        capability._active(window, delivery=True)
+                        verify.assert_called_once_with(lease)
+                        inspect.assert_not_called()
+                    self.assertTrue(any(sql.startswith('BEGIN IMMEDIATE') for sql in statements), statements)
+                    self.assertTrue(any(sql.startswith('UPDATE kernel_clock') for sql in statements), statements)
+                    self.assertLess(time.monotonic(), original_deadline)
+                    self.assertLessEqual(window.deadline, original_deadline)
+                    self.evidence['records'].append({'scenario': 'live_verify_fallback',
+                        'kind': kind, 'statements': statements})
+                finally:
+                    kernel.close()
+
+    def test_live_delivery_preserves_actual_permanent_sql_error_before_response_read(self):
+        row, window, _ = self.live_completed_response()
+        errors = []
+        def missing_authority_table(lease):
+            try:
+                self.kernel._connection.execute('SELECT state FROM absent_live_parent_authority')
+            except sqlite3.OperationalError as error:
+                errors.append(error)
+                raise
+        with patch.object(self.kernel, '_verify_active_lease_readonly', side_effect=missing_authority_table) as verify, \
+                patch.object(self.children.store, 'request', wraps=self.children.store.request) as read:
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                self.children._await_window(row, window)
+            self.assertIs(caught.exception, errors[0])
+            verify.assert_called_once_with(self.lease)
+            read.assert_not_called()
+        self.evidence['records'].append({'scenario': 'live_permanent_sql',
+            'type': type(caught.exception).__name__, 'message': str(caught.exception)})
+
+    def test_live_delivery_inherits_original_expired_control_before_response_read(self):
+        row, window, _ = self.live_completed_response()
+        original_deadline = window.deadline
+        before = self.watermark()
+        with patch.object(self.children.store, 'request', wraps=self.children.store.request) as read:
+            with self.kernel._control_lock(.005):
+                time.sleep(.01)
+                with self.assertRaises(TimeoutError) as caught:
+                    self.children._await_window(row, window)
+            self.assertEqual(str(caught.exception), 'Kernel control admission budget elapsed')
+            read.assert_not_called()
+        self.assertLessEqual(window.deadline, original_deadline)
+        self.assertEqual(self.watermark(), before)
+        self.assertEqual(self.kernel._connection.execute('SELECT token FROM kernel_budget_samples').fetchall(), [])
+        self.evidence['records'].append({'scenario': 'live_inherited_control_expiry',
+            'original_native_deadline': original_deadline, 'retained_native_deadline': window.deadline,
+            'refusal': str(caught.exception)})
+
+    def test_live_response_read_cancellation_keeps_existing_boundary_behavior(self):
+        row, window, result = self.live_completed_response()
+        original_read = self.children.store.request
+        def cancel_after_response_read(*args):
+            response = original_read(*args)
+            self.kernel.cancel('parent', lease=self.lease, reason='during response read', timeout_seconds=.1)
+            return response
+        with patch.object(self.children.store, 'request', side_effect=cancel_after_response_read) as read:
+            self.assertEqual(self.children._await_window(row, window), result.to_dict())
+            read.assert_called_once()
+        self.assertEqual(self.kernel.get('parent').state, 'cancelled')
+        with patch.object(self.children.store, 'request', wraps=self.children.store.request) as read:
+            with self.assertRaises(ChildExecutionError) as caught:
+                self.children._await_window(row, window)
+            self.assertEqual(caught.exception.code, 'parent_authority_revoked')
+            read.assert_not_called()
+        self.evidence['records'].append({'scenario': 'live_response_cancel_race',
+            'delivered': result.to_dict(), 'next_read_refusal': caught.exception.code})
 
     def test_real_writer_held_beyond_original_cutoff_allows_readonly_delivery_without_clock_write(self):
         row, window, result = self.completed_child()

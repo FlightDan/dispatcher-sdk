@@ -12,6 +12,7 @@ from typing import Any, Iterator, Mapping
 
 from .._inspection import InspectionBudget, InspectionBudgetExceeded
 from .._sqlite_admission import retry_sqlite_admission
+from .._sqlite_errors import is_sqlite_contention
 from ..durability import Durability, validate_durability
 from .contracts import ObservationError, ObservationIdentity, ObservationOptions, identifier, positive
 
@@ -276,14 +277,23 @@ class ObservationJournal:
             connection.close()
 
     @contextmanager
-    def _transaction(self, *, timeout_seconds: float | None = None) -> Iterator[tuple[sqlite3.Connection, float]]:
+    def _transaction(self, *, timeout_seconds: float | None = None,
+                     _deadline: float | None = None,
+                     _connection: sqlite3.Connection | None = None) -> Iterator[tuple[sqlite3.Connection, float]]:
         if not self.writer:
             raise ObservationError("read-only observation journal cannot write")
         duration = self.options.write_timeout if timeout_seconds is None else min(
             self.options.write_timeout, positive(timeout_seconds, "timeout_seconds"))
         deadline = time.monotonic() + duration
-        connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True,
-                                     timeout=0)
+        if _deadline is not None:
+            deadline = min(deadline, _deadline)
+        if time.monotonic() >= deadline:
+            expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
+            expired.rollback_confirmed = True  # No connection or write was admitted.
+            raise expired
+        owns_connection = _connection is None
+        connection = _connection if _connection is not None else sqlite3.connect(
+            self.path.as_uri() + "?mode=rw", uri=True, timeout=0)
         connection.row_factory = sqlite3.Row
         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         def admit(operation, *, commit=False):
@@ -291,7 +301,8 @@ class ObservationJournal:
                 expired=_ObservationWriteBudgetExceeded("observation write admission budget elapsed"),
                 transaction_retained=(lambda: connection.in_transaction) if commit else None)
         try:
-            admit(lambda: connection.execute("PRAGMA trusted_schema=OFF"))
+            if owns_connection:
+                admit(lambda: connection.execute("PRAGMA trusted_schema=OFF"))
             admit(lambda: connection.execute(f"PRAGMA synchronous={2 if self.durability == 'full' else 1}"))
             admit(lambda: connection.execute("BEGIN IMMEDIATE"))
             admit(lambda: self._validate_binding(connection))
@@ -313,7 +324,8 @@ class ObservationJournal:
                     and (transaction_was_open or connection.total_changes == 0))
             raise
         finally:
-            connection.close()
+            if owns_connection:
+                connection.close()
 
     @contextmanager
     def _flush_anchor(self):
@@ -500,38 +512,130 @@ class ObservationJournal:
                                for name, value in (tails or {}).items() if name in ("stdout", "stderr")})
         if len(encoded_metrics.encode("utf-8")) + len(encoded_tails) + len(_json(events).encode("utf-8")) > self.options.batch_bytes:
             raise ValueError("observation batch exceeds its byte limit")
-        with self._transaction() as (connection, now):
-            coverage_json, state = '[]', 'active'
-            previous = connection.execute("SELECT * FROM obs_sources WHERE execution_id=? AND attempt=? AND fence=? AND source_id=?",
-                                          (*_key(identity), source_id)).fetchone()
-            if previous is not None:
-                if previous["sequence"] >= sequence:
-                    return False
-                if previous["identity_json"] != _json(identity.to_dict()):
-                    raise ObservationError("source identity was rebound with different provenance")
-                if previous["source_scope"] != source_scope:
-                    raise ObservationError("source collector scope differs")
-                old = json.loads(previous["metrics_json"])
-                if any(name not in metrics or metrics[name]["count"] < metric["count"] for name, metric in old.items()):
-                    raise ObservationError("cumulative metric counters regressed")
-            if source_scope is not None:
-                collector = connection.execute("SELECT * FROM obs_collectors WHERE execution_id=? AND attempt=? AND fence=? AND source_id=?",
-                                               (*_key(identity), source_id)).fetchone()
-                if collector is None or (collector["source_scope"], collector["incarnation"]) != (source_scope, collector_incarnation):
-                    raise ObservationError("collector scope registration is unavailable or differs")
-                coverage_json = collector["coverage_json"]
-                if not set(metrics).issubset(json.loads(coverage_json)):
-                    raise ObservationError("metric is outside declared collector coverage")
-                state = self._activate_collector(connection, identity, collector, now)
-            connection.execute("INSERT INTO obs_sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                               "ON CONFLICT(execution_id,attempt,fence,source_id) DO UPDATE SET "
-                               "sequence=excluded.sequence,metrics_json=excluded.metrics_json,tails_json=excluded.tails_json,"
-                               "captured_at=excluded.captured_at,persisted_at=excluded.persisted_at,gaps=excluded.gaps,state=excluded.state",
-                               (*_key(identity), source_id, sequence, _json(identity.to_dict()), encoded_metrics,
-                                encoded_tails, captured_at, now, gaps, state, source_scope, collector_incarnation, coverage_json))
-            for event in events:
-                self._event(connection, identity, source_id, event["kind"], event["captured_at"], event["details"], now)
-            return True
+        if not self.writer:
+            raise ObservationError("read-only observation journal cannot write")
+        deadline = time.monotonic() + self.options.write_timeout
+        with self._batch_connection(deadline) as connection:
+            if self._committed_batch_replay(identity, source_id, sequence, deadline, connection):
+                if time.monotonic() >= deadline:
+                    expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
+                    expired.rollback_confirmed = True  # The read snapshot ended without a write.
+                    raise expired
+                return False
+            with self._transaction(_deadline=deadline, _connection=connection) as (connection, now):
+                coverage_json, state = '[]', 'active'
+                previous = connection.execute("SELECT * FROM obs_sources WHERE execution_id=? AND attempt=? AND fence=? AND source_id=?",
+                                              (*_key(identity), source_id)).fetchone()
+                if previous is not None:
+                    if previous["sequence"] >= sequence:
+                        return False
+                    if previous["identity_json"] != _json(identity.to_dict()):
+                        raise ObservationError("source identity was rebound with different provenance")
+                    if previous["source_scope"] != source_scope:
+                        raise ObservationError("source collector scope differs")
+                    old = json.loads(previous["metrics_json"])
+                    if any(name not in metrics or metrics[name]["count"] < metric["count"] for name, metric in old.items()):
+                        raise ObservationError("cumulative metric counters regressed")
+                if source_scope is not None:
+                    collector = connection.execute("SELECT * FROM obs_collectors WHERE execution_id=? AND attempt=? AND fence=? AND source_id=?",
+                                                   (*_key(identity), source_id)).fetchone()
+                    if collector is None or (collector["source_scope"], collector["incarnation"]) != (source_scope, collector_incarnation):
+                        raise ObservationError("collector scope registration is unavailable or differs")
+                    coverage_json = collector["coverage_json"]
+                    if not set(metrics).issubset(json.loads(coverage_json)):
+                        raise ObservationError("metric is outside declared collector coverage")
+                    state = self._activate_collector(connection, identity, collector, now)
+                connection.execute("INSERT INTO obs_sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                                   "ON CONFLICT(execution_id,attempt,fence,source_id) DO UPDATE SET "
+                                   "sequence=excluded.sequence,metrics_json=excluded.metrics_json,tails_json=excluded.tails_json,"
+                                   "captured_at=excluded.captured_at,persisted_at=excluded.persisted_at,gaps=excluded.gaps,state=excluded.state",
+                                   (*_key(identity), source_id, sequence, _json(identity.to_dict()), encoded_metrics,
+                                    encoded_tails, captured_at, now, gaps, state, source_scope, collector_incarnation, coverage_json))
+                for event in events:
+                    self._event(connection, identity, source_id, event["kind"], event["captured_at"], event["details"], now)
+                return True
+
+    @contextmanager
+    def _batch_connection(self, deadline: float) -> Iterator[sqlite3.Connection]:
+        """Own one connection across factual replay and atomic publication."""
+        if time.monotonic() >= deadline:
+            expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
+            expired.rollback_confirmed = True
+            raise expired
+        connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, timeout=0)
+        completed = False
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            retry_sqlite_admission(lambda: connection.execute("PRAGMA trusted_schema=OFF"),
+                deadline=deadline,
+                expired=_ObservationWriteBudgetExceeded("observation write admission budget elapsed"))
+            yield connection
+            completed = True
+        except _ObservationWriteBudgetExceeded as error:
+            transaction_was_open = connection.in_transaction
+            connection.rollback()
+            error.rollback_confirmed = (getattr(error, "rollback_confirmed", False)
+                or not connection.in_transaction
+                and (transaction_was_open or connection.total_changes == 0))
+            raise
+        finally:
+            no_changes = connection.total_changes == 0
+            connection.close()
+            if completed and no_changes and time.monotonic() >= deadline:
+                expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
+                expired.rollback_confirmed = True
+                raise expired
+
+    def _committed_batch_replay(self, identity: ObservationIdentity, source_id: str,
+                                sequence: int, deadline: float, connection: sqlite3.Connection) -> bool:
+        """Prove an already committed no-op without acquiring a writer.
+
+        The read snapshot cannot see an unfinished publication. A miss ends
+        that snapshot and rechecks atomically using the same connection,
+        spending only what remains of the same operation's allowance.
+        """
+        if time.monotonic() >= deadline:
+            expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
+            expired.rollback_confirmed = True  # No connection or write was admitted.
+            raise expired
+
+        def admitted(operation):
+            if time.monotonic() >= deadline:
+                raise _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
+            return operation()
+
+        try:
+            admitted(lambda: connection.execute("BEGIN"))
+            admitted(lambda: self._validate_binding(connection))
+            with closing(admitted(lambda: connection.execute(
+                    "SELECT sequence FROM obs_sources WHERE execution_id=? AND attempt=? AND fence=? AND source_id=?",
+                    (*_key(identity), source_id)))) as cursor:
+                previous = cursor.fetchone()
+            if time.monotonic() >= deadline:
+                raise _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
+            replay = previous is not None and previous["sequence"] >= sequence
+            if replay:
+                admitted(lambda: self._validate_existing_writer(connection, deadline=deadline))
+            return replay
+        except _ObservationWriteBudgetExceeded as error:
+            connection.rollback()
+            error.rollback_confirmed = not connection.in_transaction and connection.total_changes == 0
+            raise
+        except sqlite3.OperationalError as error:
+            if is_sqlite_contention(error):
+                return False
+            code = getattr(error, "sqlite_errorcode", None)
+            interrupted = (type(code) is int and code & 255 == 9
+                           or code is None and str(error).lower() == "interrupted")
+            if time.monotonic() >= deadline and interrupted:
+                connection.rollback()
+                expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
+                expired.rollback_confirmed = not connection.in_transaction and connection.total_changes == 0
+                raise expired from error
+            raise
+        finally:
+            connection.rollback()
 
     @staticmethod
     def _metric_name(name: str) -> None:

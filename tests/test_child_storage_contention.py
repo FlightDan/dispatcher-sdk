@@ -158,8 +158,8 @@ class ChildStorageContentionTests(unittest.TestCase):
         self.assertEqual(original[0]["constraints"], limits["envelope"]["constraints"])
 
     def test_kernel_busy_during_await_preserves_already_successful_child(self):
-        waiting, resume = threading.Event(), threading.Event()
-        calls, row_seen = WitnessList(), WitnessList()
+        waiting, resume, delivered = threading.Event(), threading.Event(), threading.Event()
+        calls, row_seen, returned = WitnessList(), WitnessList(), WitnessList()
         self.addCleanup(resume.set)
         original_await = HandlerChildren._await
         def gated_await(capability, row):
@@ -173,7 +173,10 @@ class ChildStorageContentionTests(unittest.TestCase):
             calls.append(context.lease.execution_id)
             return {"original_result": [1, 2, 3]}
         def parent(payload, context):
-            return context.children.run("child", {}, request_id="one", timeout_seconds=3)
+            value = context.children.run("child", {}, request_id="one", timeout_seconds=3)
+            returned.append(value)
+            delivered.set()
+            return value
         runtime = self.runtime(parent, child)
         with patch.object(HandlerChildren, "_await", gated_await):
             driver, outcomes, errors = self.drive(runtime)
@@ -184,8 +187,22 @@ class ChildStorageContentionTests(unittest.TestCase):
             with self.writer(runtime.kernel.db_path):
                 resume.set()
                 time.sleep(.35)
-                self.assertTrue(driver.is_alive(), "await should retry the live parent's control operation")
-            result = self.finish(driver, outcomes, errors)
+                self.evidence["records"].append({"stage": "kernel_writer_held",
+                    "child_delivered": delivered.is_set(), "returned": list(returned),
+                    "driver_alive": driver.is_alive(), "calls": list(calls)})
+                self.assertTrue(delivered.is_set(), "the committed child result must remain readable")
+                self.assertEqual([raw_result], returned)
+            snapshot = self.finish(driver, outcomes, errors)
+            # run_once may return the original running snapshot when the
+            # parent's independent publication encounters this same writer.
+            # Recover only that original result; never invoke either handler.
+            def settled_parent():
+                runtime.recover_completions(timeout_seconds=.1)
+                current = runtime.kernel.get("parent")
+                return current if current.state == "succeeded" else None
+            result = self.poll(settled_parent, seconds=2)
+            self.evidence["records"].append({"stage": "original_parent_settled",
+                "run_once_snapshot": snapshot.to_dict(), "canonical": result.to_dict()})
         self.assertEqual("succeeded", result.state, result.to_dict())
         self.assertEqual(raw_result, result.result.value)
         self.assertEqual([row_seen[0]["child_execution_id"]], calls)

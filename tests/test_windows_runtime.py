@@ -493,6 +493,207 @@ class WindowsDescendantContainmentTests(unittest.TestCase):
 
 
 class WindowsPublicationRaceTests(unittest.TestCase):
+    def test_directory_cleanup_preserves_primary_error(self):
+        for failed_read in (False, True, "malformed", "runtime_failure", "multiple_cleanup"):
+            with self.subTest(failed_read=failed_read), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "worker"
+                root.mkdir()
+                original = PermissionError(13, "original publication read denial", "returned.json")
+                if failed_read in ("malformed", "multiple_cleanup"):
+                    original = json.JSONDecodeError("original malformed publication", "{", 1)
+                elif failed_read == "runtime_failure":
+                    original = RuntimeError("original runtime failure")
+                cleanup = PermissionError(13, "secondary directory denial", str(root))
+                cleanup.winerror = 5
+                native_cleanup = RuntimeError("earlier native cleanup failure")
+                if failed_read == "multiple_cleanup":
+                    original.__cause__ = native_cleanup
+                with patch.object(windows_runtime.tempfile, "mkdtemp", return_value=str(root)), \
+                        patch.object(windows_runtime.shutil, "rmtree", side_effect=cleanup):
+                    with self.assertRaises(type(original) if failed_read else PermissionError) as caught:
+                        with windows_runtime._worker_directory():
+                            if failed_read:
+                                raise original
+                self.assertIs(caught.exception, original if failed_read else cleanup)
+                if failed_read:
+                    self.assertIs(caught.exception.__cause__, cleanup)
+                if failed_read == "multiple_cleanup":
+                    self.assertIs(cleanup.__cause__, native_cleanup)
+                self.assertTrue(root.exists())
+
+    def test_publication_permission_conflicts_preserve_deadline_error_and_containment(self):
+        # Keep the real poll loop, file protocol and deadline watchdog. Only
+        # native process operations and the individual file-open refusal are
+        # substituted; these checks do not establish native Windows sharing.
+        for disposition, publication, winerror in (
+            ("transient", "returned.json", None),
+            ("transient", "outcome.json", 32),
+            ("permanent", "returned.json", None),
+            ("permanent", "outcome.json", None),
+            ("permanent_cleanup", "returned.json", None),
+            ("malformed", "returned.json", None),
+            ("malformed_cleanup", "returned.json", None),
+            ("runtime_failure_cleanup", "returned.json", None),
+            ("access_denied", "returned.json", 5),
+            ("cleared_after_cutoff", "returned.json", 33),
+        ):
+            with self.subTest(disposition=disposition, publication=publication):
+                roots, reads, cleanup, phases, descendant_bounds, closed = [], [], [], [], [], []
+                work_seconds = 2 if disposition in ("transient", "malformed", "malformed_cleanup") else .08
+                decode_errors = []
+                business_bounds, cleanup_bounds = [], []
+                original_watchdog = windows_runtime._Watchdog
+
+                class Watchdog(original_watchdog):
+                    def business_deadline(self, seconds, **kwargs):
+                        self_test.assertEqual(seconds, work_seconds)
+                        deadline = super().business_deadline(seconds, **kwargs)
+                        business_bounds.append(deadline)
+                        return deadline
+
+                    def cleanup_deadline(self, deadline):
+                        cleanup_bounds.append(deadline)
+                        super().cleanup_deadline(deadline)
+
+                terminated = threading.Event()
+                close_error = RuntimeError("secondary native close failure")
+                expected = {"kind": "ok", "value": "original-publication", "effect_ids": []}
+                error = PermissionError(13, "publication open denied", publication)
+                if disposition == "runtime_failure_cleanup":
+                    error = RuntimeError("original publication read failure")
+                if winerror is not None:
+                    error.winerror = winerror
+
+                def create(api, arguments):
+                    roots.append(Path(arguments[-1]))
+                    return None, None
+
+                class Handle:
+                    revocation_reason = None
+                    exitcode = 0
+
+                    def __init__(self, *args):
+                        pass
+
+                    def resume(self):
+                        windows_runtime._atomic_write(roots[0] / "ready", json.dumps({"worker_pid": 7}))
+                        windows_runtime._atomic_write(roots[0] / "returned.json", json.dumps({
+                            "completed_monotonic": time.monotonic(), "outcome_json": json.dumps(expected)}))
+                        windows_runtime._atomic_write(roots[0] / "outcome.json", json.dumps(expected))
+                        if disposition in ("malformed", "malformed_cleanup"):
+                            windows_runtime._atomic_write(roots[0] / "returned.json", "{")
+
+                    def preserve_worker(self, pid):
+                        self_test.assertEqual(pid, 7)
+
+                    def stop_descendants(self, deadline):
+                        descendant_bounds.append(deadline)
+                        return True
+
+                    def exited(self):
+                        return False
+
+                    def terminate(self):
+                        terminated.set()
+                        return True
+
+                    def close(self):
+                        closed.append(True)
+                        if disposition in ("permanent_cleanup", "malformed_cleanup", "runtime_failure_cleanup"):
+                            raise close_error
+
+                original_read = Path.read_text
+
+                def read(path, *args, **kwargs):
+                    if roots and path == roots[0] / publication:
+                        reads.append(time.monotonic())
+                        if disposition == "runtime_failure_cleanup":
+                            raise error
+                        denied = (disposition in ("permanent", "permanent_cleanup", "access_denied")
+                            or (disposition in ("transient", "malformed", "malformed_cleanup") and len(reads) == 1)
+                            or (disposition == "cleared_after_cutoff" and not terminated.is_set()))
+                        if denied:
+                            if len(reads) > 1:
+                                raise PermissionError(13, "later publication open denied", publication)
+                            raise error
+                    return original_read(path, *args, **kwargs)
+
+                original_loads = json.loads
+
+                def loads(text, *args, **kwargs):
+                    try:
+                        return original_loads(text, *args, **kwargs)
+                    except json.JSONDecodeError as exc:
+                        decode_errors.append(exc)
+                        raise
+
+                def phase(name, details):
+                    phases.append((name, details))
+                    # Secondary diagnostic refusal must not replace the file
+                    # error or interfere with successful factual recovery.
+                    raise RuntimeError("diagnostic sink unavailable")
+
+                self_test = self
+                began = time.monotonic()
+                with patch.object(windows_runtime, "_WinAPI", return_value=object()), \
+                        patch.object(windows_runtime, "_create_suspended", side_effect=create), \
+                        patch.object(windows_runtime, "WindowsProcessHandle", Handle), \
+                        patch.object(windows_runtime, "_Watchdog", Watchdog), \
+                        patch.object(Path, "read_text", read), \
+                        patch.object(windows_runtime.json, "loads", loads):
+                    arguments = dict(db_path="/unused/kernel.db", handler=_echo,
+                        command=_command({}, timeout=work_seconds), lease=None, now=None, start_timeout=5,
+                        on_cleanup_confirmed=lambda: cleanup.append(time.monotonic()), on_phase=phase)
+                    if disposition in ("permanent", "permanent_cleanup", "access_denied"):
+                        with self.assertRaises(PermissionError) as caught:
+                            invoke_windows_handler(**arguments)
+                        self.assertIs(caught.exception, error)
+                    elif disposition in ("malformed", "malformed_cleanup"):
+                        with self.assertRaises(json.JSONDecodeError) as caught:
+                            invoke_windows_handler(**arguments)
+                        self.assertEqual(len(reads), 2)
+                        self.assertEqual(len(decode_errors), 1)
+                        self.assertIs(caught.exception, decode_errors[0])
+                        if disposition == "malformed_cleanup":
+                            self.assertIs(caught.exception.__cause__, close_error)
+                    elif disposition == "runtime_failure_cleanup":
+                        with self.assertRaises(RuntimeError) as caught:
+                            invoke_windows_handler(**arguments)
+                        self.assertIs(caught.exception, error)
+                        self.assertIs(caught.exception.__cause__, close_error)
+                    else:
+                        outcome = invoke_windows_handler(**arguments)
+                        if disposition == "transient":
+                            self.assertEqual(outcome, expected)
+                            self.assertGreaterEqual(len(reads), 2)
+                        else:
+                            self.assertEqual(outcome["kind"], "timeout")
+                            self.assertEqual(outcome["details"]["business_outcome"], expected)
+                self.assertTrue(terminated.is_set())
+                self.assertEqual(closed, [True])
+                self.assertEqual(len(cleanup), 1)
+                self.assertLess(time.monotonic() - began, 5)
+                self.assertEqual(len(business_bounds), 1)
+                self.assertTrue(all(bound == business_bounds[0] for bound in cleanup_bounds))
+                if disposition in ("access_denied", "runtime_failure_cleanup"):
+                    self.assertEqual(len(reads), 1)
+                    self.assertFalse(any(name == "worker_publication_read_deferred" for name, _ in phases))
+                else:
+                    deferred = [details for name, details in phases if name == "worker_publication_read_deferred"]
+                    self.assertEqual(len(deferred), 1)
+                    self.assertEqual(deferred[0]["publication"], publication)
+                    self.assertEqual(deferred[0]["exception_type"], "PermissionError")
+                    self.assertIn("publication open denied", deferred[0]["traceback"])
+                if disposition == "permanent":
+                    self.assertGreaterEqual(reads[-1], cleanup[0])
+                if disposition in ("permanent_cleanup", "malformed_cleanup", "runtime_failure_cleanup"):
+                    failed_cleanup = [details for name, details in phases
+                                      if name == "worker_publication_cleanup_failed"]
+                    self.assertEqual(len(failed_cleanup), 1)
+                    self.assertEqual(failed_cleanup[0]["exception_type"], "RuntimeError")
+                if descendant_bounds:
+                    self.assertLessEqual(max(descendant_bounds), business_bounds[0])
+
     def test_bootstrap_restores_missing_python_streams_and_descriptors(self):
         # Exercise descriptor/Python stream setup in a disposable interpreter.
         # Only the two Windows-specific calls and actual worker are substituted;

@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, sample_clock
-from dispatcher_sdk.execution_kernel.children import CHILD_SCHEMA, ChildExecutionError, ChildService, HandlerChildren
+from dispatcher_sdk.execution_kernel.children import CHILD_SCHEMA, ChildExecutionError, ChildService, HandlerChildren, _RetryWindow, _retry
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, ExecutionLease, ExecutionResultV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.errors import ExecutionNotFoundError
 from dispatcher_sdk.execution_kernel.errors import CASConflictError, StaleFenceError
@@ -86,6 +86,7 @@ class ManagedChildAdmissionTests(unittest.TestCase):
         self.admission_evidence = None
         if self._testMethodName in (
                 'test_first_child_waits_for_actual_parent_entry_confirmation',
+                'test_targeted_child_claim_fences_parent_cancel_between_verify_and_claim',
                 'test_targeted_child_claim_rejects_expired_inherited_work_window'):
             root = retained_directory('sdk-managed-child-admission-')
             self.admission_evidence = {'test': self.id(), 'interpreter': sys.executable,
@@ -456,22 +457,35 @@ class ManagedChildAdmissionTests(unittest.TestCase):
             self.assertEqual({"child": "executed"}, results[0].result.value["value"])
 
     def test_targeted_child_claim_fences_parent_cancel_between_verify_and_claim(self):
+        self.admission_evidence['budgets'] = {'parent': 10, 'sample_attempt': .1}
         with SQLiteKernel(self.journal.path.parent / "kernel.sqlite3") as kernel:
-            parent = self.make_command("parent")
-            kernel.submit(parent)
-            lease = kernel.claim_and_start("parent-owner")
-            budget = kernel.prepare_execution_budget(lease).enter_handler(10, origin_id="execution:parent")
-            kernel.confirm_handler_entry(lease, budget)
-            kernel.submit_child(self.make_command("child"), lease, budget)
-            kernel.verify(lease)
-            # A concurrent cancellation lands after the coordinator's verify
-            # but before the targeted claim's transaction.
-            with SQLiteKernel(kernel.db_path) as other:
-                other.cancel("parent", expected_revision=lease.revision)
-            with self.assertRaises(StaleFenceError):
-                kernel.claim_and_start("child-owner", execution_id="child")
-            self.assertEqual("queued", kernel.get("child").state)
-            self.assertEqual(0, kernel.get("child").attempt)
+            try:
+                parent = self.make_command("parent")
+                self.admission_stage('submit_parent', lambda: kernel.submit(parent))
+                lease = self.admission_stage('claim_parent', lambda: kernel.claim_and_start("parent-owner"))
+                budget = kernel.prepare_execution_budget(lease).enter_handler(10, origin_id="execution:parent")
+                self.admission_stage('confirm_parent', lambda: kernel.confirm_handler_entry(lease, budget))
+                self.admission_stage('submit_child', lambda: kernel.submit_child(self.make_command("child"), lease, budget))
+                window = _RetryWindow(budget, kernel, execution_id='parent')
+                original_deadline = window.deadline
+                self.admission_stage('verify_parent', lambda: kernel.verify(lease))
+                # Cancellation remains between the last coordinator verify
+                # and every targeted claim. Retry only transient admission,
+                # retaining any captured fact within the original ten seconds.
+                with SQLiteKernel(kernel.db_path) as other:
+                    self.admission_stage('cancel_parent', lambda: other.cancel("parent", expected_revision=lease.revision))
+                with self.assertRaises(StaleFenceError):
+                    _retry(window, lambda: self.admission_stage('claim_child', lambda:
+                        kernel.claim_and_start("child-owner", execution_id="child",
+                            timeout_seconds=window.timeout())), kernel=None)
+                self.assertLessEqual(window.deadline, original_deadline)
+                snapshot = kernel.get("child")
+                self.assertEqual("queued", snapshot.state)
+                self.assertEqual(0, snapshot.attempt)
+                self.admission_evidence.update(original_native_deadline=original_deadline,
+                    retained_native_deadline=window.deadline, child=snapshot.to_dict())
+            finally:
+                self.capture_admission('before_cleanup', kernel)
 
     def test_targeted_child_claim_rejects_expired_inherited_work_window(self):
         offset = [0]

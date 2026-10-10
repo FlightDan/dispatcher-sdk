@@ -525,8 +525,12 @@ def _atomic_write(path: Path, text: str) -> None:
 @contextmanager
 def _worker_directory():
     directory = tempfile.mkdtemp(prefix="dispatcher-windows-")
+    primary_failure = None
     try:
         yield directory
+    except BaseException as error:
+        primary_failure = (error, error.__traceback__)
+        raise
     finally:
         # Containment is checked before leaving this scope. A separate process
         # (for example a file scanner) can still briefly hold a diagnostic file.
@@ -537,10 +541,23 @@ def _worker_directory():
                 # violation with NotADirectoryError while handling the error.
                 shutil.rmtree(directory)
                 break
-            except PermissionError as error:
-                if getattr(error, "winerror", None) not in (32, 33) or time.monotonic() >= deadline:
-                    raise
-                time.sleep(_POLL_SECONDS)
+            except BaseException as error:
+                if (isinstance(error, PermissionError) and getattr(error, "winerror", None) in (32, 33)
+                        and time.monotonic() < deadline):
+                    time.sleep(_POLL_SECONDS)
+                    continue
+                if primary_failure is not None:
+                    original, original_traceback = primary_failure
+                    # Preserve an earlier native-cleanup cause if directory
+                    # cleanup also fails while the same primary propagates.
+                    try:
+                        if (error is not original and error.__cause__ is None
+                                and original.__cause__ is not error):
+                            error.__cause__ = original.__cause__
+                    except BaseException:
+                        pass
+                    raise original.with_traceback(original_traceback) from error
+                raise
 
 
 def _worker_main(directory: str) -> None:
@@ -716,6 +733,36 @@ def invoke_windows_handler(
         returned = False
         telemetry_unknown = None
         final_telemetry_receipt = None
+        publication_error = None
+        primary_failure = None
+        unavailable = object()
+
+        def read_publication(path):
+            nonlocal publication_error
+            try:
+                text = path.read_text(encoding="utf-8")
+            except PermissionError as exc:
+                # CRT file opens can report EACCES without a WinError. This
+                # does not establish a sharing conflict. Definite access
+                # denial remains an error; ambiguous denial must actually
+                # clear on this same file before any outcome can succeed.
+                winerror = getattr(exc, "winerror", None)
+                if winerror not in (32, 33) and not (winerror is None and exc.errno == 13):
+                    publication_error = (path, exc, exc.__traceback__)
+                    raise
+                if publication_error is None:
+                    publication_error = (path, exc, exc.__traceback__)
+                    try:
+                        details = _bootstrap_diagnostic(exc, "worker_publication_read")
+                        details.update(publication=path.name, errno=exc.errno, winerror=winerror)
+                        _observe_phase(on_phase, "worker_publication_read_deferred", details)
+                    except BaseException:
+                        pass
+                return unavailable
+            if publication_error is not None and publication_error[0] == path:
+                publication_error = None
+            return json.loads(text)
+
         try:
             watchdog = (_Watchdog(handle, start_deadline, budget_envelope, now, guarded=True)
                         if guarded else _Watchdog(handle, start_deadline, budget_envelope, now))
@@ -768,7 +815,10 @@ def invoke_windows_handler(
                         except BaseException:
                             pass
                 if not returned and (root / "returned.json").exists():
-                    completion = json.loads((root / "returned.json").read_text(encoding="utf-8"))
+                    completion = read_publication(root / "returned.json")
+                    if completion is unavailable:
+                        time.sleep(_POLL_SECONDS)
+                        continue
                     completed = completion.get("completed_monotonic")
                     if (deadline is None or type(completed) not in {int, float} or not math.isfinite(completed)
                             or completed >= deadline):
@@ -787,7 +837,11 @@ def invoke_windows_handler(
                         telemetry_unknown = f"{type(exc).__name__}: {exc}"
                         break
                 if (root / "outcome.json").exists():
-                    outcome = json.loads((root / "outcome.json").read_text(encoding="utf-8"))
+                    available = read_publication(root / "outcome.json")
+                    if available is unavailable:
+                        time.sleep(_POLL_SECONDS)
+                        continue
+                    outcome = available
                     if type(outcome) is dict:
                         final_telemetry_receipt = outcome.get("telemetry_flush")
                     work_expired = not returned and deadline is not None and time.monotonic() >= deadline
@@ -861,23 +915,50 @@ def invoke_windows_handler(
                 watchdog.clock_error = exc
                 if tracker.envelope is not None:
                     watchdog.retain_capture(tracker.envelope)
+        except BaseException as exc:
+            primary_failure = (exc, exc.__traceback__)
+            raise
         finally:
             try:
-                if not handle.terminate():
-                    raise RuntimeError("Windows Job did not reach zero active processes")
-                contained_at = time.monotonic()
-                if on_cleanup_confirmed is not None:
-                    on_cleanup_confirmed()
-            finally:
                 try:
-                    if watchdog is not None:
-                        watchdog.close()
+                    if not handle.terminate():
+                        raise RuntimeError("Windows Job did not reach zero active processes")
+                    contained_at = time.monotonic()
+                    if on_cleanup_confirmed is not None:
+                        on_cleanup_confirmed()
                 finally:
                     try:
-                        handle.close()
+                        if watchdog is not None:
+                            watchdog.close()
                     finally:
-                        if registered and on_finished is not None:
-                            on_finished(handle)
+                        try:
+                            handle.close()
+                        finally:
+                            if registered and on_finished is not None:
+                                on_finished(handle)
+            except BaseException as exc:
+                primary = (primary_failure if primary_failure is not None else
+                           publication_error[1:] if publication_error is not None else None)
+                if primary is None:
+                    raise
+                try:
+                    _observe_phase(on_phase, "worker_publication_cleanup_failed",
+                                   _bootstrap_diagnostic(exc, "worker_publication_cleanup"))
+                except BaseException:
+                    pass
+                error, error_traceback = primary
+                raise error.with_traceback(error_traceback) from exc
+        if publication_error is not None:
+            # Containment has already run. One factual read adds no wait or
+            # authority; persistent denial must not turn into a successful
+            # result from another packet, or silently become a timeout.
+            path, error, error_traceback = publication_error
+            try:
+                read_publication(path)
+            except OSError:
+                raise error.with_traceback(error_traceback)
+            if publication_error is not None:
+                raise error.with_traceback(error_traceback)
         if watchdog is not None:
             snapshot = getattr(watchdog, "snapshot", None)
             observed = snapshot() if callable(snapshot) else None

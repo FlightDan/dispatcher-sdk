@@ -35,6 +35,22 @@ stall callbacks or a separately limited native supervisor handler are described
 in [execution activity and supervision](EXECUTION_OBSERVABILITY.md). A stall
 notice reports an observation; the application chooses its response.
 
+Waiting for an admitted child result on a file-backed built-in SQLite Kernel
+reads the parent's exact lease and budget guards without acquiring a writer.
+Cancellation or lease expiry observed by that authority check, and unresolved
+ancestor clock samples, prevent delivery. Cancellation committed during the
+following response read retains the existing race: that response may return,
+while the next wait refuses the revoked parent. This observation neither renews
+authority nor persists a newly observed
+wall time; business admission and budget capture retain their writing checks.
+Returning the child result and publishing the parent's result are separate
+steps. If publication is pending, `runtime.recover_completions()` retries that
+original result without invoking either handler again. Custom Kernels and
+in-memory Kernels retain their existing verification path.
+The expired wait's factual fallback does not deliver a never-claimed child with
+`attempt=0` and `fence=0`. A queued or cancelled child with that legal identity
+keeps the original wait refusal; malformed started identities remain errors.
+
 Use `app.runtime` and `app.orchestrator` for cancellation, effect inspection,
 evidence-based resolution or advanced dependencies. These are escape hatches;
 the managed request identity must not be rewritten. Recovery which reopens a Run

@@ -235,6 +235,197 @@ class ObservationJournalTests(unittest.TestCase):
             with self.assertRaises(ObservationError):
                 self.journal.write_batch(self.identity, source_id="worker", sequence=4, metrics=metrics, captured_at=103)
 
+    def seed_committed_batch(self):
+        metrics = {"stdout_bytes": {"count": 3, "first_at": 100, "last_at": 100}}
+        with closing(sqlite3.connect(self.journal.path)) as connection, connection:
+            connection.execute("INSERT INTO obs_sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (self.identity.execution_id, self.identity.attempt, self.identity.fence, "worker", 2,
+                 json.dumps(self.identity.to_dict(), sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=False, allow_nan=False), json.dumps(metrics), "{}", 100, 100, 0,
+                 "active", None, None, "[]"))
+        return metrics
+
+    def test_committed_replays_need_no_writer_clock_or_collector_activation(self):
+        metrics = self.seed_committed_batch()
+        with closing(sqlite3.connect(self.journal.path, timeout=0)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            with patch.object(self.journal, "clock", side_effect=AssertionError("replay sampled clock")), \
+                    patch.object(self.journal, "_transaction", side_effect=AssertionError("replay requested writer")), \
+                    patch.object(self.journal, "_activate_collector", side_effect=AssertionError("replay activated collector")):
+                for sequence in (2, 1):
+                    self.assertFalse(self.journal.write_batch(self.identity, source_id="worker",
+                        sequence=sequence, metrics=metrics, captured_at=100, source_scope="unregistered"))
+            row = writer.execute("SELECT sequence,metrics_json FROM obs_sources").fetchone()
+            self.assertEqual(row[0], 2)
+            self.assertEqual(json.loads(row[1]), metrics)
+            writer.rollback()
+
+    def test_advancing_batch_rechecks_a_concurrent_committed_replay(self):
+        from dispatcher_sdk.observability import journal as module
+        metrics = self.seed_committed_batch()
+        original = self.journal._committed_batch_replay
+        advanced = {"stdout_bytes": {"count": 7, "first_at": 100, "last_at": 102}}
+        reads = []
+        # Prepare the competing publication before the SDK's original 30ms
+        # call. Only its actual COMMIT interleaves the read and atomic recheck.
+        with closing(module.sqlite3.connect(self.journal.path, timeout=0)) as publisher:
+            # The external publisher tests committed visibility, not FULL
+            # power-loss durability. The SDK journal retains FULL writes.
+            publisher.execute("PRAGMA synchronous=NORMAL")
+            self.assertEqual(publisher.execute("PRAGMA synchronous").fetchone()[0], 1)
+            self.assertEqual(self.journal.durability, "full")
+            # Establish this publisher's WAL before the timed interleave.
+            # Its preparation cannot stand in for the SDK's admission cost.
+            publisher.execute("UPDATE obs_sources SET sequence=sequence")
+            publisher.commit()
+            publisher.execute("BEGIN IMMEDIATE")
+            publisher.execute("UPDATE obs_sources SET sequence=3,metrics_json=?", (json.dumps(advanced),))
+
+            def publish_after_read(identity, source_id, sequence, deadline, connection):
+                result = original(identity, source_id, sequence, deadline, connection)
+                reads.append(result)
+                publisher.commit()
+                return result
+
+            with patch.object(self.journal, "_committed_batch_replay", publish_after_read):
+                self.assertFalse(self.journal.write_batch(self.identity, source_id="worker", sequence=3,
+                                                         metrics=metrics, captured_at=101))
+            self.assertEqual(reads, [False])
+            self.assertEqual(self.journal.inspect("execution")["metrics"]["stdout_bytes"]["count"], 7)
+            advanced["stdout_bytes"]["count"] = 8
+            self.assertTrue(self.journal.write_batch(self.identity, source_id="worker", sequence=4,
+                                                     metrics=advanced, captured_at=103))
+            self.assertEqual(self.journal.inspect("execution")["metrics"]["stdout_bytes"]["count"], 8)
+            self.storage_evidence.save(phase="concurrent-replay-atomic-recheck",
+                checkpoint={"publisher_synchronous": "NORMAL", "sdk_durability": self.journal.durability,
+                            "original_write_timeout": self.options.write_timeout,
+                            "read_results": reads, "replayed_sequence": 3, "replayed_count": 7,
+                            "advanced_sequence": 4, "advanced_count": 8})
+
+    def test_uncommitted_newer_sequence_cannot_prove_replay(self):
+        metrics = self.seed_committed_batch()
+        with closing(sqlite3.connect(self.journal.path, timeout=0)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE obs_sources SET sequence=3")
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                self.journal.write_batch(self.identity, source_id="worker", sequence=3,
+                                         metrics=metrics, captured_at=100)
+            self.assertEqual(str(caught.exception), "database is locked")
+            writer.rollback()
+        with closing(sqlite3.connect(self.journal.path)) as connection:
+            row = connection.execute("SELECT sequence,metrics_json FROM obs_sources").fetchone()
+        self.assertEqual(row[0], 2)
+        self.assertEqual(json.loads(row[1]), metrics)
+
+    def test_replay_preserves_malformed_input_and_readonly_refusal(self):
+        metrics = self.seed_committed_batch()
+        with patch.object(self.journal, "_committed_batch_replay", side_effect=AssertionError("invalid input reached read")):
+            with self.assertRaises(ValueError):
+                self.journal.write_batch(self.identity, source_id="worker", sequence=0,
+                                         metrics=metrics, captured_at=100)
+            with self.assertRaises(ValueError):
+                self.journal.write_batch(self.identity, source_id="worker", sequence=2,
+                    metrics={"stdout_bytes": {"count": -1}}, captured_at=100)
+        readonly = self.open_journal(writer=False)
+        with patch.object(readonly, "_committed_batch_replay", side_effect=AssertionError("readonly writer attempted replay")):
+            with self.assertRaisesRegex(ObservationError, "read-only observation journal cannot write"):
+                readonly.write_batch(self.identity, source_id="worker", sequence=2,
+                                     metrics=metrics, captured_at=100)
+
+    def test_replay_preserves_permanent_sql_and_binding_errors(self):
+        metrics = self.seed_committed_batch()
+        with closing(sqlite3.connect(self.journal.path)) as connection, connection:
+            connection.execute("UPDATE obs_meta SET source_id='foreign-binding'")
+        with self.assertRaisesRegex(ObservationError, "schema or source binding differs"):
+            self.journal.write_batch(self.identity, source_id="worker", sequence=2,
+                                     metrics=metrics, captured_at=100)
+        with closing(sqlite3.connect(self.journal.path)) as connection, connection:
+            connection.execute("UPDATE obs_meta SET source_id='host-store-id'")
+            connection.execute("DROP TABLE obs_sources")
+        with self.assertRaisesRegex(sqlite3.OperationalError, "no such table: obs_sources"):
+            self.journal.write_batch(self.identity, source_id="worker", sequence=2,
+                                     metrics=metrics, captured_at=100)
+
+    def test_existing_writer_replay_validates_pending_schema(self):
+        metrics = self.seed_committed_batch()
+        existing = ObservationJournal._open_existing_writer(self.journal.path,
+            kernel_path=self.journal.kernel_path, source_id=self.journal.source_id, options=self.options)
+        with closing(sqlite3.connect(self.journal.path)) as connection, connection:
+            connection.execute("CREATE TABLE obs_unexpected(value)")
+        with self.assertRaisesRegex(ObservationError, "schema differs"):
+            existing.write_batch(self.identity, source_id="worker", sequence=2,
+                                 metrics=metrics, captured_at=100)
+
+    def test_replay_close_error_cannot_become_a_success_or_writer_fallback(self):
+        from dispatcher_sdk.observability import journal as module
+        metrics = self.seed_committed_batch()
+        original = module.sqlite3.connect
+        refusal = OSError("actual read connection close failed")
+
+        class RefusingClose(sqlite3.Connection):
+            def close(self):
+                super().close()
+                raise refusal
+
+        def connect(*args, **kwargs):
+            return original(*args, **{**kwargs, "factory": RefusingClose})
+
+        with patch.object(module.sqlite3, "connect", connect), \
+                patch.object(self.journal, "_transaction", side_effect=AssertionError("close failure fell back")):
+            with self.assertRaises(OSError) as caught:
+                self.journal.write_batch(self.identity, source_id="worker", sequence=2,
+                                         metrics=metrics, captured_at=100)
+        self.assertIs(caught.exception, refusal)
+
+    def test_replay_close_expiry_cannot_return_success(self):
+        from dispatcher_sdk.observability import journal as module
+        from dispatcher_sdk.observability.journal import _ObservationWriteBudgetExceeded
+        metrics = self.seed_committed_batch()
+        original = module.sqlite3.connect
+        timeout = self.options.write_timeout
+
+        class SlowClose(sqlite3.Connection):
+            def close(self):
+                super().close()
+                time.sleep(timeout + .01)
+
+        def connect(*args, **kwargs):
+            return original(*args, **{**kwargs, "factory": SlowClose})
+
+        with patch.object(module.sqlite3, "connect", connect), \
+                patch.object(self.journal, "_transaction", side_effect=AssertionError("replay requested writer")):
+            with self.assertRaises(_ObservationWriteBudgetExceeded) as caught:
+                self.journal.write_batch(self.identity, source_id="worker", sequence=2,
+                                         metrics=metrics, captured_at=100)
+        self.assertTrue(caught.exception.rollback_confirmed)
+
+    def test_read_expiry_refuses_writer_under_original_absolute_deadline(self):
+        from dispatcher_sdk.observability import journal as module
+        from dispatcher_sdk.observability.journal import _ObservationWriteBudgetExceeded
+        original_connect, original_read = module.sqlite3.connect, self.journal._committed_batch_replay
+        connections, read_deadlines = [], []
+
+        def connect(path, *args, **kwargs):
+            connections.append(str(path))
+            return original_connect(path, *args, **kwargs)
+
+        def read(identity, source_id, sequence, deadline, connection):
+            read_deadlines.append(deadline)
+            result = original_read(identity, source_id, sequence, deadline, connection)
+            time.sleep(self.options.write_timeout + .01)
+            return result
+
+        with patch.object(module.sqlite3, "connect", connect), \
+                patch.object(self.journal, "_committed_batch_replay", read), \
+                patch.object(self.journal, "clock", side_effect=AssertionError("expired writer sampled clock")):
+            with self.assertRaises(_ObservationWriteBudgetExceeded) as caught:
+                self.journal.write_batch(self.identity, source_id="new-worker", sequence=1,
+                    metrics={"stdout_bytes": {"count": 1}}, captured_at=100)
+        self.assertTrue(caught.exception.rollback_confirmed)
+        self.assertEqual(len(read_deadlines), 1)
+        self.assertEqual(len(connections), 1)
+        self.assertIn("mode=rw", connections[0])
+
     def test_late_old_attempt_is_history_without_changing_current(self):
         old = self.recorder(source_id="old")
         old.report_bytes("stdout", b"old")
@@ -636,11 +827,12 @@ class ObservationJournalTests(unittest.TestCase):
                         self.assertIs(recorder._thread, flusher)
                         if pressure:
                             self.assertFalse(result["source_closed"], result)
-                        if result["state"] == "persisted":
+                        if result["source_closed"]:
                             self.assertTrue(result["final_flush_persisted"], result)
-                            self.assertTrue(result["source_closed"], result)
+                            self.assertEqual("pending", result["state"], result)
+                            self.assertEqual("process_observer_still_active", result["reason"], result)
                         else:
-                            self.assertFalse(result["source_closed"], result)
+                            self.assertNotEqual("persisted", result["state"], result)
                     finally:
                         release.set()
                         if writer is not None:
@@ -672,6 +864,7 @@ class ObservationJournalTests(unittest.TestCase):
                     self.assertEqual(row[0], "active")
                 if "process_observer" in completed:
                     self.assertTrue(completed["process_observer"]["unfinished_collector"])
+                    self.assertNotEqual("persisted", completed["state"], completed)
                 # Native Windows rename must succeed after actual handles are
                 # released; a green lifetime receipt alone does not prove that.
                 renamed = self.journal.path.with_suffix(".released")

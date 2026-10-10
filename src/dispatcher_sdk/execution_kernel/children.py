@@ -709,12 +709,22 @@ class HandlerChildren:
                 source_id=self.service_spec["source_id"], options=options)
         self.store = _Store(journal)
 
-    def _active(self, window=None) -> None:
+    def _active(self, window=None, *, delivery: bool = False) -> None:
         try:
             if window is None:
                 _verify_parent(self.kernel, self.parent_lease)
             else:
-                _retry(window, lambda: self.kernel.verify(self.parent_lease), kernel=self.kernel)
+                def verify():
+                    from .child_factual_read import uses_independent_reader
+                    if delivery and uses_independent_reader(self.kernel):
+                        # Waiting for an admitted result grants no business
+                        # authority and must not compete for the writer lock.
+                        self.kernel._verify_active_lease_readonly(self.parent_lease)
+                        self.kernel._assert_budget_clock(
+                            self.kernel._connection, self.command.execution_id)
+                    else:
+                        self.kernel.verify(self.parent_lease)
+                _retry(window, verify, kernel=self.kernel)
         except (StaleFenceError, InvalidStateTransitionError, ExecutionNotFoundError) as exc:
             raise ChildExecutionError("parent_authority_revoked", str(exc),
                                       execution_id=self.command.execution_id) from exc
@@ -1064,7 +1074,7 @@ class HandlerChildren:
 
     def _await_window(self, row: Mapping[str, Any], window: _RetryWindow) -> dict[str, Any]:
         while True:
-            self._active(window)
+            self._active(window, delivery=True)
             current = _retry(window, lambda: self.store.request(self.command.execution_id, row["request_id"]), store=self.store)
             if current is None:
                 raise ChildExecutionError("child_registration_missing", "durable child registration disappeared")

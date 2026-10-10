@@ -7,6 +7,7 @@ import time
 import unittest
 
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, sample_clock
+from dispatcher_sdk.execution_kernel.children import _transient_control_error
 from dispatcher_sdk.execution_kernel.runtime import Runtime, _ObservationCleanupPendingError
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
 from dispatcher_sdk.observability import ObservationOptions
@@ -37,7 +38,13 @@ class BudgetCaptureCloseLifetimeTests(unittest.TestCase):
                 # Its production sampler and SQLite acknowledgement are intact.
                 with context._budget_lock:
                     context._capture_budget(timeout_seconds=.05)
-            except sqlite3.OperationalError as error:
+            except (sqlite3.OperationalError, TimeoutError) as error:
+                # Arming the real writer may spend this same capture window
+                # before its ACK; retain only the known bounded refusal.
+                if (not _transient_control_error(error)
+                        or (isinstance(error, TimeoutError)
+                            and str(error) != "Kernel control admission budget elapsed")):
+                    raise
                 capture_errors.append(error)
                 evidence["capture_error"] = {"type": type(error).__name__, "message": str(error),
                     "token": getattr(error, "budget_sample_token", None),

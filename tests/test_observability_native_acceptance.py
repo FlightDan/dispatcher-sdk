@@ -387,13 +387,94 @@ def native_registration_child(payload, context):
 
 def native_shared_oom_clue(payload, context):
     root = Path(payload["root"])
+    # Capture this worker's original final observer publication without another
+    # sample, flush, retry, or allowance. Diagnostics cannot alter its outcome.
+    try:
+        from copy import deepcopy
+        from types import SimpleNamespace
+        from tests._storage_evidence import StorageEvidence
+        activity = context.activity
+        storage = None
+        original_close = activity.close
+
+        def retain_close(*args, **kwargs):
+            record = {}
+
+            def diagnostic(operation):
+                try:
+                    operation()
+                except BaseException:
+                    pass
+
+            diagnostic(lambda: record.update(began=time.monotonic(),
+                original_write_timeout=activity.journal.options.write_timeout,
+                close_args=args, close_kwargs=kwargs))
+            try:
+                receipt = original_close(*args, **kwargs)
+                diagnostic(lambda: record.update(receipt=receipt))
+                return receipt
+            except BaseException as error:
+                diagnostic(lambda: record.update(raised={"type": type(error).__name__, "message": str(error),
+                    "traceback": traceback.format_exception(type(error), error, error.__traceback__)}))
+                raise
+            finally:
+                try:
+                    record.update(returned=time.monotonic(), original_close_deadline=activity._close_deadline)
+                    observer = activity._process_observer
+                    local = None
+                    if observer is not None:
+                        local = {"stop_set": observer._stop.is_set(), "error": observer._last_error,
+                            "collector_alive": observer._thread is not None and observer._thread.is_alive(),
+                            "processes": []}
+                        if observer._lock.acquire(blocking=False):
+                            try:
+                                processes = tuple(observer._processes.values())
+                            finally:
+                                observer._lock.release()
+                            for observed in processes:
+                                if observed._lock.acquire(blocking=False):
+                                    try:
+                                        report = dict(observed._report)
+                                        fact = {"report": report, "registered": observed._registered,
+                                            "last_persisted_state": observed._last_persisted_state,
+                                            "last_persisted_monotonic": observed._last_persisted_monotonic}
+                                    finally:
+                                        observed._lock.release()
+                                    local["processes"].append(deepcopy(fact))
+                                else:
+                                    local["processes"].append({"process_id": observed.process_id,
+                                                              "unknown_reason": "diagnostic_report_lock_busy"})
+                        else:
+                            local["unknown_reason"] = "diagnostic_observer_lock_busy"
+                    record["observer_local"] = local
+                    storage.save(phase="exit137-worker-close", checkpoint=record)
+                except BaseException:
+                    pass
+                finally:
+                    try:
+                        storage.stop()
+                    except BaseException:
+                        pass
+
+        try:
+            storage = StorageEvidence(root, SimpleNamespace(id=lambda: "native_shared_oom_clue.worker"))
+            storage.start()
+            activity.close = retain_close
+        except BaseException:
+            try:
+                storage.stop()
+            except BaseException:
+                pass
+    except BaseException:
+        pass
     code = """import pathlib,sys,time
 root=pathlib.Path(sys.argv[1]);(root/'exit137-ready').touch()
 while not (root/'release-exit137').exists(): time.sleep(.005)
 sys.exit(137)
 """
     process = subprocess.Popen([sys.executable, "-c", code, str(root)])
-    context.activity.observe_process(process, process_id="exit137", role="tool")
+    observed_process = context.activity.observe_process(process, process_id="exit137", role="tool")
+    registered = observed_process.snapshot()
     wait_file(root / "exit137-ready")
     clue = {"scope": "shared_cgroup", "known": False, "observed_at": time.time()}
     try:
@@ -406,8 +487,77 @@ sys.exit(137)
     context.activity.phase("shared_cgroup_oom_clue", details=clue)
     mark(root, "oom-clue", **clue)
     (root / "release-exit137").touch()
-    returncode = process.wait(timeout=2)
-    context.activity.observe_process(process, process_id="exit137", role="tool")
+    # Registration is asynchronous. Share the original process-wait allowance
+    # with factual read-only readiness; keep all final public assertions below.
+    began = time.monotonic()
+    deadline = began + 2
+    readiness = {"began": began, "deadline": deadline, "original_wait_seconds": 2,
+        "original_write_timeout": context.activity.journal.options.write_timeout,
+        "registered": registered, "identity": context.activity.identity.to_dict(),
+        "source_id": context.activity.source_id, "reads": [], "read_count": 0}
+    try:
+        returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
+        readiness["process_wait_returned"] = time.monotonic()
+        readiness["returncode"] = returncode
+        context.activity.observe_process(process, process_id="exit137", role="tool")
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("exit137 durable observation did not complete within the original 2-second window")
+            read = {"began": time.monotonic(), "timeout": min(.1, remaining)}
+            try:
+                report = context.activity.journal.inspect(context.activity.identity.execution_id,
+                    attempt=context.activity.identity.attempt, fence=context.activity.identity.fence,
+                    timeout=read["timeout"])
+            except BaseException as error:
+                try:
+                    read.update(returned=time.monotonic(), error={"type": type(error).__name__,
+                        "message": str(error), "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                        "sqlite_errorname": getattr(error, "sqlite_errorname", None)})
+                    readiness["read_count"] += 1
+                    readiness["reads"].append(read)
+                    if len(readiness["reads"]) > 32:
+                        del readiness["reads"][0]
+                except BaseException:
+                    pass
+                raise
+            read.update(returned=time.monotonic(), report=report)
+            readiness["read_count"] += 1
+            readiness["reads"].append(read)
+            if len(readiness["reads"]) > 32:
+                del readiness["reads"][0]
+            durable = next((item for item in report.get("processes", ())
+                if item.get("process_id") == registered["process_id"]), None)
+            if (read["returned"] <= deadline and report.get("complete") is True
+                    and not report.get("truncated") and not report.get("timed_out")
+                    and durable is not None
+                    and durable.get("execution_id") == context.activity.identity.execution_id
+                    and durable.get("attempt") == context.activity.identity.attempt
+                    and durable.get("fence") == context.activity.identity.fence
+                    and durable.get("registration", {}).get("source") == context.activity.source_id
+                    and durable["registration"].get("pid") == registered["pid"]
+                    and durable["registration"]["birth_identity"] == registered["birth_identity"]
+                    and durable.get("state") == "exited"
+                    and durable.get("evidence", {}).get("returncode") == 137
+                    and durable["evidence"].get("exit_kind") == "status"
+                    and "signal" in durable["evidence"] and durable["evidence"]["signal"] is None
+                    and durable["evidence"].get("oom") == "unknown"):
+                readiness.update(state="durable", returned=read["returned"], process=durable)
+                break
+            time.sleep(min(.01, max(0, deadline - time.monotonic())))
+    except BaseException as error:
+        try:
+            readiness.update(state="refused", returned=time.monotonic(), error={
+                "type": type(error).__name__, "message": str(error),
+                "traceback": traceback.format_exception(type(error), error, error.__traceback__)})
+        except BaseException:
+            pass
+        raise
+    finally:
+        try:
+            write_json(root / "exit137-durable-readiness.json", readiness)
+        except BaseException:
+            pass
     return {"returncode": returncode, "clue": clue}
 
 

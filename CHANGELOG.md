@@ -14,8 +14,26 @@
 - Native Windows descendant cleanup treats `ERROR_ACCESS_DENIED` as an exit race
   only when the same acquired process handle is signaled. A live process or any
   other termination error remains a cleanup failure.
+- Native Windows result-file reads retry temporary or unclassified permission
+  refusals within the existing watchdog deadlines. Persistent refusal prevents
+  success after containment; definite access denial remains an immediate error.
+  Primary invocation failures retain secondary native and directory cleanup
+  causes, including when a readable result packet contains malformed JSON.
 - Settlement-note pages avoid repeatedly encoding earlier notes. Inspection
   retains its original time and byte limits, cursors and incomplete evidence rules.
+- Committed observation-batch replays use a read-only sequence proof. A missing
+  proof falls back to the atomic write using the same connection and original deadline;
+  malformed input, binding and permanent storage failures remain errors.
+- Final telemetry receipts propagate incomplete or unfinished process collection.
+  Persisted activity batches and closed sources remain separate facts; collection
+  failure cannot certify complete telemetry or overwrite the handler's result.
+- Admitted child-result waits on the built-in file-backed SQLite Kernel inspect
+  parent authority and ancestor clock guards without a writing transaction.
+  Exact lease checks and original deadlines remain enforced; pending result
+  publication is recovered separately without reinvoking handlers.
+  Expired factual delivery recognizes a never-claimed queued or cancelled child
+  as undeliverable, preserving the original refusal instead of reporting its
+  legal zero attempt/fence as malformed ancestry.
 - Active development and GitHub's default branch use `main`. Versions are
   identified by release tags such as `v0.7.2`.
 - The portable process observability example uses finite startup and delivery

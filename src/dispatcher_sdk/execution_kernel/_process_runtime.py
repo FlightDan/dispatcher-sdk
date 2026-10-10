@@ -600,23 +600,56 @@ def _wait_packet(receiver: Any, deadline: float, tracker: _BudgetTracker,
             return _receive_packet(receiver), deadline
 
 
+def _process_observer_close_summary(report: Any) -> tuple[dict[str, Any] | None, bool]:
+    if type(report) is not dict:
+        return None, False
+    summary = {key: report[key] for key in ("complete", "collector_alive", "unfinished_collector")
+               if type(report.get(key)) is bool}
+    incomplete = bool(report.get("collector_alive") or report.get("unfinished_collector")) or report.get("complete") is False
+    error = report.get("error")
+    if error is not None:
+        incomplete = True
+        summary["error"] = error[:2048] if type(error) is str else type(error).__name__[:2048]
+    errors, remaining = [], 2048
+    reports = report.get("processes", ())
+    if isinstance(reports, (list, tuple)):
+        for process in reports[:32]:
+            error = process.get("collection_error") if type(process) is dict else None
+            if error is not None:
+                incomplete = True
+                if remaining:
+                    text = error[:min(256, remaining)] if type(error) is str else type(error).__name__[:remaining]
+                    errors.append(text)
+                    remaining -= len(text)
+    if errors:
+        summary["process_collection_errors"] = errors
+    return summary, incomplete
+
+
 def _close_context(context: HandlerContext | None) -> dict[str, Any]:
     if context is not None:
         try:
             receipt = context.close()
+            observer, observer_incomplete = _process_observer_close_summary(
+                receipt.get("process_observer") if type(receipt) is dict else None)
+            summary = ({key: receipt[key] for key in ("state", "reason", "timed_out", "final_flush_persisted", "source_closed")
+                        if key in receipt} if type(receipt) is dict else {})
+            if observer is not None:
+                summary["process_observer"] = observer
             checkpoint = receipt.get("budget_checkpoint") if type(receipt) is dict else None
             if type(checkpoint) is dict and checkpoint.get("state") != "confirmed":
                 pending = getattr(context._budget_capture, "_pending", None)
                 return {"state": "unknown", "reason": "owned budget checkpoint remains pending",
+                    **({"receipt": summary} if observer is not None else {}),
                     "budget_checkpoint": {**checkpoint,
                         "token": None if pending is None else pending[0],
                         "captured_envelope": None if pending is None or pending[1] is None else pending[1].to_dict()}}
             if type(receipt) is dict and (receipt.get("state") in {"unknown", "degraded", "pending"}
-                    or receipt.get("pending_events", 0) or receipt.get("pending_bytes", 0)):
+                    or receipt.get("pending_events", 0) or receipt.get("pending_bytes", 0) or observer_incomplete):
                 return {"state": "unknown", "reason": str(receipt.get("reason") or receipt.get("unknown_reason")
+                    or ("process_observer_incomplete" if observer_incomplete and receipt.get("state") == "persisted" else None)
                     or receipt.get("state") or "final telemetry remains pending")[:2048],
-                    "receipt": {key: receipt[key] for key in ("state", "reason", "timed_out", "final_flush_persisted", "source_closed")
-                                if key in receipt}}
+                    "receipt": summary}
         except BaseException as exc:
             # Collection/flush failure cannot overwrite the original outcome.
             return {"state": "unknown", "reason": f"{type(exc).__name__}: {exc}"[:2048]}
