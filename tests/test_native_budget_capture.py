@@ -9,6 +9,7 @@ import time
 import unittest
 
 from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 from dispatcher_sdk.execution_kernel._process_runtime import (
     _BudgetTracker, _DeadlineExpired, _DeadlineGuard, _KernelBudgetCapture, _wait_packet,
@@ -16,7 +17,7 @@ from dispatcher_sdk.execution_kernel._process_runtime import (
 from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError, BudgetEnvelope, sample_clock
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
-from dispatcher_sdk.execution_kernel.children import _RetryWindow
+from dispatcher_sdk.execution_kernel.children import _RetryWindow, _retry
 from dispatcher_sdk.execution_kernel.context import HandlerContext, HandlerEffects
 
 
@@ -136,7 +137,17 @@ class NativeBudgetCaptureTests(unittest.TestCase):
     def test_targeted_claim_transfers_real_failed_ack_to_original_child_retry_window(self):
         root = retained_directory('sdk-targeted-claim-capture-')
         wall = [time.time()]
-        evidence = {}
+        evidence = {'test': self.id(), 'claim_attempts': []}
+        storage_evidence = StorageEvidence(root, self)
+        storage_evidence.start(include_kernel=True)
+        self.addCleanup(storage_evidence.stop)
+
+        def save_storage(phase):
+            try:
+                storage_evidence.save(phase=phase, checkpoint=evidence)
+            except Exception as error:
+                evidence['diagnostic_error'] = {'type': type(error).__name__, 'message': str(error)}
+
         try:
             with SQLiteKernel(root / 'kernel.sqlite3', now=lambda: wall[0], default_lease_seconds=90) as kernel:
                 parent, child = self._admitted_child(kernel)
@@ -183,17 +194,49 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                     canonical = BudgetEnvelope.from_dict(fresh.get_execution_limits('parent')['envelope'])
                     self.assertEqual(canonical.constraints, parent.constraints)
                     self.assertGreaterEqual(canonical.checkpoint.wall_at, baseline + 4)
-                    running = kernel.claim_and_start('child-owner', execution_id='child', timeout_seconds=.1)
-                    self.assertIsNotNone(running)
-                    self.assertEqual(fresh.get('child').attempt, 1)
-                    self.assertEqual(window.envelope.constraints, child.constraints)
                     evidence.update(token=tokens[0], original=child.to_dict(), resumed=window.envelope.to_dict(),
-                        canonical=canonical.to_dict(), fresh_recovery_fenced=True, child_attempt=1,
+                        canonical=canonical.to_dict(), fresh_recovery_fenced=True,
                         original_native_deadline=original_deadline, resumed_native_deadline=window.deadline)
+
+                    def claim_original_child():
+                        attempt = {'began': time.monotonic(), 'owner': 'child-owner',
+                            'execution_id': 'child', 'native_deadline': window.deadline,
+                            'budget': window.envelope.to_dict()}
+                        evidence['claim_attempts'].append(attempt)
+                        try:
+                            attempt['timeout_seconds'] = window.timeout()
+                            running = kernel.claim_and_start('child-owner', execution_id='child',
+                                timeout_seconds=attempt['timeout_seconds'])
+                            attempt['returned_snapshot'] = None if running is None else running.to_dict()
+                            return running
+                        except Exception as error:
+                            attempt['error'] = {'type': type(error).__name__, 'message': str(error),
+                                'budget_sample_token': getattr(error, 'budget_sample_token', None)}
+                            raise
+                        finally:
+                            attempt['returned'] = time.monotonic()
+
+                    try:
+                        # Successful admission spends the original child's
+                        # retained window; each storage attempt remains <= .1.
+                        running = _retry(window, claim_original_child)
+                        self.assertIsNotNone(running)
+                        self.assertEqual(running.attempt, 1)
+                        self.assertEqual(fresh.get('child').attempt, 1)
+                        self.assertEqual(window.envelope.constraints, child.constraints)
+                        self.assertLessEqual(window.deadline, original_deadline)
+                        evidence['child_attempt'] = running.attempt
+                        evidence['final_native_deadline'] = window.deadline
+                    finally:
+                        save_storage('before_cleanup')
         finally:
+            save_storage('cleanup')
             path = root / 'evidence.json'
-            path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
-            print('targeted_claim_capture_evidence=' + str(path), flush=True)
+            try:
+                path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+                print('targeted_claim_capture_evidence=' + str(path), flush=True)
+            except Exception as error:
+                print('targeted_claim_capture_evidence_error=' + repr(error), flush=True)
 
     def test_slow_real_guard_arm_return_retains_forward_sample_before_timeout(self):
         root = retained_directory('sdk-slow-budget-arm-')
