@@ -103,15 +103,59 @@ def handler_call_failure(root, phase, error, context, *, began, request, supplie
             pass
 
 
-def await_value(read, predicate=bool, *, seconds=6):
+def await_value(read, predicate=bool, *, seconds=6, publication_reads=None):
     deadline = time.monotonic() + seconds
+    last_read_error = None
+    if publication_reads is not None:
+        publication_reads.update(original_seconds=seconds, original_deadline=deadline, errors=0)
+
+    def marker_expiry():
+        if last_read_error is not None:
+            raise last_read_error
+        raise TimeoutError('acceptance marker read exceeded its original wait')
+
     while True:
-        value = read()
+        if publication_reads is not None and time.monotonic() >= deadline:
+            marker_expiry()
+        try:
+            value = read()
+        except PermissionError as error:
+            winerror = getattr(error, 'winerror', None)
+            if (publication_reads is None or os.name != 'nt'
+                    or not (winerror in (32, 33) or (winerror is None and error.errno == 13))):
+                raise
+            last_read_error = error
+            fact = {'type': type(error).__name__, 'message': str(error),
+                'errno': error.errno, 'winerror': winerror, 'at': time.monotonic(),
+                'traceback': traceback.format_exc()[-8192:]}
+            publication_reads.setdefault('first_error', fact)
+            publication_reads.update(last_error=fact, errors=publication_reads['errors'] + 1)
+            value = None
+        if publication_reads is not None and time.monotonic() >= deadline:
+            marker_expiry()
         if predicate(value):
+            if publication_reads is not None:
+                publication_reads.update(successful_read=True, returned_at=time.monotonic())
             return value
         if time.monotonic() >= deadline:
+            if last_read_error is not None:
+                raise last_read_error
             raise TimeoutError('acceptance condition not reached: ' + repr(value))
-        time.sleep(.02)
+        time.sleep(.02 if publication_reads is None else min(.02, max(0., deadline-time.monotonic())))
+
+
+def await_marker(path, *, seconds):
+    """Poll one published marker within its existing caller wait allowance."""
+    path = Path(path)
+    reads = {'path': str(path), 'successful_read': False}
+    try:
+        return await_value(lambda: read_json(path), seconds=seconds, publication_reads=reads)
+    finally:
+        # Evidence IO is outside polling and cannot replace its original error.
+        try:
+            save(path.with_name(path.name + '.read-attempts.json'), reads)
+        except BaseException:
+            pass
 
 
 def read_json(path):
@@ -337,7 +381,7 @@ def parent_child_case(root, mode):
                     isolation_mode='process', child_capacity=1, observation_options=OPTIONS) as app:
         task = app.submit('parent', payload, request_id='parent-' + mode, timeout_seconds=20)
         if mode == 'success':
-            first = await_value(lambda: read_json(root / 'first-reported.json'), seconds=12)
+            first = await_marker(root / 'first-reported.json', seconds=12)
             entered = read_json(root / 'child-entered.json')
             partial = await_value(lambda: app.runtime.observe(entered['execution_id'], timeout=.5),
                 lambda value: value.get('metrics', {}).get('stdout_bytes', {}).get('count', 0) >= 2, seconds=3)
@@ -581,7 +625,7 @@ def silence_cancel_case(root):
         check(receipt.get('replayed') is False, 'initial stall registration unexpectedly replayed')
         check(not (root / 'silent-entered.json').exists(), 'silent execution started before watch setup')
         app.start()
-        await_value(lambda: read_json(root / 'silent-entered.json'), seconds=6)
+        await_marker(root / 'silent-entered.json', seconds=6)
         try:
             task.wait(timeout=.05)
         except TimeoutError:

@@ -2,6 +2,9 @@
 
 ## 0.7.2
 
+- The public acceptance example polls Windows marker files within its original
+  wait deadlines when sharing temporarily prevents reading. Definite access
+  denial remains immediate; persistent refusal preserves the original error.
 - Cancellation reports read the Runtime's durable native process cleanup notes
   when cancellation receipts lack cleanup proof. Matching execution ID, attempt,
   fence and Kernel store binding are required, including after restart and without

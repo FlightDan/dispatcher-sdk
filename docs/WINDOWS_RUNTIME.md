@@ -136,6 +136,14 @@ test fixture import/PID-publication errors. The cleanup and recovery
 assertions remain intact. The core adds no Windows-specific Python
 dependency.
 
+The public observability acceptance example separately polls its two marker
+files within their original 12-second and 6-second waits. Windows sharing errors
+32/33, and ambiguous errno 13 without a WinError, may be retried within that
+same deadline. WinError 5 propagates immediately. A persistent refusal retains
+the original permission error, and a read returning after the cutoff cannot
+establish readiness. Read diagnostics are saved beside the marker after polling;
+other file reads and SDK operations retain their existing behavior.
+
 GitHub CI also exposed intermittent sharing violations when deleting private
 diagnostic logs after worker containment. Cleanup now retries only Windows
 sharing/lock errors for up to five seconds, then reports any remaining failure.
