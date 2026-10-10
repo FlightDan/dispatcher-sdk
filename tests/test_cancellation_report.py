@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 from dispatcher_sdk.execution_kernel import CASConflictError, RetryPolicy, Runtime, SandboxHandler, SandboxSpec, SandboxOutcomeUnknown
 from dispatcher_sdk.execution_kernel.cancellation import CancellationJournal, inspect_cancellation_journal
@@ -22,6 +23,8 @@ from dispatcher_sdk.orchestrator import Orchestrator, Operations, inspect_cancel
 from tests.test_runtime_host import wait_until
 from tests.test_runtime_host_cancel_tree import cancellable_process_tree
 from tests.test_sandbox_runtime import FileBackend
+from tests._acceptance_evidence import retained_directory
+from tests._storage_evidence import StorageEvidence
 
 
 def echo(payload, context):
@@ -54,9 +57,62 @@ def _crash_after_commit(root):
 
 class CancellationReportTests(unittest.TestCase):
     def setUp(self):
+        if self._testMethodName in (
+                "test_settlement_cleanup_requires_matching_generation_and_native_source",
+                "test_collected_remote_result_does_not_imply_cleanup_succeeded"):
+            self.root = retained_directory("sdk-cancellation-report-")
+            self.reader_evidence = {"test": self.id(), "synthetic_notes": []}
+            self.storage_evidence = StorageEvidence(self.root, self)
+            self.storage_evidence.start(include_kernel=True)
+            self.addCleanup(self.storage_evidence.stop)
+            self.addCleanup(self.save_reader_evidence)
+            return
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+
+    def tearDown(self):
+        if hasattr(self, "reader_evidence"):
+            self.save_reader_evidence(phase="before_cleanup")
+
+    def save_reader_evidence(self, *, phase="cleanup"):
+        try:
+            self.storage_evidence.save(phase=phase, checkpoint=self.reader_evidence)
+            path = self.root / "synthetic-reader-inputs.json"
+            path.write_text(json.dumps(self.reader_evidence, indent=2))
+            print("cancellation_reader_evidence=" + str(path), flush=True)
+        except Exception as error:
+            # Optional diagnostics must preserve the original reader failure.
+            print("cancellation_reader_evidence_error=" + repr(error), flush=True)
+
+    def seed_cleanup_note(self, journal, identity, evidence):
+        # These two reader fixtures author synthetic inputs. Production note()
+        # durability and its fixed budget are exercised by separate tests.
+        seed = {"kind": "synthetic_reader_input", "began": time.monotonic(),
+                "journal_path": journal.path, "source_id": journal.source_id,
+                "kernel_path": journal.kernel_path, "identity": dict(identity),
+                "evidence_json": json.dumps(evidence)}
+        self.reader_evidence["synthetic_notes"].append(seed)
+        try:
+            uri = Path(journal.path).resolve().as_uri() + "?mode=rw"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                connection.row_factory = sqlite3.Row
+                with connection:
+                    cursor = connection.execute(
+                        "INSERT INTO settlement_notes(note_id,execution_id,attempt,fence,phase,evidence_json,created_at) "
+                        "VALUES(?,?,?,?,?,?,?)", (str(uuid4()), identity["execution_id"],
+                            identity["attempt"], identity["fence"], "process_cleanup",
+                            seed["evidence_json"], time.time()))
+                    row = dict(connection.execute("SELECT * FROM settlement_notes WHERE sequence=?",
+                                                  (cursor.lastrowid,)).fetchone())
+                    seed["binding"] = [dict(item) for item in connection.execute("SELECT * FROM settlement_meta")]
+                seed["committed_row"] = row
+            return row
+        except Exception as error:
+            seed["error"] = {"type": type(error).__name__, "message": str(error)}
+            raise
+        finally:
+            seed["returned"] = time.monotonic()
 
     def stack(self, handlers=None, isolation="thread"):
         runtime = Runtime(str(self.root / "kernel.db"), handlers or {"echo": echo},
@@ -341,15 +397,15 @@ class CancellationReportTests(unittest.TestCase):
             for changed in ({**identity, "execution_id": "other"},
                             {**identity, "attempt": lease.attempt + 1},
                             {**identity, "fence": lease.fence + 1}):
-                journal.note(changed, "process_cleanup", proof)
+                self.seed_cleanup_note(journal, changed, proof)
             self.assertEqual(self.report(sdk).cleanup.status, "unknown")
             for evidence in ({"state": "confirmed", "source": "worker_self_report"},
                              {"state": "pending", "source": "runtime_supervisor_reaped"},
                              {"state": "confirmed", "source": "runtime_supervisor_reaped", "large": "x" * 4096}):
                 with self.subTest(evidence=evidence["state"], source=evidence["source"]):
-                    journal.note(identity, "process_cleanup", evidence)
+                    self.seed_cleanup_note(journal, identity, evidence)
                     self.assertEqual(self.report(sdk).cleanup.status, "unknown")
-            note = journal.note(identity, "process_cleanup", proof)
+            note = self.seed_cleanup_note(journal, identity, proof)
             for invalid in ("{", "[]", '{"state":[],"source":{}}',
                             '{"nested":' + "[" * 1500 + "0" + "]" * 1500 + "}"):
                 with self.subTest(invalid=invalid):
@@ -594,9 +650,9 @@ class CancellationReportTests(unittest.TestCase):
             self.assertTrue(records[0]["result_known"])
             self.assertFalse(records[0]["cleanup_confirmed"])
             self.assertNotEqual(report.cleanup.status, "confirmed")
-            runtime._settlement_journal.note(
+            self.seed_cleanup_note(runtime._settlement_journal,
                 {"execution_id": "x", "attempt": report.kernel_attempt, "fence": report.fence},
-                "process_cleanup", {"state": "confirmed", "source": "runtime_supervisor_reaped"})
+                {"state": "confirmed", "source": "runtime_supervisor_reaped"})
             report = self.report(sdk)
             self.assertEqual(report.local_process_tree_reaped.status, "confirmed")
             self.assertEqual(report.cleanup.status, "pending")
