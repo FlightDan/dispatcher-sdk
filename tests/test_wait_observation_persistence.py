@@ -245,13 +245,13 @@ class WaitObservationTests(unittest.TestCase):
                              wait_exemptions=('memory',))
         service = StallSupervisor(self.journal, self.kernel, clock=self.clock,
                                   clock_sample=self.clock.sample)
-        service.watch(self.identity, policy, target={})
+        # Classification uses the actual claimed identity. Policy activation
+        # and replay have separate coverage in test_stall_supervision.
+        row = self.identity.to_dict()
         with recorder.wait('memory'):
             recorder.flush()
             result = recorder.close(timeout=1)
             self.assertTrue(result['source_closed'])
-        with self.journal._read_connection(3) as (connection, _):
-            row = dict(connection.execute("SELECT * FROM obs_policies WHERE state='active'").fetchone())
         status = self.kernel.supervision_status('work')
         report = self.journal.inspect('work')
         self.assertEqual(report['waits'][0]['details']['_collector_source_id'], 'old')

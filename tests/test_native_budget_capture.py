@@ -239,18 +239,56 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                 print('targeted_claim_capture_evidence_error=' + repr(error), flush=True)
 
     def test_slow_real_guard_arm_return_retains_forward_sample_before_timeout(self):
+        import traceback
+
         root = retained_directory('sdk-slow-budget-arm-')
         wall = [time.time()]
-        evidence = {}
+        evidence = {'test': self.id(), 'sample_attempts': [], 'diagnostic_errors': []}
+        storage_evidence = StorageEvidence(root, self)
+        storage_evidence.start(include_kernel=True)
+        self.addCleanup(storage_evidence.stop)
+
+        def save_storage(phase):
+            try:
+                storage_evidence.save(phase=phase, checkpoint=evidence)
+            except BaseException as error:
+                evidence['diagnostic_errors'].append({'phase': phase,
+                    'type': type(error).__name__, 'message': str(error)})
+
         try:
             with SQLiteKernel(root / 'kernel.sqlite3', now=lambda: wall[0], default_lease_seconds=90) as kernel:
                 parent, child = self._admitted_child(kernel)
                 baseline = wall[0]
+                # Preparation spends this existing child constraint. It must
+                # not capture another authoritative clock sample of its own.
+                window = _RetryWindow(child, None)
+                original_deadline = window.deadline
+                owner = _KernelBudgetCapture(kernel, 'parent')
                 begin = kernel._begin_budget_sample
                 observer = sqlite3.connect(kernel.db_path, timeout=.1)
                 tokens = []
+                callback_entered = False
+                canonical_before = [tuple(row) for row in kernel._connection.execute(
+                    'SELECT execution_id,envelope_json FROM kernel_execution_limits ORDER BY execution_id')]
+                evidence.update(original_child_budget=child.to_dict(), original_parent_budget=parent.to_dict(),
+                    original_native_deadline=original_deadline, canonical_before=canonical_before)
+
+                def facts():
+                    return {'tokens': list(tokens), 'callback_entered': callback_entered,
+                        'wall': wall[0], 'owner_pending': None if owner._pending is None else {
+                            'token': owner._pending[0], 'envelope': None if owner._pending[1] is None
+                            else owner._pending[1].to_dict()},
+                        'registered_owners': [{'token': token, 'execution_id': registered.execution_id,
+                            'same_owner': registered is owner, 'pending': registered._pending is not None}
+                            for token, registered in kernel._budget_sample_owners.items()],
+                        'markers': [tuple(row) for row in kernel._connection.execute(
+                            'SELECT token,execution_id,reason FROM kernel_budget_samples LIMIT 2')],
+                        'canonical': [tuple(row) for row in kernel._connection.execute(
+                            'SELECT execution_id,envelope_json FROM kernel_execution_limits ORDER BY execution_id')]}
 
                 def slow_committed_arm(execution_id, **options):
+                    nonlocal callback_entered
+                    callback_entered = True
                     token = begin(execution_id, **options)
                     tokens.append(token)
                     self.assertEqual(observer.execute('SELECT token FROM kernel_budget_samples').fetchone()[0], token)
@@ -264,15 +302,73 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                     evidence['original_control_deadline'] = deadline
                     return token
 
+                def sample_original_child():
+                    with window.project():
+                        timeout = min(.01, window.remaining())
+                    attempt = {'began': time.monotonic(), 'timeout_seconds': timeout,
+                        'native_deadline': window.deadline}
+                    evidence['sample_attempts'].append(attempt)
+                    try:
+                        return owner(child, timeout_seconds=timeout)
+                    except TimeoutError as error:
+                        attempt['error'] = {'type': type(error).__name__, 'message': str(error),
+                            'traceback': traceback.format_exception(type(error), error, error.__traceback__),
+                            'budget_sample_token': getattr(error, 'budget_sample_token', None)}
+                        # Only refusal before any callback/arm can retry. Once
+                        # the target starts, return its exact error so _retry
+                        # cannot replay the deliberately expired capture.
+                        if (type(error) is TimeoutError
+                                and str(error) == 'Kernel control admission budget elapsed'
+                                and getattr(error, 'budget_sample_token', None) is None
+                                and not callback_entered and not tokens and owner._pending is None):
+                            retry_preparation = False
+                            try:
+                                with window.project():
+                                    remaining = window.remaining()
+                                if remaining > 0:
+                                    with kernel._control_lock(min(.1, remaining)):
+                                        proof = facts()
+                                    attempt['preparation_proof'] = proof
+                                    with window.project():
+                                        live = window.remaining() > 0
+                                    if (live and not proof['callback_entered'] and not proof['tokens']
+                                            and proof['owner_pending'] is None and not proof['registered_owners']
+                                            and not proof['markers'] and proof['canonical'] == canonical_before
+                                            and proof['wall'] == baseline):
+                                        retry_preparation = True
+                            except BaseException as proof_error:
+                                attempt['proof_error'] = {'type': type(proof_error).__name__,
+                                    'message': str(proof_error)}
+                            if retry_preparation:
+                                attempt['retry_preparation'] = True
+                                raise
+                        return error
+                    except BaseException as error:
+                        attempt['error'] = {'type': type(error).__name__, 'message': str(error),
+                            'traceback': traceback.format_exception(type(error), error, error.__traceback__),
+                            'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None)}
+                        # Generic _retry also recognizes BUSY and unresolved
+                        # guards. Those must never replay this target; only
+                        # the proved pre-arm Timeout above may escape to it.
+                        return error
+                    finally:
+                        attempt['returned'] = time.monotonic()
+
                 kernel._begin_budget_sample = slow_committed_arm
                 try:
                     with self.assertRaises(TimeoutError) as caught:
                         # Exercise the parent's guarded sampling directly. A
                         # child claim's unrelated setup must not consume the
                         # control window before this slow committed arm.
-                        kernel._sample_budget('parent', child, timeout_seconds=.01)
+                        outcome = _retry(window, sample_original_child)
+                        if isinstance(outcome, BaseException):
+                            raise outcome
+                        self.fail('slow committed arm unexpectedly completed its original capture')
                     error = caught.exception
                     evidence['error'] = {'type': type(error).__name__, 'message': str(error)}
+                    self.assertTrue(callback_entered, evidence)
+                    self.assertTrue(hasattr(error, 'budget_sample_envelope'), evidence)
+                    self.assertLessEqual(window.deadline, original_deadline)
                     retained = error.budget_sample_envelope
                     self.assertIsNotNone(retained)
                     self.assertEqual(retained.constraints, child.constraints)
@@ -281,6 +377,13 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                     self.assertIs(kernel._budget_sample_owners[tokens[0]], error.budget_sample_owner)
                     self.assertIs(error.budget_sample_owner._pending[1], retained)
                 finally:
+                    try:
+                        evidence['before_cleanup'] = facts()
+                        evidence['retained_native_deadline'] = window.deadline
+                    except BaseException as diagnostic_error:
+                        evidence['diagnostic_errors'].append({'phase': 'before_cleanup',
+                            'type': type(diagnostic_error).__name__, 'message': str(diagnostic_error)})
+                    save_storage('before_cleanup')
                     observer.close()
                     wall[0] = baseline
                     kernel._begin_budget_sample = begin
@@ -298,10 +401,21 @@ class NativeBudgetCaptureTests(unittest.TestCase):
                     self.assertEqual(fresh.get('child').attempt, 0)
                     evidence.update(token=tokens[0], retained=retained.to_dict(), resumed=resumed.to_dict(),
                         canonical=canonical.to_dict(), fresh_recovery_fenced=True, same_token_acknowledged=True)
+        except BaseException as error:
+            evidence['fixture_failure'] = {'type': type(error).__name__, 'message': str(error),
+                'traceback': traceback.format_exception(type(error), error, error.__traceback__)}
+            raise
         finally:
+            save_storage('cleanup')
             path = root / 'evidence.json'
-            path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
-            print('slow_budget_arm_evidence=' + str(path), flush=True)
+            try:
+                path.write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+                print('slow_budget_arm_evidence=' + str(path), flush=True)
+            except BaseException as error:
+                try:
+                    print('slow_budget_arm_evidence_error=' + repr(error), flush=True)
+                except BaseException:
+                    pass
 
     def test_failed_real_acknowledgement_fences_recovery_but_allows_factual_cancel_and_owner_retry(self):
         root = retained_directory('sdk-native-budget-capture-')
