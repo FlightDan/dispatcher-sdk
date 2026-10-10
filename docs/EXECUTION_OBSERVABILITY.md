@@ -459,8 +459,8 @@ See [the portable example](../examples/execution_observability.py) for a real
 parent/child execution. The [public acceptance consumer](../examples/sdk_observability_acceptance.py)
 retains raw parent child-call and child progress-call failures beside its phase
 markers, including the original traceback, SQLite error code, execution identity
-and supplied budget. Set `SDK_ACCEPTANCE_EVIDENCE_DIR` to choose the evidence
-directory. These diagnostics preserve the original exception and deadlines;
+and supplied budget. Pass `--evidence-dir <new-empty-directory>` to choose its
+evidence directory. These diagnostics preserve the original exception and deadlines;
 an unfinished child result or ACK remains unconfirmed.
 
 The

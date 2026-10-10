@@ -32,8 +32,8 @@ When reporting a problem, include the SDK version or commit, Python version,
 platform, isolation mode, relevant IDs and states, and a minimal reproduction.
 The [public observability consumer](../examples/sdk_observability_acceptance.py)
 retains raw child-call and progress-call tracebacks, SQLite error codes and
-original budgets. Set `SDK_ACCEPTANCE_EVIDENCE_DIR` to keep its evidence in a
-chosen directory; the diagnostic records do not retry the failed call.
+original budgets. Pass `--evidence-dir <new-empty-directory>` to choose its
+evidence directory; the diagnostic records do not retry the failed call.
 Remove credentials and private payloads. Use
 [GitHub Issues](https://github.com/FlightDan/dispatcher-sdk/issues) for bugs and
 [security reporting](../SECURITY.md) for vulnerabilities.

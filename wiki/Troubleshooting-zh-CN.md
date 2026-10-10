@@ -30,8 +30,8 @@
 
 反馈问题时，请提供 SDK 版本或 commit、Python 版本、平台、隔离模式、相关身份和状态，
 以及最小复现（能重现问题的最小示例）。[公共观测消费者](../examples/sdk_observability_acceptance.py)
-会保留子调用和进度调用的原始异常堆栈、SQLite 错误码和原有预算。设置
-`SDK_ACCEPTANCE_EVIDENCE_DIR` 可指定证据目录；诊断记录不会重试失败调用。
+会保留子调用和进度调用的原始异常堆栈、SQLite 错误码和原有预算。使用
+`--evidence-dir <新的空目录>` 指定证据目录；诊断记录不会重试失败调用。
 请先移除凭据和私有数据。
 一般问题请提交到 [GitHub Issues](https://github.com/FlightDan/dispatcher-sdk/issues)，
 漏洞请使用[安全报告渠道](../SECURITY.md)。
