@@ -266,13 +266,14 @@ class ObservationJournalTests(unittest.TestCase):
         original = self.journal._committed_batch_replay
         advanced = {"stdout_bytes": {"count": 7, "first_at": 100, "last_at": 102}}
         reads = []
+        phases = {}
         # Prepare the competing publication before the SDK's original 30ms
         # call. Only its actual COMMIT interleaves the read and atomic recheck.
         with closing(module.sqlite3.connect(self.journal.path, timeout=0)) as publisher:
             # The external publisher tests committed visibility, not FULL
             # power-loss durability. The SDK journal retains FULL writes.
-            publisher.execute("PRAGMA synchronous=NORMAL")
-            self.assertEqual(publisher.execute("PRAGMA synchronous").fetchone()[0], 1)
+            publisher.execute("PRAGMA synchronous=OFF")
+            self.assertEqual(publisher.execute("PRAGMA synchronous").fetchone()[0], 0)
             self.assertEqual(self.journal.durability, "full")
             # Establish this publisher's WAL before the timed interleave.
             # Its preparation cannot stand in for the SDK's admission cost.
@@ -282,14 +283,35 @@ class ObservationJournalTests(unittest.TestCase):
             publisher.execute("UPDATE obs_sources SET sequence=3,metrics_json=?", (json.dumps(advanced),))
 
             def publish_after_read(identity, source_id, sequence, deadline, connection):
+                phases['original_deadline'] = deadline
+                phases['read_began'] = time.monotonic()
                 result = original(identity, source_id, sequence, deadline, connection)
+                phases['read_returned'] = time.monotonic()
+                phases['read_result'] = result
                 reads.append(result)
-                publisher.commit()
+                phases['publisher_in_transaction_before_commit'] = publisher.in_transaction
+                phases['commit_began'] = time.monotonic()
+                try:
+                    publisher.commit()
+                finally:
+                    phases['commit_returned'] = time.monotonic()
+                    phases['publisher_in_transaction_after_commit'] = publisher.in_transaction
                 return result
 
-            with patch.object(self.journal, "_committed_batch_replay", publish_after_read):
-                self.assertFalse(self.journal.write_batch(self.identity, source_id="worker", sequence=3,
-                                                         metrics=metrics, captured_at=101))
+            try:
+                with patch.object(self.journal, "_committed_batch_replay", publish_after_read):
+                    self.assertFalse(self.journal.write_batch(self.identity, source_id="worker", sequence=3,
+                                                             metrics=metrics, captured_at=101))
+            finally:
+                # Persist outside the SDK call's original admission window.
+                try:
+                    self.storage_evidence.save(phase="concurrent-replay-publication",
+                        checkpoint={"publisher_synchronous": "OFF", "sdk_durability": self.journal.durability,
+                                    "original_write_timeout": self.options.write_timeout, "phases": phases,
+                                    "read_results": reads})
+                except BaseException as error:
+                    # Secondary diagnostics must preserve the original refusal.
+                    phases['diagnostic_error'] = {'type': type(error).__name__, 'message': str(error)[:2048]}
             self.assertEqual(reads, [False])
             self.assertEqual(self.journal.inspect("execution")["metrics"]["stdout_bytes"]["count"], 7)
             advanced["stdout_bytes"]["count"] = 8
@@ -297,7 +319,7 @@ class ObservationJournalTests(unittest.TestCase):
                                                      metrics=advanced, captured_at=103))
             self.assertEqual(self.journal.inspect("execution")["metrics"]["stdout_bytes"]["count"], 8)
             self.storage_evidence.save(phase="concurrent-replay-atomic-recheck",
-                checkpoint={"publisher_synchronous": "NORMAL", "sdk_durability": self.journal.durability,
+                checkpoint={"publisher_synchronous": "OFF", "sdk_durability": self.journal.durability,
                             "original_write_timeout": self.options.write_timeout,
                             "read_results": reads, "replayed_sequence": 3, "replayed_count": 7,
                             "advanced_sequence": 4, "advanced_count": 8})

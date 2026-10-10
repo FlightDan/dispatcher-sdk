@@ -156,6 +156,13 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
                     self.children._await(row)
                 read.assert_not_called()
                 claim.assert_not_called()
+            returned = time.monotonic()
+            record.update(returned_refusal_at=returned,
+                retained_native_deadline=window.deadline,
+                retained_budget=window.envelope.to_dict(),
+                retained_view=window.envelope.view(sample=window.envelope.checkpoint).to_dict(),
+                readonly_statements=reader_statements,
+                result_reads=read.call_count, child_claims=claim.call_count)
             self.assertEqual(len(errors), 1)
             self.assertIs(caught.exception, errors[0])
             if isinstance(caught.exception, sqlite3.OperationalError):
@@ -165,7 +172,8 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
                 # before a capture attempts SQL; preserve that exact expiry.
                 self.assertEqual(caught.exception.code, 'child_wait_timeout')
             self.assertIsNone(caught.exception.__cause__)
-            self.assertGreaterEqual(time.monotonic(), original_deadline)
+            # A stronger captured floor can shorten the original allowance.
+            self.assertGreaterEqual(returned, window.deadline)
             self.assertLessEqual(window.deadline, original_deadline)
             self.assertEqual(window.envelope.constraints, original_constraints)
             self.assertIsNone(window._delivery_deadline)
@@ -181,7 +189,7 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
             self.assertEqual(current.to_dict(), snapshot.to_dict())
             self.assertFalse(any(sql.lstrip().upper().startswith(('BEGIN', 'UPDATE', 'INSERT', 'DELETE'))
                 for sql in reader_statements), reader_statements)
-            record.update(returned_refusal_at=time.monotonic(),
+            record.update(assertions_completed_at=time.monotonic(),
                 retained_native_deadline=window.deadline, proof_deadline=proof_deadlines[0],
                 readonly_statements=reader_statements, child_after=current.to_dict(),
                 result_reads=read.call_count, child_claims=claim.call_count,
@@ -338,6 +346,10 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         before = self.watermark()
         canonical = self.kernel._connection.execute(
             'SELECT execution_id,envelope_json FROM kernel_execution_limits ORDER BY execution_id').fetchall()
+        record = {'scenario': 'live_foreign_ancestor' if ancestor else 'live_foreign_parent',
+            'token': token, 'original_native_deadline': original_deadline,
+            'original_budget': window.envelope.to_dict()}
+        self.evidence['records'].append(record)
         with patch.object(self.children.store, 'request', wraps=self.children.store.request) as read, \
                 patch.object(self.kernel, '_finish_budget_sample', wraps=self.kernel._finish_budget_sample) as ack, \
                 patch.object(self.kernel, '_begin_budget_sample', wraps=self.kernel._begin_budget_sample) as arm:
@@ -347,15 +359,21 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
             read.assert_not_called()
             ack.assert_not_called()
             arm.assert_not_called()
+        returned = time.monotonic()
+        record.update(returned_refusal_at=returned, retained_native_deadline=window.deadline,
+            retained_budget=window.envelope.to_dict(),
+            retained_view=window.envelope.view(sample=window.envelope.checkpoint).to_dict(),
+            refusal=str(caught.exception), response_reads=read.call_count,
+            sample_acknowledgements=ack.call_count, sample_arms=arm.call_count)
         self.assertLessEqual(window.deadline, original_deadline)
-        self.assertGreaterEqual(time.monotonic(), original_deadline)
+        self.assertGreaterEqual(returned, window.deadline)
         self.assertEqual(self.watermark(), before)
         self.assertEqual(self.kernel._connection.execute(
             'SELECT execution_id,envelope_json FROM kernel_execution_limits ORDER BY execution_id').fetchall(), canonical)
         markers = self.kernel._connection.execute(
             'SELECT token,execution_id,reason FROM kernel_budget_samples').fetchall()
         self.assertEqual([tuple(marker) for marker in markers], [(token, guarded_id, 'sampling')])
-        self.evidence['records'].append({'scenario': 'live_foreign_ancestor' if ancestor else 'live_foreign_parent',
+        record.update({'scenario': 'live_foreign_ancestor' if ancestor else 'live_foreign_parent',
             'token': token, 'markers': [tuple(marker) for marker in markers],
             'original_native_deadline': original_deadline, 'retained_native_deadline': window.deadline,
             'refusal': str(caught.exception), 'watermark': before})
@@ -464,7 +482,22 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         before = self.watermark()
         with patch.object(self.children.store, 'request', wraps=self.children.store.request) as read:
             with self.kernel._control_lock(.005):
+                control_deadline = self.kernel._control_deadline
+                self.assertIsNotNone(control_deadline)
                 time.sleep(.01)
+                # Windows' monotonic clock can remain on the same coarse tick
+                # after this sleep. Observe expiry of the original 5ms bound.
+                while time.monotonic() < control_deadline:
+                    self.assertLess(time.monotonic(), original_deadline)
+                    time.sleep(.001)
+                expired_at = time.monotonic()
+                self.evidence['records'].append({
+                    'scenario': 'live_inherited_control_expiry_precondition',
+                    'original_control_deadline': control_deadline,
+                    'observed_expired_at': expired_at,
+                    'original_native_deadline': original_deadline})
+                self.assertGreaterEqual(expired_at, control_deadline)
+                self.assertLess(expired_at, original_deadline)
                 with self.assertRaises(TimeoutError) as caught:
                     self.children._await_window(row, window)
             self.assertEqual(str(caught.exception), 'Kernel control admission budget elapsed')

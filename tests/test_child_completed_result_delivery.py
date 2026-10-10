@@ -72,16 +72,29 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
         from dispatcher_sdk.execution_kernel.errors import ExecutionNotFoundError
         root = retained_directory('sdk-child-delivery-writer-cutoff-')
         witness = SimpleNamespace(waiting=threading.Event(), resume=threading.Event(), row=None,
-                                  calls=[], outcomes=[], errors=[], rescues=[], writer={})
+            publication_held=threading.Event(), release_publication=threading.Event(),
+            publication={}, publication_calls=[], request_before_writer=None,
+            calls=[], outcomes=[], errors=[], rescues=[],
+            writer={}, post_release={}, recovery=[], diagnostic_errors=[], final=None)
 
         def retain_observations():
             # Also runs when setup or a timing assertion fails before the
             # normal completed-result report can be assembled.
             path = root / 'observations.json'
-            path.write_text(json.dumps({'row': witness.row, 'calls': witness.calls,
-                'errors': witness.errors, 'rescues': witness.rescues, 'writer': witness.writer,
-                'outcomes': [item.to_dict() for item in witness.outcomes]}, indent=2), encoding='utf-8')
-            print('child_writer_cutoff_observations=' + str(path), flush=True)
+            try:
+                path.write_text(json.dumps({'row': witness.row, 'calls': witness.calls,
+                    'errors': witness.errors, 'rescues': witness.rescues, 'writer': witness.writer,
+                    'publication': witness.publication, 'request_before_writer': witness.request_before_writer,
+                    'publication_calls': witness.publication_calls,
+                    'post_release': witness.post_release, 'recovery': witness.recovery,
+                    'outcomes': [item.to_dict() for item in witness.outcomes],
+                    'diagnostic_errors': witness.diagnostic_errors,
+                    'final': None if witness.final is None else witness.final.to_dict()},
+                    indent=2), encoding='utf-8')
+                print('child_writer_cutoff_observations=' + str(path), flush=True)
+            except BaseException as error:
+                witness.diagnostic_errors.append({
+                    'type': type(error).__name__, 'message': str(error)[:2048]})
 
         self.addCleanup(retain_observations)
 
@@ -96,6 +109,41 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
             handler.__execution_kernel_revision__ = 'child-writer-cutoff-delivery-v1'
         original = HandlerChildren._await
         original_completed = HandlerChildren._completed_result
+        original_finish = _Store.finish
+
+        def hold_publication(store, row, *args, **kwargs):
+            if (store is not runtime._child_service.store
+                    or row['parent_execution_id'] != 'parent' or row['request_id'] != 'one'):
+                return original_finish(store, row, *args, **kwargs)
+            envelope = BudgetEnvelope.from_dict(json.loads(row['budget_json']))
+            cutoff = min(item.work_deadline_at for item in envelope.constraints)
+            parent_cutoff = min(item.work_deadline_at for item in envelope.constraints
+                if item.source in ('execution', 'parent'))
+            result = kwargs.get('result')
+            completed_at = result.get('completed_at') if isinstance(result, dict) else None
+            on_time = (isinstance(result, dict) and result.get('status') == 'succeeded'
+                and type(completed_at) in (int, float) and math.isfinite(completed_at)
+                and completed_at <= cutoff)
+            entry = {'entered_at': time.time(), 'entered_monotonic': time.monotonic(),
+                'original_cutoff': cutoff, 'original_parent_cutoff': parent_cutoff,
+                'result': result, 'on_time': on_time}
+            witness.publication_calls.append(entry)
+            if on_time:
+                # Hold the actual producer before its transaction; durable child
+                # success alone does not guarantee that the response is pending.
+                if not witness.publication_held.is_set():
+                    witness.publication = entry
+                witness.publication_held.set()
+                released = witness.release_publication.wait(max(0., parent_cutoff-time.time()))
+                entry.update({'release_signalled': released, 'released_at': time.time(),
+                    'released_monotonic': time.monotonic()})
+            try:
+                return original_finish(store, row, *args, **kwargs)
+            except BaseException as error:
+                entry['finish_error'] = {'type': type(error).__name__, 'message': str(error)}
+                raise
+            finally:
+                entry['finish_returned_at'] = time.time()
 
         def gate(capability, row):
             witness.row = dict(row)
@@ -108,6 +156,8 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
             owner = window._pending_sample_owner or window._capture
             entry = {'exception_type': type(error).__name__, 'message': str(error),
                 'code': getattr(error, 'code', None), 'began': time.monotonic(),
+                'exception_module': type(error).__module__,
+                'original_native_deadline': window.deadline,
                 'proof_deadline': window._delivery_deadline,
                 'window_budget': window.envelope.to_dict(),
                 'owner_pending': (None if owner is None or owner._pending is None else
@@ -135,7 +185,8 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                 except BaseException as error:
                     witness.errors.append(repr(error))
             with patch.object(HandlerChildren, '_await', gate), patch.object(
-                    HandlerChildren, '_completed_result', observe_rescue):
+                    HandlerChildren, '_completed_result', observe_rescue), patch.object(
+                    _Store, 'finish', hold_publication):
                 driver = threading.Thread(target=drive)
                 driver.start()
                 writer = None
@@ -157,6 +208,14 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                     child_result = snapshot.result.to_dict()
                     cutoff = min(item.work_deadline_at for item in
                         BudgetEnvelope.from_dict(json.loads(witness.row['budget_json'])).constraints)
+                    held = witness.publication_held.wait(max(0., end-time.monotonic()))
+                    witness.request_before_writer = runtime._child_service.store.request('parent', 'one')
+                    retain_observations()
+                    self.assertTrue(held, witness.publication)
+                    self.assertIsNotNone(witness.request_before_writer)
+                    self.assertIn(witness.request_before_writer['state'], ('pending', 'running'))
+                    self.assertIsNone(witness.request_before_writer['response_json'])
+                    self.assertEqual(witness.publication['result'], child_result)
                     writer = sqlite3.connect(runtime.kernel.db_path, timeout=.1)
                     writer.execute('BEGIN IMMEDIATE')
                     witness.writer['held_at'] = time.monotonic()
@@ -164,12 +223,52 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                     time.sleep(max(0, cutoff - time.time() + .03))
                 finally:
                     witness.resume.set()
-                    if writer is not None:
-                        witness.writer['release_started'] = time.monotonic()
-                        writer.rollback()
-                        writer.close()
-                        witness.writer['release_returned'] = time.monotonic()
-                    driver.join(3)
+                    try:
+                        if writer is not None:
+                            witness.writer['release_started'] = time.monotonic()
+                            writer.rollback()
+                            writer.close()
+                            witness.writer['release_returned'] = time.monotonic()
+                    finally:
+                        witness.release_publication.set()
+                    began = time.monotonic()
+                    deadline = began + 3
+                    if 'original_parent_cutoff' in witness.publication:
+                        deadline = min(deadline, began + max(0.,
+                            witness.publication['original_parent_cutoff']-time.time()))
+                    witness.post_release.update({'began': began, 'deadline': deadline,
+                        'original_join_allowance_seconds': 3})
+                    driver.join(max(0., deadline-time.monotonic()))
+                    witness.post_release['joined_at'] = time.monotonic()
+                    retain_observations()
+                if witness.outcomes:
+                    witness.final = witness.outcomes[0]
+                    while witness.final.state == 'running' and time.monotonic() < deadline:
+                        attempt = {'began': time.monotonic(),
+                            'timeout_seconds': min(.1, max(0., deadline-time.monotonic()))}
+                        if attempt['timeout_seconds'] <= 0:
+                            break
+                        witness.recovery.append(attempt)
+                        try:
+                            attempt['reports'] = list(runtime.recover_completions(
+                                timeout_seconds=attempt['timeout_seconds']))
+                            attempt['returned_at'] = time.monotonic()
+                            remaining = deadline-time.monotonic()
+                            if remaining <= 0:
+                                break
+                            with runtime.kernel._control_lock(min(.1, remaining)):
+                                final = runtime.kernel.get('parent')
+                            attempt['read_returned_at'] = time.monotonic()
+                            attempt['snapshot'] = final.to_dict()
+                            if time.monotonic() >= deadline:
+                                break
+                            witness.final = final
+                        except BaseException as error:
+                            attempt['error'] = {'type': type(error).__name__, 'message': str(error)}
+                            retain_observations()
+                            raise
+                        if witness.final.state == 'running':
+                            time.sleep(min(.005, max(0., deadline-time.monotonic())))
             import dispatcher_sdk
             report = {'sdk_import': dispatcher_sdk.__file__, 'python': sys.executable,
                 'command': 'PYTHONPATH=src:tests .venv/bin/python -m unittest '
@@ -178,7 +277,11 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                 'parent_timeout_seconds': 12, 'child_timeout_seconds': 5,
                 'cutoff': cutoff, 'child_result': child_result, 'calls': witness.calls,
                 'errors': witness.errors, 'rescue_original_errors': witness.rescues, 'writer': witness.writer,
-                'parent': witness.outcomes[0].to_dict() if witness.outcomes else None}
+                'publication': witness.publication, 'request_before_writer': witness.request_before_writer,
+                'publication_calls': witness.publication_calls,
+                'post_release': witness.post_release, 'recovery': witness.recovery,
+                'original_parent': witness.outcomes[0].to_dict() if witness.outcomes else None,
+                'parent': None if witness.final is None else witness.final.to_dict()}
             evidence = root/'evidence.json'
             evidence.write_text(json.dumps(report, indent=2), encoding='utf-8')
             print('child_writer_cutoff_evidence=' + str(evidence), flush=True)
@@ -187,14 +290,21 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
             self.assertEqual(witness.calls, [child_id])
             self.assertEqual(len(witness.rescues), 1, report)
             rescue = witness.rescues[0]
+            self.assertGreaterEqual(rescue['began'], rescue['original_native_deadline'])
             if rescue['exception_type'] == 'ChildExecutionError':
                 self.assertEqual(rescue['code'], 'child_wait_timeout')
             elif rescue['exception_type'] == 'BudgetClockUnknownError':
                 self.assertEqual(rescue['message'], 'budget_clock_sample_unresolved:sampling')
+            elif rescue['exception_type'] == 'InspectionBudgetExceeded':
+                self.assertEqual(rescue['exception_module'], 'dispatcher_sdk._inspection')
+                self.assertEqual(rescue['message'], 'inspection timeout exceeded')
             else:
                 self.assertIn(rescue['exception_type'], ('OperationalError', 'TimeoutError'))
-            self.assertEqual(witness.outcomes[0].state, 'succeeded', report)
-            self.assertEqual(witness.outcomes[0].result.value, child_result)
+            self.assertIsNotNone(witness.final, report)
+            self.assertEqual(witness.final.state, 'succeeded', report)
+            self.assertEqual(witness.final.result.value, child_result)
+            self.assertEqual(witness.final.attempt, witness.row['parent_attempt'])
+            self.assertEqual(witness.final.fence, witness.row['parent_fence'])
             self.assertLessEqual(child_result['completed_at'], cutoff)
 
     @unittest.skipUnless(os.name == 'posix', 'requires native POSIX process containment')

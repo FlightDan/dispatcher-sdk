@@ -39,41 +39,119 @@ class ChildReceiptReadTests(unittest.TestCase):
 
     def test_actual_receipt_contention_retries_inside_same_window_and_enforces_stronger_floor(self):
         from dataclasses import replace
-        row, window = self.short_row(1)
+        import traceback
+
+        began = time.monotonic()
+        envelope = self.parent_budget.derive(source='tool', origin_id='receipt-read', timeout_seconds=1)
+        derived_at = time.monotonic()
+        record = {'scenario': 'receipt_writer_released_before_original_cutoff',
+                  'began': began, 'original_child_seconds': 1, 'stronger_floor_seconds': .3,
+                  'writer_hold_seconds': .25, 'producer_context': 'projected_and_store_bound',
+                  'stages': [], 'diagnostic_errors': []}
+        self.evidence['records'].append(record)
+        window = None
+
+        def retain(stage, **values):
+            # Copy only existing checkpoints: diagnostics never sample the
+            # clock or call remaining(), including after the final capture.
+            try:
+                stage.update(values)
+                if window is not None:
+                    if 'entry_envelope' not in stage:
+                        stage['entry_deadline'] = window.deadline
+                        stage['entry_envelope'] = window.envelope.to_dict()
+                    stage['deadline'] = window.deadline
+                    stage['retained_envelope'] = window.envelope.to_dict()
+            except BaseException as error:
+                record['diagnostic_errors'].append({'type': type(error).__name__, 'message': str(error)})
+
+        def phase(name, operation, **values):
+            stage = {'phase': name, 'began': time.monotonic()}
+            record['stages'].append(stage)
+            retain(stage, **values)
+            try:
+                result = operation()
+            except BaseException as error:
+                try:
+                    retain(stage, ended=time.monotonic(), error_type=type(error).__name__,
+                           error_message=str(error), sqlite_errorcode=getattr(error, 'sqlite_errorcode', None),
+                           sqlite_errorname=getattr(error, 'sqlite_errorname', None),
+                           traceback=''.join(traceback.format_exception(type(error), error, error.__traceback__)))
+                except BaseException:
+                    pass
+                raise
+            retain(stage, ended=time.monotonic())
+            return result
+
+        record['stages'].append({'phase': 'derive', 'began': began, 'ended': derived_at,
+                                 'original_envelope': envelope.to_dict()})
+        window = phase('window_init', lambda: _RetryWindow(envelope, self.kernel))
+        record['initial_deadline'] = window.deadline
+        retain(record['stages'][-1])
+
+        def enqueue():
+            # Match the real producer's one original envelope and admission
+            # context; no retry or fresh preparation allowance is introduced.
+            with window.project(), self.children.store.bound(window):
+                return self.children._enqueue(request_id='receipt-read', child_id='receipt-child', action='run',
+                    child_command=self.command('receipt-child'), envelope=envelope, window=window)
+
+        row = phase('enqueue', enqueue)
+        record['wait_id'] = row['wait_id']
         original = BudgetEnvelope.from_dict(json.loads(row['budget_json']))
+        record['original_constraints'] = original.to_dict()['constraints']
         narrowed = replace(original, checkpoint=replace(original.checkpoint,
             wall_at=original.checkpoint.wall_at + .3))
-        self.facts.note({'execution_id': row['child_execution_id'], 'attempt': 0, 'fence': 0},
+        record['published_floor'] = narrowed.to_dict()
+        note_timeout = phase('note_timeout_remaining', window.remaining)
+        record['note_timeout_seconds'] = note_timeout
+        phase('publish_stronger_floor', lambda: self.facts.note(
+            {'execution_id': row['child_execution_id'], 'attempt': 0, 'fence': 0},
             'child_budget_checkpoint', {'wait_id': row['wait_id'], 'budget_envelope': narrowed.to_dict()},
-            timeout_seconds=window.remaining())
-        writer = self.exclusive_writer()
+            timeout_seconds=note_timeout))
+        writer = phase('exclusive_writer_acquire', self.exclusive_writer)
+
         def unlock():
-            time.sleep(.25)
-            writer.rollback()
-            writer.close()
+            phase('writer_hold', lambda: time.sleep(.25))
+            phase('writer_rollback', writer.rollback)
+            phase('writer_close', writer.close)
+
         release = threading.Thread(target=unlock)
         release.start()
         before = time.monotonic()
         original_facts = self.children.store._facts
+
+        def open_facts(*args, **kwargs):
+            return phase('facts_open', lambda: original_facts(*args, **kwargs),
+                         timeout_seconds=kwargs.get('timeout_seconds'))
+
         try:
-            with patch.object(self.children.store, '_facts', wraps=original_facts) as reads:
-                self.children.store.attach(row, window)
+            with patch.object(self.children.store, '_facts', side_effect=open_facts) as reads:
+                phase('attach', lambda: self.children.store.attach(row, window))
                 attempts = reads.call_count
+                record['read_attempts'] = attempts
         finally:
-            release.join(1)
+            phase('release_join', lambda: release.join(1), timeout_seconds=1)
         elapsed = time.monotonic() - before
-        remaining = window.remaining()
-        original_remaining = original.view(sample=self.kernel_clock()).remaining_work_seconds
-        self.assertGreaterEqual(attempts, 2)
-        self.assertGreaterEqual(elapsed, .20)
-        self.assertLess(elapsed, 1)
-        self.assertGreater(remaining, 0)
-        self.assertLess(remaining, original_remaining - .25)
-        self.assertEqual(window.envelope.constraints, original.constraints)
-        self.evidence['records'].append({'scenario': 'receipt_writer_released_before_original_cutoff',
-            'read_attempts': attempts, 'elapsed': elapsed, 'original_remaining': original_remaining,
-            'enforced_remaining': remaining, 'original_constraints': original.to_dict()['constraints'],
-            'retained_floor': window.envelope.to_dict()})
+        record['elapsed'] = elapsed
+        # This is the original final remaining() call, including its real
+        # capture/ACK/remember work, rather than an extra diagnostic sample.
+        remaining = phase('final_remaining_capture_ack_remember', window.remaining)
+        record['enforced_remaining'] = remaining
+        original_remaining = phase('original_remaining',
+            lambda: original.view(sample=self.kernel_clock()).remaining_work_seconds)
+        record['original_remaining'] = original_remaining
+        record['retained_floor'] = window.envelope.to_dict()
+
+        def assertions():
+            self.assertGreaterEqual(attempts, 2)
+            self.assertGreaterEqual(elapsed, .20)
+            self.assertLess(elapsed, 1)
+            self.assertGreater(remaining, 0)
+            self.assertLess(remaining, original_remaining - .25)
+            self.assertEqual(window.envelope.constraints, original.constraints)
+
+        phase('original_assertions', assertions)
 
     def kernel_clock(self):
         from dispatcher_sdk.execution_kernel.budget import sample_clock

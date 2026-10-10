@@ -521,6 +521,7 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                     close=Mock(return_value=report))
                 recorder._process_observer = observer
                 recorder.report_bytes("stdout", b"final")
+                close_began = time.monotonic()
                 receipt = recorder.close(timeout=.4)
                 receipts.append(receipt)
                 self.assertEqual(expected, receipt["state"], receipt)
@@ -529,7 +530,8 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 self.assertEqual(report, receipt["process_observer"])
                 self.assertTrue(observer._stop.is_set())
                 observer.close.assert_called_once()
-                self.assertLessEqual(observer.close.call_args.kwargs["timeout"], .1)
+                observer_timeout = observer.close.call_args.kwargs["timeout"]
+                self.assertLessEqual(close_began + 4 * observer_timeout, recorder._close_deadline)
                 with closing(sqlite3.connect(journal.path)) as connection:
                     row = connection.execute("SELECT state,metrics_json FROM obs_sources WHERE source_id=?",
                         (recorder.source_id,)).fetchone()
