@@ -22,6 +22,7 @@ import dispatcher_sdk
 from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError, BudgetEnvelope, ClockCheckpoint, DeadlineConstraint, sample_clock
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
+from dispatcher_sdk.execution_kernel.settlement import SettlementJournal
 from dispatcher_sdk.execution_kernel.runtime import Runtime
 from dispatcher_sdk.execution_kernel.context import HandlerContext
 from dispatcher_sdk.execution_kernel.errors import HandlerExecutionError
@@ -977,12 +978,15 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 settlement_began = time.monotonic()
                 end = settlement_began + 3
                 evidence["settlement_deadline"] = end
+                class SettlementWindowExpired(AssertionError):
+                    pass
                 def maintenance_remaining(stage):
                     remaining = end-time.monotonic()
                     evidence["maintenance_stage"] = stage
                     evidence["settlement_elapsed"] = time.monotonic()-settlement_began
-                    self.assertGreater(remaining, 0,
-                        "original shared settlement window expired at " + stage)
+                    if remaining <= 0:
+                        raise SettlementWindowExpired(
+                            "original shared settlement window expired at " + stage)
                     return remaining
 
                 def maintenance_read(stage, read, execution_id):
@@ -1001,18 +1005,101 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 self.assertTrue(any(item["source"] == "parent" for item in limits["envelope"]["constraints"]))
                 reports = []
                 evidence["settlement_reports"] = reports
-                while True:
-                    final_parent = maintenance_read("parent winner", runtime.kernel.get, "parent")
-                    final_child = maintenance_read("child winner", runtime.kernel.get, child_id)
-                    evidence["canonical_parent"] = final_parent.to_dict()
-                    evidence["canonical_child"] = final_child.to_dict()
-                    if final_parent.state == "timed_out" and final_child.state in {"timed_out", "cancelled", "dead"}:
-                        break
-                    reports.extend(runtime.recover_completions(
-                        timeout_seconds=min(.5, maintenance_remaining("completion recovery"))))
-                    remaining = end-time.monotonic()
-                    if remaining > 0:
-                        time.sleep(min(.02, remaining))
+                try:
+                    while True:
+                        final_parent = maintenance_read("parent winner", runtime.kernel.get, "parent")
+                        final_child = maintenance_read("child winner", runtime.kernel.get, child_id)
+                        evidence["canonical_parent"] = final_parent.to_dict()
+                        evidence["canonical_child"] = final_child.to_dict()
+                        if final_parent.state == "timed_out" and final_child.state in {"timed_out", "cancelled", "dead"}:
+                            break
+                        reports.extend(runtime.recover_completions(
+                            timeout_seconds=min(.5, maintenance_remaining("completion recovery"))))
+                        remaining = end-time.monotonic()
+                        if remaining > 0:
+                            time.sleep(min(.02, remaining))
+                except SettlementWindowExpired:
+                    # A terminated worker may have committed a sampling guard
+                    # before its sampled fact was retained. This is a distinct,
+                    # durable unknown outcome, never a terminal timeout claim.
+                    with runtime.kernel._control_lock(2):
+                        final_parent = runtime.kernel.get("parent")
+                        final_child = runtime.kernel.get(child_id)
+                    limits = runtime.kernel.get_execution_limits("parent", timeout_seconds=2)
+                    self.assertEqual("running", final_parent.state)
+                    self.assertEqual("budget_clock_sample_unresolved:sampling",
+                        limits["clock_unknown_reason"])
+                    with evidence_lock:
+                        originals = {item["result"]["execution_id"]: item["result"]
+                            for item in original_results}
+                        native = list(invocations)
+                    self.assertEqual({"parent", child_id}, set(originals))
+                    self.assertEqual(2, len(native), "maintenance must not replay either handler")
+                    self.assertEqual({"parent", child_id},
+                        {item["command"]["execution_id"] for item in native})
+                    self.assertTrue(all(item["outcome"]["kind"] == "timeout" for item in native))
+                    entered_pids = {str(event["arguments"][0]["worker_pid"]) for item in native
+                        if item["command"]["execution_id"] == child_id for event in item["callbacks"]
+                        if event["callback"] == "on_entered"}
+                    self.assertEqual({Path(payload["entered"]).read_text(encoding="ascii")}, entered_pids)
+                    self.assertEqual(["job_empty" if os.name == "nt" else "tree_reaped"] * 2, receipts)
+                    parent_receipts = runtime._settlement_journal.inspect("parent", timeout_seconds=2)
+                    self.assertEqual(1, len(parent_receipts))
+                    self.assertEqual("pending", parent_receipts[0]["state"])
+                    self.assertEqual({"execution_id": "parent", "attempt": final_parent.attempt,
+                        "fence": final_parent.fence}, parent_receipts[0]["identity"])
+                    self.assertEqual(originals["parent"], parent_receipts[0]["result"])
+                    child_receipts = runtime._settlement_journal.inspect(child_id, timeout_seconds=2)
+                    self.assertEqual(1, len(child_receipts))
+                    self.assertEqual(originals[child_id], child_receipts[0]["result"])
+                    self.assertEqual({"execution_id": child_id, "attempt": final_child.attempt,
+                        "fence": final_child.fence}, child_receipts[0]["identity"])
+                    if child_receipts[0]["state"] == "settled":
+                        self.assertEqual("timed_out", final_child.state)
+                        self.assertEqual(originals[child_id], final_child.result.to_dict())
+                    elif child_receipts[0]["state"] == "superseded":
+                        self.assertIn(final_child.state, {"cancelled", "dead"})
+                        self.assertNotEqual(originals[child_id]["result_id"], final_child.result.result_id)
+                    else:
+                        self.assertEqual("pending", child_receipts[0]["state"])
+                        self.assertEqual("running", final_child.state)
+                        self.assertIsNone(final_child.result)
+                    self.assertIsNotNone(final_parent.lease)
+                    original_lease = final_parent.lease
+                    def sampling_guards():
+                        uri = (root / "kernel.db").resolve().as_uri() + "?mode=ro"
+                        with closing(sqlite3.connect(uri, uri=True)) as connection:
+                            return connection.execute("SELECT token,execution_id,reason "
+                                "FROM kernel_budget_samples ORDER BY token").fetchall()
+                    guards_before = sampling_guards()
+                    self.assertEqual(1, len(guards_before))
+                    self.assertEqual(("parent", "sampling"), guards_before[0][1:])
+                    journal_binding = {"path": runtime._settlement_journal.path,
+                        "source_id": runtime._settlement_journal.source_id,
+                        "kernel_path": root / "kernel.db"}
+                    runtime.close()
+                    evidence["runtime_cleanup"] = {"returned": True}
+                    runtime = None
+                    with SQLiteKernel(root / "kernel.db") as reopened:
+                        reopened_limits = reopened.get_execution_limits("parent", timeout_seconds=2)
+                        self.assertEqual(limits["clock_unknown_reason"],
+                            reopened_limits["clock_unknown_reason"])
+                        self.assertEqual(final_parent.to_dict(), reopened.get("parent").to_dict())
+                        self.assertEqual(final_child.to_dict(), reopened.get(child_id).to_dict())
+                        with self.assertRaisesRegex(BudgetClockUnknownError,
+                                "budget_clock_sample_unresolved:sampling"):
+                            reopened.admission_budget(original_lease, timeout_seconds=2)
+                    self.assertEqual(guards_before, sampling_guards())
+                    reopened_receipts = SettlementJournal.open_readonly(**journal_binding, timeout_seconds=2)
+                    self.assertEqual(parent_receipts, reopened_receipts.inspect("parent", timeout_seconds=2))
+                    self.assertEqual(child_receipts, reopened_receipts.inspect(child_id, timeout_seconds=2))
+                    time.sleep(1.2)
+                    self.assertFalse(Path(payload["escaped"]).exists())
+                    evidence["unknown_sample_boundary"] = {"limits": reopened_limits,
+                        "guards": guards_before,
+                        "parent_receipt": parent_receipts[0], "child_receipt": child_receipts[0]}
+                    storage_evidence.save(phase="unknown-sample-boundary", checkpoint=evidence["unknown_sample_boundary"])
+                    return
                 evidence["settlement_elapsed"] = time.monotonic()-settlement_began
                 storage_evidence.save(phase="settlement-boundary", checkpoint={
                     "original_parent": evidence["parent_returned"],
