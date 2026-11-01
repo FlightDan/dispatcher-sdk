@@ -881,8 +881,9 @@ class SettlementJournal:
                 key = tuple(identity.values())
                 tree = connection.execute(
                     "SELECT 1 FROM settlement_notes WHERE execution_id=? AND attempt=? AND fence=? "
-                    "AND phase='worker_tree_cleanup_observed' AND evidence_json=? LIMIT 1",
-                    (*key, _json({'state': 'confirmed', 'source': 'posix_supervisor_containment'}))).fetchone()
+                    "AND phase='worker_tree_cleanup_observed' AND evidence_json IN (?,?) LIMIT 1",
+                    (*key, _json({'state': 'confirmed', 'source': 'posix_supervisor_containment'}),
+                     _json({'state': 'confirmed', 'source': 'windows_job_containment'}))).fetchone()
                 entry = connection.execute(
                     "SELECT 1 FROM settlement_notes WHERE execution_id=? AND attempt=? AND fence=? "
                     "AND phase='handler_entered' LIMIT 1", key).fetchone()
@@ -940,7 +941,8 @@ class SettlementJournal:
                 lease = ExecutionLease.from_dict(evidence.get('lease'))
                 return (lease.execution_id, lease.attempt, lease.fence) == key
             if label == 'worker_tree_cleanup':
-                return evidence.get('state') == 'confirmed' and evidence.get('source') == 'posix_supervisor_containment'
+                return evidence.get('state') == 'confirmed' and evidence.get('source') in {
+                    'posix_supervisor_containment', 'windows_job_containment'}
             return ((evidence.get('state'), evidence.get('source')) in {
                 ('confirmed', 'runtime_supervisor_reaped'), ('not_invoked', 'runtime_admission_denied')})
         with self._connection(timeout_seconds) as connection:
@@ -954,6 +956,14 @@ class SettlementJournal:
                 row = connection.execute(
                     'SELECT sequence,length(CAST(evidence_json AS BLOB)) AS bytes FROM settlement_notes WHERE '
                     + selector + ' ORDER BY sequence DESC LIMIT 1', parameters).fetchone()
+                if row is None and label == 'worker_tree_cleanup':
+                    # Windows Job observations use the durable lifecycle
+                    # outbox, whose receipt ID is not the POSIX canonical ID.
+                    row = connection.execute(
+                        'SELECT sequence,length(CAST(evidence_json AS BLOB)) AS bytes FROM settlement_notes '
+                        'WHERE execution_id=? AND attempt=? AND fence=? AND phase=? AND evidence_json=? '
+                        'ORDER BY sequence DESC LIMIT 1',
+                        (*key, phase, _json({'state': 'confirmed', 'source': 'windows_job_containment'}))).fetchone()
                 fact = {'state': 'unknown', 'reason': 'observation_not_available'}
                 if row is not None:
                     if row['bytes'] > max_bytes:

@@ -1,4 +1,5 @@
 """Lifecycle retirement rejects stale producers and collects bounded batches."""
+import contextlib
 import sqlite3
 import tempfile
 import unittest
@@ -18,13 +19,13 @@ class RetirementTests(unittest.TestCase):
             k.lifecycle_reserve('job', 0, 0, 'old-token', slots=1)
             seq = k.lifecycle_append('old-token', 'legacy-id', 'phase', {})
             k.close()
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 db.execute('DROP TABLE kernel_lifecycle_retired')
                 db.execute('DROP TABLE kernel_lifecycle_metadata')
                 db.execute('DROP TABLE kernel_schema_meta')
                 db.execute(_schema_statement_for('kernel_schema_meta', KERNEL_SCHEMA_V11))
                 db.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',11)")
-            with sqlite3.connect(path, isolation_level=None) as db:
+            with contextlib.closing(sqlite3.connect(path, isolation_level=None)) as db, db:
                 upgrade_kernel_schema_v11_to_v12(db)
             k = SQLiteKernel(path)
             event = k.lifecycle_peek()

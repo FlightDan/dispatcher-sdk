@@ -14,8 +14,26 @@ from typing import Any
 from .._inspection import InspectionBudget
 from .contracts import identifier
 
-# Bound each SQLite value/row as well as the number of rows returned.
+# Bound values returned to Python as well as the number of rows returned.
+# On Python 3.10, SQLite can still materialize larger stored values internally.
 _MAX_SQLITE_LENGTH = 65536
+
+
+def _bounded_projection(*columns: str) -> str:
+    """Bound data returned to Python even when Connection.setlimit is absent."""
+    size = "+".join(f"coalesce(length(CAST({column} AS BLOB)),0)" for column in columns)
+    within = f"({size})<={_MAX_SQLITE_LENGTH}"
+    return ",".join(f"CASE WHEN {within} THEN {column} END AS {column}" for column in columns) + f", NOT ({within}) AS _oversized"
+
+
+def _checked(row: sqlite3.Row | None) -> sqlite3.Row | None:
+    if row is not None and row["_oversized"]:
+        raise sqlite3.DataError("inspection row exceeds length limit")
+    return row
+
+
+def _values(row: sqlite3.Row) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys() if key != "_oversized"}
 
 
 def inspect_legacy_execution_page(
@@ -49,9 +67,8 @@ def inspect_legacy_execution_page(
         connection = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True,
                                      isolation_level=None, timeout=budget.sqlite_timeout_seconds)
         try:
-            if not hasattr(connection, "setlimit") or not hasattr(sqlite3, "SQLITE_LIMIT_LENGTH"):
-                raise RuntimeError("bounded inspection requires SQLite limit support (Python 3.11+)")
-            connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _MAX_SQLITE_LENGTH)
+            if hasattr(connection, "setlimit") and hasattr(sqlite3, "SQLITE_LIMIT_LENGTH"):
+                connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _MAX_SQLITE_LENGTH)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA trusted_schema=OFF")
@@ -65,9 +82,9 @@ def inspect_legacy_execution_page(
     with closing(open_reader(orchestrator_path)) as orch:
         with closing(open_reader(kernel_path)) as kernel:
             budget.check()
-            orch_version = orch.execute("SELECT version FROM sdk_schema_meta WHERE component='orchestrator'").fetchone()
+            orch_version = _checked(orch.execute(f"SELECT {_bounded_projection('version')} FROM sdk_schema_meta WHERE component='orchestrator'").fetchone())
             orch_observed_at = time.time()
-            kernel_version = kernel.execute("SELECT schema_version FROM kernel_schema_meta WHERE component='execution_kernel'").fetchone()
+            kernel_version = _checked(kernel.execute(f"SELECT {_bounded_projection('schema_version')} FROM kernel_schema_meta WHERE component='execution_kernel'").fetchone())
             kernel_observed_at = time.time()
             if orch_version is None or orch_version[0] not in (4, 5):
                 raise ValueError("unsupported Orchestrator schema marker")
@@ -76,47 +93,49 @@ def inspect_legacy_execution_page(
             # Keyset cursors require a unique ordering key. A schema marker
             # alone does not establish that the required index exists.
             cursor_index = False
-            for index in orch.execute("PRAGMA index_list(sdk_executions)"):
+            for index in orch.execute(f"SELECT {_bounded_projection('name', 'partial')} FROM pragma_index_list('sdk_executions') WHERE \"unique\"=1"):
                 budget.check()
-                if not index[2] or index[4]:
+                _checked(index)
+                if index['partial']:
                     continue
-                name = index[1].replace('"', '""')
-                columns = orch.execute(f'PRAGMA index_xinfo("{name}")').fetchall()
-                keys = [(column[2], column[4]) for column in columns if column[5]]
+                columns = orch.execute(f'SELECT {_bounded_projection("name", "coll")} FROM pragma_index_xinfo(?) WHERE "key"=1 LIMIT 4', (index['name'],))
+                keys = [(_checked(column)['name'], column['coll']) for column in columns]
                 if keys == [("run_id", "BINARY"), ("task_id", "BINARY"),
                             ("attempt", "BINARY")]:
                     cursor_index = True
                     break
             if not cursor_index:
                 raise ValueError("unsupported execution cursor index")
-            run = orch.execute("SELECT run_id,revision,state FROM sdk_runs WHERE run_id=?", (run_id,)).fetchone()
+            run = _checked(orch.execute(f"SELECT {_bounded_projection('run_id', 'revision', 'state')} FROM sdk_runs WHERE run_id=?", (run_id,)).fetchone())
             if run is None:
                 raise ValueError("Run not found")
             # Reading the marker and Run above establishes this connection's
             # snapshot; Kernel's snapshot is established by its marker read.
             observed_at = {"orchestrator": orch_observed_at, "kernel": kernel_observed_at}
             rows = orch.execute(
-                "SELECT execution_id,task_id,attempt,generation,active FROM sdk_executions "
+                f"SELECT {_bounded_projection('execution_id', 'task_id', 'attempt', 'generation', 'active')} FROM sdk_executions "
                 "WHERE run_id COLLATE BINARY=? AND (task_id COLLATE BINARY>? OR "
                 "(task_id COLLATE BINARY=? AND attempt>?)) "
                 "ORDER BY task_id COLLATE BINARY,attempt LIMIT ?",
                 (run_id, after_task_id, after_task_id, after_attempt, limit + 1),
             ).fetchall()
+            for row in rows:
+                _checked(row)
             has_more = len(rows) > limit
             result = []
             for row in rows[:limit]:
                 budget.check()
-                factual = kernel.execute(
-                    "SELECT state,attempt,fence FROM kernel_executions WHERE execution_id=?",
+                factual = _checked(kernel.execute(
+                    f"SELECT {_bounded_projection('state', 'attempt', 'fence')} FROM kernel_executions WHERE execution_id=?",
                     (row["execution_id"],),
-                ).fetchone()
-                result.append({**dict(row), "kernel_observation": (
-                    {"status": "observed", **dict(factual)} if factual is not None
+                ).fetchone())
+                result.append({**_values(row), "kernel_observation": (
+                    {"status": "observed", **_values(factual)} if factual is not None
                     else {"status": "not_observed"})})
             budget.check()
             last = result[-1] if has_more and result else None
             return {
-                "run": dict(run), "orchestrator_schema": orch_version[0],
+                "run": _values(run), "orchestrator_schema": orch_version[0],
                 "kernel_schema": kernel_version[0], "observed_at": observed_at,
                 "executions": result, "has_more": has_more,
                 "next_cursor": ({"after_task_id": last["task_id"],

@@ -1,4 +1,5 @@
 """Factual child delivery borrows exact captured facts without publishing them."""
+import contextlib
 import json
 from dataclasses import replace
 import sqlite3
@@ -208,7 +209,7 @@ class ChildResultClockCleanupTests(unittest.TestCase):
         writer.rollback()
         second = window._capture
         second_token = 'second-exact-wait-guard'
-        with sqlite3.connect(self.kernel.db_path, timeout=.1) as native:
+        with contextlib.closing(sqlite3.connect(self.kernel.db_path, timeout=.1)) as native, native:
             native.execute("INSERT INTO kernel_budget_samples(token,execution_id,reason) VALUES(?,'parent','sampling')",
                            (second_token,))
         second._armed(second_token)

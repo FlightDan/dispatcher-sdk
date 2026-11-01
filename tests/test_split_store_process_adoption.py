@@ -183,8 +183,11 @@ def _activate_in_process(orchestrator_path, kernel_path, manifest, results):
     claimed = worker.claim_and_start("worker", execution_id="sdk-managed:legacy:new")
     if claimed is None or claimed.execution_id != "sdk-managed:legacy:new":
         raise AssertionError("resumed execution was not claimed")
-    from dispatcher_sdk.execution_kernel._process_runtime import invoke_process_handler
-    outcome = invoke_process_handler(db_path=kernel_path, handler=_handler, command=command, lease=claimed,
+    if os.name == "nt":
+        from dispatcher_sdk.execution_kernel._windows_runtime import invoke_windows_handler as invoke_handler
+    else:
+        from dispatcher_sdk.execution_kernel._process_runtime import invoke_process_handler as invoke_handler
+    outcome = invoke_handler(db_path=kernel_path, handler=_handler, command=command, lease=claimed,
         now=None, start_timeout=10, budget_envelope=worker._prepare_handler_entry(claimed),
         authority_verifier=_WorkerVerifier(expiry, admission), worker_credential="resumed")
     if outcome.get("kind") != "ok" or outcome["value"] != {"execution_id": claimed.execution_id,

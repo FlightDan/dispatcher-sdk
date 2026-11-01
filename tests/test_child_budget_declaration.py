@@ -211,6 +211,7 @@ class ChildBudgetDeclarationTests(unittest.TestCase):
         failure = ChildExecutionError('parent_revocation_unknown', 'parent revocation state is unknown')
         self.service._retain_registration(row, failure, failure)
         self.assertEqual(json.loads(store.error)['code'], 'registration_or_cleanup_pending')
+
         class ExpiredWindow(Window):
             _delivery_deadline = None
             def remaining(self): return 0.0
@@ -241,6 +242,23 @@ class ChildBudgetDeclarationTests(unittest.TestCase):
                 caller._await(row)
         self.assertEqual(raised.exception.code, 'parent_revocation_unknown')
         self.assertEqual(json.loads(store.error)['code'], 'registration_or_cleanup_pending')
+
+    def test_unresolved_parent_sample_keeps_registration_when_revocation_is_not_durable(self):
+        from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError
+        row = {'action': 'run', 'parent_lease_json': json.dumps(self.lease.to_dict()),
+               'budget_json': json.dumps(self.envelope.to_dict()), 'parent_execution_id': self.lease.execution_id,
+               'child_execution_id': self.child.execution_id, 'request_id': 'request'}
+        self.service._stop = threading.Event()
+        with patch('dispatcher_sdk.execution_kernel.children._inspect_parent_revocation'), \
+             patch('dispatcher_sdk.execution_kernel.children._RetryWindow',
+                   side_effect=BudgetClockUnknownError('budget_clock_sample_unresolved:sampling')), \
+             patch('dispatcher_sdk.execution_kernel.children._parent_durably_revoked', return_value=False), \
+             patch.object(self.service, '_retain_registration') as retain, \
+             patch.object(self.service, '_cancel') as cancel:
+            self.service._execute(row)
+        retain.assert_called_once()
+        self.assertEqual(str(retain.call_args.args[2]), 'parent revocation is not durable')
+        cancel.assert_not_called()
 
     def test_child_service_executes_declaration_before_real_kernel_submission(self):
         outcomes = []

@@ -1,5 +1,6 @@
 """Thread entry uses the same durable ACK rules as native workers."""
 
+import contextlib
 import json
 from pathlib import Path
 import sqlite3
@@ -40,7 +41,7 @@ class HandlerEntryContentionTests(unittest.TestCase):
                 calls.append(attempt)
                 try:
                     if broken:
-                        with sqlite3.connect(runtime.kernel.db_path) as connection:
+                        with contextlib.closing(sqlite3.connect(runtime.kernel.db_path)) as connection, connection:
                             connection.execute('SELECT * FROM deliberately_missing_entry_table')
                     result = confirm(lease, envelope, **kwargs)
                     attempt['confirmed'] = result.to_dict()

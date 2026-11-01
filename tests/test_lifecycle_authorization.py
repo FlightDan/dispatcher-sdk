@@ -1,4 +1,5 @@
 """Host-scoped lifecycle retention does not require live Run admission."""
+import contextlib
 import unittest
 from unittest.mock import Mock
 
@@ -61,9 +62,9 @@ class LifecyclePeekContinuationTests(unittest.TestCase):
         from unittest.mock import patch
         from tests.test_execution_kernel_v2_p1 import make_command
         from dispatcher_sdk.execution_kernel import SQLiteKernel
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
             kernel = SQLiteKernel(Path(directory) / 'kernel.db')
-            self.addCleanup(kernel.close)
+            stack.callback(kernel.close)
             for i in range(129):
                 name = f'e{i:03}'
                 kernel.submit(make_command(name))
@@ -91,9 +92,9 @@ class LifecycleRetentionTests(unittest.TestCase):
         from tests.test_execution_kernel_v2_p1 import make_command
         from dispatcher_sdk.execution_kernel import SQLiteKernel
         from dispatcher_sdk.execution_kernel.errors import LifecycleReceiptExpiredError
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
             kernel = SQLiteKernel(Path(directory) / 'kernel.db')
-            self.addCleanup(kernel.close)
+            stack.callback(kernel.close)
             kernel.submit(make_command('x'))
             kernel.lifecycle_reserve('x', 0, 0, 'producer', slots=2)
             first = kernel.lifecycle_append('producer', 'first', 'phase', {'fact': 1})
@@ -112,9 +113,9 @@ class LifecycleRetentionTests(unittest.TestCase):
         from tests.test_execution_kernel_v2_p1 import make_command
         from dispatcher_sdk.execution_kernel import SQLiteKernel
         from dispatcher_sdk.execution_kernel.settlement import SettlementJournal
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
             kernel = SQLiteKernel(Path(directory) / 'kernel.db')
-            self.addCleanup(kernel.close)
+            stack.callback(kernel.close)
             journal = SettlementJournal(Path(directory) / 'settlement.db', source_id='test', kernel_path=kernel.db_path)
             kernel.submit(make_command('x'))
             kernel.lifecycle_reserve('x', 0, 0, 'producer', slots=1)

@@ -32,7 +32,7 @@ class TransactionResultTests(unittest.TestCase):
                     self.fail("writer must not enter")
         error = caught.exception
         result = error.observation_transaction
-        self.assertEqual((error.sqlite_errorcode, error.sqlite_errorname),
+        self.assertEqual((getattr(error, 'sqlite_errorcode', None), getattr(error, 'sqlite_errorname', None)),
                          (result.sqlite_errorcode, result.sqlite_errorname))
         self.assertEqual(("admission", False, True, "not_applied", None),
                          (result.phase, result.transaction_entered, result.rollback_confirmed,
@@ -74,7 +74,7 @@ class TransactionResultTests(unittest.TestCase):
         result = caught.exception.observation_transaction
         self.assertEqual(("body", True, True, "not_applied"),
                          (result.phase, result.transaction_entered, result.rollback_confirmed, result.outcome))
-        self.assertEqual(caught.exception.sqlite_errorname, result.sqlite_errorname)
+        self.assertEqual(getattr(caught.exception, 'sqlite_errorname', None), result.sqlite_errorname)
         with closing(sqlite3.connect(self.journal.path)) as reader:
             self.assertEqual(0, reader.execute("SELECT COUNT(*) FROM obs_current").fetchone()[0])
 
@@ -112,8 +112,12 @@ class TransactionResultTests(unittest.TestCase):
                 connection.set_progress_handler(lambda: 1, 1)
                 connection.execute("SELECT count(*) FROM obs_current").fetchone()
         result = caught.exception.observation_transaction
-        self.assertEqual(sqlite3.SQLITE_INTERRUPT, result.sqlite_errorcode)
-        self.assertEqual("SQLITE_INTERRUPT", result.sqlite_errorname)
+        code = getattr(caught.exception, 'sqlite_errorcode', None)
+        name = getattr(caught.exception, 'sqlite_errorname', None)
+        self.assertEqual(str(caught.exception).lower(), 'interrupted')
+        if code is not None:
+            self.assertEqual((code, name), (9, 'SQLITE_INTERRUPT'))
+        self.assertEqual((code, name), (result.sqlite_errorcode, result.sqlite_errorname))
         self.assertEqual(("body", True), (result.phase, result.transaction_entered))
         self.assertIn(result.outcome, ("not_applied", "unknown"))
         self.assertEqual(result.outcome == "not_applied", result.rollback_confirmed)

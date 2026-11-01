@@ -1,4 +1,5 @@
 """Split-store public lifecycle across processes with a synthetic scoped budget host."""
+import contextlib
 import json
 import hashlib
 import multiprocessing
@@ -24,13 +25,13 @@ from tests.test_managed_legacy_policy_integration import _LifecycleHost
 @contextmanager
 def _synthetic_bookkeeping(path):
     """Replace existing SDK digest bookkeeping with shared opaque test tokens."""
-    with sqlite3.connect(path) as db:
+    with contextlib.closing(sqlite3.connect(path)) as db, db:
         db.execute('CREATE TABLE IF NOT EXISTS tokens(id INTEGER PRIMARY KEY, value BLOB UNIQUE NOT NULL)')
     class Token:
         def __init__(self, value=b''): self.value = bytes(value)
         def update(self, value): self.value += bytes(value)
         def digest(self):
-            with sqlite3.connect(path, timeout=5) as db:
+            with contextlib.closing(sqlite3.connect(path, timeout=5)) as db, db:
                 db.execute('INSERT OR IGNORE INTO tokens(value) VALUES(?)', (self.value,))
                 value = db.execute('SELECT id FROM tokens WHERE value=?', (self.value,)).fetchone()[0]
             return value.to_bytes(32, 'big')
@@ -164,7 +165,7 @@ def _activate_scoped_process(orchestrator_path, kernel_path, manifest, results):
             value = completed.result.value
             if value["execution_id"] != command.execution_id or value["pid"] == os.getpid():
                 raise AssertionError("handler identity or process was incorrect: " + repr(value))
-            with sqlite3.connect(lifecycle_host.path) as db:
+            with contextlib.closing(sqlite3.connect(lifecycle_host.path)) as db, db:
                 if db.execute('SELECT COUNT(*) FROM producers').fetchone()[0] < 1 or lifecycle_host.acks < 1:
                     raise AssertionError('host reservation or receiver verification was not exercised')
             binding = runtime.settlement_storage

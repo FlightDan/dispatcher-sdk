@@ -3,6 +3,7 @@
 The existing real-Kernel integration supplies the local control fixture; it
 seeds pause/resume state. The host verifier is synthetic, not an isolation proof.
 """
+import contextlib
 import json
 import multiprocessing
 import sqlite3
@@ -19,7 +20,7 @@ def _encoded(value):
 
 
 def _commit_projection(path, binding, source, target, context):
-    with sqlite3.connect(path) as db:
+    with contextlib.closing(sqlite3.connect(path)) as db, db:
         db.execute("BEGIN IMMEDIATE")
         version, state, fence, lease = db.execute(
             "SELECT version,state,fence,lease FROM projection").fetchone()
@@ -50,7 +51,7 @@ class _SQLiteParticipant:
         self.path = str(Path(self.root) / ("app-%d.sqlite" % self.next_id))
         type(self).next_id += 1
         self.calls = 0
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             db.execute("CREATE TABLE projection (version TEXT,state TEXT,fence INTEGER,lease TEXT)")
             db.execute("INSERT INTO projection VALUES(?,?,?,?)", ("p1", _encoded({"old": 1}), -1, ""))
             db.execute("CREATE TABLE receipt (data TEXT,source TEXT,target TEXT)")
@@ -58,7 +59,7 @@ class _SQLiteParticipant:
     def _read(self):
         if not Path(self.path).exists():
             return (None, None, None)
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             row = db.execute("SELECT data,source,target FROM receipt").fetchone()
         return tuple(json.loads(value) for value in row) if row else (None, None, None)
 
@@ -123,7 +124,7 @@ class ExternalProjectionProcessReceiptTests(unittest.TestCase):
                                    source, target, context)
             with self.assertRaisesRegex(RuntimeError, "injected participant failure"):
                 _commit_projection(participant.path, binding, source, target, {**context, "fail_after_update": True})
-            with sqlite3.connect(participant.path) as db:
+            with contextlib.closing(sqlite3.connect(participant.path)) as db, db:
                 self.assertEqual(db.execute("SELECT version,state,fence,lease FROM projection").fetchone(),
                                  ("p1", _encoded(source), -1, ""))
                 self.assertEqual(db.execute("SELECT count(*) FROM receipt").fetchone()[0], 0)
@@ -138,7 +139,7 @@ class ExternalProjectionProcessReceiptTests(unittest.TestCase):
                 _commit_projection(participant.path, binding, source, target, {"lease_fence": 2, "lease_id": "other"})
             with self.assertRaisesRegex(ValueError, "changed receipt"):
                 _commit_projection(participant.path, binding, source, {"new": 3}, context)
-            with sqlite3.connect(participant.path) as db:
+            with contextlib.closing(sqlite3.connect(participant.path)) as db, db:
                 self.assertEqual(db.execute("SELECT version,state,fence,lease FROM projection").fetchone(),
                                  ("p2", _encoded(target), 2, "lease-2"))
                 self.assertEqual(db.execute("SELECT count(*) FROM receipt").fetchone()[0], 1)

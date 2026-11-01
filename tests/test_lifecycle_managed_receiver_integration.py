@@ -1,4 +1,5 @@
 """Protected Run lifecycle delivery uses exact durable receiver facts."""
+import contextlib
 import tempfile
 import time
 import unittest
@@ -34,7 +35,7 @@ class ProtectedLifecycleReceiverTests(unittest.TestCase):
                 runtime.close()
 
     def test_append_verifier_observes_frozen_payload_at_precommit(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
             payload = {'fact': {'value': 'original'}}
             observed = []
             def verifier(credential, operation, identity, event):
@@ -44,7 +45,7 @@ class ProtectedLifecycleReceiverTests(unittest.TestCase):
                     event['payload']['fact']['value'] = 'changed by verifier'
                 return {'allowed': True, 'expires_at': time.time() + 60}
             kernel = SQLiteKernel(Path(directory) / 'kernel.sqlite', lifecycle_verifier=verifier)
-            self.addCleanup(kernel.close)
+            stack.callback(kernel.close)
             kernel.submit(fixture_module.command('job'))
             token = kernel.lifecycle_reserve('job', 0, 0, 'producer', slots=1)
             kernel.lifecycle_append(token, 'event', 'phase', payload)

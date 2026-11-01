@@ -1,4 +1,5 @@
 """Lifecycle receipts use a durable namespace independent of arbitrary note IDs."""
+import contextlib
 import sqlite3
 import tempfile
 import threading
@@ -44,7 +45,7 @@ class LifecycleReceiptTests(unittest.TestCase):
             store = kernel.kernel_store_identity()
             kernel.close()
             journal = SettlementJournal(Path(directory) / 'journal', source_id='source', kernel_path=path)
-            with sqlite3.connect(path, isolation_level=None, timeout=0) as locked:
+            with contextlib.closing(sqlite3.connect(path, isolation_level=None, timeout=0)) as locked, locked:
                 locked.execute('PRAGMA journal_mode=DELETE')
                 locked.execute('BEGIN EXCLUSIVE')
                 with self.assertRaises(SettlementBusyError):
@@ -119,7 +120,7 @@ class LifecycleReceiptTests(unittest.TestCase):
             sequence = kernel.lifecycle_append('p', 'legacy-id', 'phase', {'v': 1})
             second = kernel.lifecycle_append('p', 'fresh-legacy-id', 'phase', {'v': 2})
             kernel.close()
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 db.execute('DROP TABLE kernel_lifecycle_retired')
                 db.execute('DROP TABLE kernel_lifecycle_metadata')
                 db.execute('DROP TABLE kernel_schema_meta')
@@ -128,7 +129,7 @@ class LifecycleReceiptTests(unittest.TestCase):
             journal = SettlementJournal(Path(directory) / 'journal', source_id='source', kernel_path=path)
             identity = {'execution_id': 'job', 'attempt': 0, 'fence': 0}
             legacy = journal.note(identity, 'phase', {'v': 1}, note_id='legacy-id')
-            with sqlite3.connect(path, isolation_level=None) as db:
+            with contextlib.closing(sqlite3.connect(path, isolation_level=None)) as db, db:
                 upgrade_kernel_schema_v11_to_v12(db)
             with self.assertRaises(SettlementConflictError):
                 journal.lifecycle_note(identity, 'phase', {'v': 1}, store_id=store,
@@ -295,7 +296,7 @@ class LifecycleReceiptTests(unittest.TestCase):
             kernel_db.submit(make_command('job'))
             kernel_db.lifecycle_reserve('job', 0, 0, 'p', slots=1)
             kernel_db.lifecycle_append('p', 'event', 'phase', {})
-            with sqlite3.connect(source) as db:
+            with contextlib.closing(sqlite3.connect(source)) as db, db:
                 for statement in _SCHEMA:
                     db.execute(statement.replace('CHECK(version=2)', 'CHECK(version=3)'))
                 db.execute('INSERT INTO settlement_meta VALUES(1,3,?,?)', ('source', str(kernel.resolve())))

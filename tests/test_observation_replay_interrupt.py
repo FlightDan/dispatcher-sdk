@@ -1,4 +1,5 @@
 """Real SQLite replay interruption and late read-only close diagnostics."""
+import contextlib
 import sqlite3
 import tempfile
 import time
@@ -47,15 +48,18 @@ class ObservationReplayInterruptTests(unittest.TestCase):
                 self.write()
         error = caught.exception
         self.assertIsInstance(error.__cause__, sqlite3.OperationalError)
-        self.assertEqual((error.__cause__.sqlite_errorcode, error.__cause__.sqlite_errorname),
-                         (sqlite3.SQLITE_INTERRUPT, 'SQLITE_INTERRUPT'))
+        code = getattr(error.__cause__, 'sqlite_errorcode', None)
+        name = getattr(error.__cause__, 'sqlite_errorname', None)
+        self.assertEqual(str(error.__cause__).lower(), 'interrupted')
+        if code is not None:
+            self.assertEqual((code, name), (9, 'SQLITE_INTERRUPT'))
         result = error.observation_transaction
         self.assertEqual((result.operation, result.phase, result.sqlite_errorcode, result.sqlite_errorname),
-                         ('write_batch', 'replay_read', sqlite3.SQLITE_INTERRUPT, 'SQLITE_INTERRUPT'))
+                         ('write_batch', 'replay_read', code, name))
         self.assertEqual((result.transaction_entered, result.rollback_confirmed, result.outcome),
                          (False, True, 'not_applied'))
         self.assertIn((True, False), rolled_back)
-        with sqlite3.connect(self.journal.path) as db:
+        with contextlib.closing(sqlite3.connect(self.journal.path)) as db, db:
             self.assertEqual(db.execute('SELECT count(*) FROM obs_sources').fetchone()[0], 0)
 
     def test_replayed_read_close_after_deadline_reports_not_applied(self):
@@ -75,5 +79,5 @@ class ObservationReplayInterruptTests(unittest.TestCase):
                          ('write_batch', 'close', None, None))
         self.assertEqual((result.transaction_entered, result.rollback_confirmed, result.outcome),
                          (False, True, 'not_applied'))
-        with sqlite3.connect(self.journal.path) as db:
+        with contextlib.closing(sqlite3.connect(self.journal.path)) as db, db:
             self.assertEqual(db.execute('SELECT sequence FROM obs_sources').fetchone()[0], 1)

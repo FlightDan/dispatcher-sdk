@@ -207,7 +207,7 @@ class IsolatedExecutionKernelConsumerTests(unittest.TestCase):
                 shutil.copy2(ROOT / "examples" / supervisor_example.name, supervisor_example)
                 self._run([str(interpreter), str(supervisor_example), "--evidence-dir",
                            str(evidence / "managed-stall-example" / "workspace")], cwd=public_consumer,
-                          timeout=30, evidence_directory=evidence / "managed-stall-example")
+                          timeout=75, evidence_directory=evidence / "managed-stall-example")
 
             installed_suite = root / "installed-suite"
             shutil.copytree(ROOT / "tests", installed_suite / "tests",

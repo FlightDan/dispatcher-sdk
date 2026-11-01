@@ -1,4 +1,5 @@
 """Factual completion clocks survive real writer locks without new authority."""
+import contextlib
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -298,7 +299,7 @@ class CompletionClockTests(unittest.TestCase):
     def test_actual_extra_foreign_guard_prevents_own_captured_exemption(self):
         owner, token, captured = self.owned_capture()
         foreign = "foreign-extra-token"
-        with sqlite3.connect(self.kernel.db_path, timeout=0) as writer:
+        with contextlib.closing(sqlite3.connect(self.kernel.db_path, timeout=0)) as writer, writer:
             writer.execute("INSERT INTO kernel_budget_samples(token,execution_id,reason) VALUES(?,?,'sampling')",
                 (foreign, "original"))
         try:
@@ -729,7 +730,7 @@ class CompletionClockTests(unittest.TestCase):
             capture_completion_time(self.context)
         self.context.lease = self.lease
         bad = self.root / "unsupported.sqlite3"
-        with sqlite3.connect(bad) as connection:
+        with contextlib.closing(sqlite3.connect(bad)) as connection, connection:
             connection.execute("CREATE TABLE kernel_schema_meta(component,schema_version)")
             connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',4)")
         original_path = self.kernel.db_path
@@ -741,13 +742,13 @@ class CompletionClockTests(unittest.TestCase):
             self.kernel.db_path = original_path
 
     def test_actual_malformed_watermark_and_cyclic_ancestry_remain_unknown(self):
-        with sqlite3.connect(self.kernel.db_path, timeout=0) as writer:
+        with contextlib.closing(sqlite3.connect(self.kernel.db_path, timeout=0)) as writer, writer:
             writer.execute("UPDATE kernel_execution_limits SET parent_execution_id=?,"
                 "parent_attempt=?,parent_fence=? WHERE execution_id=?",
                 (self.lease.execution_id, self.lease.attempt, self.lease.fence, self.lease.execution_id))
         with self.assertRaisesRegex(BudgetClockUnknownError, "ancestry"):
             capture_completion_time(self.context)
-        with sqlite3.connect(self.kernel.db_path, timeout=0) as writer:
+        with contextlib.closing(sqlite3.connect(self.kernel.db_path, timeout=0)) as writer, writer:
             writer.execute("UPDATE kernel_execution_limits SET parent_execution_id=NULL,"
                 "parent_attempt=NULL,parent_fence=NULL WHERE execution_id=?", (self.lease.execution_id,))
             writer.execute("PRAGMA ignore_check_constraints=ON")
@@ -809,7 +810,7 @@ class CompletionClockTests(unittest.TestCase):
                 for scalar_type, oversized in (("text", "x"*400000), ("blob", b"x"*400000)):
                     with self.subTest(field=field, scalar_type=scalar_type):
                         path = self.root / ("malformed-"+str(index)+"-"+scalar_type+".sqlite3")
-                        with sqlite3.connect(path) as writer:
+                        with contextlib.closing(sqlite3.connect(path)) as writer, writer:
                             writer.execute("CREATE TABLE kernel_schema_meta(component,schema_version)")
                             writer.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',10)")
                             writer.execute("CREATE TABLE kernel_clock(singleton,watermark)")

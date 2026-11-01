@@ -101,16 +101,17 @@ def copy_rebind_settlement(source: str | Path, destination: str | Path, *,
             target._validate(db)
             if time.monotonic() >= deadline:
                 raise SettlementBusyError('settlement migration budget elapsed')
-        with open(temporary, 'rb') as artifact:
+        with open(temporary, 'r+b') as artifact:
             os.fsync(artifact.fileno())
         authorize()
         # A hard link publishes a fully formed file without replacing any target.
         os.link(temporary, dst)
-        directory = os.open(dst.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        if os.name == 'posix':
+            directory = os.open(dst.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         return {**claim, 'automatic_activation': False, 'source_preserved': True}
     finally:
         temporary.unlink(missing_ok=True)

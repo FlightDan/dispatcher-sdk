@@ -1,3 +1,4 @@
+import contextlib
 import multiprocessing
 import json
 import os
@@ -114,7 +115,7 @@ class SupervisorOutcomeHandoffTests(unittest.TestCase):
 
     def test_busy_write_is_unknown_and_retry_succeeds(self):
         self.intent()
-        with sqlite3.connect(self.binding['path'], isolation_level=None) as lock:
+        with contextlib.closing(sqlite3.connect(self.binding['path'], isolation_level=None)) as lock, lock:
             lock.execute('BEGIN IMMEDIATE')
             with self.assertRaises(SettlementBusyError):
                 self.journal.record_supervisor_outcome(IDENTITY, RAW, timeout_seconds=.02)
@@ -180,7 +181,7 @@ class SupervisorOutcomeHandoffTests(unittest.TestCase):
 
     def test_worker_tree_cleanup_write_failure_remains_unknown_until_retry(self):
         self.intent()
-        with sqlite3.connect(self.binding['path'], isolation_level=None) as lock:
+        with contextlib.closing(sqlite3.connect(self.binding['path'], isolation_level=None)) as lock, lock:
             lock.execute('BEGIN IMMEDIATE')
             with self.assertRaises(SettlementBusyError):
                 self.journal.record_worker_tree_cleanup(IDENTITY, timeout_seconds=.02)
@@ -195,7 +196,7 @@ class SupervisorOutcomeHandoffTests(unittest.TestCase):
         self.intent()
         ctx = multiprocessing.get_context('fork')
         receiver, sender = ctx.Pipe(duplex=False)
-        with sqlite3.connect(self.binding['path'], isolation_level=None) as lock:
+        with contextlib.closing(sqlite3.connect(self.binding['path'], isolation_level=None)) as lock, lock:
             lock.execute('BEGIN IMMEDIATE')
             proc = ctx.Process(target=supervisor_with_short_work_budget, args=(sender, self.binding))
             proc.start()
@@ -267,7 +268,7 @@ class SupervisorOutcomeHandoffTests(unittest.TestCase):
             process._send_packet(channel, {'kind': 'worker_completed', 'outcome_json': '{"kind":"ok"}'})
             return 0
 
-        with sqlite3.connect(self.binding['path'], isolation_level=None) as lock:
+        with contextlib.closing(sqlite3.connect(self.binding['path'], isolation_level=None)) as lock, lock:
             lock.execute('BEGIN IMMEDIATE')
             with patch.object(process.multiprocessing, 'get_context', return_value=ctx), \
                  patch.object(process, '_worker_entry', worker):
@@ -364,7 +365,7 @@ class SupervisorOutcomeHandoffTests(unittest.TestCase):
             process._send_packet(channel, {'kind': 'worker_completed', 'outcome_json': '{"kind":"ok"}'})
             return 0
 
-        with sqlite3.connect(self.binding['path'], isolation_level=None) as lock:
+        with contextlib.closing(sqlite3.connect(self.binding['path'], isolation_level=None)) as lock, lock:
             lock.execute('BEGIN IMMEDIATE')
             with patch.object(process.multiprocessing, 'get_context', return_value=ctx), \
                  patch.object(process, '_worker_entry', worker), \
@@ -451,7 +452,7 @@ class SupervisorOutcomeHandoffTests(unittest.TestCase):
             process._send_packet(channel, {'kind': 'worker_completed', 'outcome_json': '{"kind":"ok"}'})
             return 0
 
-        with sqlite3.connect(self.binding['path'], isolation_level=None) as lock:
+        with contextlib.closing(sqlite3.connect(self.binding['path'], isolation_level=None)) as lock, lock:
             lock.execute('BEGIN IMMEDIATE')
             with patch.object(process.multiprocessing, 'get_context', return_value=ctx), \
                  patch.object(process, '_worker_entry', worker), \
@@ -584,7 +585,7 @@ class SupervisorOutcomeHandoffTests(unittest.TestCase):
             time.sleep(10)
             return 0
 
-        with sqlite3.connect(self.binding['path'], isolation_level=None) as lock:
+        with contextlib.closing(sqlite3.connect(self.binding['path'], isolation_level=None)) as lock, lock:
             lock.execute('BEGIN IMMEDIATE')
             with patch.object(process.multiprocessing, 'get_context', return_value=ctx), \
                  patch.object(process, '_worker_entry', worker), \

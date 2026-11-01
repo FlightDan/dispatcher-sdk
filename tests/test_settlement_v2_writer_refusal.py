@@ -1,4 +1,5 @@
 """Explicit v2 settlement selection cannot admit a writer or modify evidence."""
+import contextlib
 import json
 import multiprocessing
 import os
@@ -26,26 +27,26 @@ class SettlementV2WriterRefusalTests(unittest.TestCase):
             source = runtime.settlement_storage['source_id']
             runtime.close()
             path = root / 'v2.sqlite'
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 for statement in _SCHEMA[:-1]:
                     db.execute(statement)
-                db.execute('INSERT INTO settlement_meta VALUES(1,2,?,?)', (source, str(kernel_path)))
+                db.execute('INSERT INTO settlement_meta VALUES(1,2,?,?)', (source, str(kernel_path.resolve())))
                 db.execute("INSERT INTO settlement_notes(note_id,execution_id,attempt,fence,phase,evidence_json,created_at) "
                            "VALUES('old','execution',2,3,'supervisor_spawn_intent','{}',1)")
                 db.commit()
                 before = list(db.iterdump())
-            binding = {'path': str(path), 'kernel_path': str(kernel_path), 'source_id': source}
+            binding = {'path': str(path), 'kernel_path': str(kernel_path.resolve()), 'source_id': source}
             with self.assertRaises(SettlementBindingError):
                 SettlementJournal.open_existing(**binding, timeout_seconds=1)
             readonly = SettlementJournal.open_readonly(**binding, timeout_seconds=1)
             self.assertEqual(readonly.inspect_notes('execution', timeout_seconds=1)['notes'][0]['note_id'], 'old')
             with self.assertRaises(SettlementBindingError):
                 Kernel.open_sqlite(kernel_path, {}, isolation_mode='thread', settlement_journal_path=str(path))
-            child = _Store(SimpleNamespace(source_id=source, kernel_path=str(kernel_path)),
+            child = _Store(SimpleNamespace(source_id=source, kernel_path=str(kernel_path.resolve())),
                            {**binding, 'available': True})
             with self.assertRaises(SettlementBindingError):
                 child._facts(writer=True, timeout_seconds=1)
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 self.assertEqual(list(db.iterdump()), before)
             if not hasattr(os, 'fork'):
                 self.skipTest('supervisor writer observation requires POSIX fork')
@@ -70,7 +71,7 @@ class SettlementV2WriterRefusalTests(unittest.TestCase):
                 completed = next(packet for packet in packets if packet.get('kind') == 'handler_completed')
                 self.assertEqual(completed['outcome_handoff']['state'], 'unknown')
                 self.assertEqual(completed['outcome_handoff']['reason'], 'journal_write_failed')
-                with sqlite3.connect(path) as db:
+                with contextlib.closing(sqlite3.connect(path)) as db, db:
                     self.assertEqual(list(db.iterdump()), before)
             finally:
                 receiver.close()

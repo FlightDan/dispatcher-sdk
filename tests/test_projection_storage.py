@@ -1,3 +1,4 @@
+import contextlib
 import tempfile
 import threading
 import unittest
@@ -24,7 +25,7 @@ class ProjectionStorageTests(unittest.TestCase):
             self.assertEqual(reopened.identity(), identity)
             for read in (reopened.inspect('s'), reopened.read('s')):
                 self.assertEqual({key: read[key] for key in identity}, identity)
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 with self.assertRaises(sqlite3.IntegrityError):
                     db.execute("UPDATE projection_meta SET incarnation='different'")
                 with self.assertRaises(sqlite3.IntegrityError):
@@ -33,14 +34,14 @@ class ProjectionStorageTests(unittest.TestCase):
     def test_legacy_store_is_refused_without_mutation(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / 'legacy.db'
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 db.execute('CREATE TABLE projection_meta(version INTEGER NOT NULL)')
                 db.execute('INSERT INTO projection_meta VALUES(1)')
                 db.execute('CREATE TABLE projection_streams(stream_id TEXT)')
                 db.execute('CREATE TABLE projection_pages(stream_id TEXT)')
             with self.assertRaisesRegex(ProjectionStorageError, 'legacy identity'):
                 ProjectionStorage(path)
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 self.assertEqual(db.execute('SELECT * FROM projection_meta').fetchall(), [(1,)])
 
     def test_committed_page_survives_abrupt_writer_exit(self):
@@ -119,7 +120,7 @@ class ProjectionStorageTests(unittest.TestCase):
             store.create("s", total_bytes=2, binding={"source": "host"})
             store.append("s", sequence=0, data=b"a", complete=False)
             store.append("s", sequence=1, data=b"b", complete=True)
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 db.execute("DELETE FROM projection_pages WHERE stream_id='s' AND sequence=0")
             with self.assertRaisesRegex(ProjectionStorageError, "missing"):
                 store.read("s")

@@ -3,6 +3,7 @@
 Host authority is simulated; this does not establish actual writer isolation,
 Runtime settlement, or acceptance by a real host.
 """
+import contextlib
 import json
 import os
 import multiprocessing
@@ -27,7 +28,7 @@ def _seed_legacy(kernel_path, orchestrator_path):
     command = ExecutionCommandV2(execution_id="legacy-execution", idempotency_key="legacy-key",
         registry_revision="host-supplied", correlation_id="legacy", causation_id=None,
         handler_id="handler", handler_contract_version=1, retry_policy=RetryPolicy(), timeout_seconds=1, payload={})
-    with sqlite3.connect(kernel_path) as db:
+    with contextlib.closing(sqlite3.connect(kernel_path)) as db, db:
         db.executescript(KERNEL_SCHEMA_V5)
         db.execute("INSERT INTO kernel_executions(execution_id,idempotency_key,registry_revision,command_json,"
             "state,attempt,redelivery_count,next_attempt_at,fence,revision,created_at,updated_at) "
@@ -35,7 +36,7 @@ def _seed_legacy(kernel_path, orchestrator_path):
             (command.execution_id, command.idempotency_key, command.registry_revision, command.to_json()))
         db.execute("INSERT INTO kernel_events VALUES(1,'legacy-event','legacy-execution',1,'submitted',NULL,'queued','{}',1)")
         db.execute("UPDATE kernel_clock SET event_sequence=1,watermark=1")
-    with sqlite3.connect(orchestrator_path) as db:
+    with contextlib.closing(sqlite3.connect(orchestrator_path)) as db, db:
         execute_schema(db, SCHEMA_V4)
         results = ResultsMixin()
         results.max_result_deliveries = 5
@@ -181,11 +182,11 @@ class LegacySchemaSplitStoreLifecycleTests(unittest.TestCase):
                 with maintenance_lease(source, "fixture", "upgrade") as lease:
                     report = upgrade_storage(source, target, lease=lease)
                 self.assertEqual((report["source_version"], report["target_version"]), versions)
-            with sqlite3.connect(old_kernel) as source, sqlite3.connect(kernel_path) as target:
+            with contextlib.closing(sqlite3.connect(old_kernel)) as source, source, contextlib.closing(sqlite3.connect(kernel_path)) as target, target:
                 self.assertEqual(source.execute("SELECT schema_version FROM kernel_schema_meta").fetchone()[0], 5)
                 self.assertEqual(source.execute("SELECT * FROM kernel_executions").fetchall(), target.execute("SELECT * FROM kernel_executions").fetchall())
                 self.assertEqual(source.execute("SELECT * FROM kernel_events").fetchall(), target.execute("SELECT * FROM kernel_events").fetchall())
-            with sqlite3.connect(old_orchestrator) as source, sqlite3.connect(orchestrator_path) as target:
+            with contextlib.closing(sqlite3.connect(old_orchestrator)) as source, source, contextlib.closing(sqlite3.connect(orchestrator_path)) as target, target:
                 self.assertEqual(source.execute("SELECT version FROM sdk_schema_meta").fetchone()[0], 4)
                 for table in ("sdk_runs", "sdk_run_items", "sdk_run_history", "sdk_events", "sdk_storage_identity"):
                     self.assertEqual(source.execute(f"SELECT * FROM {table}").fetchall(), target.execute(f"SELECT * FROM {table}").fetchall())

@@ -4,6 +4,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel._sqlite_schema import KERNEL_SCHEMA_V5
 from dispatcher_sdk.orchestrator.adoption_inspection import inspect_legacy_execution_page
@@ -13,6 +14,22 @@ from dispatcher_sdk.orchestrator.store import SCHEMA_V4, execute_schema, initial
 
 
 class LegacyExecutionInspectionTests(unittest.TestCase):
+    def test_without_connection_setlimit(self):
+        class LegacyConnection(sqlite3.Connection):
+            def __getattribute__(self, name):
+                if name == 'setlimit':
+                    raise AttributeError(name)
+                return super().__getattribute__(name)
+
+        connect = sqlite3.connect
+        def legacy_connect(*args, **kwargs):
+            return connect(*args, factory=LegacyConnection, **kwargs)
+
+        with patch('dispatcher_sdk.orchestrator.adoption_inspection.sqlite3.connect', side_effect=legacy_connect):
+            self.test_split_store_paging_and_missing_kernel_fact()
+            self.test_rejects_missing_cursor_index_and_oversized_row()
+            self.test_unsupported_schema_marker_is_rejected()
+
     def test_split_store_paging_and_missing_kernel_fact(self):
         with tempfile.TemporaryDirectory() as directory:
             orchestration = Path(directory) / "orchestration.db"

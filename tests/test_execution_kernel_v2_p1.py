@@ -313,7 +313,7 @@ class TerminalEffectInvariantTests(unittest.TestCase):
             def handler(payload, context):
                 def perform():
                     entered.set()
-                    release.wait(5)
+                    release.wait()
                     return {"receipt": "late"}
 
                 try:
@@ -341,7 +341,15 @@ class TerminalEffectInvariantTests(unittest.TestCase):
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     running = executor.submit(stack.run_once)
                     self.assertTrue(entered.wait(5))
-                    parked = running.result(timeout=5)
+                    parked = running.result(timeout=10)
+                # Completion is bounded and may return the running snapshot
+                # while its retained outcome awaits settlement recovery.
+                deadline = time.monotonic() + 10
+                while parked.state == "running" and time.monotonic() < deadline:
+                    stack.recover_completions(timeout_seconds=0.5)
+                    parked = stack.kernel.get("thread-inflight")
+                    if parked.state == "running":
+                        time.sleep(0.02)
                 self.assertEqual(parked.state, "recovery_required")
                 self.assertEqual(
                     stack.kernel.get_effect("thread-inflight").state,

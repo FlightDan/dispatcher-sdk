@@ -1,3 +1,4 @@
+import contextlib
 import sqlite3
 import tempfile
 import unittest
@@ -53,11 +54,11 @@ class BudgetObservationTests(unittest.TestCase):
         self.assertEqual(observe_budget(self.ledger, 'run', 'other', 'tokens', amount=1)['status'], 'available')
 
     def test_malformed_facts_unknown_preserve_deadline_watermark(self):
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             db.execute("INSERT INTO application_reservations VALUES('run','agent','tokens','bad',1,'invalid',NULL)")
         self.now = 21
         self.assertEqual(self.status()['status'], 'unknown')
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             db.execute("DELETE FROM application_reservations WHERE request_id='bad'")
         self.now = 11
         self.assertEqual(self.status()['status'], 'expired')

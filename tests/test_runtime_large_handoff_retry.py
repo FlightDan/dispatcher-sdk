@@ -1,4 +1,5 @@
 """Real supervisor retry; registry identity functions are fixed test stubs."""
+import contextlib
 import os
 import multiprocessing
 import sqlite3
@@ -282,16 +283,16 @@ class LargeHandoffRetryTests(unittest.TestCase):
                 result = ExecutionResultV2.from_dict(record['result'])
                 check = runtime.kernel._is_committed_supervisor_result
                 self.assertTrue(check(lease, result, timeout_seconds=1))
-                with sqlite3.connect(Path(root) / 'kernel.sqlite') as db:
+                with contextlib.closing(sqlite3.connect(Path(root) / 'kernel.sqlite')) as db, db:
                     command = db.execute('SELECT command_json FROM kernel_executions WHERE execution_id=?', ('large',)).fetchone()[0]
                     event = db.execute("SELECT data_json FROM kernel_events WHERE execution_id=? AND revision=? AND event_type='retry_scheduled'", ('large', lease.revision + 1)).fetchone()[0]
                     db.execute('UPDATE kernel_executions SET command_json=? WHERE execution_id=?', (command + ' ' * 2000000, 'large'))
                 self.assertTrue(check(lease, result, timeout_seconds=1))
-                with sqlite3.connect(Path(root) / 'kernel.sqlite') as db:
+                with contextlib.closing(sqlite3.connect(Path(root) / 'kernel.sqlite')) as db, db:
                     db.execute("UPDATE kernel_events SET data_json=? WHERE execution_id=? AND revision=? AND event_type='retry_scheduled'", (event + ' ' * 300000, 'large', lease.revision + 1))
                 with self.assertRaises(TimeoutError):
                     check(lease, result, timeout_seconds=1, max_record_bytes=256 * 1024)
-                with sqlite3.connect(Path(root) / 'kernel.sqlite') as db:
+                with contextlib.closing(sqlite3.connect(Path(root) / 'kernel.sqlite')) as db, db:
                     db.execute('UPDATE kernel_executions SET command_json=? WHERE execution_id=?', (command, 'large'))
                     db.execute("UPDATE kernel_events SET data_json=? WHERE execution_id=? AND revision=? AND event_type='retry_scheduled'", (event, 'large', lease.revision + 1))
                 self.assertFalse(check(lease, replace(result, result_id='different'), timeout_seconds=1))

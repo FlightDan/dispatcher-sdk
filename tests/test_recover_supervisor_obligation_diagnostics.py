@@ -1,4 +1,5 @@
 """Exact durable Kernel facts only; no Runtime registry initialization."""
+import contextlib
 from pathlib import Path
 import os
 import multiprocessing
@@ -198,11 +199,16 @@ class RecoverSupervisorObligationDiagnosticsTests(unittest.TestCase):
             replacement.submit(make_command('exec', attempts=3))
             foreign = replacement.claim_and_start('owner', execution_id='exec')
             replacement.register_supervisor_obligation(foreign)
-        with sqlite3.connect(self.kernel_path) as connection:
+        with contextlib.closing(sqlite3.connect(self.kernel_path)) as connection, connection:
             connection.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        original_store = self.kernel.kernel_store_identity()
+        self.kernel.close()
         os.replace(replacement_path, self.kernel_path)
-        report = runtime.recover_claim_lifecycle(self.lease.execution_id, self.lease.attempt,
-                                                   self.lease.fence, timeout_seconds=1)
+        # Windows cannot replace an open SQLite file; retain the identity
+        # observed on the original live connection for this mismatch check.
+        with patch.object(self.kernel, 'kernel_store_identity', return_value=original_store):
+            report = runtime.recover_claim_lifecycle(self.lease.execution_id, self.lease.attempt,
+                                                       self.lease.fence, timeout_seconds=1)
         self.assertEqual((report['state'], report['reason']), ('unknown', 'kernel_store_identity_mismatch'))
         self.assertEqual(report['supervisor_obligation']['state'], 'unknown')
         notes = runtime._settlement_journal.inspect_notes('exec', timeout_seconds=1)['notes']

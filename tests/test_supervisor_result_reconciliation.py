@@ -1,4 +1,5 @@
 """Host-verifier contract tests; the verifier is simulated, not host isolation proof."""
+import contextlib
 import multiprocessing
 from dataclasses import replace
 import os
@@ -167,7 +168,7 @@ class SupervisorResultReconciliationTests(unittest.TestCase):
     def test_other_store_identity_fails_closed(self):
         lease, result, budget = self.prepare()
         other_path = Path(self.temp.name) / "other.sqlite"
-        with sqlite3.connect(self.path) as source, sqlite3.connect(other_path) as target:
+        with contextlib.closing(sqlite3.connect(self.path)) as source, source, contextlib.closing(sqlite3.connect(other_path)) as target, target:
             source.backup(target)
             target.execute("UPDATE kernel_store_identity SET store_id=? WHERE singleton=1", ("other-store",))
         with SQLiteKernel(other_path, authority_verifier=self.verify) as other:

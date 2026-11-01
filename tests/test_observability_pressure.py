@@ -1,4 +1,5 @@
 """Portable native A12/A13 witnesses; preserve raw evidence outside fixtures."""
+import contextlib
 import json
 from itertools import count
 import os
@@ -401,7 +402,7 @@ class ObservabilityPressureTests(unittest.TestCase):
         self.assertEqual(result.state, "succeeded", result.result)
         self.assertNotEqual(result.result.value["pid"], os.getpid())
         database = runtime.observation_storage["path"]
-        with sqlite3.connect(database) as connection:
+        with contextlib.closing(sqlite3.connect(database)) as connection, connection:
             before = list(connection.iterdump())
         cursor, total, summaries, pages, maximum = 0, 0, 0, 0, 0
         actual_numbers = set()
@@ -432,7 +433,7 @@ class ObservabilityPressureTests(unittest.TestCase):
         self.assertEqual(summaries, 10_000)
         self.assertEqual(actual_numbers, set(range(10_000)))
         observed = runtime.observe(name, timeout=.5)
-        with sqlite3.connect(database) as connection:
+        with contextlib.closing(sqlite3.connect(database)) as connection, connection:
             self.assertEqual(list(connection.iterdump()), before)
         self.evidence.update({"execution_id": name, "actual_result": result.result.to_dict(),
             "configuration": options.__dict__, "persisted_events": total, "summaries": summaries,

@@ -1,4 +1,5 @@
 """Durable recovery scan progress, independent of Runtime launch and hashing."""
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
@@ -58,16 +59,16 @@ class SettlementRecoveryCursorTests(unittest.TestCase):
         self.assertEqual(self.open().next_pending_round_robin(timeout_seconds=1)['identity']['execution_id'], observed[0])
 
     def test_v2_readonly_then_transactional_upgrade_retains_records_and_binding(self):
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             for statement in _SCHEMA[:-1]: db.execute(statement)
-            db.execute('INSERT INTO settlement_meta VALUES(1,2,?,?)', ('source', str(self.kernel_path)))
+            db.execute('INSERT INTO settlement_meta VALUES(1,2,?,?)', ('source', str(self.kernel_path.resolve())))
             original = ExecutionLease('legacy', 'legacy-lease', 'worker', 1, 1, 9999999999, 1)
             db.execute('INSERT INTO settlement_records VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                        ('legacy', 1, 1, json.dumps(original.to_dict()), 'deferred',
                         json.dumps({'kind': 'unknown', 'outcome': {}}), 'pending', '{}', 1, 1.0, 1.0))
         old = SettlementJournal.open_readonly(self.path, source_id='source', kernel_path=self.kernel_path, timeout_seconds=1)
         self.assertEqual(old.pending(timeout_seconds=1)[0]['identity']['execution_id'], 'legacy')
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual(db.execute('SELECT version FROM settlement_meta').fetchone()[0], 2)
         with self.assertRaises(SettlementBindingError):
             SettlementJournal(self.path, source_id='wrong', kernel_path=self.kernel_path, timeout_seconds=1)
@@ -76,9 +77,9 @@ class SettlementRecoveryCursorTests(unittest.TestCase):
         upgraded = Path(self.temp.name) / 'upgraded.sqlite'
         journal = SettlementJournal.upgrade_v2_copy(self.path, upgraded, source_id='source', kernel_path=self.kernel_path, timeout_seconds=1)
         self.assertEqual(journal.next_pending_round_robin(timeout_seconds=1)['identity']['execution_id'], 'legacy')
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual(db.execute('SELECT version FROM settlement_meta').fetchone()[0], 2)
-        with sqlite3.connect(upgraded) as db:
+        with contextlib.closing(sqlite3.connect(upgraded)) as db, db:
             self.assertEqual(db.execute('SELECT version FROM settlement_meta').fetchone()[0], 3)
 
     def test_oversized_obligation_is_visible_and_does_not_block_next(self):
@@ -91,7 +92,7 @@ class SettlementRecoveryCursorTests(unittest.TestCase):
         self.assertEqual(first['identity'], {'execution_id': 'big', 'attempt': 1, 'fence': 1})
         self.assertGreater(first['required_bytes'], 256 * 1024)
         self.assertEqual(journal.next_pending_round_robin(timeout_seconds=1)['identity']['execution_id'], 'execution-0')
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual(db.execute("SELECT state FROM settlement_records WHERE execution_id='big'").fetchone()[0], 'pending')
 
     def test_large_identifier_is_not_materialized_in_bounded_diagnostic(self):
@@ -102,14 +103,14 @@ class SettlementRecoveryCursorTests(unittest.TestCase):
         report = journal.next_pending_round_robin(timeout_seconds=1)
         self.assertTrue(report['oversized'])
         self.assertIsNone(report['identity'])
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual(db.execute('SELECT typeof(last_rowid) FROM settlement_recovery_cursor').fetchone()[0], 'integer')
 
     def test_vacuum_renumbering_still_wraps_to_all_remaining_rows(self):
         journal = self.open()
         self.seed(journal)
         journal.next_pending_round_robin(timeout_seconds=1)
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             db.execute("DELETE FROM settlement_records WHERE execution_id='execution-0'")
             db.commit()
             db.execute('VACUUM')
@@ -188,7 +189,7 @@ class SettlementRecoveryCursorTests(unittest.TestCase):
     def test_writer_contention_does_not_advance_cursor(self):
         journal = self.open()
         self.seed(journal, 2)
-        with sqlite3.connect(self.path) as connection:
+        with contextlib.closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute('BEGIN IMMEDIATE')
             with self.assertRaises(SettlementBusyError):
                 journal.next_pending_round_robin(timeout_seconds=.02)
@@ -205,9 +206,9 @@ class SettlementRecoveryCursorTests(unittest.TestCase):
         self.assertEqual(journal.inspect('execution-0', timeout_seconds=1)[0]['state'], 'recorded')
 
     def test_failed_copy_upgrade_leaves_original_and_no_destination(self):
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             for statement in _SCHEMA[:-1]: db.execute(statement)
-            db.execute('INSERT INTO settlement_meta VALUES(1,2,?,?)', ('source', str(self.kernel_path)))
+            db.execute('INSERT INTO settlement_meta VALUES(1,2,?,?)', ('source', str(self.kernel_path.resolve())))
         destination = Path(self.temp.name) / 'failed-copy.sqlite'
         validate = SettlementJournal._validate
         def fail_v3(journal, connection):
@@ -219,7 +220,7 @@ class SettlementRecoveryCursorTests(unittest.TestCase):
             with self.assertRaisesRegex(SettlementBindingError, 'injected'):
                 SettlementJournal.upgrade_v2_copy(self.path, destination, source_id='source', kernel_path=self.kernel_path, timeout_seconds=1)
         self.assertFalse(destination.exists())
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual(db.execute('SELECT version FROM settlement_meta').fetchone()[0], 2)
 
     def test_concurrent_scanners_advance_one_shared_cursor(self):
@@ -245,18 +246,18 @@ class SettlementRecoveryCursorTests(unittest.TestCase):
             journal_path = Path(first._settlement_journal.path)
             first.close()
             journal_path.unlink()
-            with sqlite3.connect(journal_path) as db:
+            with contextlib.closing(sqlite3.connect(journal_path)) as db, db:
                 for statement in _SCHEMA[:-1]: db.execute(statement)
-                db.execute('INSERT INTO settlement_meta VALUES(1,2,?,?)', (source_id, str(kernel_path)))
+                db.execute('INSERT INTO settlement_meta VALUES(1,2,?,?)', (source_id, str(kernel_path.resolve())))
             with self.assertRaises(SettlementBindingError):
                 Kernel.open_sqlite(kernel_path, {}, isolation_mode='thread')
-            with sqlite3.connect(journal_path) as db:
+            with contextlib.closing(sqlite3.connect(journal_path)) as db, db:
                 self.assertEqual(db.execute('SELECT version FROM settlement_meta').fetchone()[0], 2)
             destination = Path(self.temp.name) / 'copy.sqlite'
             SettlementJournal.upgrade_v2_copy(journal_path, destination, source_id=source_id, kernel_path=kernel_path, timeout_seconds=1)
-            selected = Kernel.open_sqlite(kernel_path, {}, isolation_mode='thread', settlement_journal_path=str(destination))
+            selected = Kernel.open_sqlite(kernel_path, {}, isolation_mode='thread', settlement_journal_path=str(destination.resolve()))
             try:
-                self.assertEqual(selected.settlement_storage, {'path': str(destination), 'kernel_path': str(kernel_path),
+                self.assertEqual(selected.settlement_storage, {'path': str(destination.resolve()), 'kernel_path': str(kernel_path.resolve()),
                                  'source_id': source_id, 'available': True})
             finally:
                 selected.close()

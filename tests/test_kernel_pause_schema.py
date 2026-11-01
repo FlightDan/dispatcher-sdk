@@ -1,3 +1,4 @@
+import contextlib
 import sqlite3
 import unittest
 
@@ -7,7 +8,7 @@ from dispatcher_sdk.execution_kernel.errors import StorageIsolationError
 
 class KernelPauseSchemaTests(unittest.TestCase):
     def test_historical_upgrade_chain_and_corrupt_v6_rejection(self):
-        with sqlite3.connect(":memory:") as connection:
+        with contextlib.closing(sqlite3.connect(":memory:")) as connection, connection:
             connection.executescript(schema.KERNEL_SCHEMA_V4)
             schema.upgrade_kernel_schema_v4_to_v5(connection)
             schema.validate_kernel_schema_v5(connection)

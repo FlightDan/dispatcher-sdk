@@ -1,4 +1,5 @@
 """Exact-generation process obligations gate retry across Kernel clients."""
+import contextlib
 import multiprocessing
 import sqlite3
 import tempfile
@@ -224,7 +225,7 @@ class SupervisorSchemaUpgradeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.sqlite"
             target = Path(directory) / "target.sqlite"
-            with sqlite3.connect(source) as db:
+            with contextlib.closing(sqlite3.connect(source)) as db, db:
                 db.executescript(KERNEL_SCHEMA_V8)
                 db.execute("UPDATE kernel_clock SET watermark=17")
                 db.execute("INSERT INTO kernel_executions(execution_id,idempotency_key,registry_revision,command_json,state,attempt,redelivery_count,next_attempt_at,fence,revision,created_at,updated_at) VALUES('old','key','rev','{}','queued',0,0,1,0,1,1,1)")
@@ -233,11 +234,11 @@ class SupervisorSchemaUpgradeTests(unittest.TestCase):
             with maintenance_lease(source, "test", "upgrade") as lease:
                 report = upgrade_storage(source, target, lease=lease)
             self.assertEqual((report["source_version"], report["target_version"]), (8, 12))
-            with sqlite3.connect(source) as db:
+            with contextlib.closing(sqlite3.connect(source)) as db, db:
                 self.assertEqual(db.execute("SELECT schema_version FROM kernel_schema_meta").fetchone()[0], 8)
                 source_execution = db.execute("SELECT * FROM kernel_executions").fetchall()
                 source_events = db.execute("SELECT * FROM kernel_events").fetchall()
-            with sqlite3.connect(target) as db:
+            with contextlib.closing(sqlite3.connect(target)) as db, db:
                 self.assertEqual(db.execute("SELECT * FROM kernel_executions").fetchall(), source_execution)
                 self.assertEqual(db.execute("SELECT * FROM kernel_events").fetchall(), source_events)
             with SQLiteKernel(target) as kernel:

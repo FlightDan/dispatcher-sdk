@@ -1,4 +1,5 @@
 """Exercise exact lifecycle notes through real Kernel and journal storage."""
+import contextlib
 from pathlib import Path
 import multiprocessing
 import os
@@ -385,6 +386,65 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
         finally:
             peer.close()
 
+    def test_windows_containment_receipt_retries_and_preserves_exact_identity(self):
+        self.submit("windows-containment")
+        lease = self.runtime.kernel.claim_and_start("worker", execution_id="windows-containment")
+        identity = {"execution_id": lease.execution_id, "attempt": lease.attempt, "fence": lease.fence}
+        journal = self.runtime._settlement_journal
+        self.assertTrue(self.runtime._diagnostic_note(identity, "supervisor_spawn_intent",
+            {"source": "runtime_pre_spawn", "cleanup": "unknown"}, timeout_seconds=1))
+        evidence = {"state": "confirmed", "source": "windows_job_containment"}
+        with patch.object(journal, "lifecycle_note", side_effect=OSError("journal unavailable")):
+            self.assertFalse(self.runtime._diagnostic_note(identity, "worker_tree_cleanup_observed", evidence))
+            self.assertEqual(journal.inspect_supervisor_handoff(identity, timeout_seconds=1)
+                             ["facts"]["worker_tree_cleanup"]["state"], "unknown")
+        self.runtime._retry_diagnostic_notes(time.monotonic() + 2)
+        fact = journal.inspect_supervisor_handoff(identity, timeout_seconds=1)["facts"]["worker_tree_cleanup"]
+        self.assertEqual(fact["evidence"], evidence)
+        other = {**identity, "fence": identity["fence"] + 1}
+        self.assertEqual(journal.inspect_supervisor_handoff(other, timeout_seconds=1)
+                         ["facts"]["worker_tree_cleanup"]["state"], "unknown")
+        entry = journal.scan_supervisor_cleanup(timeout_seconds=1)["registrations"][0]
+        self.assertEqual(entry["worker_tree_cleanup"], "confirmed")
+
+    def test_close_waits_for_diagnostic_writer_and_persists_retained_note(self):
+        self.submit("close-writer")
+        identity = {"execution_id": "close-writer", "attempt": 0, "fence": 0}
+        self.runtime._diagnostic_retry_lock.acquire()
+        try:
+            self.assertFalse(self.runtime._diagnostic_note(identity, "receipt", {"state": "unknown"},
+                                                           timeout_seconds=.01))
+        except BaseException:
+            self.runtime._diagnostic_retry_lock.release()
+            raise
+        release = threading.Timer(.3, self.runtime._diagnostic_retry_lock.release)
+        release.start()
+        try:
+            self.runtime.close()
+        finally:
+            release.join()
+        self.assertEqual([n["phase"] for n in self.reopen_notes("close-writer")], ["receipt"])
+
+    def test_close_still_fails_closed_if_diagnostic_writer_remains_busy(self):
+        self.submit("close-writer-busy")
+        identity = {"execution_id": "close-writer-busy", "attempt": 0, "fence": 0}
+        self.runtime._diagnostic_retry_lock.acquire()
+        try:
+            self.assertFalse(self.runtime._diagnostic_note(identity, "receipt", {"state": "unknown"},
+                                                           timeout_seconds=.01))
+            with self.assertRaises(_UnpersistedDiagnosticsError):
+                self.runtime.close()
+        except BaseException:
+            self.runtime._diagnostic_retry_lock.release()
+            raise
+        release = threading.Timer(.3, self.runtime._diagnostic_retry_lock.release)
+        release.start()
+        try:
+            self.runtime.close()
+        finally:
+            release.join()
+        self.assertEqual([n["phase"] for n in self.reopen_notes("close-writer-busy")], ["receipt"])
+
     def test_receiver_ack_survives_outbox_ack_failure(self):
         self.submit("receiver-ack")
         identity = {"execution_id": "receiver-ack", "attempt": 0, "fence": 0}
@@ -402,7 +462,7 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
         process.start()
         process.join(10)
         self.assertEqual(process.exitcode, 27)
-        with sqlite3.connect(self.path) as connection:
+        with contextlib.closing(sqlite3.connect(self.path)) as connection, connection:
             rows = connection.execute("SELECT attempt,fence,state FROM kernel_lifecycle_producers WHERE execution_id=?",
                                       ("cancel-crash",)).fetchall()
         self.assertEqual(rows, [(0, 0, "open")])
@@ -417,7 +477,7 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
         with patch.object(self.runtime.kernel, "cancel", side_effect=commit_then_raise):
             with self.assertRaisesRegex(OSError, "acknowledgement lost"):
                 self.runtime.cancel("cancel-uncertain", expected_revision=self.runtime.kernel.get("cancel-uncertain").revision)
-        with sqlite3.connect(self.path) as connection:
+        with contextlib.closing(sqlite3.connect(self.path)) as connection, connection:
             states = connection.execute("SELECT state FROM kernel_lifecycle_producers WHERE execution_id=?",
                                         ("cancel-uncertain",)).fetchall()
         self.assertEqual(states, [("open",)])

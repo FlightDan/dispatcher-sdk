@@ -2,6 +2,7 @@
 
 All existing digest paths are stubbed. This proves no host isolation or real Run acceptance.
 """
+import contextlib
 import hashlib
 import json
 import multiprocessing
@@ -49,7 +50,7 @@ class _LifecycleHost:
         self.binding = None
         self.acks = 0
         self.last_error = None
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS producers(token TEXT PRIMARY KEY, identity TEXT NOT NULL)')
 
     def __call__(self, credential, operation, identity, event):
@@ -59,7 +60,7 @@ class _LifecycleHost:
         if operation == 'reserve' and allowed:
             token = event['producer_id']
             encoded = json.dumps(identity, sort_keys=True)
-            with sqlite3.connect(self.path, timeout=1) as db:
+            with contextlib.closing(sqlite3.connect(self.path, timeout=1)) as db, db:
                 db.execute('INSERT OR IGNORE INTO producers VALUES(?,?)', (token, encoded))
                 allowed = db.execute('SELECT identity FROM producers WHERE token=?', (token,)).fetchone()[0] == encoded
         result = {'allowed': allowed, 'expires_at': self.expiry}
@@ -207,7 +208,7 @@ def _activate_with_runtime(orchestrator_path, kernel_path, manifest, results):
             value = completed.result.value
             if value["execution_id"] != command.execution_id or value["pid"] == os.getpid():
                 raise AssertionError("separate handler identity differs: " + repr(value))
-            with sqlite3.connect(lifecycle_host.path) as db:
+            with contextlib.closing(sqlite3.connect(lifecycle_host.path)) as db, db:
                 if db.execute('SELECT COUNT(*) FROM producers').fetchone()[0] < 1 or lifecycle_host.acks < 1:
                     raise AssertionError('host reservation or receiver verification was not exercised')
             obligations = runtime.kernel.inspect_supervisor_obligations(command.execution_id)["obligations"]

@@ -64,6 +64,7 @@ class SupervisorCleanupScanTests(unittest.TestCase):
                          patch.object(_process_runtime, '_finish_budget_capture', side_effect=fail_capture):
                         return invoke(**kwargs)
                 with patch.object(runtime_module, 'invoke_process_handler', side_effect=native_with_pending_capture), \
+                     patch('dispatcher_sdk.execution_kernel._windows_runtime.invoke_windows_handler', side_effect=native_with_pending_capture), \
                      patch.object(runtime, '_finish_received_budget_checkpoints', side_effect=TimeoutError('busy')):
                     runtime.run_once(execution_id='replay')
                 record = runtime._settlement_journal.inspect('replay', timeout_seconds=1)[0]
@@ -103,7 +104,8 @@ class SupervisorCleanupScanTests(unittest.TestCase):
                     kwargs['on_phase']('supervisor_not_invoked', {'source': 'runtime_pre_spawn'})
                     retained.append((token, envelope))
                     return outcome
-                with patch.object(runtime_module, 'invoke_process_handler', side_effect=unknown_completion):
+                with patch.object(runtime_module, 'invoke_process_handler', side_effect=unknown_completion), \
+                     patch('dispatcher_sdk.execution_kernel._windows_runtime.invoke_windows_handler', side_effect=unknown_completion):
                     runtime.run_once(execution_id='clock')
                 record = runtime._settlement_journal.inspect('clock', timeout_seconds=1)[0]
                 self.assertEqual(record['evidence']['supervisor_not_invoked']['process_creation'], 'not_invoked')
@@ -169,7 +171,8 @@ class SupervisorCleanupScanTests(unittest.TestCase):
                 command = runtime.command("work", execution_id="ambiguous", idempotency_key="ambiguous",
                                           correlation_id="ambiguous", timeout_seconds=10, payload={})
                 runtime.submit(command)
-                with patch.object(runtime_module, "invoke_process_handler", side_effect=OSError("ambiguous")):
+                with patch.object(runtime_module, "invoke_process_handler", side_effect=OSError("ambiguous")), \
+                     patch("dispatcher_sdk.execution_kernel._windows_runtime.invoke_windows_handler", side_effect=OSError("ambiguous")):
                     with self.assertRaises(OSError):
                         runtime.run_once(execution_id="ambiguous")
                 obligation = runtime.kernel.inspect_supervisor_obligations("ambiguous")["obligations"][0]
@@ -231,6 +234,9 @@ class SupervisorCleanupScanTests(unittest.TestCase):
                 intent = next(note for note in notes if note["phase"] == "supervisor_spawn_intent")
                 self.assertGreater(intent["identity"]["attempt"], 0)
                 self.assertGreater(intent["identity"]["fence"], 0)
+                entry = next(item for item in journal.scan_supervisor_cleanup(timeout_seconds=1)["registrations"]
+                             if item["identity"] == intent["identity"])
+                self.assertEqual(entry["worker_tree_cleanup"], "confirmed")
             finally:
                 runtime.close()
 

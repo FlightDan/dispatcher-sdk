@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sqlite3
 import tempfile
@@ -38,7 +39,7 @@ class StreamedInstallTests(unittest.TestCase):
                     'migration_version':'m','application_projection_version':'p'}
         receipt = {'kind':'paused_revision_install','decision':envelope,'activation':'closed','target_control_epoch':3,
                    'claims_used':1,'max_claims':5,'deadline_at':100,'worker_principal':'worker','worker_expires_at':90}
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             db.executescript('''
               CREATE TABLE sdk_control_operations(operation_id TEXT,run_id TEXT,kernel_store_id TEXT,orchestrator_store_id TEXT,orchestrator_incarnation TEXT,kernel_receipt TEXT,max_claims INTEGER,deadline_at REAL);
               CREATE TABLE sdk_revision_decisions(operation_id TEXT,run_id TEXT,source_revision INTEGER,source_epoch INTEGER,source_generation INTEGER,target_generation INTEGER,deployment TEXT,migration_version TEXT,application_projection_version TEXT,source_application_state TEXT,target_application_state TEXT,decision TEXT,kernel_install_receipt TEXT,orchestrator_install_receipt TEXT);
@@ -95,16 +96,16 @@ class StreamedInstallTests(unittest.TestCase):
     def test_install_and_replay_retains_history_pointer(self):
         first = self.install()
         self.assertEqual(self.install()['orchestrator_install_receipt'], first['orchestrator_install_receipt'])
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             self.assertEqual(db.execute("SELECT value FROM sdk_run_history WHERE run_id='run' AND item_key='application_state' AND revision=2").fetchone()[0], '{"a":2}')
             self.assertEqual(db.execute("SELECT pointer FROM sdk_streamed_projection_pointers WHERE run_id='run' AND revision=2").fetchone()[0], STREAM_POINTER_PREFIX + canonical(self.target))
             self.assertEqual(tuple(db.execute("SELECT revision FROM sdk_runs").fetchone()), (2,))
 
     def test_actual_get_run_reads_noncanonical_materialized_json(self):
         from dispatcher_sdk.orchestrator.engine import Orchestrator
-        with sqlite3.connect(self.storage.path) as db:
+        with contextlib.closing(sqlite3.connect(self.storage.path)) as db, db:
             db.execute("UPDATE projection_pages SET data=? WHERE stream_id='target'", (b'[ 1,2 ]',))
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             db.execute('CREATE TABLE sdk_disposed_runs(run_id TEXT)')
         self.install()
         actual = Orchestrator.__new__(Orchestrator)
@@ -115,7 +116,7 @@ class StreamedInstallTests(unittest.TestCase):
     def test_direct_save_retains_stream_history_then_records_changed_json(self):
         from dispatcher_sdk.orchestrator.engine import Orchestrator
         from dispatcher_sdk.orchestrator.projection_stream import compare_projection_stream, iter_installed_projection
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             db.execute('CREATE TABLE sdk_disposed_runs(run_id TEXT)')
             db.execute("ALTER TABLE sdk_runs ADD COLUMN state TEXT DEFAULT 'running'")
         self.install()
@@ -123,7 +124,7 @@ class StreamedInstallTests(unittest.TestCase):
         actual.db_path, actual.durability = str(self.path), 'full'
         state = actual.get_run('run')
         state.update(state='running', revision=3)
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             actual._save(db, state, changes=set())
         self.assertEqual(actual.get_run('run')['application_state'], {'a':2})
         actual.projection_verifier = lambda credential, storage: {'retained_immutable':True, 'run_id':'run',
@@ -133,15 +134,15 @@ class StreamedInstallTests(unittest.TestCase):
             stream_id='target', expected_binding=self.target['binding'], source_read_credential='read')['total_bytes'], 7)
         state = actual.get_run('run')
         state.update(state='running', revision=4, application_state={'a':3})
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             actual._save(db, state, changes=set())
         self.assertEqual(actual.get_run('run')['application_state'], {'a':3})
         self.assertEqual(actual.get_run_at('run', 2)['application_state'], {'a':2})
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             self.assertEqual(db.execute("SELECT value FROM sdk_run_history WHERE revision=4 AND item_key='application_state'").fetchone()[0], '{"a":3}')
         state = actual.get_run('run')
         state.update(state='running', revision=5, application_state={'a':'😊' * 75000})
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             actual._save(db, state, changes=set())
         raw = canonical(state['application_state']).encode('utf-8')
         self.storage.create('changed', total_bytes=len(raw), binding={'kind':'changed'})
@@ -195,7 +196,7 @@ class StreamedInstallTests(unittest.TestCase):
                         content_pages=mappings,migration_version='m',application_projection_version='p')
         receipt = kernel.install_revision_decision('decision',worker_credential='next',expected_decision=dict(envelope))
         self.host.kernel = kernel
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             db.execute('UPDATE sdk_control_operations SET kernel_store_id=?,kernel_receipt=?', (kid,canonical(barrier)))
             db.execute('UPDATE sdk_revision_decisions SET source_generation=0,target_generation=1,decision=?,kernel_install_receipt=?', (canonical(self.declaration),canonical(receipt)))
             db.execute('UPDATE sdk_managed_runs SET generation=0')
@@ -204,10 +205,10 @@ class StreamedInstallTests(unittest.TestCase):
         self.assertEqual(self.install()['orchestrator_install_receipt'], result['orchestrator_install_receipt'])
 
     def test_missing_target_is_atomic(self):
-        with sqlite3.connect(self.storage.path) as db:
+        with contextlib.closing(sqlite3.connect(self.storage.path)) as db, db:
             db.execute("DELETE FROM projection_pages WHERE stream_id='target'")
         with self.assertRaises(Exception): self.install()
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             self.assertEqual(db.execute('SELECT revision FROM sdk_runs').fetchone()[0], 1)
             self.assertIsNone(db.execute('SELECT orchestrator_install_receipt FROM sdk_revision_decisions').fetchone()[0])
 
@@ -215,21 +216,21 @@ class StreamedInstallTests(unittest.TestCase):
         self.host.projection_verifier = lambda *_: {'retained_immutable':False}
         with self.assertRaises(OrchestrationError): self.install()
         self.host.projection_verifier = lambda *_: {'retained_immutable':True,'valid_json':True,'decision':self.claim}
-        with self.connect() as db: db.execute("UPDATE sdk_run_items SET value='{\"a\":9}'")
+        with contextlib.closing(self.connect()) as db, db: db.execute("UPDATE sdk_run_items SET value='{\"a\":9}'")
         with self.assertRaises(OrchestrationError): self.install()
 
     def test_invalid_json_and_kernel_receipt_are_rejected(self):
-        with sqlite3.connect(self.storage.path) as db:
+        with contextlib.closing(sqlite3.connect(self.storage.path)) as db, db:
             db.execute("UPDATE projection_pages SET data=? WHERE stream_id='target'", (b'{bad  }',))
         with self.assertRaises(OrchestrationError): self.install()
-        with sqlite3.connect(self.storage.path) as db:
+        with contextlib.closing(sqlite3.connect(self.storage.path)) as db, db:
             db.execute("UPDATE projection_pages SET data=? WHERE stream_id='target'", (b'{\"a\":2}',))
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             row = json.loads(db.execute('SELECT kernel_install_receipt FROM sdk_revision_decisions').fetchone()[0])
             row['decision']['target_generation'] = 5
             db.execute('UPDATE sdk_revision_decisions SET kernel_install_receipt=?', (canonical(row),))
         with self.assertRaises(OrchestrationError): self.install()
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             self.assertEqual(db.execute('SELECT revision FROM sdk_runs').fetchone()[0], 1)
 
     def test_late_lease_failure_rolls_back_installation(self):
@@ -237,6 +238,6 @@ class StreamedInstallTests(unittest.TestCase):
                 {'lease_id':'lease','lease_fence':1}, {'lease_id':'lease','lease_fence':1},
                 OrchestrationError('expired')]):
             with self.assertRaises(OrchestrationError): self.install()
-        with self.connect() as db:
+        with contextlib.closing(self.connect()) as db, db:
             self.assertEqual(db.execute('SELECT revision FROM sdk_runs').fetchone()[0], 1)
             self.assertIsNone(db.execute('SELECT orchestrator_install_receipt FROM sdk_revision_decisions').fetchone()[0])

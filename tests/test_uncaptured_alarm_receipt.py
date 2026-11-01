@@ -1,4 +1,5 @@
 """Native alarm receipts survive an interrupted, durably armed clock sample."""
+import contextlib
 import json
 import multiprocessing
 import os
@@ -138,7 +139,7 @@ class UncapturedAlarmReceiptTests(unittest.TestCase):
                 self.assertEqual(checkpoint['token'], evidence['token'])
                 self.assertIsNone(checkpoint['captured_envelope'])
                 self.assertEqual(checkpoint['error']['cause'], '_DeadlineExpired')
-            with sqlite3.connect('file:' + str(path) + '?mode=ro', uri=True) as connection:
+            with contextlib.closing(sqlite3.connect('file:' + str(path) + '?mode=ro', uri=True)) as connection, connection:
                 self.assertEqual(connection.execute(
                     'SELECT token,reason FROM kernel_budget_samples').fetchall(),
                     [(evidence['token'], 'sampling')])

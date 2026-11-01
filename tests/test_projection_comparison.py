@@ -1,3 +1,4 @@
+import contextlib
 import sqlite3
 import tempfile
 import unittest
@@ -20,7 +21,7 @@ class ProjectionComparisonTests(unittest.TestCase):
             store.append("s", sequence=0, data=data[:3], complete=False)
             store.append("s", sequence=1, data=data[3:], complete=True)
             pointer = {"stream_id": "s", "binding": binding, "total_bytes": len(data), **store.identity()}
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 db.execute("CREATE TABLE sdk_run_revisions(run_id TEXT, revision INTEGER)")
                 db.execute("CREATE TABLE sdk_run_history(run_id TEXT, section TEXT, item_key TEXT, revision INTEGER, value TEXT)")
                 db.execute("CREATE TABLE sdk_streamed_projection_pointers(run_id TEXT, revision INTEGER, pointer TEXT)")
@@ -57,7 +58,7 @@ class ProjectionComparisonTests(unittest.TestCase):
     def test_direct_bytes_complete_and_bound(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "run.sqlite"
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 db.execute("CREATE TABLE sdk_runs(run_id TEXT, revision INTEGER)")
                 db.execute("CREATE TABLE sdk_run_items(run_id TEXT, section TEXT, item_key TEXT, value TEXT)")
                 db.execute("INSERT INTO sdk_runs VALUES('r',2)")
@@ -74,15 +75,15 @@ class ProjectionComparisonTests(unittest.TestCase):
                 compare_projection_stream(RunStore(), "r", expected_revision=2, storage=store, stream_id="s", expected_binding=binding)
             store.append("s", sequence=1, data=encoded[5:], complete=True)
             self.assertEqual(compare_projection_stream(RunStore(), "r", expected_revision=2, storage=store, stream_id="s", expected_binding=binding)["total_bytes"], len(encoded))
-            with sqlite3.connect(store.path) as db:
+            with contextlib.closing(sqlite3.connect(store.path)) as db, db:
                 db.execute("UPDATE projection_pages SET complete=1 WHERE stream_id='s' AND sequence=0")
             with self.assertRaises(OrchestrationError):
                 compare_projection_stream(RunStore(), "r", expected_revision=2, storage=store, stream_id="s", expected_binding=binding)
-            with sqlite3.connect(store.path) as db:
+            with contextlib.closing(sqlite3.connect(store.path)) as db, db:
                 db.execute("UPDATE projection_pages SET complete=0 WHERE stream_id='s' AND sequence=0")
             with self.assertRaises(OrchestrationError):
                 compare_projection_stream(RunStore(), "r", expected_revision=2, storage=store, stream_id="s", expected_binding={"operation": "op", "revision": True})
-            with sqlite3.connect(path) as db:
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
                 db.execute("UPDATE sdk_run_items SET value=?", ('{"a":[2,true]}',))
             with self.assertRaises(OrchestrationError):
                 compare_projection_stream(RunStore(), "r", expected_revision=2, storage=store, stream_id="s", expected_binding=binding)

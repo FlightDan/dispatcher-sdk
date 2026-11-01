@@ -1,3 +1,4 @@
+import contextlib
 from pathlib import Path
 import json
 import os
@@ -99,7 +100,7 @@ class RuntimeObservationIntegrationTests(unittest.TestCase):
         for path in root.glob('*.sqlite3'):
             tables = {}
             try:
-                with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=.1) as connection:
+                with contextlib.closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=.1)) as connection, connection:
                     connection.row_factory = sqlite3.Row
                     names = connection.execute("SELECT name FROM sqlite_master WHERE type='table' "
                         "AND name NOT LIKE 'sqlite_%'").fetchall()

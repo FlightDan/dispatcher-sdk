@@ -1,4 +1,5 @@
 """Exercise real POSIX alarms during a supervisor-owned durable clock sample."""
+import contextlib
 import multiprocessing
 import os
 import signal
@@ -75,7 +76,7 @@ def capture_during_alarm(path, delay, sender, startup=True):
             evidence['close'] = 'confirmed'
         except BudgetClockUnknownError:
             evidence['close'] = 'unknown'
-        with sqlite3.connect(path) as connection:
+        with contextlib.closing(sqlite3.connect(path)) as connection, connection:
             evidence['samples'] = connection.execute('SELECT count(*) FROM kernel_budget_samples').fetchone()[0]
         sender.send(evidence)
     finally:

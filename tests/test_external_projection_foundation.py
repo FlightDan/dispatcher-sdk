@@ -1,3 +1,4 @@
+import contextlib
 import json
 from pathlib import Path
 import tempfile
@@ -223,7 +224,7 @@ class ExternalProjectionMigrationTests(unittest.TestCase):
         from dispatcher_sdk.storage_migration import upgrade_storage, _validate_v5, StorageMigrationError
         with tempfile.TemporaryDirectory() as directory:
             source, target = Path(directory) / "v5.sqlite", Path(directory) / "v6.sqlite"
-            with sqlite3.connect(source) as c:
+            with contextlib.closing(sqlite3.connect(source)) as c, c:
                 execute_schema(c, SCHEMA_V5)
                 result = ResultsMixin()
                 result.max_result_deliveries = 5
@@ -238,10 +239,10 @@ class ExternalProjectionMigrationTests(unittest.TestCase):
                 Orchestrator(source, Kernel())
             with maintenance_lease(source, "test", "upgrade") as lease:
                 upgrade_storage(source, target, lease=lease)
-            with sqlite3.connect(source) as c:
+            with contextlib.closing(sqlite3.connect(source)) as c, c:
                 self.assertEqual(c.execute("SELECT version FROM sdk_schema_meta").fetchone()[0], 5)
                 self.assertEqual(c.execute("SELECT revision FROM sdk_runs WHERE run_id='historic'").fetchone()[0], 4)
-            with sqlite3.connect(target) as c:
+            with contextlib.closing(sqlite3.connect(target)) as c, c:
                 self.assertEqual(c.execute("SELECT version FROM sdk_schema_meta").fetchone()[0], 6)
                 self.assertEqual(c.execute("SELECT revision FROM sdk_runs WHERE run_id='historic'").fetchone()[0], 4)
                 with self.assertRaises(StorageMigrationError):
@@ -259,7 +260,7 @@ class ExternalProjectionMigrationTests(unittest.TestCase):
             root = Path(directory)
             for version, schema in ((4, SCHEMA_V4), (5, SCHEMA_V5)):
                 source, target = root / f"v{version}.sqlite", root / f"v{version}-target.sqlite"
-                with sqlite3.connect(source) as c:
+                with contextlib.closing(sqlite3.connect(source)) as c, c:
                     execute_schema(c, schema)
                     result = ResultsMixin()
                     result.max_result_deliveries = 5
@@ -278,7 +279,7 @@ class ExternalProjectionMigrationTests(unittest.TestCase):
                         self.assertFalse(target.exists())
                     else:
                         upgrade_storage(source, target, lease=lease)
-                        with sqlite3.connect(target) as c:
+                        with contextlib.closing(sqlite3.connect(target)) as c, c:
                             self.assertEqual(c.execute("SELECT version FROM sdk_schema_meta").fetchone()[0], 6)
 
 class RealKernelProjectionIntegrationTests(ExternalProjectionFoundationTests):

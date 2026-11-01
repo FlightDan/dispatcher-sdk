@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 import sqlite3
@@ -37,7 +38,7 @@ class DiagnosticsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "summary.sqlite3"
-            with sqlite3.connect(path) as connection:
+            with contextlib.closing(sqlite3.connect(path)) as connection, connection:
                 connection.execute("CREATE TABLE kernel_executions(state TEXT, next_attempt_at REAL)")
                 connection.execute("CREATE TABLE kernel_clock(singleton INTEGER, watermark REAL)")
                 connection.execute("INSERT INTO kernel_clock VALUES(1, 0)")

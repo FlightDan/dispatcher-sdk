@@ -1,4 +1,5 @@
 """Completed child delivery observes parent authority without a writer grant."""
+import contextlib
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -209,7 +210,7 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
 
     def test_unstarted_boundary_keeps_malformed_child_identity_raw(self):
         row, window, _ = self.unstarted_child()
-        with sqlite3.connect(self.kernel.db_path, timeout=.1) as corrupt:
+        with contextlib.closing(sqlite3.connect(self.kernel.db_path, timeout=.1)) as corrupt, corrupt:
             # Only this corruption fixture bypasses schema CHECKs; production
             # readers must still reject these malformed persisted identities.
             corrupt.execute('PRAGMA ignore_check_constraints=ON')

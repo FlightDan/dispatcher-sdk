@@ -1,4 +1,5 @@
 """Controlled application decisions with synthetic host authority and no hashing."""
+import contextlib
 import json
 import tempfile
 import unittest
@@ -77,7 +78,7 @@ class ControlledApplyTest(unittest.TestCase):
         self.assertEqual(first['application_state'], {'step': 1})
         self.assertEqual(first['waits']['w']['state'], 'open')
         self.assertEqual(self.apply(), first)
-        with self.sdk._connect() as db:
+        with contextlib.closing(self.sdk._connect()) as db, db:
             self.assertEqual(db.execute('SELECT cursor FROM sdk_subscriptions WHERE run_id=? AND name=?', ('run', 'consumer')).fetchone()[0], 1)
             self.assertEqual(db.execute('SELECT count(*) FROM sdk_commands WHERE run_id=? AND command_id=?', ('run', 'decision-1')).fetchone()[0], 1)
 
@@ -96,7 +97,7 @@ class ControlledApplyTest(unittest.TestCase):
                     with self.assertRaises((OrchestrationError, RevisionConflict)):
                         self.apply(**changes)
                     self.assertEqual(self.sdk.get_run('run')['revision'], 1)
-                    with self.sdk._connect() as db:
+                    with contextlib.closing(self.sdk._connect()) as db, db:
                         self.assertIsNone(db.execute('SELECT 1 FROM sdk_subscriptions WHERE run_id=?', ('run',)).fetchone())
                         self.assertIsNone(db.execute('SELECT 1 FROM sdk_commands WHERE run_id=? AND command_id=?', ('run', 'decision-1')).fetchone())
                 finally:
@@ -122,7 +123,7 @@ class ControlledApplyTest(unittest.TestCase):
             self.apply()
         self.assertEqual(len(calls), 2)
         self.assertEqual(self.sdk.get_run('run')['revision'], 1)
-        with self.sdk._connect() as db:
+        with contextlib.closing(self.sdk._connect()) as db, db:
             self.assertIsNone(db.execute('SELECT 1 FROM sdk_subscriptions WHERE run_id=?', ('run',)).fetchone())
             self.assertIsNone(db.execute('SELECT 1 FROM sdk_commands WHERE run_id=? AND command_id=?', ('run', 'decision-1')).fetchone())
 

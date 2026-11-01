@@ -1,4 +1,5 @@
 """Synthetic host authorization tests; these do not establish host isolation."""
+import contextlib
 import sqlite3
 import os
 import tempfile
@@ -27,12 +28,12 @@ class SettlementCopyRebindTests(unittest.TestCase):
         self.claims = []
 
     def create_source(self, version):
-        with sqlite3.connect(self.source) as db:
+        with contextlib.closing(sqlite3.connect(self.source)) as db, db:
             for statement in (_SCHEMA[:-1] if version == 2 else
                               [s.replace('CHECK(version=2)', 'CHECK(version=3)') for s in _SCHEMA]):
                 db.execute(statement)
             db.execute('INSERT INTO settlement_meta VALUES(1,?,?,?)',
-                       (version, 'origin', str(self.old_kernel)))
+                       (version, 'origin', str(self.old_kernel.resolve())))
             if version == 3:
                 db.execute('INSERT INTO settlement_recovery_cursor VALUES(1,42)')
             db.execute('INSERT INTO settlement_records VALUES(?,?,?,?,?,?,?,?,?,?,?)',
@@ -58,14 +59,14 @@ class SettlementCopyRebindTests(unittest.TestCase):
                 receipt = self.copy()
                 self.assertEqual(receipt['source_version'], version)
                 self.assertFalse(receipt['automatic_activation'])
-                with sqlite3.connect(self.source) as original, sqlite3.connect(self.dest) as copied:
+                with contextlib.closing(sqlite3.connect(self.source)) as original, original, contextlib.closing(sqlite3.connect(self.dest)) as copied, copied:
                     for table in ('settlement_records', 'settlement_notes'):
                         self.assertEqual(original.execute(f'SELECT * FROM {table}').fetchall(),
                                          copied.execute(f'SELECT * FROM {table}').fetchall())
                     self.assertEqual(original.execute('SELECT version,kernel_path FROM settlement_meta').fetchone(),
-                                     (version, str(self.old_kernel)))
+                                     (version, str(self.old_kernel.resolve())))
                     self.assertEqual(copied.execute('SELECT version,kernel_path FROM settlement_meta').fetchone(),
-                                     (3, str(self.new_kernel)))
+                                     (3, str(self.new_kernel.resolve())))
                     if version == 3:
                         self.assertEqual(copied.execute('SELECT last_rowid FROM settlement_recovery_cursor').fetchone(), (42,))
                 SettlementJournal.open_existing(self.dest, source_id='origin', kernel_path=self.new_kernel)
@@ -98,7 +99,7 @@ class SettlementCopyRebindTests(unittest.TestCase):
         sequence = kernel.lifecycle_append('p', 'event', 'phase', {'fact': 1})
         store_id = kernel.kernel_store_identity()
         kernel.close()
-        with sqlite3.connect(self.old_kernel) as source_kernel, sqlite3.connect(self.new_kernel) as destination_kernel:
+        with contextlib.closing(sqlite3.connect(self.old_kernel)) as source_kernel, source_kernel, contextlib.closing(sqlite3.connect(self.new_kernel)) as destination_kernel, destination_kernel:
             source_kernel.backup(destination_kernel)
         journal = SettlementJournal(self.source, source_id='origin', kernel_path=self.old_kernel)
         identity = {'execution_id': 'exec', 'attempt': 0, 'fence': 0}
@@ -150,14 +151,14 @@ class SettlementCopyRebindTests(unittest.TestCase):
                 destination = root / 'selected.sqlite'
                 if version == 2:
                     # Construct the historical schema with exactly the captured facts.
-                    with sqlite3.connect(source) as db:
+                    with contextlib.closing(sqlite3.connect(source)) as db, db:
                         db.execute('DROP TABLE settlement_lifecycle_receipts')
                         db.execute('DROP TABLE settlement_recovery_cursor')
                         db.execute('ALTER TABLE settlement_meta RENAME TO old_meta')
                         db.execute(_SCHEMA[0])
                         db.execute('INSERT INTO settlement_meta SELECT singleton,2,source_id,kernel_path FROM old_meta')
                         db.execute('DROP TABLE old_meta')
-                with sqlite3.connect(source) as db:
+                with contextlib.closing(sqlite3.connect(source)) as db, db:
                     metadata = db.execute('SELECT source_id,kernel_path,version FROM settlement_meta').fetchone()
                     source_records = db.execute('SELECT * FROM settlement_records').fetchall()
                     source_notes = db.execute('SELECT * FROM settlement_notes').fetchall()
@@ -185,7 +186,7 @@ class SettlementCopyRebindTests(unittest.TestCase):
                     self.assertEqual(runtime._settlement_journal.inspect('execution')[0]['identity'], original['identity'])
                 finally:
                     runtime.close()
-                with sqlite3.connect(source) as db:
+                with contextlib.closing(sqlite3.connect(source)) as db, db:
                     self.assertEqual(db.execute('SELECT source_id,kernel_path,version FROM settlement_meta').fetchone(), metadata)
                     self.assertEqual(db.execute('SELECT * FROM settlement_records').fetchall(), source_records)
                     self.assertEqual(db.execute('SELECT * FROM settlement_notes').fetchall(), source_notes)

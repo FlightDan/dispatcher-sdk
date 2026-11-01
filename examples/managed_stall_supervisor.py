@@ -48,7 +48,10 @@ def main():
                 request_id="original-work", timeout_seconds=10)
             task.watch_stall(StallPolicy("example-progress", metrics=("progress",),
                 sample_interval=.2, consecutive_windows=2, max_deliveries=2))
-            deadline = time.monotonic() + 8
+            # Process startup can be slow under CPU emulation. This bounds the
+            # caller's observation separately from the execution and notice
+            # budgets, which still apply unchanged inside the SDK.
+            deadline = time.monotonic() + 30
             try:
                 report = None
                 while time.monotonic() < deadline:
@@ -72,23 +75,12 @@ def main():
                 result = task.wait(timeout=remaining)
                 if result["status"] != "succeeded":
                     raise RuntimeError("original business did not succeed: " + repr(result))
-                if args.evidence_dir is not None:
-                    (directory / "success.json").write_text(json.dumps({
-                        "interpreter": sys.executable,
-                        "sdk_import": __import__("dispatcher_sdk").__file__,
-                        "business_before_release": business_before_release,
-                        "business_result": result, "supervisor": report,
-                        "bounds": {"supervisor_timeout": 2, "notice_budget": 5,
-                                   "business_timeout": 10, "application_wait": 8}}, indent=2), encoding="utf-8")
-                print(json.dumps({"business": result["status"],
-                    "supervisor": report["execution"]["result"]["value"],
-                    "capacity": report["capacity"], "memory_limit_bytes": report["memory_limit_bytes"]}))
             except BaseException as error:
                 evidence = {"error_type": type(error).__name__, "error": str(error),
                     "interpreter": sys.executable,
                     "sdk_import": __import__("dispatcher_sdk").__file__,
                     "bounds": {"supervisor_timeout": 2, "notice_budget": 5,
-                               "business_timeout": 10, "application_wait": 8}}
+                               "business_timeout": 10, "application_wait": 30}}
                 try:
                     evidence.update(business=task.snapshot, supervisor=app.stall_supervisor_status(),
                         notices=[app.stall_supervisor_status(notice["notification_id"])
@@ -100,7 +92,27 @@ def main():
                 raise
             finally:
                 release.touch()
+        if args.evidence_dir is not None:
+            (directory / "success.json").write_text(json.dumps({
+                "interpreter": sys.executable,
+                "sdk_import": __import__("dispatcher_sdk").__file__,
+                "business_before_release": business_before_release,
+                "business_result": result, "supervisor": report,
+                "bounds": {"supervisor_timeout": 2, "notice_budget": 5,
+                           "business_timeout": 10, "application_wait": 30}}, indent=2), encoding="utf-8")
+        print(json.dumps({"business": result["status"],
+            "supervisor": report["execution"]["result"]["value"],
+            "capacity": report["capacity"], "memory_limit_bytes": report["memory_limit_bytes"]}))
         succeeded = True
+    except BaseException as error:
+        failure = directory / "failure.json"
+        if not failure.exists():
+            failure.write_text(json.dumps({"error_type": type(error).__name__, "error": str(error),
+                "phase": "dispatcher setup or shutdown",
+                "bounds": {"supervisor_timeout": 2, "notice_budget": 5,
+                           "business_timeout": 10, "application_wait": 30}}, indent=2), encoding="utf-8")
+            print("managed_stall_evidence=" + str(directory), file=sys.stderr, flush=True)
+        raise
     finally:
         if succeeded and args.evidence_dir is None:
             shutil.rmtree(directory)

@@ -1,4 +1,5 @@
 """Raw journal observations are never host acceptance or cleanup authority."""
+import contextlib
 import multiprocessing
 import json
 import os
@@ -150,7 +151,7 @@ class ExactHandoffInspectionTests(unittest.TestCase):
             report = journal.inspect_supervisor_handoff(identity, max_bytes=1024)
             self.assertEqual(report['facts']['spawn_intent'], {'state': 'unknown', 'reason': 'byte_budget_exceeded'})
             self.assertEqual(report['facts']['worker_packet']['state'], 'unknown')
-            with sqlite3.connect(journal.path) as db:
+            with contextlib.closing(sqlite3.connect(journal.path)) as db, db:
                 db.execute("UPDATE settlement_notes SET evidence_json='not-json' WHERE phase='supervisor_spawn_intent'")
             report = journal.inspect_supervisor_handoff(identity, max_bytes=1024)
             self.assertEqual(report['facts']['spawn_intent'], {'state': 'unknown', 'reason': 'invalid_observation'})
@@ -180,7 +181,7 @@ class ExactHandoffInspectionTests(unittest.TestCase):
                 self.assertEqual(report['facts']['worker_packet']['reason'], 'invalid_observation')
             self.assertEqual(journal.inspect_supervisor_handoff(identity, max_bytes=1024)['facts']['spawn_intent']['reason'], 'byte_budget_exceeded')
             self.assertEqual(journal.inspect_supervisor_handoff(identity, max_bytes=4096)['facts']['spawn_intent']['state'], 'observed')
-            with sqlite3.connect(journal.path) as db:
+            with contextlib.closing(sqlite3.connect(journal.path)) as db, db:
                 db.execute('UPDATE settlement_notes SET evidence_json=? WHERE note_id=?', ('{}', note_id))
             self.assertEqual(journal.inspect_supervisor_handoff(identity)['facts']['worker_packet']['reason'], 'invalid_observation')
             phase = 'supervisor_disposition_observed'

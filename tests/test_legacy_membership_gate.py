@@ -4,6 +4,7 @@ The test inserts a fixture mapping only; it does not exercise or claim an
 adoption protocol.  No production API currently installs these mappings.
 """
 
+import contextlib
 from pathlib import Path
 from dataclasses import replace
 import tempfile
@@ -589,13 +590,13 @@ class LegacyMembershipGateTests(unittest.TestCase):
                 kernel = SQLiteKernel(path, authority_verifier=verifier, worker_credential="manager")
                 self.assertEqual(receipt, kernel.install_revision_decision("decision", worker_credential="next", expected_decision=dict(envelope)))
                 import sqlite3
-                with sqlite3.connect(path) as external:
+                with contextlib.closing(sqlite3.connect(path)) as external, external:
                     external.execute("UPDATE kernel_store_identity SET store_id='different'")
                 with self.assertRaises(CASConflictError):
                     kernel.install_revision_decision("decision", worker_credential="next", expected_decision=dict(envelope))
                 with self.assertRaises(CASConflictError):
                     kernel.observe_revision_authority("decision-id")
-                with sqlite3.connect(path) as external:
+                with contextlib.closing(sqlite3.connect(path)) as external, external:
                     external.execute("UPDATE kernel_store_identity SET store_id=?", (envelope["kernel_store_id"],))
                 with kernel._transaction() as (connection, _):
                     self.assertEqual(tuple(connection.execute("SELECT generation,control_epoch,state FROM kernel_run_controls WHERE run_id='run'").fetchone()), (1, 3, "paused"))

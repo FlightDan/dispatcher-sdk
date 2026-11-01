@@ -1,3 +1,4 @@
+import contextlib
 import tempfile
 import threading
 import unittest
@@ -69,7 +70,7 @@ class ApplicationBudgetTests(unittest.TestCase):
         with patch.object(self.ledger, '_now', side_effect=[11, 11, 30]):
             with self.assertRaisesRegex(BudgetError, 'deadline'):
                 self.ledger.reserve('run', 'second', 'tokens', 'insert', amount=1)
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             self.assertIsNone(db.execute("SELECT 1 FROM application_reservations WHERE request_id='insert'").fetchone())
 
     def test_concurrent_reservations_cannot_overallocate(self):
@@ -90,7 +91,7 @@ class ApplicationBudgetTests(unittest.TestCase):
         self.assertEqual(self.ledger.inspect("run", "agent", "tokens")["reserved"], 6)
 
     def test_missing_ledger_table_fails_closed_on_reopen(self):
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             db.execute("DROP TABLE application_reservations")
         with self.assertRaisesRegex(BudgetError, "incomplete"):
             ApplicationBudget(self.path)
@@ -115,7 +116,7 @@ class ApplicationBudgetTests(unittest.TestCase):
             restarted.import_legacy("run", "agent", "tokens", **manifest)
 
     def test_missing_import_table_fails_closed_on_reopen(self):
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             db.execute("DROP TABLE application_budget_imports")
         with self.assertRaisesRegex(BudgetError, "incomplete"):
             ApplicationBudget(self.path)
@@ -130,7 +131,7 @@ class ApplicationBudgetTests(unittest.TestCase):
                 self.ledger.reserve("run", "agent", "tokens", "third", amount=1)
             self.ledger.create("run", "other", "tokens", allowance=10, deadline=20)
             self.assertTrue(self.ledger.reserve("run", "other", "tokens", "first", amount=1)["spend_authorized"])
-            with sqlite3.connect(self.path) as db:
+            with contextlib.closing(sqlite3.connect(self.path)) as db, db:
                 db.execute("INSERT INTO application_reservations VALUES(?,?,?,?,?,'settled',?)",
                            ("run", "agent", "tokens", "external", 1, 1))
             with self.assertRaisesRegex(BudgetError, "history exceeds"):
@@ -164,7 +165,7 @@ class ApplicationBudgetTests(unittest.TestCase):
         self.ledger.reserve('run', 'agent', 'tokens', 'old', amount=2)
         self.ledger.settle('run', 'agent', 'tokens', 'old', actual=1)
         self.ledger.archive_settled('run', 'agent', 'tokens')
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             db.execute('DELETE FROM application_budget_archive_totals')
         with self.assertRaisesRegex(BudgetError, 'archived usage'):
             self.ledger.reserve('run', 'agent', 'tokens', 'new', amount=1)
@@ -172,7 +173,7 @@ class ApplicationBudgetTests(unittest.TestCase):
     def test_v2_migration_retains_usage(self):
         self.ledger.reserve('run', 'agent', 'tokens', 'old', amount=2)
         self.ledger.settle('run', 'agent', 'tokens', 'old', actual=1)
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             db.execute('DROP TABLE application_budget_archive')
             db.execute('DROP TABLE application_budget_archive_totals')
             db.execute('UPDATE application_budget_meta SET version=2')

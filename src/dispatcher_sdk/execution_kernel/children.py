@@ -1550,6 +1550,19 @@ class ChildService:
             if code == "parent_revocation_unknown":
                 self._retain_registration(row, exc, exc)
                 return
+            if (lease is not None and isinstance(exc, BudgetClockUnknownError)
+                    and str(exc) == "budget_clock_sample_unresolved:sampling"):
+                # A dead controller can leave both a clock sample and a
+                # registration in flight. Absence of the child does not prove
+                # that the original owner can no longer submit it.
+                try:
+                    revoked = _parent_durably_revoked(self.runtime.kernel, lease)
+                except Exception as lookup_error:
+                    self._retain_registration(row, exc, lookup_error)
+                    return
+                if not revoked:
+                    self._retain_registration(row, exc, RuntimeError("parent revocation is not durable"))
+                    return
             if lease is not None and (isinstance(exc, (StaleFenceError, InvalidStateTransitionError))
                     or code == "parent_authority_revoked"):
                 try:

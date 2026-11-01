@@ -404,7 +404,7 @@ class InProcessRuntime:
                     self._lifecycle_condition.wait()
             self._persist_pending_settlements(time.monotonic() + 1, limit=64)
             if hasattr(self, "_diagnostic_pending_lock"):
-                self._retry_diagnostic_notes(time.monotonic() + 1)
+                self._retry_diagnostic_notes(time.monotonic() + 1, wait_for_writer=True)
             observation_pending = self._drain_observation_workers(time.monotonic() + 1.0)
             try:
                 unresolved = self.recover_sandboxes(all_pages=True)
@@ -479,7 +479,7 @@ class InProcessRuntime:
         if isinstance(self._close_error, _ProcessCleanupPendingError):
             self._close_error = None
         if hasattr(self, "_diagnostic_pending_lock") and not self._kernel_storage_closed:
-            self._retry_diagnostic_notes(time.monotonic() + 1)
+            self._retry_diagnostic_notes(time.monotonic() + 1, wait_for_writer=True)
             if self._diagnostics_block_admission():
                 if self._close_error is None:
                     self._close_error = _UnpersistedDiagnosticsError("runtime closed with diagnostic facts not confirmed durable")
@@ -2574,6 +2574,11 @@ class InProcessRuntime:
         def cleanup_confirmed() -> None:
             nonlocal native_cleanup_confirmed
             native_cleanup_confirmed = True
+            if os.name == "nt" and self._settlement_journal is not None:
+                # The parent owns the Windows Job containment fact. Use the
+                # lifecycle outbox so an unacknowledged write can be retried.
+                self._diagnostic_note(lease, "worker_tree_cleanup_observed", {
+                    "state": "confirmed", "source": "windows_job_containment"})
             with self._lifecycle_lock:
                 registration = self._process_registration_events.get(generation)
                 if registration is not None:
