@@ -23,7 +23,7 @@
 | 使用远程执行 | [沙箱运行时](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_RUNTIME.md)、[适配器](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_ADAPTERS.md) | 按指南配置对应服务 |
 | 查看 SQLite 积压和并发情况 | [SQLite 运维](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SQLITE_OPERATIONS.md) | 在目标主机运行并发基准脚本 |
 | 激活本地恢复副本 | [本地恢复](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/LOCAL_RECOVERY.md) | [恢复演练](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/local_restore.py) |
-| 接入并修订分离存储中的旧 Run（仅开发中） | [跨库存储接入](../docs/SPLIT_STORE_ADOPTION.md)、[当前状态](Improvement-Status-zh-CN.md) | 真实宿主隔离和旧 Run 验收尚未完成 |
+| 接入并修订分离存储中的旧 Run（仅开发中） | [跨库存储接入](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/SPLIT_STORE_ADOPTION.md)、[当前状态](Improvement-Status-zh-CN.md) | 真实宿主隔离和旧 Run 验收尚未完成 |
 
 上面的同 Run 恢复仅指在新 generation 下重新打开符合条件的失败或取消 Run。
 它不表示更完整的旧多任务 Run 接入、修订、激活和恢复流程已经通过验收；

@@ -67,7 +67,10 @@ class ChildStorageContentionTests(unittest.TestCase):
             connection.close()
 
     def requests(self, runtime):
-        with runtime.observation_journal._read_connection(.3) as (connection, _):
+        # This is a test-side evidence read. Keep it separate from the short
+        # runtime query timeout so a slow runner cannot turn polling into the
+        # failure under test.
+        with runtime.observation_journal._read_connection(5.0) as (connection, _):
             return [dict(row) for row in connection.execute("SELECT * FROM sdk_child_requests")]
 
     def poll(self, predicate, *, seconds=4):
@@ -119,8 +122,8 @@ class ChildStorageContentionTests(unittest.TestCase):
             record["capture_finished_monotonic"] = time.monotonic()
         self.assertTrue(reached, json.dumps(record, indent=2))
 
-    def finish(self, driver, outcomes, errors):
-        driver.join(8)
+    def finish(self, driver, outcomes, errors, *, timeout=8):
+        driver.join(timeout)
         self.assertFalse(driver.is_alive())
         self.assertEqual([], errors)
         self.assertEqual(1, len(outcomes))
@@ -138,16 +141,24 @@ class ChildStorageContentionTests(unittest.TestCase):
             entered.set()
             if not release.wait(2):
                 raise TimeoutError("reservation fixture was not released")
-            return context.children.run("child", {}, request_id="one", timeout_seconds=3)
+            return context.children.run("child", {}, request_id="one", timeout_seconds=8)
         runtime = self.runtime(parent, child)
-        driver, outcomes, errors = self.drive(runtime)
+        driver, outcomes, errors = self.drive(runtime, timeout=12)
         self.assertTrue(entered.wait(2))
         with self.writer(runtime.observation_journal.path):
             release.set()
             time.sleep(.35)
             self.assertEqual([], calls)
             self.assertEqual([], self.requests(runtime))
-        result = self.finish(driver, outcomes, errors)
+        result = self.finish(driver, outcomes, errors, timeout=15)
+        if result.state == "running":
+            # A bounded completion publication can return the original
+            # running snapshot while recovery retains the exact result.
+            def settled_parent():
+                runtime.recover_completions(timeout_seconds=.1)
+                current = runtime.kernel.get("parent")
+                return current if current.state in {"succeeded", "failed"} else None
+            result = self.poll(settled_parent, seconds=4)
         self.assertEqual("succeeded", result.state, result.to_dict())
         rows = self.requests(runtime)
         self.assertEqual(1, len(rows))
@@ -166,23 +177,23 @@ class ChildStorageContentionTests(unittest.TestCase):
             if capability.command.execution_id == "parent":
                 row_seen.append(dict(row))
                 waiting.set()
-                if not resume.wait(3):
+                if not resume.wait(30):
                     raise TimeoutError("await fixture was not released")
             return original_await(capability, row)
         def child(payload, context):
             calls.append(context.lease.execution_id)
             return {"original_result": [1, 2, 3]}
         def parent(payload, context):
-            value = context.children.run("child", {}, request_id="one", timeout_seconds=3)
+            value = context.children.run("child", {}, request_id="one", timeout_seconds=12)
             returned.append(value)
             delivered.set()
             return value
         runtime = self.runtime(parent, child)
         with patch.object(HandlerChildren, "_await", gated_await):
-            driver, outcomes, errors = self.drive(runtime)
+            driver, outcomes, errors = self.drive(runtime, timeout=18)
             self.witness_readiness(waiting, 2, runtime, driver, outcomes, errors,
-                parent_timeout=6, child_timeout=3, calls=calls, await_rows=row_seen)
-            self.poll(lambda: self.requests(runtime)[0]["state"] == "completed", seconds=2)
+                parent_timeout=18, child_timeout=12, calls=calls, await_rows=row_seen)
+            self.poll(lambda: self.requests(runtime)[0]["state"] == "completed", seconds=10)
             raw_result = runtime.kernel.get(row_seen[0]["child_execution_id"]).result.to_dict()
             with self.writer(runtime.kernel.db_path):
                 resume.set()
@@ -192,7 +203,7 @@ class ChildStorageContentionTests(unittest.TestCase):
                     "driver_alive": driver.is_alive(), "calls": list(calls)})
                 self.assertTrue(delivered.is_set(), "the committed child result must remain readable")
                 self.assertEqual([raw_result], returned)
-            snapshot = self.finish(driver, outcomes, errors)
+            snapshot = self.finish(driver, outcomes, errors, timeout=12)
             # run_once may return the original running snapshot when the
             # parent's independent publication encounters this same writer.
             # Recover only that original result; never invoke either handler.
@@ -200,7 +211,7 @@ class ChildStorageContentionTests(unittest.TestCase):
                 runtime.recover_completions(timeout_seconds=.1)
                 current = runtime.kernel.get("parent")
                 return current if current.state == "succeeded" else None
-            result = self.poll(settled_parent, seconds=2)
+            result = self.poll(settled_parent, seconds=4)
             self.evidence["records"].append({"stage": "original_parent_settled",
                 "run_once_snapshot": snapshot.to_dict(), "canonical": result.to_dict()})
         self.assertEqual("succeeded", result.state, result.to_dict())

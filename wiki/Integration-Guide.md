@@ -23,7 +23,7 @@ freezing and safe discovery without moving business policy into the SDK.
 | Use remote execution | [Sandbox runtime](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_RUNTIME.md), [adapters](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_ADAPTERS.md) | Follow the service setup in those guides |
 | Inspect SQLite backlog and contention | [SQLite operations](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SQLITE_OPERATIONS.md) | Run the contention benchmark on the target host |
 | Activate a restored local snapshot | [Local recovery](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/LOCAL_RECOVERY.md) | [Local restore drill](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/local_restore.py) |
-| Adopt and revise a legacy Run across separate stores (development only) | [Cross-store adoption](../docs/SPLIT_STORE_ADOPTION.md), [current status](Improvement-Status.md) | Real host isolation and old-Run acceptance remain incomplete |
+| Adopt and revise a legacy Run across separate stores (development only) | [Cross-store adoption](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/SPLIT_STORE_ADOPTION.md), [current status](Improvement-Status.md) | Real host isolation and old-Run acceptance remain incomplete |
 
 The existing same-Run recovery entry above covers reopening an eligible failed or
 cancelled Run under a new generation. It does not mean the broader legacy

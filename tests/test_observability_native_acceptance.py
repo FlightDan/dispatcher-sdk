@@ -1087,6 +1087,14 @@ class NativeObservabilityAcceptanceTests(unittest.TestCase):
                     runtime.submit_managed(command, run_id="native", generation=0)
                     began = time.monotonic()
                     result = runtime.run_once()
+                    # The worker may reach its cutoff before the background
+                    # settlement writer publishes the terminal snapshot.
+                    deadline = began + 9
+                    while result.state == "running" and time.monotonic() < deadline:
+                        runtime.recover_completions(timeout_seconds=.1)
+                        result = runtime.kernel.get(command.execution_id)
+                        if result.state == "running":
+                            time.sleep(.01)
                     mark(root, "host-result", state=result.state)
                     write_json(root / "result.json", result.to_dict())
                     observed = runtime.observe(command.execution_id)

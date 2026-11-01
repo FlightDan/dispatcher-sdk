@@ -2,15 +2,18 @@
 
 [English](Storage-and-Recovery.md) | [简体中文](Storage-and-Recovery-zh-CN.md) | [首页](Home-zh-CN.md)
 
-下文的 schema 版本说明已发布的 0.7.2。当前 0.7.3.dev1 开发候选版本尚未发布，
+下文的 schema 版本说明已发布的 0.7.2。0.7.3 源码候选版本
 使用 Kernel schema 12、Orchestrator schema 6 和 Settlement Journal schema 4。打开或复制升级存储前，请先查看
-[开发状态](Improvement-Status-zh-CN.md)和[存储升级契约](../docs/STORAGE_AND_UPGRADES.md)。
+[开发状态](Improvement-Status-zh-CN.md)和[存储升级契约](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/STORAGE_AND_UPGRADES.md)。
 复制升级不会自动接入已有 Run，也不会隔离旧 writer。
 
-开发候选版的 schema 12 还保存生命周期生产者责任和待写事件。宿主须可信地
+0.7.3 源码候选版的 schema 12 还保存生命周期生产者责任和待写事件。宿主须可信地
 核验接收回执及生产者恢复；已持久化事件可以重放，持久化前丢失的事实仍是
 未知。宿主证明某执行代次的生产者确已静默，并保留所需证据后，可显式分批退役该代次，裁剪已投递事件、已关闭生产者及对应日志回执；其他元数据不在此清理范围内，详见
-[开发接入说明](../docs/SDK_DEVELOPMENT_INTEGRATION.md)。
+[开发接入说明](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/SDK_DEVELOPMENT_INTEGRATION.md)。
+
+如果 worker 在写入预算时钟采样标记后、保存采样事实前死亡，标记会在重开后保持未知，
+并阻止继续执行业务。SDK 无法重建这项丢失的时钟事实。
 
 已发布的 0.7.2 单文件部署默认使用 SQLite WAL 和 `synchronous=FULL`。Kernel SQLite 布局为
 schema 5，Orchestrator 存储为 schema 4，通知收件箱使用独立的 schema 1。公开的

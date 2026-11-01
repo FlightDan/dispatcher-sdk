@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel import HandlerContext, Kernel, RetryPolicy
 from dispatcher_sdk.orchestrator import CommandConflict, OrchestrationError, Orchestrator, RevisionConflict
+from tests.test_runtime_host import wait_until
 
 
 def echo(payload, context):
@@ -179,6 +180,13 @@ class ReopenRunTests(unittest.TestCase):
         claim = self.sdk.claim_results(owner="test", lease_seconds=5, limit=1)[0]
         self.sdk.acknowledge_result(
             claim["result"]["result_id"], lease_id=claim["lease_id"], fence=claim["fence"])
+        # Result delivery can finish before the handler thread's cleanup
+        # callback releases its authority. Wait for that real cleanup before
+        # the recovery preflight; another test covers reopening while it is live.
+        execution_id = submitted["tasks"]["submitted"]["attempts"][0]["command"]["execution_id"]
+        wait_until(lambda: all(generation[0] != execution_id
+                               for generation in self.sdk.runtime._thread_authority_by_execution),
+                   timeout=5)
         failed = self.sdk.apply_operations(
             "run", command_id="finish", expected_revision=self.sdk.get_run("run")["revision"],
             operations=[{"kind": "finish", "state": "failed"}])

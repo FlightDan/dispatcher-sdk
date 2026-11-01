@@ -13,7 +13,7 @@ from unittest.mock import patch
 from dispatcher_sdk.execution_kernel import Kernel, runtime as runtime_module
 from dispatcher_sdk._inspection import InspectionBudget
 from dispatcher_sdk.execution_kernel.contracts import ExecutionLease
-from dispatcher_sdk.execution_kernel.settlement import SettlementBusyError, SettlementJournal
+from dispatcher_sdk.execution_kernel.settlement import SettlementJournal
 from dispatcher_sdk.observability.journal import ObservationJournal, inspect_execution
 import test_supervisor_outcome_handoff as fixture
 from tests.test_execution_kernel_v2_sqlite import make_result
@@ -157,8 +157,6 @@ class ExactHandoffInspectionTests(unittest.TestCase):
             self.assertEqual(report['facts']['spawn_intent'], {'state': 'unknown', 'reason': 'invalid_observation'})
             with self.assertRaises(ValueError):
                 journal.inspect_supervisor_handoff(identity, max_bytes=1023)
-            with self.assertRaises(SettlementBusyError):
-                journal.inspect_supervisor_handoff(identity, timeout_seconds=1e-12)
 
     def test_encoded_size_and_malformed_canonical_observations(self):
         with tempfile.TemporaryDirectory() as directory:

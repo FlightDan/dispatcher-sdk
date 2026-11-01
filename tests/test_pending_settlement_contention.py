@@ -109,7 +109,7 @@ class PendingSettlementContentionTests(unittest.TestCase):
                         break
                 self.assertEqual(current.result.to_dict(), original)
                 self.assertEqual(runtime._pending_settlements.identities(), ())
-                self.assertEqual(runtime._settlement_journal.inspect(name)[0]["result"], original)
+                self.assertEqual(runtime._settlement_journal.inspect(name, timeout_seconds=1)[0]["result"], original)
                 self.assertEqual(len(calls.read_text().splitlines()), 1)
                 self.assertIsNotNone(runtime.run_once(execution_id=name + "-next"))
                 self.assertEqual(len(calls.read_text().splitlines()), 2)

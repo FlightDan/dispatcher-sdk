@@ -262,13 +262,18 @@ class ObservationJournalTests(unittest.TestCase):
 
     def test_advancing_batch_rechecks_a_concurrent_committed_replay(self):
         from dispatcher_sdk.observability import journal as module
+        # The publisher's real SQLite COMMIT runs inside the injected overlap
+        # below. Give that interleaving its own practical CI window; the other
+        # journal cases continue to exercise the default 30ms write budget.
+        self.options = ObservationOptions(tail_bytes=16, write_timeout=2)
+        self.journal = self.open_journal()
         metrics = self.seed_committed_batch()
         original = self.journal._committed_batch_replay
         advanced = {"stdout_bytes": {"count": 7, "first_at": 100, "last_at": 102}}
         reads = []
         phases = {}
-        # Prepare the competing publication before the SDK's original 30ms
-        # call. Only its actual COMMIT interleaves the read and atomic recheck.
+        # Prepare the competing publication before the SDK call. Only its
+        # actual COMMIT interleaves the read and atomic recheck.
         with closing(module.sqlite3.connect(self.journal.path, timeout=0)) as publisher:
             # The external publisher tests committed visibility, not FULL
             # power-loss durability. The SDK journal retains FULL writes.

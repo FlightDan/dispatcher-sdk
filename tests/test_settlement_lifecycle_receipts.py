@@ -56,8 +56,7 @@ class LifecycleReceiptTests(unittest.TestCase):
                 locked.rollback()
 
     def test_existing_identical_note_id_cannot_fake_lifecycle_receipt(self):
-        with tempfile.TemporaryDirectory() as directory:
-            kernel = SQLiteKernel(Path(directory) / 'kernel')
+        with tempfile.TemporaryDirectory() as directory, SQLiteKernel(Path(directory) / 'kernel') as kernel:
             store = kernel.kernel_store_identity()
             journal = SettlementJournal(Path(directory) / 'journal', source_id='source', kernel_path=Path(directory) / 'kernel')
             identity = {'execution_id': 'job', 'attempt': 0, 'fence': 0}
@@ -287,11 +286,10 @@ class LifecycleReceiptTests(unittest.TestCase):
             kernel.close()
 
     def test_v3_copy_upgrade_preserves_notes_and_source(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, SQLiteKernel(Path(directory) / 'kernel') as kernel_db:
             source = Path(directory) / 'v3'
             destination = Path(directory) / 'v4'
             kernel = Path(directory) / 'kernel'
-            kernel_db = SQLiteKernel(kernel)
             store = kernel_db.kernel_store_identity()
             kernel_db.submit(make_command('job'))
             kernel_db.lifecycle_reserve('job', 0, 0, 'p', slots=1)

@@ -144,6 +144,19 @@ class ManagedStallSupervisorTests(unittest.TestCase):
             time.sleep(.02)
         self.fail("original wait exhausted; last=" + repr(last))
 
+    def wait_for_diagnostics_to_settle(self, runtime, timeout=20):
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            last = runtime._stop_obligations_snapshot()
+            if (last["pending_diagnostic_count"] == 0 and
+                    last["unknown_diagnostic_handoff_count"] == 0 and
+                    last["failed_diagnostic_execution_count"] == 0 and
+                    last["diagnostic_retention_overflow"] is False):
+                return
+            time.sleep(.02)
+        self.fail("diagnostic writer did not settle before shutdown: " + repr(last))
+
     def notice(self, app, *, fail=False, hold=False):
         task = app.submit("business", {"entered": str(self.root / "entered"),
             "release": str(self.root / "release")}, request_id="business", timeout_seconds=20)
@@ -349,9 +362,11 @@ class ManagedStallSupervisorTests(unittest.TestCase):
 
     def test_reserved_capacity_shortage_leaves_second_actual_episode_pending(self):
         app = self.open(business_workers=2)
+        tasks = []
         for name in ("first", "second"):
             task = app.submit("business", {"entered": str(self.root / (name+"-entered")),
                 "release": str(self.root / "release")}, request_id=name, timeout_seconds=20)
+            tasks.append(task)
             app.orchestrator.flush()
             snapshot = task.snapshot
             app.runtime.watch_stall(snapshot["command"]["execution_id"],
@@ -373,6 +388,16 @@ class ManagedStallSupervisorTests(unittest.TestCase):
         self.assertEqual(report["peak_active"], 1)
         self.assertEqual(len(report["invocations"]), 1)
         (self.root / "agent_release").touch()
+        # Finish and drain the held managed execution before releasing the
+        # business tasks. This keeps the pending-notice assertions above as
+        # the capacity-shortage witness and prevents teardown from racing a
+        # second admission or its diagnostic persistence.
+        app._managed_stall_supervisor.close(timeout=20)
+        (self.root / "release").touch()
+        for task in tasks:
+            self.assertEqual("released", task.wait(timeout=20)["value"])
+        self.wait_for_diagnostics_to_settle(app.runtime)
+        app.close(timeout=20)
 
     def test_unsupported_native_memory_control_does_not_claim_or_invoke(self):
         app = self.open()

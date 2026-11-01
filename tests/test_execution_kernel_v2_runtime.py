@@ -519,7 +519,10 @@ class RuntimeTests(unittest.TestCase):
             handlers = {("echo", 1): echo_handler}
             stack = Kernel.open_sqlite(path, handlers)
             try:
-                cmd = make_command("open", stack.registry_revision)
+                # The Windows installed-suite run may be heavily loaded; the
+                # command timeout covers runtime setup and receipt publication
+                # as well as this trivial handler's execution.
+                cmd = make_command("open", stack.registry_revision, timeout=15)
                 stack.submit(cmd)
                 result = stack.run_once()
                 # A bounded result publication can remain pending after the
@@ -651,7 +654,7 @@ class RuntimeTests(unittest.TestCase):
                         # the original work cutoff, including control and
                         # receipt work between them; deadline exhaustion has
                         # dedicated budget tests.
-                        timeout=5,
+                        timeout=15,
                     )
                 )
                 self.assertEqual(stack.run_once().state, "queued")
@@ -668,16 +671,16 @@ class RuntimeTests(unittest.TestCase):
             {("effect", 1): effect_handler},
         )
         try:
-            stack.submit(
-                make_command(
-                    "effects",
-                    stack.registry_revision,
-                    handler_id="effect",
-                )
+            command = make_command(
+                "effects",
+                stack.registry_revision,
+                handler_id="effect",
+                timeout=15,
             )
+            stack.submit(command)
             result = stack.run_once()
             record = {"test": self.id(), "interpreter": sys.executable,
-                "result": result.to_dict(), "original_timeout": 1}
+                "result": result.to_dict(), "original_timeout": command.timeout_seconds}
             (root / "evidence.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
             print("effect_handler_evidence=" + str(root / "evidence.json"), flush=True)
             self.assertEqual(result.state, "succeeded", result.to_dict())

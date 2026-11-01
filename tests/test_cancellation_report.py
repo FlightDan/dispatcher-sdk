@@ -588,6 +588,8 @@ class CancellationReportTests(unittest.TestCase):
         with runtime:
             self.setup_task(runtime, sdk)
             runtime.cancel("x", expected_revision=runtime.kernel.get("x").revision)
+            runtime._retry_diagnostic_notes(time.monotonic() + 5, wait_for_writer=True)
+            self.assertFalse(runtime._diagnostics_block_admission())
             for invalid in ("{", "[]", '{"state":"invented","code":"bad"}',
                             '{"state":[],"code":"bad"}', '{"state":{},"code":"bad"}',
                             '{"state":"confirmed","code":[]}', '{"state":"confirmed","code":{}}'):

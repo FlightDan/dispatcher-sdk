@@ -2,14 +2,14 @@
 
 [English](Storage-and-Recovery.md) | [简体中文](Storage-and-Recovery-zh-CN.md) | [Home](Home.md)
 
-The schema values below describe the published 0.7.2 release. The current
-0.7.3.dev1 development candidate is unreleased and uses Kernel schema 12,
+The schema values below describe the published 0.7.2 release. The 0.7.3
+source candidate uses Kernel schema 12,
 Orchestrator schema 6 and Settlement Journal schema 4. Review the [development status](Improvement-Status.md)
-and [storage upgrade contract](../docs/STORAGE_AND_UPGRADES.md) before opening
+and [storage upgrade contract](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/STORAGE_AND_UPGRADES.md) before opening
 or copy-upgrading a store. A copy upgrade does not adopt an existing Run or
 isolate old writers.
 
-For the development candidate, schema 12 also stores lifecycle producer
+For the 0.7.3 source candidate, schema 12 also stores lifecycle producer
 reservations and pending events. A host must provide trusted receipt and
 producer-recovery verification; persisted events can be replayed, while facts
 lost before persistence remain unknown. A quiescent generation can be explicitly
@@ -17,7 +17,11 @@ retired and its delivered events, closed producers and matching journal receipts
 pruned in bounded batches, once the host has proved no future producer can use
 that generation and has preserved required evidence. Other metadata is outside
 this retention path. See the
-[development integration guide](../docs/SDK_DEVELOPMENT_INTEGRATION.md).
+[development integration guide](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/SDK_DEVELOPMENT_INTEGRATION.md).
+
+If a worker dies after arming a budget-clock sample but before retaining its
+sampled fact, the guard remains unknown across reopen and blocks renewed
+business admission. The SDK cannot reconstruct that missing clock fact.
 
 The published 0.7.2 single-file deployment uses SQLite WAL with `synchronous=FULL` by
 default. The Kernel SQLite layout is schema 5, the Orchestrator store is schema

@@ -102,7 +102,18 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
             self.assertNotIn("worker_ready", phases)
             self.assertNotIn("process_cleanup", phases)
             self.assertTrue(self.runtime._diagnostics_block_admission())
-        self.runtime._retry_diagnostic_notes(time.monotonic() + 2)
+            # Reproduce a concurrent writer owning the lock at retry time.
+            self.assertTrue(self.runtime._diagnostic_retry_lock.acquire(timeout=5))
+        try:
+            self.runtime._retry_diagnostic_notes(time.monotonic() + 1)
+            self.assertNotIn("supervisor_registered",
+                             [note["phase"] for note in self.reopen_notes("ordered-worker")])
+        finally:
+            self.runtime._diagnostic_retry_lock.release()
+        # The background settlement thread may already own the writer; wait
+        # for that handoff before inspecting the durable receiver journal.
+        self.runtime._retry_diagnostic_notes(time.monotonic() + 5, wait_for_writer=True)
+        self.assertFalse(self.runtime._diagnostics_block_admission("ordered-worker"))
         notes = self.reopen_notes("ordered-worker")
         phases = [note["phase"] for note in notes]
         for earlier, later in (("supervisor_registered", "worker_ready"),

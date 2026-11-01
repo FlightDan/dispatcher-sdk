@@ -13,6 +13,9 @@ from dispatcher_sdk.execution_kernel.settlement import SettlementJournal
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
 
 
+_INHERITED_HEADROOM_SECONDS = 24 * 60 * 60
+
+
 class ChildPreentrySettlementTests(unittest.TestCase):
     def setUp(self):
         self.root = retained_directory('sdk-child-preentry-settlement-')
@@ -20,18 +23,24 @@ class ChildPreentrySettlementTests(unittest.TestCase):
         self.kernel = SQLiteKernel(self.root/'kernel.sqlite3', now=lambda: self.wall[0])
         self.addCleanup(lambda: self.kernel.close())
         self.parent = ExecutionCommandV2('parent', 'parent', 'original-binding', 'root', None,
-            'parent', 1, RetryPolicy(), 10, {})
+            'parent', 1, RetryPolicy(), _INHERITED_HEADROOM_SECONDS, {})
         self.kernel.submit(self.parent)
-        self.parent_lease = self.kernel.claim_and_start('owner', execution_id='parent', lease_seconds=90)
+        self.parent_lease = self.kernel.claim_and_start('owner', execution_id='parent',
+            lease_seconds=2 * _INHERITED_HEADROOM_SECONDS)
         prepared = self.kernel._prepare_handler_entry(self.parent_lease)
-        entered = prepared.enter_handler(10, origin_id='execution:parent', sample=sample_clock(wall_time=100))
+        entered = prepared.enter_handler(_INHERITED_HEADROOM_SECONDS,
+            origin_id='execution:parent', sample=sample_clock(wall_time=100))
         parent_budget = self.kernel.confirm_handler_entry(self.parent_lease, entered)
-        inherited = parent_budget.derive(source='tool', origin_id='child-call:original', deadline_at=101,
+        self.inherited_deadline_at = parent_budget.started_at + _INHERITED_HEADROOM_SECONDS
+        self.completion_at = self.inherited_deadline_at + 1
+        inherited = parent_budget.derive(source='tool', origin_id='child-call:original',
+                                         deadline_at=self.inherited_deadline_at,
                                          sample=sample_clock(wall_time=100))
         child = replace(self.parent, execution_id='child', idempotency_key='child', causation_id='parent',
                         handler_id='child', timeout_seconds=2)
         self.kernel.submit_child(child, self.parent_lease, inherited)
-        self.lease = self.kernel.claim_and_start('owner', execution_id='child', lease_seconds=90)
+        self.lease = self.kernel.claim_and_start('owner', execution_id='child',
+            lease_seconds=2 * _INHERITED_HEADROOM_SECONDS)
         # This is the original claim timestamp, not inherited parent entry or
         # proof that a native child handler entered its business body.
         claimed_snapshot = self.kernel.get('child')
@@ -42,7 +51,7 @@ class ChildPreentrySettlementTests(unittest.TestCase):
         self.evidence = {'root': str(self.root), 'inherited': self.inherited.to_dict(),
             'frozen_wall': self.wall[0], 'original_claimed_snapshot': claimed_snapshot.to_dict(),
             'result_start_source': 'original SQLiteKernel.claim_and_start snapshot',
-            'original_completed_at': 102}
+            'original_completed_at': self.completion_at}
 
     def tearDown(self):
         self.evidence['limits'] = self.kernel.get_execution_limits('child')
@@ -53,14 +62,14 @@ class ChildPreentrySettlementTests(unittest.TestCase):
 
     def original_result(self):
         return ExecutionResultV2('original-result', 'child', 'failed', self.lease.attempt,
-            self.lease.fence, [], self.original_started_at, 102, 'root', 'parent', None,
+            self.lease.fence, [], self.original_started_at, self.wall[0], 'root', 'parent', None,
             ExecutionError('handler_process_start_failure', 'handler supervisor did not reach invocation',
                            retryable=False, details={'exitcode': 0, 'raw': [True, 1, 1.0]}))
 
     def settle(self, prepared):
-        self.wall[0] = 102
+        self.wall[0] = self.completion_at
         original = self.original_result()
-        checkpoint = prepared.recheckpoint(sample=sample_clock(wall_time=102))
+        checkpoint = prepared.recheckpoint(sample=sample_clock(wall_time=self.wall[0]))
         self.evidence.update(original=original.to_dict(), prepared=prepared.to_dict(), checkpoint=checkpoint.to_dict())
         try:
             result = self.kernel._complete_sdk_result(self.lease, original, budget_envelope=checkpoint)
@@ -92,9 +101,9 @@ class ChildPreentrySettlementTests(unittest.TestCase):
 
     def test_exact_original_receipt_restores_preentry_failure_after_reopen(self):
         prepared = self.kernel._prepare_handler_entry(self.lease)
-        self.wall[0] = 102
+        self.wall[0] = self.completion_at
         original = self.original_result()
-        retained = prepared.recheckpoint(sample=sample_clock(wall_time=102))
+        retained = prepared.recheckpoint(sample=sample_clock(wall_time=self.wall[0]))
         self.evidence.update(original=original.to_dict(), prepared=prepared.to_dict(), checkpoint=retained.to_dict())
         journal = SettlementJournal(self.root/'settlements.sqlite3', source_id='host', kernel_path=self.kernel.db_path)
         journal.record(self.lease, original, evidence={'budget_envelope': retained.to_dict()})
