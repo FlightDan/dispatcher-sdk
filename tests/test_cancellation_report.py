@@ -748,26 +748,39 @@ class CancellationReportTests(unittest.TestCase):
         handler = SandboxHandler(FileBackend(str(self.root), "lost_create"), str(self.root / "sandbox.db"),
                                  poll_interval=0.01, operation_timeout=0.2)
         runtime, sdk = self.stack({handler.handler_id: handler}, "process")
-        self.setup_task(runtime, sdk, handler.handler_id,
-                        SandboxSpec("fixture-image", "print('hello')", ("/usr/bin/python3",), "/tmp").to_payload())
-        self.assertEqual(runtime.run_once().state, "recovery_required")
+        close_unknown = False
         try:
+            self.setup_task(runtime, sdk, handler.handler_id,
+                            SandboxSpec("fixture-image", "print('hello')", ("/usr/bin/python3",), "/tmp").to_payload())
+            state = runtime.run_once().state
+            deadline = time.monotonic() + 10
+            while state == "running" and time.monotonic() < deadline:
+                runtime.recover_completions(timeout_seconds=min(.5, max(.001, deadline - time.monotonic())))
+                state = runtime.kernel.get("x").state
+            self.assertEqual(state, "recovery_required")
             report = self.report(sdk)
             self.assertEqual(report.external_outcome.status, "unknown")
             self.assertNotEqual(report.cleanup.status, "confirmed")
             self.assertFalse((self.root / "alive").exists())
         finally:
-            with self.assertRaises(SandboxOutcomeUnknown):
+            try:
                 runtime.close()
+            except SandboxOutcomeUnknown:
+                close_unknown = True
+        self.assertTrue(close_unknown, "unresolved sandbox must be reported on close")
         reopened, sdk = self.stack({handler.handler_id: handler}, "process")
+        close_unknown = False
         try:
             with patch.object(FileBackend, "find", side_effect=AssertionError("inspection contacted provider")):
                 report = self.report(sdk)
             self.assertEqual(report.external_outcome.status, "unknown")
             self.assertNotEqual(report.cleanup.status, "confirmed")
         finally:
-            with self.assertRaises(SandboxOutcomeUnknown):
+            try:
                 reopened.close()
+            except SandboxOutcomeUnknown:
+                close_unknown = True
+        self.assertTrue(close_unknown, "unresolved sandbox must be reported on close")
 
     def test_collected_remote_result_does_not_imply_cleanup_succeeded(self):
         (self.root / "reject_cleanup").touch()

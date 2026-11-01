@@ -68,8 +68,13 @@ class RecoveryPendingFairPaginationTests(unittest.TestCase):
                         break
                 self.assertEqual(runtime.kernel.get("later").result.to_dict(), result.to_dict())
                 self.assertTrue(any(item.get("execution_id") == "later" and item["state"] == "recorded" for item in reports))
-                seen_blocked = {item.get("execution_id") for item in reports if item["state"] == "pending" and item.get("execution_id") is not None}
-                self.assertEqual(seen_blocked, {execution_id for execution_id, _ in blocked[1:]})
+                expected_blocked = {execution_id for execution_id, _ in blocked[1:]}
+                # The later receipt may also report pending transiently before it is recorded.
+                pending_ids = {item.get("execution_id") for item in reports
+                               if item["state"] == "pending" and item.get("execution_id") is not None}
+                self.assertLessEqual(pending_ids, expected_blocked | {"later"})
+                seen_blocked = pending_ids & expected_blocked
+                self.assertEqual(seen_blocked, expected_blocked)
                 with runtime._settlement_inflight_lock:
                     runtime._settlement_inflight.remove(first_key)
                 # A valid cursor can be just past the formerly in-flight row.

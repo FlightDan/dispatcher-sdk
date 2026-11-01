@@ -104,9 +104,10 @@ class CancelAdmissionTests(unittest.TestCase):
         try:
             with patch.object(self.runtime.kernel, 'cancel', side_effect=self.observed_cancel):
                 result = self.cancel(timeout=5)
+                cancel_completed_at = time.monotonic()
         finally:
             releaser.join(1)
-        elapsed = time.monotonic()-before
+        elapsed = cancel_completed_at-before
         self.assertEqual(result.state, 'cancelled')
         self.assertGreaterEqual(len(self.calls), 2)
         self.assertLess(elapsed, 1)

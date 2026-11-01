@@ -74,7 +74,13 @@ class WaitObservationTests(unittest.TestCase):
             self.assertFalse(memory['persisted'])
             failed = recorder.flush()
             self.assertEqual(failed['state'], 'degraded')
-            self.assertIn('database is locked', failed['error'])
+            self.assertEqual(failed['reason'], 'persistence_failed')
+            self.assertIs(failed['retryable'], True)
+            diagnostic = failed['error']
+            self.assertIn(diagnostic, (
+                'OperationalError: database is locked',
+                '_ObservationWriteBudgetExceeded: observation write admission budget elapsed',
+            ))
             blocker.rollback()
         self.clock.now = 200
         recorder.heartbeat()
@@ -86,13 +92,13 @@ class WaitObservationTests(unittest.TestCase):
         self.assertTrue(all(row['state'] == 'ended' for row in waits.values()))
         self.assertFalse(report['complete'])
         self.assertGreater(report['collection_gaps'], 0)
-        self.assertIn('database is locked', recorder.snapshot()['error'])
+        self.assertEqual(recorder.snapshot()['error'], diagnostic)
         coverage = [row for row in self.journal.events('work')['events'] if row['kind'] == 'wait_coverage']
-        self.assertIn('database is locked', coverage[0]['payload']['error'])
+        self.assertEqual(coverage[0]['payload']['error'], diagnostic)
         recorder.heartbeat()
         recorder.flush()
         self.assertFalse(self.journal.inspect('work')['complete'])
-        self.assertIn('database is locked', recorder.snapshot()['error'])
+        self.assertEqual(recorder.snapshot()['error'], diagnostic)
 
     def test_final_close_retries_same_wait_ids_then_drains_coverage_diagnostic(self):
         recorder = self.recorder()

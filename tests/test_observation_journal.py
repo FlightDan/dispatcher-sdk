@@ -442,7 +442,11 @@ class ObservationJournalTests(unittest.TestCase):
             time.sleep(self.options.write_timeout + .01)
             return result
 
-        with patch.object(module.sqlite3, "connect", connect), \
+        # StorageEvidence shares its SQLite proxy with settlement workers.
+        # Give this test a private proxy so only journal connections are counted.
+        journal_sqlite = SimpleNamespace(**vars(module.sqlite3))
+        journal_sqlite.connect = connect
+        with patch.object(module, "sqlite3", journal_sqlite), \
                 patch.object(self.journal, "_committed_batch_replay", read), \
                 patch.object(self.journal, "clock", side_effect=AssertionError("expired writer sampled clock")):
             with self.assertRaises(_ObservationWriteBudgetExceeded) as caught:

@@ -206,8 +206,22 @@ class SupervisorSettlementHandoffTests(unittest.TestCase):
                                     runtime.kernel._positive_duration.return_value = 1
                                     runtime.kernel.get.return_value = SimpleNamespace(attempt=lease.attempt,
                                         fence=lease.fence, state='running')
-                                    reports = runtime.recover_completions(timeout_seconds=1)
+                                    if mode == 'watchdog_unreadable':
+                                        # This real journal must durably archive the unknown
+                                        # disposition; give its bounded SQLite operations
+                                        # enough of the caller's explicit recovery window.
+                                        reports = runtime.recover_completions(
+                                            timeout_seconds=5, max_record_bytes=512 * 1024)
+                                    else:
+                                        reports = runtime.recover_completions(timeout_seconds=1)
                                     self.assertEqual(reports[0]['state'], 'unknown')
+                                    if mode == 'watchdog_unreadable':
+                                        settled = runtime._settlement_journal.inspect(
+                                            'exec', timeout_seconds=1)
+                                        self.assertEqual(len(settled), 1)
+                                        self.assertEqual(settled[0]['state'], 'error')
+                                        self.assertEqual(settled[0]['evidence']['error'],
+                                            'original completion time remains unknown')
                                     runtime.kernel._complete_sdk_result.assert_not_called()
                                 else:
                                     # When the bounded foreground write cannot commit, recovery

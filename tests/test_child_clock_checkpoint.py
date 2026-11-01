@@ -582,13 +582,13 @@ class ChildClockCheckpointTests(unittest.TestCase):
         row, window = self.enqueue("paged-history")
         identity = {"execution_id": row["child_execution_id"], "attempt": 0, "fence": 0}
         for index in range(50):
-            self.facts.note(identity, "prior_diagnostic", {"index": index})
+            self.facts.note(identity, "prior_diagnostic", {"index": index}, timeout_seconds=1)
         baseline = self.wall[0]
         self.wall[0] = baseline + 4
         checkpoint = window.envelope.recheckpoint(sample=sample_clock(wall_time=self.wall[0]))
         self.wall[0] = baseline
         last = self.facts.note(identity, "child_budget_checkpoint",
-            {"wait_id": row["wait_id"], "budget_envelope": checkpoint.to_dict()})
+            {"wait_id": row["wait_id"], "budget_envelope": checkpoint.to_dict()}, timeout_seconds=1)
         # This establishes pagination, independently of the attachment's
         # strict per-attempt inspection budget and original work cutoff.
         page = self.facts.inspect_notes(row["child_execution_id"], timeout_seconds=1)

@@ -1008,14 +1008,31 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 self.assertTrue(any(item["source"] == "parent" for item in limits["envelope"]["constraints"]))
                 reports = []
                 evidence["settlement_reports"] = reports
+                child_observation = None
                 try:
                     while True:
                         final_parent = maintenance_read("parent winner", runtime.kernel.get, "parent")
                         final_child = maintenance_read("child winner", runtime.kernel.get, child_id)
                         evidence["canonical_parent"] = final_parent.to_dict()
                         evidence["canonical_child"] = final_child.to_dict()
-                        if final_parent.state == "timed_out" and final_child.state in {"timed_out", "cancelled", "dead"}:
-                            break
+                        with evidence_lock:
+                            captured = {item["result"]["execution_id"]: item["result"]
+                                for item in original_results}
+                        terminal = (final_parent.state == "timed_out" and
+                            final_child.state in {"timed_out", "cancelled", "dead"})
+                        if terminal and {"parent", child_id} <= captured.keys():
+                            if final_child.state == "timed_out":
+                                break
+                            # Cancellation can win before the child supervisor
+                            # returns its timeout. Wait for that exact result's
+                            # superseded receipt within the same window.
+                            child_observation = runtime.observe(child_id,
+                                timeout=maintenance_remaining("child receipt observation"))
+                            maintenance_remaining("child receipt observation completed")
+                            if any(receipt.get("state") == "superseded" and
+                                    receipt.get("result", {}).get("result_id") == captured[child_id]["result_id"]
+                                    for receipt in child_observation.get("settlement_obligations", ())):
+                                break
                         reports.extend(runtime.recover_completions(
                             timeout_seconds=min(.5, maintenance_remaining("completion recovery"))))
                         remaining = end-time.monotonic()
@@ -1028,6 +1045,9 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                     with runtime.kernel._control_lock(2):
                         final_parent = runtime.kernel.get("parent")
                         final_child = runtime.kernel.get(child_id)
+                    if final_parent.state == "timed_out":
+                        self.fail("parent timeout reached, but original child outcome or its "
+                            "superseded receipt was not observed within the settlement window")
                     limits = runtime.kernel.get_execution_limits("parent", timeout_seconds=2)
                     self.assertEqual("running", final_parent.state)
                     self.assertEqual("budget_clock_sample_unresolved:sampling",
@@ -1124,11 +1144,8 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                     # A cancellation/reaper winner is immutable. Maintenance
                     # keeps the native timeout as a superseded obligation;
                     # it must never replace that winner to satisfy this test.
-                    reports.extend(runtime.recover_completions(
-                        timeout_seconds=min(.5, maintenance_remaining("superseded completion recovery"))))
-                    child_observation = runtime.observe(child_id,
-                        timeout=maintenance_remaining("superseded child observation"))
-                    maintenance_remaining("superseded child observation completed")
+                    if child_observation is None:
+                        self.fail("missing superseded child observation from settlement window")
                     evidence["child_settlement_observation"] = child_observation
                     superseded = [receipt for receipt in child_observation.get("settlement_obligations", ())
                         if receipt.get("state") == "superseded"
