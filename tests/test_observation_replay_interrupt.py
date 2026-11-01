@@ -64,10 +64,15 @@ class ObservationReplayInterruptTests(unittest.TestCase):
 
     def test_replayed_read_close_after_deadline_reports_not_applied(self):
         self.assertTrue(self.write())
+        closed_without_writes = []
         class SlowClose(sqlite3.Connection):
             def close(self):
-                time.sleep(.06)
+                closed_without_writes.append(self.total_changes == 0)
+                started = time.monotonic()
+                while time.monotonic() - started < self.journal_timeout:
+                    time.sleep(.005)
                 return super().close()
+        SlowClose.journal_timeout = self.journal.options.write_timeout
         original_connect = sqlite3.connect
         proxy = SimpleNamespace(**{**vars(sqlite3), 'connect': lambda *args, **kwargs:
                                     original_connect(*args, factory=SlowClose, **kwargs)})
@@ -75,6 +80,7 @@ class ObservationReplayInterruptTests(unittest.TestCase):
             with self.assertRaises(_ObservationWriteBudgetExceeded) as caught:
                 self.write()
         result = caught.exception.observation_transaction
+        self.assertEqual(closed_without_writes, [True])
         self.assertEqual((result.operation, result.phase, result.sqlite_errorcode, result.sqlite_errorname),
                          ('write_batch', 'close', None, None))
         self.assertEqual((result.transaction_entered, result.rollback_confirmed, result.outcome),

@@ -38,6 +38,7 @@ from dispatcher_sdk.storage_snapshots import (
 from dispatcher_sdk import storage_snapshots as snapshots
 from dispatcher_sdk.storage_snapshots import VerifiedSnapshot
 from dispatcher_sdk.execution_kernel._sandbox_registry import register_journals
+from dispatcher_sdk.execution_kernel.runtime import _UnpersistedDiagnosticsError
 
 
 def echo(payload, context):
@@ -224,12 +225,60 @@ class StorageActivationTests(unittest.TestCase):
         self._seed()
         self._restore()
         activated = self._activate()
-        with Runtime(activated.components["kernel"], {"echo": echo}, isolation_mode="thread") as runtime:
-            runtime.run_once()
+        runtime = Runtime(activated.components["kernel"], {"echo": echo}, isolation_mode="thread")
+        try:
+            with runtime:
+                runtime.run_once()
+        except _UnpersistedDiagnosticsError as error:
+            with runtime._diagnostic_pending_lock:
+                details = (f"diagnostic errors={runtime._diagnostic_errors!r}; "
+                           f"pending={list(runtime._diagnostic_pending.values())!r}; "
+                           f"unknown handoffs={runtime._diagnostic_unknown_handoffs!r}; "
+                           f"failed executions={runtime._diagnostic_failed_executions!r}; "
+                           f"overflow={runtime._diagnostic_pending_overflow!r}")
+            try:
+                runtime.close()
+            except Exception as retry_error:
+                details += f"; close retry failed: {retry_error!r}"
+            error.args = (*error.args, details)
+            raise
         shutil.rmtree(self.destination)
         with self.assertRaises(ActivationConflictError):
             self._activate()
         self.assertFalse(self.destination.exists())
+
+    def test_close_retries_transient_diagnostic_delivery(self):
+        self._seed()
+        self._restore()
+        activated = self._activate()
+        runtime = Runtime(activated.components["kernel"], {"echo": echo}, isolation_mode="thread")
+        result = runtime.run_once()
+        identity = {"execution_id": "queued", "attempt": result.result.attempt, "fence": result.result.fence}
+        journal = runtime._settlement_journal
+        original = journal.lifecycle_note
+        try:
+            runtime._stop_event.set()
+            if runtime._settlement_thread is not None:
+                runtime._settlement_thread.join()
+            with mock.patch.object(journal, "lifecycle_note", side_effect=TimeoutError("busy")):
+                self.assertFalse(runtime._diagnostic_note(identity, "test_pending", {"value": 1}))
+            calls = []
+
+            def fail_once(*args, **kwargs):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise TimeoutError("busy")
+                return original(*args, **kwargs)
+
+            with mock.patch.object(journal, "lifecycle_note", side_effect=fail_once):
+                runtime.close()
+            self.assertGreaterEqual(len(calls), 2)
+            self.assertTrue(runtime._kernel_storage_closed)
+            notes = journal.inspect_notes("queued", timeout_seconds=5)["notes"]
+            self.assertEqual([note["phase"] for note in notes if note["phase"] == "test_pending"],
+                             ["test_pending"])
+        finally:
+            runtime.close()
 
     def test_lost_reservation_after_retirement_fails_closed(self):
         self._seed()

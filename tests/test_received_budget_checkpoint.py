@@ -357,19 +357,56 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
 
     def test_foreground_received_fact_ack_precedes_recorded_result(self):
         outcome = self.produce()
-        returned = self.settle(outcome)
-        self.assertEqual(returned.state, 'succeeded')
-        self.assertEqual(returned.result.value, outcome['value'])
+        checkpoint = outcome['budget_checkpoint']['supervisor']
+        ack = self.runtime.kernel._finish_received_budget_sample
+        complete = self.runtime.kernel._complete_sdk_result
+        trace = {'acks': [], 'completions': [], 'handler_calls': []}
+        self.evidence['records'].append({'ordering': trace})
+
+        def unexpected_handler(*args, **kwargs):
+            trace['handler_calls'].append(True)
+            raise AssertionError('settlement must not replay business work')
+
+        def observe_ack(token, execution_id, envelope, **options):
+            published = ack(token, execution_id, envelope, **options)
+            trace['acks'].append({'token': token, 'execution_id': execution_id,
+                'envelope': envelope.to_dict()})
+            return published
+
+        def observe_completion(lease, result, **options):
+            trace['completions'].append({'result_id': result.result_id, 'acks_seen': len(trace['acks'])})
+            self.assertTrue(trace['acks'], trace)
+            fact = trace['acks'][-1]
+            self.assertEqual((fact['token'], fact['execution_id']), (checkpoint['token'], 'work'))
+            self.assertEqual(fact['envelope'], checkpoint['captured_envelope'])
+            return complete(lease, result, **options)
+
+        with patch.object(self.runtime.kernel, '_finish_received_budget_sample', side_effect=observe_ack), \
+             patch.object(self.runtime.kernel, '_complete_sdk_result', side_effect=observe_completion), \
+             patch.dict(self.runtime.handlers, {key: unexpected_handler for key in self.runtime.handlers}):
+            returned = self.settle(outcome)
+            receipts = self.runtime._settlement_journal.inspect('work')
+            entries = self.runtime._pending_settlements.entries(1)
+            self.evidence['records'].append({'foreground': {'execution': returned.to_dict(),
+                'receipts': receipts, 'local_pending': [{'identity': entry.identity,
+                    'payload': entry.payload, 'evidence': entry.evidence} for entry in entries],
+                'settlement_error': self.runtime._settlement_error, 'guards': self.guards()}})
+            self.assertTrue(len(receipts) == 1 or len(entries) == 1, self.evidence)
+            original = receipts[0] if receipts else {'result': entries[0].payload}
+            self.assertEqual(original['result']['value'], outcome['value'])
+            if returned.state == 'running':
+                self.assertEqual(returned.to_dict(), self.running.to_dict())
+            else:
+                self.assertEqual(returned.state, 'succeeded')
+                self.assertEqual(returned.result.to_dict(), original['result'])
+            if returned.state != 'succeeded' or not receipts or receipts[0]['state'] != 'recorded':
+                self.recover_recorded(original)
+            self.assertTrue(trace['completions'], trace)
+            self.assertTrue(all(item['result_id'] == original['result']['result_id']
+                                for item in trace['completions']), trace)
+            self.assertEqual(trace['handler_calls'], [], trace)
         self.assert_published(outcome)
-        receipt = self.receipt()
-        self.evidence['records'].append({'foreground': {'execution': returned.to_dict(),
-            'receipt': receipt, 'settlement_error': self.runtime._settlement_error,
-            'guards_after_ack': self.guards()}})
-        # Kernel success and ACK publication precede the bounded archive write.
-        # If that write expires, maintenance archives the same result without
-        # repeating business work or restoring spent execution authority.
-        if receipt['state'] == 'pending':
-            self.recover_recorded(receipt)
+        self.assertEqual(self.runtime.kernel.get('work').result.to_dict(), original['result'])
         self.assertEqual(self.receipt()['state'], 'recorded')
 
     def test_receipt_writer_contention_keeps_positive_fact_locally_until_durable(self):

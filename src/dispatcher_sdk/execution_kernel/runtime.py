@@ -404,7 +404,7 @@ class InProcessRuntime:
                     self._lifecycle_condition.wait()
             self._persist_pending_settlements(time.monotonic() + 1, limit=64)
             if hasattr(self, "_diagnostic_pending_lock"):
-                self._retry_diagnostic_notes(time.monotonic() + 1, wait_for_writer=True)
+                self._drain_diagnostic_notes(time.monotonic() + 1)
             observation_pending = self._drain_observation_workers(time.monotonic() + 1.0)
             try:
                 unresolved = self.recover_sandboxes(all_pages=True)
@@ -479,7 +479,7 @@ class InProcessRuntime:
         if isinstance(self._close_error, _ProcessCleanupPendingError):
             self._close_error = None
         if hasattr(self, "_diagnostic_pending_lock") and not self._kernel_storage_closed:
-            self._retry_diagnostic_notes(time.monotonic() + 1, wait_for_writer=True)
+            self._drain_diagnostic_notes(time.monotonic() + 1)
             if self._diagnostics_block_admission():
                 if self._close_error is None:
                     self._close_error = _UnpersistedDiagnosticsError("runtime closed with diagnostic facts not confirmed durable")
@@ -1105,6 +1105,19 @@ class InProcessRuntime:
                             self._diagnostic_failed_executions.add(execution_id)
             self._diagnostic_errors[execution_id] = f"{type(exc).__name__}: {exc}"
             return False
+
+    def _drain_diagnostic_notes(self, deadline: float) -> None:
+        # A single pass can encounter transient storage contention and return
+        # early. Close owns this bounded interval and should retry the same
+        # retained facts before reporting that durability is still unknown.
+        while True:
+            self._retry_diagnostic_notes(deadline, wait_for_writer=True)
+            if not self._diagnostics_block_admission():
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(.01, remaining))
 
     def _retry_diagnostic_notes(self, deadline: float, *, wait_for_writer: bool = False,
                                 priority_execution_id: str | None = None) -> None:

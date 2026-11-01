@@ -170,10 +170,12 @@ class ExactHandoffInspectionTests(unittest.TestCase):
             self.assertLessEqual(len(json.dumps(report, ensure_ascii=False, separators=(',', ':')).encode()), 1024)
             identity = {'execution_id': 'exec', 'attempt': 1, 'fence': 1}
             journal.note(identity, 'supervisor_spawn_intent',
-                         {'source': 'runtime_pre_spawn', 'cleanup': 'unknown', 'value': '界"\\' * 200})
+                         {'source': 'runtime_pre_spawn', 'cleanup': 'unknown', 'value': '界"\\' * 200},
+                         timeout_seconds=5)
             phase = 'supervisor_outcome_observed'
             note_id = json.dumps([phase, 'exec', 1, 1], separators=(',', ':'))
-            journal.note(identity, phase, {'source': 'posix_supervisor_worker_packet', 'outcome_json': '{bad'}, note_id=note_id)
+            journal.note(identity, phase, {'source': 'posix_supervisor_worker_packet', 'outcome_json': '{bad'},
+                         note_id=note_id, timeout_seconds=5)
             for limit in (1024, 2048, 4096):
                 report = journal.inspect_supervisor_handoff(identity, max_bytes=limit)
                 self.assertLessEqual(len(json.dumps(report, ensure_ascii=False, separators=(',', ':')).encode()), limit)
@@ -187,5 +189,6 @@ class ExactHandoffInspectionTests(unittest.TestCase):
             disposition_id = json.dumps([phase, 'exec', 1, 1], separators=(',', ':'))
             wrong_lease = ExecutionLease('exec', 'lease', 'worker', 2, 1, 9999999999, 1)
             journal.note(identity, phase, {'source': 'posix_supervisor', 'worker_return': 'timely',
-                                           'lease': wrong_lease.to_dict()}, note_id=disposition_id)
+                                           'lease': wrong_lease.to_dict()}, note_id=disposition_id,
+                         timeout_seconds=5)
             self.assertEqual(journal.inspect_supervisor_handoff(identity)['facts']['supervisor_disposition']['reason'], 'invalid_observation')

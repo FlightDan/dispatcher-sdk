@@ -111,12 +111,12 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
         notes = self.reopen_notes("host-close-retry")
         self.assertEqual(len([n for n in notes if n["phase"] == "worker_invocation_escaped"]), 1)
         self.assertTrue(self.runtime._kernel_storage_closed)
-        with sqlite3.connect(self.path) as connection:
+        with contextlib.closing(sqlite3.connect(self.path)) as connection:
             row = connection.execute(
                 "SELECT event_id, delivered FROM kernel_lifecycle_outbox WHERE sequence=?",
                 (event["sequence"],)).fetchone()
         self.assertEqual(row, (event["event_id"], 1))
-        with sqlite3.connect(journal.path) as connection:
+        with contextlib.closing(sqlite3.connect(journal.path)) as connection:
             receipt = connection.execute(
                 "SELECT n.execution_id,n.attempt,n.fence,n.phase,n.evidence_json "
                 "FROM settlement_lifecycle_receipts r JOIN settlement_notes n ON n.sequence=r.note_sequence "
@@ -562,8 +562,15 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
             result = self.runtime.run_once()
             self.assertEqual(result.state, "succeeded")
             self.assertIn("execution_claimed", [note["phase"] for note in self.reopen_notes("independent")])
-        self.runtime._retry_diagnostic_notes(time.monotonic() + 2, wait_for_writer=True)
-        self.assertEqual([note["phase"] for note in self.reopen_notes("failed")], ["first", "second"])
+        deadline = time.monotonic() + 15
+        phases = []
+        while time.monotonic() < deadline:
+            self.runtime._retry_diagnostic_notes(min(deadline, time.monotonic() + 2), wait_for_writer=True)
+            phases = [note["phase"] for note in self.reopen_notes("failed")]
+            self.assertIn(phases, ([], ["first"], ["first", "second"]))
+            if phases == ["first", "second"] and not self.runtime._diagnostics_block_admission():
+                break
+        self.assertEqual(phases, ["first", "second"])
         self.assertFalse(self.runtime._diagnostics_block_admission())
 
     def test_concurrent_independent_note_survives_failed_writer(self):

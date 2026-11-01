@@ -501,7 +501,9 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             kernel, context, capability = self.direct(Path(directory))
             try:
-                envelope = context.budget_envelope.derive(source='tool', origin_id='test-tool', timeout_seconds=.1)
+                # This test exercises revocation ordering, not deadline expiry.
+                # Leave enough time for the real durable clock sample on slower hosts.
+                envelope = context.budget_envelope.derive(source='tool', origin_id='test-tool', timeout_seconds=2)
                 row = {'budget_json': json.dumps(envelope.to_dict()), 'parent_execution_id': 'parent',
                        'parent_attempt': context.lease.attempt, 'parent_fence': context.lease.fence,
                        'child_execution_id': 'unread-child', 'action': 'run'}
