@@ -425,6 +425,31 @@ class CancelAdmissionTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as caught:
                     runtime.cancel('historical', expected_revision=queued.revision)
                 self.assertIs(caught.exception, raw)
+            # The raised operation leaves its producer's final evidence
+            # uncertain. This fixture knows the patched call returned and
+            # explicitly authorizes recovery before admitting a new attempt.
+            kernel = runtime.kernel
+            identity = ('historical', queued.attempt, queued.fence)
+            producers = [item for item in kernel.lifecycle_list_open_producers()['producers']
+                         if (item['execution_id'], item['attempt'], item['fence']) == identity]
+            self.assertEqual(len(producers), 1)
+            self.assertIsNone(kernel.claim_and_start('manual-owner', execution_id='historical'))
+            journal = runtime._settlement_journal
+            def verify(credential, operation, observed, event):
+                proof = (event or {}).get('proof', {})
+                committed = operation == 'ack' and journal.lifecycle_receipt_committed(
+                    {key: observed[key] for key in ('execution_id', 'attempt', 'fence')},
+                    event['phase'], event['payload'], store_id=event['store_id'],
+                    outbox_sequence=event['sequence'])
+                return {'allowed': True, 'expires_at': kernel._wall_time() + 100,
+                        'producer_dead': operation == 'recover' and proof.get('returned') is True,
+                        'evidence_unknown_acknowledged': proof.get('unknown_acknowledged') is True,
+                        'receiver_committed': committed}
+            kernel._lifecycle_verifier = verify
+            self.assertTrue(kernel.lifecycle_recover_producer(producers[0]['token'],
+                {'returned': True, 'unknown_acknowledged': True}, identity=identity))
+            runtime._retry_diagnostic_notes(time.monotonic() + 2, wait_for_writer=True)
+            self.assertIsNone(kernel.lifecycle_peek(execution_id='historical'))
             lease = runtime.kernel.claim_and_start('manual-owner', execution_id='historical')
             self.assertGreater(lease.attempt, queued.attempt)
             for filters in ({'attempt': queued.attempt}, {'fence': queued.fence},

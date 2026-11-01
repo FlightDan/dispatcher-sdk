@@ -2,7 +2,24 @@
 
 [English](Storage-and-Recovery.md) | [简体中文](Storage-and-Recovery-zh-CN.md) | [Home](Home.md)
 
-The 0.7 single-file deployment uses SQLite WAL with `synchronous=FULL` by
+The schema values below describe the published 0.7.2 release. The current
+0.7.3.dev1 development candidate is unreleased and uses Kernel schema 12,
+Orchestrator schema 6 and Settlement Journal schema 4. Review the [development status](Improvement-Status.md)
+and [storage upgrade contract](../docs/STORAGE_AND_UPGRADES.md) before opening
+or copy-upgrading a store. A copy upgrade does not adopt an existing Run or
+isolate old writers.
+
+For the development candidate, schema 12 also stores lifecycle producer
+reservations and pending events. A host must provide trusted receipt and
+producer-recovery verification; persisted events can be replayed, while facts
+lost before persistence remain unknown. A quiescent generation can be explicitly
+retired and its delivered events, closed producers and matching journal receipts
+pruned in bounded batches, once the host has proved no future producer can use
+that generation and has preserved required evidence. Other metadata is outside
+this retention path. See the
+[development integration guide](../docs/SDK_DEVELOPMENT_INTEGRATION.md).
+
+The published 0.7.2 single-file deployment uses SQLite WAL with `synchronous=FULL` by
 default. The Kernel SQLite layout is schema 5, the Orchestrator store is schema
 4, and the notification inbox has its own schema 1. The public Kernel execution
 record contract is still version 2; contract versions and storage layouts are
@@ -47,6 +64,6 @@ Existing indeterminate effects remain unresolved after activation. Queued work
 can continue, while abandoned leases follow normal expiry and reaping. Never
 delete retirement, reservation, pending or read-only markers by hand.
 
-See [SQLite operations](../docs/SQLITE_OPERATIONS.md),
-[storage upgrades](../docs/STORAGE_AND_UPGRADES.md), and the
-[local recovery procedure](../docs/LOCAL_RECOVERY.md).
+See [SQLite operations](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SQLITE_OPERATIONS.md),
+[storage upgrades](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/STORAGE_AND_UPGRADES.md), and the
+[local recovery procedure](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/LOCAL_RECOVERY.md).

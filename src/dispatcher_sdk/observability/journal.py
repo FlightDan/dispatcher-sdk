@@ -14,10 +14,17 @@ from .._inspection import InspectionBudget, InspectionBudgetExceeded
 from .._sqlite_admission import retry_sqlite_admission
 from .._sqlite_errors import is_sqlite_contention
 from ..durability import Durability, validate_durability
-from .contracts import ObservationError, ObservationIdentity, ObservationOptions, identifier, positive
+from .contracts import ObservationError, ObservationIdentity, ObservationOptions, ObservationTransactionResult, identifier, positive
 
 
 SCHEMA_VERSION = 1
+
+
+def _record_cleanup_error(error: BaseException, cleanup_error: BaseException) -> None:
+    """Retain cleanup failures even on Python versions without add_note."""
+    error.observation_cleanup_errors = (*getattr(error, "observation_cleanup_errors", ()), cleanup_error)
+    if hasattr(error, "add_note"):
+        error.add_note(f"Observation cleanup failed: {cleanup_error!r}")
 
 
 class _ObservationWriteBudgetExceeded(TimeoutError):
@@ -279,32 +286,40 @@ class ObservationJournal:
     @contextmanager
     def _transaction(self, *, timeout_seconds: float | None = None,
                      _deadline: float | None = None,
+                     operation: str = "observation_write_transaction",
                      _connection: sqlite3.Connection | None = None) -> Iterator[tuple[sqlite3.Connection, float]]:
         if not self.writer:
             raise ObservationError("read-only observation journal cannot write")
         duration = self.options.write_timeout if timeout_seconds is None else min(
             self.options.write_timeout, positive(timeout_seconds, "timeout_seconds"))
         deadline = time.monotonic() + duration
+        budget_source = "write_timeout" if timeout_seconds is None or self.options.write_timeout <= timeout_seconds else "timeout_seconds"
         if _deadline is not None:
+            if _deadline < deadline:
+                budget_source = "caller_deadline"
             deadline = min(deadline, _deadline)
-        if time.monotonic() >= deadline:
-            expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
-            expired.rollback_confirmed = True  # No connection or write was admitted.
-            raise expired
         owns_connection = _connection is None
-        connection = _connection if _connection is not None else sqlite3.connect(
-            self.path.as_uri() + "?mode=rw", uri=True, timeout=0)
-        connection.row_factory = sqlite3.Row
-        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        connection = _connection
+        entered = False
+        phase = "admission"
+        failure = None
         def admit(operation, *, commit=False):
             return retry_sqlite_admission(operation, deadline=deadline,
                 expired=_ObservationWriteBudgetExceeded("observation write admission budget elapsed"),
                 transaction_retained=(lambda: connection.in_transaction) if commit else None)
         try:
+            if time.monotonic() >= deadline:
+                raise _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
+            if connection is None:
+                connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, timeout=0)
+            connection.row_factory = sqlite3.Row
+            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             if owns_connection:
                 admit(lambda: connection.execute("PRAGMA trusted_schema=OFF"))
             admit(lambda: connection.execute(f"PRAGMA synchronous={2 if self.durability == 'full' else 1}"))
             admit(lambda: connection.execute("BEGIN IMMEDIATE"))
+            entered = True
+            phase = "validation"
             admit(lambda: self._validate_binding(connection))
             admit(lambda: self._validate_existing_writer(connection, deadline=deadline))
             if time.monotonic() >= deadline:
@@ -312,20 +327,53 @@ class ObservationJournal:
             now = float(self.clock())
             if not math.isfinite(now):
                 raise ObservationError("observation wall clock is not finite")
+            phase = "body"
             yield connection, now
             if time.monotonic() >= deadline:
                 raise _ObservationWriteBudgetExceeded("observation write operation budget elapsed")
+            phase = "commit"
             admit(connection.commit, commit=True)
+            phase = "committed"
         except BaseException as error:
-            transaction_was_open = connection.in_transaction
-            connection.rollback()
+            failure = error
+            rollback_error = None
+            rollback_confirmed = not entered
+            if connection is not None and connection.in_transaction:
+                try:
+                    connection.rollback()
+                    rollback_confirmed = not connection.in_transaction
+                except BaseException as rollback_failure:
+                    rollback_error = rollback_failure
+                    rollback_confirmed = False
             if isinstance(error, _ObservationWriteBudgetExceeded):
-                error.rollback_confirmed = (not connection.in_transaction
-                    and (transaction_was_open or connection.total_changes == 0))
+                error.rollback_confirmed = rollback_confirmed
+            error.observation_transaction = ObservationTransactionResult(
+                operation=operation, phase=phase,
+                sqlite_errorcode=getattr(error, "sqlite_errorcode", None),
+                sqlite_errorname=getattr(error, "sqlite_errorname", None),
+                budget_source=budget_source, transaction_entered=entered,
+                rollback_confirmed=rollback_confirmed,
+                outcome="not_applied" if rollback_confirmed else "unknown",
+                replay_safe=None, rollback_error=rollback_error)
+            if rollback_error is not None:
+                _record_cleanup_error(error, rollback_error)
             raise
         finally:
-            if owns_connection:
-                connection.close()
+            if owns_connection and connection is not None:
+                try:
+                    connection.close()
+                except BaseException as close_error:
+                    if failure is None:
+                        close_error.observation_transaction = ObservationTransactionResult(
+                            operation=operation, phase="close",
+                            sqlite_errorcode=getattr(close_error, "sqlite_errorcode", None),
+                            sqlite_errorname=getattr(close_error, "sqlite_errorname", None),
+                            budget_source=budget_source, transaction_entered=entered,
+                            rollback_confirmed=False,
+                            outcome="applied" if phase == "committed" else "unknown",
+                            replay_safe=None)
+                        raise
+                    _record_cleanup_error(failure, close_error)
 
     @contextmanager
     def _flush_anchor(self):
@@ -422,7 +470,7 @@ class ObservationJournal:
 
     def bind_current(self, identity: ObservationIdentity) -> bool:
         """Bind an authoritative current identity; old bindings cannot regress it."""
-        with self._transaction() as (connection, now):
+        with self._transaction(operation="bind_current") as (connection, now):
             row = connection.execute("SELECT * FROM obs_current WHERE execution_id=?",
                                      (identity.execution_id,)).fetchone()
             encoded = _json(identity.to_dict())
@@ -476,7 +524,7 @@ class ObservationJournal:
               details: Mapping[str, Any] | None = None, source_id: str = "runtime",
               timeout_seconds: float | None = None) -> None:
         identifier(phase, "phase")
-        with self._transaction(timeout_seconds=timeout_seconds) as (connection, now):
+        with self._transaction(timeout_seconds=timeout_seconds, operation="phase") as (connection, now):
             self._event(connection, identity, source_id, "phase", now if captured_at is None else captured_at,
                         {"phase": phase, "details": dict(details or {})}, now)
 
@@ -522,7 +570,8 @@ class ObservationJournal:
                     expired.rollback_confirmed = True  # The read snapshot ended without a write.
                     raise expired
                 return False
-            with self._transaction(_deadline=deadline, _connection=connection) as (connection, now):
+            with self._transaction(_deadline=deadline, _connection=connection,
+                                   operation="write_batch") as (connection, now):
                 coverage_json, state = '[]', 'active'
                 previous = connection.execute("SELECT * FROM obs_sources WHERE execution_id=? AND attempt=? AND fence=? AND source_id=?",
                                               (*_key(identity), source_id)).fetchone()
@@ -561,30 +610,102 @@ class ObservationJournal:
         if time.monotonic() >= deadline:
             expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
             expired.rollback_confirmed = True
+            expired.observation_transaction = ObservationTransactionResult(
+                operation="write_batch", phase="admission", sqlite_errorcode=None,
+                sqlite_errorname=None, budget_source="write_timeout", transaction_entered=False,
+                rollback_confirmed=True, outcome="not_applied", replay_safe=None)
             raise expired
-        connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, timeout=0)
+        try:
+            connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, timeout=0)
+        except BaseException as error:
+            error.observation_transaction = ObservationTransactionResult(
+                operation="write_batch", phase="connection",
+                sqlite_errorcode=getattr(error, "sqlite_errorcode", None),
+                sqlite_errorname=getattr(error, "sqlite_errorname", None),
+                budget_source="write_timeout", transaction_entered=False,
+                rollback_confirmed=True, outcome="not_applied", replay_safe=None)
+            raise
         completed = False
+        failure = None
+        yielded = False
         try:
             connection.row_factory = sqlite3.Row
             connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             retry_sqlite_admission(lambda: connection.execute("PRAGMA trusted_schema=OFF"),
                 deadline=deadline,
                 expired=_ObservationWriteBudgetExceeded("observation write admission budget elapsed"))
+            yielded = True
             yield connection
             completed = True
         except _ObservationWriteBudgetExceeded as error:
-            transaction_was_open = connection.in_transaction
-            connection.rollback()
-            error.rollback_confirmed = (getattr(error, "rollback_confirmed", False)
-                or not connection.in_transaction
-                and (transaction_was_open or connection.total_changes == 0))
+            failure = error
+            if hasattr(error, "observation_transaction"):
+                raise
+            try:
+                transaction_was_open = connection.in_transaction
+                connection.rollback()
+                error.rollback_confirmed = (getattr(error, "rollback_confirmed", False)
+                    or not connection.in_transaction
+                    and (transaction_was_open or connection.total_changes == 0))
+            except BaseException as rollback_error:
+                error.rollback_confirmed = False
+                _record_cleanup_error(error, rollback_error)
+                error.observation_transaction = ObservationTransactionResult(
+                    operation="observation_write_batch", phase="admission",
+                    sqlite_errorcode=getattr(error, "sqlite_errorcode", None),
+                    sqlite_errorname=getattr(error, "sqlite_errorname", None),
+                    budget_source="write_timeout", transaction_entered=False,
+                    rollback_confirmed=False, outcome="unknown", replay_safe=None,
+                    rollback_error=rollback_error)
+            if not hasattr(error, "observation_transaction"):
+                error.observation_transaction = ObservationTransactionResult(
+                    operation="write_batch", phase="replay_read" if yielded else "admission",
+                    sqlite_errorcode=getattr(error, "sqlite_errorcode", None),
+                    sqlite_errorname=getattr(error, "sqlite_errorname", None),
+                    budget_source="write_timeout", transaction_entered=False,
+                    rollback_confirmed=error.rollback_confirmed,
+                    outcome="not_applied" if error.rollback_confirmed else "unknown", replay_safe=None)
+            raise
+        except BaseException as error:
+            failure = error
+            if not yielded and not hasattr(error, "observation_transaction"):
+                error.observation_transaction = ObservationTransactionResult(
+                    operation="write_batch", phase="admission",
+                    sqlite_errorcode=getattr(error, "sqlite_errorcode", None),
+                    sqlite_errorname=getattr(error, "sqlite_errorname", None),
+                    budget_source="write_timeout", transaction_entered=False,
+                    rollback_confirmed=True, outcome="not_applied", replay_safe=None)
             raise
         finally:
-            no_changes = connection.total_changes == 0
-            connection.close()
+            no_changes = None
+            if completed:
+                try:
+                    no_changes = connection.total_changes == 0
+                except BaseException as accounting_error:
+                    failure = accounting_error
+            try:
+                connection.close()
+            except BaseException as close_error:
+                if failure is None:
+                    failure = close_error
+                else:
+                    _record_cleanup_error(failure, close_error)
+            if completed and failure is not None:
+                failure.observation_transaction = ObservationTransactionResult(
+                    operation="observation_write_batch", phase="close",
+                    sqlite_errorcode=getattr(failure, "sqlite_errorcode", None),
+                    sqlite_errorname=getattr(failure, "sqlite_errorname", None),
+                    budget_source="write_timeout", transaction_entered=no_changes is False,
+                    rollback_confirmed=False, outcome="applied" if no_changes is False else "unknown",
+                    replay_safe=None)
+                raise failure
             if completed and no_changes and time.monotonic() >= deadline:
                 expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
                 expired.rollback_confirmed = True
+                expired.observation_transaction = ObservationTransactionResult(
+                    operation="write_batch", phase="close", sqlite_errorcode=None,
+                    sqlite_errorname=None, budget_source="write_timeout", transaction_entered=False,
+                    rollback_confirmed=True, outcome="not_applied", replay_safe=None)
                 raise expired
 
     def _committed_batch_replay(self, identity: ObservationIdentity, source_id: str,
@@ -605,6 +726,7 @@ class ObservationJournal:
                 raise _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
             return operation()
 
+        failure = None
         try:
             admitted(lambda: connection.execute("BEGIN"))
             admitted(lambda: self._validate_binding(connection))
@@ -619,8 +741,7 @@ class ObservationJournal:
                 admitted(lambda: self._validate_existing_writer(connection, deadline=deadline))
             return replay
         except _ObservationWriteBudgetExceeded as error:
-            connection.rollback()
-            error.rollback_confirmed = not connection.in_transaction and connection.total_changes == 0
+            failure = error
             raise
         except sqlite3.OperationalError as error:
             if is_sqlite_contention(error):
@@ -629,13 +750,51 @@ class ObservationJournal:
             interrupted = (type(code) is int and code & 255 == 9
                            or code is None and str(error).lower() == "interrupted")
             if time.monotonic() >= deadline and interrupted:
-                connection.rollback()
                 expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
-                expired.rollback_confirmed = not connection.in_transaction and connection.total_changes == 0
+                expired.sqlite_errorcode = getattr(error, "sqlite_errorcode", None)
+                expired.sqlite_errorname = getattr(error, "sqlite_errorname", None)
+                failure = expired
                 raise expired from error
+            failure = error
+            raise
+        except BaseException as error:
+            failure = error
             raise
         finally:
-            connection.rollback()
+            try:
+                # An expired progress handler would also interrupt ROLLBACK,
+                # leaving the read transaction's outcome unnecessarily unknown.
+                connection.set_progress_handler(None, 0)
+                connection.rollback()
+                if isinstance(failure, _ObservationWriteBudgetExceeded):
+                    failure.rollback_confirmed = not connection.in_transaction and connection.total_changes == 0
+                if failure is not None and not hasattr(failure, "observation_transaction"):
+                    failure.observation_transaction = ObservationTransactionResult(
+                        operation="write_batch", phase="replay_read",
+                        sqlite_errorcode=getattr(failure, "sqlite_errorcode", None),
+                        sqlite_errorname=getattr(failure, "sqlite_errorname", None),
+                        budget_source="write_timeout", transaction_entered=False,
+                        rollback_confirmed=True, outcome="not_applied", replay_safe=None)
+            except BaseException as rollback_error:
+                if failure is None:
+                    rollback_error.observation_transaction = ObservationTransactionResult(
+                        operation="observation_write_batch", phase="replay_read_rollback",
+                        sqlite_errorcode=getattr(rollback_error, "sqlite_errorcode", None),
+                        sqlite_errorname=getattr(rollback_error, "sqlite_errorname", None),
+                        budget_source="write_timeout", transaction_entered=False,
+                        rollback_confirmed=False, outcome="unknown", replay_safe=None,
+                        rollback_error=rollback_error)
+                    raise
+                if isinstance(failure, _ObservationWriteBudgetExceeded):
+                    failure.rollback_confirmed = False
+                _record_cleanup_error(failure, rollback_error)
+                failure.observation_transaction = ObservationTransactionResult(
+                    operation="observation_write_batch", phase="replay_read",
+                    sqlite_errorcode=getattr(failure, "sqlite_errorcode", None),
+                    sqlite_errorname=getattr(failure, "sqlite_errorname", None),
+                    budget_source="write_timeout", transaction_entered=False,
+                    rollback_confirmed=False, outcome="unknown", replay_safe=None,
+                    rollback_error=rollback_error)
 
     @staticmethod
     def _metric_name(name: str) -> None:
@@ -652,7 +811,7 @@ class ObservationJournal:
         for name in metric_coverage:
             self._metric_name(name)
         coverage = _json(sorted(set(metric_coverage)))
-        with self._transaction() as (connection, now):
+        with self._transaction(operation="register_collector") as (connection, now):
             source = connection.execute("SELECT source_scope FROM obs_sources WHERE execution_id=? AND attempt=? AND fence=? AND source_id=?",
                                         (*_key(identity), source_id)).fetchone()
             if source is not None and source[0] != source_scope:
@@ -716,7 +875,7 @@ class ObservationJournal:
                 total[field] = value if total[field] is None else operation(total[field], value)
 
     def close_source(self, identity: ObservationIdentity, source_id: str) -> None:
-        with self._transaction() as (connection, now):
+        with self._transaction(operation="close_source") as (connection, now):
             connection.execute("UPDATE obs_sources SET state='closed',persisted_at=? WHERE execution_id=? AND attempt=? AND fence=? AND source_id=? AND state!='retired'",
                                (now, *_key(identity), source_id))
 
@@ -728,7 +887,7 @@ class ObservationJournal:
         details = {"role": role, "pid": pid, "birth_identity": birth_identity,
                    "namespace": namespace, "source": source}
         encoded = _bounded_json(details, 4096)
-        with self._transaction() as (connection, now):
+        with self._transaction(operation="register_process") as (connection, now):
             old = connection.execute("SELECT registration FROM obs_processes WHERE execution_id=? AND attempt=? AND fence=? AND process_id=?",
                                      (*_key(identity), process_id)).fetchone()
             if old is not None and old[0] != encoded:
@@ -745,7 +904,7 @@ class ObservationJournal:
         if state not in ("alive", "exited", "unknown"):
             raise ValueError("invalid process observation state")
         encoded = _bounded_json(dict(evidence or {}), 4096)
-        with self._transaction() as (connection, now):
+        with self._transaction(operation="observe_process") as (connection, now):
             observed = now if observed_at is None else observed_at
             changed = connection.execute("UPDATE obs_processes SET state=?,observed_at=?,persisted_at=?,evidence=?,unknown_reason=? "
                                          "WHERE execution_id=? AND attempt=? AND fence=? AND process_id=? "
@@ -767,13 +926,13 @@ class ObservationJournal:
         legacy_details = dict(details)
         legacy_details.pop("_collector_source_id", None)
         encoded = _bounded_json(legacy_details, 4096)
-        with self._transaction() as (connection, now):
+        with self._transaction(operation="record_wait") as (connection, now):
             connection.execute("INSERT OR IGNORE INTO obs_waits VALUES(?,?,?,?,'waiting',?,NULL,?,?)",
                                (*_key(identity), wait_id, now if started_at is None else started_at, encoded, now))
 
     def end_wait(self, identity: ObservationIdentity, wait_id: str, *, state: str = "ended",
                  ended_at: float | None = None) -> None:
-        with self._transaction() as (connection, now):
+        with self._transaction(operation="end_wait") as (connection, now):
             connection.execute("UPDATE obs_waits SET state=?,ended_at=?,persisted_at=? WHERE execution_id=? AND attempt=? AND fence=? AND wait_id=?",
                                (state, now if ended_at is None else ended_at, now, *_key(identity), wait_id))
 
@@ -956,7 +1115,7 @@ class ObservationJournal:
 
     def _bound_report(self, report: dict[str, Any], budget: InspectionBudget | None = None) -> dict[str, Any]:
         budget = budget or InspectionBudget(self.options.query_timeout, None)
-        sections = ("metrics", "sources", "waits", "child_waits", "child_requests", "processes", "phases", "retired_sources", "tails",
+        sections = ("supervisor_handoff", "metrics", "sources", "waits", "child_waits", "child_requests", "processes", "phases", "retired_sources", "tails",
                     "diagnostics", "local_cancellation_diagnostics", "settlement_obligations", "result", "budget", "settlement", "supervision",
                     "output", "script_output_fact")
         original = {name: report[name] for name in sections if isinstance(report.get(name), (dict, list))}
@@ -1064,13 +1223,25 @@ class ObservationJournal:
 
 def inspect_execution(path: str | Path, execution_id: str, *, kernel_path: str | Path,
                       source_id: str, attempt: int | None = None, fence: int | None = None,
-                      options: ObservationOptions | None = None, timeout: float | None = None) -> dict[str, Any]:
+                      options: ObservationOptions | None = None, timeout: float | None = None,
+                      settlement_journal_path: str | Path | None = None) -> dict[str, Any]:
+    """Inspect persisted activity and, for an exact generation, raw supervisor facts.
+
+    Handoff observations do not authenticate cleanup or authorize result
+    settlement; unavailable or truncated evidence remains unknown.
+    """
     from dataclasses import replace
     from ..execution_kernel.settlement import SettlementJournal, merge_diagnostic_notes
     settings = options or ObservationOptions()
     duration = settings.query_timeout if timeout is None else timeout
     budget = InspectionBudget(duration, None)
     report: dict[str, Any] = {"execution_id": execution_id, "view": "persisted", "complete": False}
+    exact_handoff = attempt is not None and fence is not None and attempt > 0 and fence > 0
+    if exact_handoff:
+        identity = {'execution_id': execution_id, 'attempt': attempt, 'fence': fence}
+        unknown_handoff = {'identity': identity, 'authority': 'not_established',
+            'facts': {}, 'unknown_reason': 'inspection_unavailable'}
+        report['supervisor_handoff'] = unknown_handoff
     reader = None
     try:
         reader = ObservationJournal.open_readonly(path, kernel_path=kernel_path, source_id=source_id,
@@ -1078,8 +1249,12 @@ def inspect_execution(path: str | Path, execution_id: str, *, kernel_path: str |
         budget.check()
         report = reader.inspect(execution_id, attempt=attempt, fence=fence,
             timeout=max(.001, duration-budget.elapsed_seconds))
+        if exact_handoff:
+            report['supervisor_handoff'] = unknown_handoff
         budget.check()
-        settlement = SettlementJournal.open_readonly(str(Path(kernel_path).resolve()) + ".settlements.sqlite3",
+        settlement_path = (str(Path(kernel_path).resolve()) + ".settlements.sqlite3"
+                           if settlement_journal_path is None else settlement_journal_path)
+        settlement = SettlementJournal.open_readonly(settlement_path,
             source_id=source_id, kernel_path=kernel_path,
             timeout_seconds=min(.1, max(.001, duration-budget.elapsed_seconds)))
         budget.check()
@@ -1089,6 +1264,14 @@ def inspect_execution(path: str | Path, execution_id: str, *, kernel_path: str |
         report["settlement_obligations"] = obligations
         if any(item.get("truncated") or item.get("more") or item.get("unknown_reason") for item in obligations):
             report.update(complete=False, unknown_reason="settlement_query_incomplete")
+        budget.check()
+        if exact_handoff:
+            try:
+                report['supervisor_handoff'] = settlement.inspect_supervisor_handoff(
+                    identity, timeout_seconds=min(.1, max(.001, duration-budget.elapsed_seconds)),
+                    max_bytes=min(256 * 1024, max(1024, settings.query_bytes // 2)))
+            except Exception as error:
+                report.update(complete=False, supervisor_handoff_error=f'{type(error).__name__}: {error}')
         budget.check()
         notes = settlement.inspect_notes(execution_id,
             timeout_seconds=min(.1, max(.001, duration-budget.elapsed_seconds)),
@@ -1100,7 +1283,8 @@ def inspect_execution(path: str | Path, execution_id: str, *, kernel_path: str |
     except Exception as error:
         report.update(complete=False, unknown_reason="diagnostic_observation_unavailable",
             error=f"{type(error).__name__}: {error}")
-    return report if reader is None else reader._bound_report(report, budget=budget)
+    return (ObservationJournal._bound_without_storage(report, options=settings, budget=budget)
+            if reader is None else reader._bound_report(report, budget=budget))
 
 
 __all__ = ["ObservationJournal", "inspect_execution"]

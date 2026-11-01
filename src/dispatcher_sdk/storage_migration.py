@@ -26,9 +26,23 @@ from .execution_kernel._sqlite_schema import (
     upgrade_kernel_schema_v2_to_v3,
     upgrade_kernel_schema_v3_to_v4,
     upgrade_kernel_schema_v4_to_v5,
+    upgrade_kernel_schema_v5_to_v6,
+    upgrade_kernel_schema_v6_to_v7,
+    upgrade_kernel_schema_v7_to_v8,
+    upgrade_kernel_schema_v8_to_v9,
+    upgrade_kernel_schema_v9_to_v10,
+    upgrade_kernel_schema_v10_to_v11,
+    upgrade_kernel_schema_v11_to_v12,
+    validate_kernel_schema_v10,
+    validate_kernel_schema_v11,
+    validate_kernel_schema_v8,
+    validate_kernel_schema_v9,
     validate_kernel_schema_v2,
     validate_kernel_schema_v3,
     validate_kernel_schema_v4,
+    validate_kernel_schema_v5,
+    validate_kernel_schema_v6,
+    validate_kernel_schema_v7,
     validate_schema as validate_kernel_schema,
 )
 from .execution_kernel.errors import StorageIsolationError
@@ -43,9 +57,13 @@ from .orchestrator.store import (
     ORCHESTRATOR_SCHEMA_VERSION,
     SCHEMA,
     SCHEMA_V3,
+    SCHEMA_V4,
     SCHEMA_V4_INSTALL,
+    SCHEMA_V5,
     StoreMixin,
     execute_schema,
+    install_v5,
+    install_v6,
     initialize_storage_tracking,
 )
 
@@ -167,6 +185,46 @@ def _validate_v3(connection: sqlite3.Connection) -> None:
         raise StorageMigrationError("schema v3 storage identity or clock is invalid")
 
 
+def _validate_v4(connection: sqlite3.Connection) -> None:
+    if _declared_version(connection) != 4:
+        raise StorageMigrationError("upgrade requires an exact schema v4 source")
+    with closing(sqlite3.connect(":memory:")) as reference:
+        execute_schema(reference, SCHEMA_V4)
+        results = ResultsMixin()
+        results.max_result_deliveries = 5
+        results._init_results(reference)
+        NotificationsMixin._init_notifications(reference)
+        initialize_storage_tracking(reference)
+        if StoreMixin._schema_objects(connection) != StoreMixin._schema_objects(reference):
+            raise StorageMigrationError("schema v4 source differs from the supported layout")
+    identity = connection.execute(
+        "SELECT store_id,incarnation FROM sdk_storage_identity WHERE singleton=1"
+    ).fetchone()
+    clock = connection.execute("SELECT mutation FROM sdk_storage_clock WHERE singleton=1").fetchone()
+    if (identity is None or any(type(value) is not str or not value for value in identity)
+            or clock is None or type(clock[0]) is not int or clock[0] < 0):
+        raise StorageMigrationError("schema v4 storage identity or clock is invalid")
+
+
+def _validate_v5(connection: sqlite3.Connection) -> None:
+    if _declared_version(connection) != 5:
+        raise StorageMigrationError("upgrade requires an exact schema v5 source")
+    with closing(sqlite3.connect(":memory:")) as reference:
+        execute_schema(reference, SCHEMA_V5)
+        results = ResultsMixin()
+        results.max_result_deliveries = 5
+        results._init_results(reference)
+        NotificationsMixin._init_notifications(reference)
+        initialize_storage_tracking(reference)
+        if StoreMixin._schema_objects(connection) != StoreMixin._schema_objects(reference):
+            raise StorageMigrationError("schema v5 source differs from the supported layout")
+    identity = connection.execute("SELECT store_id,incarnation FROM sdk_storage_identity WHERE singleton=1").fetchone()
+    clock = connection.execute("SELECT mutation FROM sdk_storage_clock WHERE singleton=1").fetchone()
+    if (identity is None or any(type(value) is not str or not value for value in identity)
+            or clock is None or type(clock[0]) is not int or clock[0] < 0):
+        raise StorageMigrationError("schema v5 storage identity or clock is invalid")
+
+
 def _validate_current(connection: sqlite3.Connection) -> None:
     if _declared_version(connection) != ORCHESTRATOR_SCHEMA_VERSION:
         raise StorageMigrationError(
@@ -199,6 +257,20 @@ def _kernel_source_version(connection: sqlite3.Connection) -> int | None:
             validate_kernel_schema_v3(connection)
         elif version == 4:
             validate_kernel_schema_v4(connection)
+        elif version == 5:
+            validate_kernel_schema_v5(connection)
+        elif version == 6:
+            validate_kernel_schema_v6(connection)
+        elif version == 7:
+            validate_kernel_schema_v7(connection)
+        elif version == 8:
+            validate_kernel_schema_v8(connection)
+        elif version == 9:
+            validate_kernel_schema_v9(connection)
+        elif version == 10:
+            validate_kernel_schema_v10(connection)
+        elif version == 11:
+            validate_kernel_schema_v11(connection)
         elif version == KERNEL_STORAGE_SCHEMA_VERSION:
             validate_kernel_schema(connection, names)
         else:
@@ -260,7 +332,31 @@ def _install_v4(connection: sqlite3.Connection) -> None:
         execute_schema(connection, SCHEMA_V4_INSTALL)
         initialize_storage_tracking(connection)
         connection.execute("INSERT INTO sdk_schema_meta VALUES('orchestrator',?)",
-                           (ORCHESTRATOR_SCHEMA_VERSION,))
+                           (4,))
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _install_v5(connection: sqlite3.Connection) -> None:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _validate_v4(connection)
+        install_v5(connection)
+        _validate_v5(connection)
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _install_v6(connection: sqlite3.Connection) -> None:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _validate_v5(connection)
+        install_v6(connection)
+        Orchestrator.__new__(Orchestrator)._validate_existing_store(connection)
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -356,6 +452,22 @@ def _quick_validate(connection: sqlite3.Connection, *, kernel_only: bool = False
             raise StorageMigrationError("copied Kernel still has a historical schema")
     else:
         _validate_current(connection)
+    # SQLite quick_check does not validate foreign keys. Inspect SDK-owned
+    # tables individually so unrelated application tables remain outside
+    # this copy operation's validation scope.
+    tables = sorted(name for name in existing_table_names(connection)
+                    if name.startswith(("kernel_", "sdk_")))
+    for name in tables:
+        quoted = '"' + name.replace('"', '""') + '"'
+        try:
+            violation = connection.execute(f"PRAGMA foreign_key_check({quoted})").fetchone()
+        except sqlite3.DatabaseError as error:
+            raise StorageMigrationError(f"cannot validate SDK foreign keys for {name!r}") from error
+        if violation is not None:
+            raise StorageMigrationError(
+                f"SDK foreign key violation in {violation[0]!r}, row {violation[1]!r}, "
+                f"references {violation[2]!r}, constraint {violation[3]!r}"
+            )
 
 
 def _report(
@@ -437,6 +549,10 @@ def upgrade_storage(
             _validate_legacy(connection)
         elif not kernel_only and source_version == 3:
             _validate_v3(connection)
+        elif not kernel_only and source_version == 4:
+            _validate_v4(connection)
+        elif not kernel_only and source_version == 5:
+            _validate_v5(connection)
         elif not kernel_only and source_version == ORCHESTRATOR_SCHEMA_VERSION:
             Orchestrator.__new__(Orchestrator)._validate_existing_store(connection)
         elif not kernel_only:
@@ -453,14 +569,32 @@ def upgrade_storage(
             target.row_factory = sqlite3.Row
             if not kernel_only and source_version == 2:
                 _install_v3(target)
-            if not kernel_only and source_version != ORCHESTRATOR_SCHEMA_VERSION:
+            if not kernel_only and source_version in {2, 3}:
                 _install_v4(target)
+            if not kernel_only and source_version in {2, 3, 4}:
+                _install_v5(target)
+            if not kernel_only and source_version in {2, 3, 4, 5}:
+                _install_v6(target)
             if kernel_source_version == 2:
                 upgrade_kernel_schema_v2_to_v3(target)
             if kernel_source_version in {2, 3}:
                 upgrade_kernel_schema_v3_to_v4(target)
             if kernel_source_version in {2, 3, 4}:
                 upgrade_kernel_schema_v4_to_v5(target)
+            if kernel_source_version in {2, 3, 4, 5}:
+                upgrade_kernel_schema_v5_to_v6(target)
+            if kernel_source_version in {2, 3, 4, 5, 6}:
+                upgrade_kernel_schema_v6_to_v7(target)
+            if kernel_source_version in {2, 3, 4, 5, 6, 7}:
+                upgrade_kernel_schema_v7_to_v8(target)
+            if kernel_source_version in {2, 3, 4, 5, 6, 7, 8}:
+                upgrade_kernel_schema_v8_to_v9(target)
+            if kernel_source_version in {2, 3, 4, 5, 6, 7, 8, 9}:
+                upgrade_kernel_schema_v9_to_v10(target)
+            if kernel_source_version in {2, 3, 4, 5, 6, 7, 8, 9, 10}:
+                upgrade_kernel_schema_v10_to_v11(target)
+            if kernel_source_version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
+                upgrade_kernel_schema_v11_to_v12(target)
             _hit(failpoint, "after_schema")
             if not kernel_only and source_version == 2:
                 converted = _convert_legacy_values(

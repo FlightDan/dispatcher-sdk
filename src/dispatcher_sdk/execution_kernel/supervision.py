@@ -749,6 +749,8 @@ class SupervisionMixin:
                 (parent_lease.execution_id,),
             ).fetchone()
             if managed is not None:
+                self._check_application_budget(connection, managed["run_id"], managed["generation"],
+                    command.execution_id, timestamp, command_json=encode_json(command.to_dict()))
                 if (not command.execution_id.startswith("sdk-managed:")
                         or command.correlation_id != managed["run_id"]):
                     raise ValueError("managed child must retain its Run control association")
@@ -757,17 +759,28 @@ class SupervisionMixin:
                     (command.execution_id,),
                 ).fetchone()
                 if mapping is None:
+                    if connection.execute(
+                        "SELECT 1 FROM kernel_executions WHERE execution_id=? OR idempotency_key=?",
+                        (command.execution_id, command.idempotency_key),
+                    ).fetchone() is not None:
+                        raise CASConflictError("existing child lacks managed Run association")
                     connection.execute(
                         "INSERT INTO kernel_managed_executions(execution_id,run_id,generation,drain_allowed) "
                         "VALUES(?,?,?,0)", (command.execution_id, managed["run_id"], managed["generation"]),
                     )
                 elif tuple(mapping) != (managed["run_id"], managed["generation"]):
                     raise CASConflictError("child managed Run association changed")
-            elif command.execution_id.startswith("sdk-managed:"):
+            elif (command.execution_id.startswith("sdk-managed:") or connection.execute(
+                    "SELECT 1 FROM kernel_managed_executions WHERE execution_id=?",
+                    (command.execution_id,),
+            ).fetchone() is not None):
                 raise ValueError("ordinary parent cannot create a managed child")
             result, _ = self._submit_in_transaction(
                 command, encode_json(command.to_dict()), connection, timestamp
             )
+            if managed is not None:
+                self._check_run_authority(connection, managed["run_id"], "child", timestamp,
+                                          execution_id=command.execution_id)
             self._bind_child_limits(connection, command.execution_id, parent, budget_envelope, depth + 1)
             return self._snapshot(result)
 

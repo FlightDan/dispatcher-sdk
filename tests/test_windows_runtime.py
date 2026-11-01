@@ -667,8 +667,8 @@ class WindowsPublicationRaceTests(unittest.TestCase):
                             self.assertEqual(outcome, expected)
                             self.assertGreaterEqual(len(reads), 2)
                         else:
-                            self.assertEqual(outcome["kind"], "timeout")
-                            self.assertEqual(outcome["details"]["business_outcome"], expected)
+                            self.assertEqual(outcome["code"], "handler_completion_disposition_unknown")
+                            self.assertFalse(outcome["completion_time_known"])
                 self.assertTrue(terminated.is_set())
                 self.assertEqual(closed, [True])
                 self.assertEqual(len(cleanup), 1)
@@ -801,9 +801,8 @@ for fd in (0, 1, 2):
                         "telemetry_flush": {"state": "unknown",
                             "reason": "worker_terminated_without_final_flush_receipt"}})
                 elif disposition.startswith("timeout"):
-                    self.assertEqual(outcome["kind"], "timeout")
-                    self.assertEqual(outcome["telemetry_flush"], expected["telemetry_flush"])
-                    self.assertEqual(outcome["details"]["business_outcome"], expected)
+                    self.assertEqual(outcome["code"], "handler_completion_disposition_unknown")
+                    self.assertFalse(outcome["completion_time_known"])
                 else:
                     self.assertEqual(outcome, {"kind": "authority_revoked",
                         "reason": "execution_cancelled", "effect_ids": []})

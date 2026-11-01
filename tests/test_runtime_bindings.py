@@ -3,6 +3,7 @@
 from dataclasses import replace
 import json
 import sys
+import tempfile
 import time
 import traceback
 import unittest
@@ -92,7 +93,8 @@ class RuntimeBindingsTests(unittest.TestCase):
             self.assertIsNone(new.run_once())
 
     def test_allowed_revision_for_other_handler_is_not_execution_authority(self):
-        with Runtime(":memory:", {"a": first, "b": second}, isolation_mode="thread") as runtime:
+        with tempfile.TemporaryDirectory() as directory, Runtime(
+                directory + "/kernel.db", {"a": first, "b": second}, isolation_mode="thread") as runtime:
             command = runtime.command("a", execution_id="x", idempotency_key="x",
                                       correlation_id="r", timeout_seconds=1, payload=None)
             forged = replace(command, handler_id="b")

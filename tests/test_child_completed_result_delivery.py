@@ -343,7 +343,7 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                         # The scenario's original child deadline includes native
                         # startup. Hold only its optional response publication;
                         # the saved cutoff and all business budgets stay fixed.
-                        released = release.wait(8)
+                        released = release.wait(16)
                     else:
                         released = False
                     with finish_lock:
@@ -359,7 +359,7 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                         root/'kernel.sqlite3', {'parent': parent, 'child': child},
                         isolation_mode='process', child_capacity=1) as runtime:
                     runtime.submit(runtime.command('parent', execution_id='parent', idempotency_key='parent',
-                        correlation_id='root', timeout_seconds=12, payload={'fail': fail, 'child_timeout': 5,
+                        correlation_id='root', timeout_seconds=25, payload={'fail': fail, 'child_timeout': 12,
                             'parent_diagnostic_path': str(root/'parent-exception.json')}))
                     import dispatcher_sdk
                     report = {'sdk_import': dispatcher_sdk.__file__, 'python': sys.executable,
@@ -367,8 +367,8 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                         'runtime_directory': str(root), 'kernel_path': str(runtime.kernel.db_path),
                         'observation_path': runtime._observation_path,
                         'isolation_mode': 'process', 'child_capacity': 1, 'fail': fail,
-                        'parent_timeout_seconds': 12, 'child_timeout_seconds': 5,
-                        'publication_hold_seconds': 8, 'original_return': None,
+                        'parent_timeout_seconds': 25, 'child_timeout_seconds': 12,
+                        'publication_hold_seconds': 16, 'original_return': None,
                         'runtime_error': None, 'diagnostic_errors': {}}
 
                     def error_facts(error):

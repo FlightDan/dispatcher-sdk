@@ -104,8 +104,8 @@ def run_worker(path, now, root, crash):
             hold_original_window.wait(max(0., deadline - time.monotonic()))
         return token
 
-    def observed_claim(connection, timestamp, revisions, execution_id=None):
-        selected = original_claim(connection, timestamp, revisions, execution_id)
+    def observed_claim(connection, timestamp, revisions, execution_id=None, *args, **kwargs):
+        selected = original_claim(connection, timestamp, revisions, execution_id, *args, **kwargs)
         # Read the exact original transaction; no new claim or clock sample.
         event(root, "claim", timestamp=timestamp, execution_id=execution_id,
               selected=None if selected is None else dict(selected),

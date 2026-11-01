@@ -1,6 +1,7 @@
-"""Recover a real worker crash after a file write but before its receipt commits.
+"""Recover after an external writer crashes before its Effect receipt commits.
 
-The child is joined before explicit repair, within the original execution budget.
+The SDK coordinator remains alive to record the uncertain outcome. The external
+writer is joined before explicit repair, within the original execution budget.
 An expired budget would preserve the repaired effect but forbid business replay.
 """
 import multiprocessing
@@ -21,18 +22,35 @@ class DemoClock:
         return self.value
 
 
+def crash_after_receipt_write(path):
+    with open(path, "a", encoding="utf-8") as output:
+        output.write("invoice-1\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os._exit(37)  # The external writer died before returning its Effect response.
+
+
 def append_receipt(payload, context):
     def perform():
-        with open(payload["path"], "a", encoding="utf-8") as output:
-            output.write("invoice-1\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os._exit(37)  # The mutation happened; the Effect response never committed.
+        process = multiprocessing.get_context("spawn").Process(
+            target=crash_after_receipt_write, args=(payload["path"],))
+        process.start()
+        try:
+            process.join(15)
+            if process.is_alive():
+                process.kill()
+                process.join()
+                raise TimeoutError("external writer did not exit")
+            if process.exitcode != 37:
+                raise RuntimeError(f"external writer exited with {process.exitcode}")
+            raise RuntimeError("external writer exited after the file mutation")
+        finally:
+            process.close()
 
     return context.effects.execute_once("invoice-write", "append-receipt", payload, perform)
 
 
-append_receipt.__execution_kernel_revision__ = "example-append-receipt-v1"
+append_receipt.__execution_kernel_revision__ = "example-append-receipt-v2"
 
 
 def worker(database, clock_value=100.0):
@@ -73,7 +91,7 @@ def worker(database, clock_value=100.0):
                     and result.get("status") == "succeeded")
             assert published and time.monotonic() <= deadline, (returned.to_dict(), reports, observations)
         else:
-            assert returned.state == "succeeded", returned.to_dict()
+            assert returned.state in {"succeeded", "recovery_required"}, returned.to_dict()
 
 
 def main():
@@ -96,7 +114,7 @@ def main():
             process.join(15)
             if process.is_alive():
                 raise TimeoutError("worker did not exit")
-            assert process.exitcode == 37
+            assert process.exitcode == 0
         finally:
             if process.is_alive():
                 process.kill()
@@ -105,10 +123,9 @@ def main():
         with Kernel.open_sqlite(database, {"append": append_receipt}, now=clock,
                                isolation_mode="thread") as runtime:
             crashed = runtime.kernel.get("invoice-1")
-            runtime.kernel.require_effect_recovery(crashed.lease, "invoice-write")
-            assert runtime.kernel.get("invoice-1").state == "recovery_required"
-            print("Worker exited; execution is recovery_required")
-            # This demo owns an exclusive temporary directory and the child has exited.
+            assert crashed.state == "recovery_required", crashed.to_dict()
+            print("External writer exited; execution is recovery_required")
+            # This demo owns an exclusive temporary directory and the writer has exited.
             # In production, establish ownership and inspect actual external state first.
             assert marker.read_text(encoding="utf-8") == "invoice-1\n"
             effect = runtime.kernel.get_effect("invoice-write")

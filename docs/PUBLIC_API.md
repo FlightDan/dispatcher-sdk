@@ -14,6 +14,7 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 | `Dispatcher`, `Task` (package root) | Managed lifecycle, replay-safe submission, built-in inbox, result consumption and task activity reads |
 | `ExecutionActivity`, `ObservationOptions`, `StallPolicy`, `ManagedStallOptions` (package root or observability package) | Activity reporting, bounded observation storage and optional stall notifications or managed supervisor handling |
 | `BudgetEnvelope`, `ExecutionBudget`, `DeadlineConstraint` (package root or execution package) | Inherited deadline constraints and budget views |
+| `ApplicationBudget`, `BudgetError` (package root or `application_budget` module) | Durable application-owned reservation, settlement and reconciliation ledger; the host enforces receipts and provides authoritative metering |
 | `ChildCalls`, `HandlerChildren`, `ChildExecutionError` (execution package) | Bounded child execution and original child failure/result identity |
 | `BudgetClockUnknownError`, `ClockCheckpoint` (execution package) | Explicit unknown clock continuity and retained observed clock floors |
 | `DeploymentMismatchError`, `RecoveryRequiredError` (package root) | Structured startup and effect-recovery boundaries |
@@ -30,9 +31,12 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 | `ScriptSpec`, `script_handler`, `script_handlers` | Freeze inline scripts and register the process-only script handler |
 | `Orchestrator` | Explicit Run/task operations, atomic `submit_task`, paged reads, historical revisions, linked continuation, receipts and delivery |
 | `Orchestrator.reopen_run`, `inspect_reopen`, `get_recovery`, `advance_recovery`, `abort_recovery`, `renew_recovery`, `resume_recoveries`, `Orchestrator.upgrade_schema` | Same-Run terminal recovery with generation fencing, durable decision/activation progress, idempotent replay and explicit schema upgrade |
+| `Orchestrator.apply_managed_operations` | Controlled, atomic task operations, application state and optional subscription cursor update for an active resumed split-store Run; requires host authority and an exclusive lease. See [adoption guide](SPLIT_STORE_ADOPTION.md) |
 | `NotificationInbox`, `InboxLease`, `InboxRecord`, `InboxState` | Durable application acceptance and fenced transactional processing |
 | `RequestResultInbox`, `RequestResultIdentity`, `RequestResultObservation` | Stable request/result correlation with independent transport and explicit caller receipts |
 | `inspect_execution_origin`, `ExecutionOriginReport`, `ExecutionHandlerBinding` | Bounded read-only result/execution lookup of the original task, attempt and frozen binding in one store |
+| `inspect_run_diagnostics`, `RunDiagnosticReport` (orchestrator package) | Bounded read-only Run summary and task/wait pages from an Orchestrator store; Kernel and deployment remain unknown |
+| `inspect_legacy_execution_page` (orchestrator package) | Read-only, paged legacy Run execution mapping across two independently observed stores; verifies schema markers and cursor index only, not adoption eligibility or isolation. Requires Python 3.11+ for SQLite length limits |
 | `SandboxSpec`, `SandboxBackend`, `SandboxHandler`, `SandboxJournal`, `sandbox_handlers` | Frozen remote execution inputs, backend contract and persistent lifecycle recovery |
 | `inspect_storage`, `backup_database`, `export_database`, `inspect_storage_usage` (storage module) | Read-only deployment preflight, SQLite backup, SQL export and bounded capacity analysis |
 | `maintenance_lease`, `inspect_maintenance` (storage module) | Exclusive maintenance and coordination status |
@@ -55,6 +59,28 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 | `inspect_work_availability`, `WorkAvailabilityReport` | Read-only Run-scoped scheduling reasons; also available as an Orchestrator method |
 | `inspect_cancellation`, `CancellationRecoveryReport`, `ExecutionCancellationReport`, `CancellationFact` | Read-only phase and generation evidence; also available as an Orchestrator method |
 | `CancellationJournal`, `inspect_cancellation_journal`, `CancellationReceipt` (execution package) | Explicit, separate durable cancellation evidence component and its read-only reader |
+
+This table describes the current `0.7.3` candidate tree; it is not an API
+inventory of the released 0.7.2 artifact. See
+[development-tree integration](SDK_DEVELOPMENT_INTEGRATION.md) before relying
+on newer interfaces or schema versions.
+
+`ApplicationBudget` is separate from Kernel claim budgets. For an existing Run,
+`import_legacy()` requires the host's authoritative settled usage, the complete
+list of outstanding reservations and their source, obtained under the host's
+writer isolation. The ledger records this provenance; it cannot authenticate
+the source or meter an external provider. A new `reserve()` result indicates a
+reservation; its boolean is reusable and is not a fenced single-use permit.
+Replay is for reconciliation and does not grant another operation. Hosts must
+enforce a single operation and the live deadline, and record actual or unknown
+usage, then reconcile unknowns using authoritative evidence. An unresolved
+reservation blocks further reservations in that scope. This adapter does not
+automatically intercept external calls or prove a hard token or cost limit.
+Each scope admits at most 10,000 unarchived reservation records; the host can
+archive settled records in bounded batches while preserving request replay.
+The host must also maintain a trustworthy deadline
+clock, including across downtime; the stored clock watermark cannot detect a
+rollback that occurs before a later observation.
 
 See [execution activity and supervision](EXECUTION_OBSERVABILITY.md) for task
 reads, handler activity, child calls and managed stall handlers. These are
@@ -96,8 +122,8 @@ are separate identities:
 
 - Execution command/result contracts use `SCHEMA_VERSION = 2`. Unknown fields,
   invalid JSON values and conflicting identities are rejected.
-- Kernel SQLite storage uses schema 5 with its `kernel_schema_meta` marker.
-  The current development tree uses Orchestrator schema 4 and `sdk_*` tables;
+- Kernel SQLite storage uses schema 12 with its `kernel_schema_meta` marker.
+  The current development tree uses Orchestrator schema 6 and `sdk_*` tables;
   supported earlier schema 2/3 stores require an explicit copy upgrade.
   Older unversioned Orchestrator databases are incompatible and are not migrated
   automatically. Table layouts are implementation details, not a public SQL API.

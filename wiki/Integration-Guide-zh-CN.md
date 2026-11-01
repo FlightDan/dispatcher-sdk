@@ -10,19 +10,24 @@
 
 | 目标 | 先读 | 可运行示例 |
 | --- | --- | --- |
-| 运行一个托管本地任务 | [统一应用接口](../docs/MANAGED_APPLICATION.md) | [托管任务](../examples/managed_task.py) |
-| 查看执行活动并监督长时间任务 | [执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md) | [父子任务示例](../examples/execution_observability.py) |
-| 持久化执行函数 | [SDK](../docs/SDK.md) 与[公共 API](../docs/PUBLIC_API.md) | [重开后执行排队任务](../examples/kernel_task.py) |
-| 使用可重放身份提交任务 | [原子任务提交](../docs/TASK_SUBMISSION.md) | 该指南中的完整示例 |
-| 执行脚本并通知 Agent | [脚本与唤醒](../docs/SDK_SCRIPT_WAKEUPS.md)、[持久化收件箱](../docs/NOTIFICATION_INBOX.md) | [脚本回调](../examples/sdk_script_wakeup.py) |
-| 编排任务依赖 | [SDK 操作](../docs/SDK.md) | [依赖任务](../examples/dependent_tasks.py) |
-| 核对中断的外部操作 | [恢复](../docs/SDK_RECOVERY.md) | [Effect 恢复](../examples/effect_recovery.py) |
-| 原地继续失败或取消的 Run | [同 Run 恢复](../docs/SDK.md#reopen-a-failed-run-in-place) | SDK 指南中的代码 |
-| 校验 LLM 输出并安排修复 | [输出契约](../docs/SDK_OUTPUT_CONTRACTS.md) | 按该指南的应用校验流程接入 |
-| 消费审计事件 | [接入 FAQ](../docs/SDK_INTEGRATION_FAQ.md) | [持久化审计](../examples/durable_audit.py) |
-| 使用远程执行 | [沙箱运行时](../docs/SANDBOX_RUNTIME.md)、[适配器](../docs/SANDBOX_ADAPTERS.md) | 按指南配置对应服务 |
-| 查看 SQLite 积压和并发情况 | [SQLite 运维](../docs/SQLITE_OPERATIONS.md) | 在目标主机运行并发基准脚本 |
-| 激活本地恢复副本 | [本地恢复](../docs/LOCAL_RECOVERY.md) | [恢复演练](../examples/local_restore.py) |
+| 运行一个托管本地任务 | [统一应用接口](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/MANAGED_APPLICATION.md) | [托管任务](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/managed_task.py) |
+| 查看执行活动并监督长时间任务 | [执行观测与监督](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/EXECUTION_OBSERVABILITY.md) | [父子任务示例](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/execution_observability.py) |
+| 持久化执行函数 | [SDK](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK.md) 与[公共 API](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/PUBLIC_API.md) | [重开后执行排队任务](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/kernel_task.py) |
+| 使用可重放身份提交任务 | [原子任务提交](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/TASK_SUBMISSION.md) | 该指南中的完整示例 |
+| 执行脚本并通知 Agent | [脚本与唤醒](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_SCRIPT_WAKEUPS.md)、[持久化收件箱](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/NOTIFICATION_INBOX.md) | [脚本回调](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/sdk_script_wakeup.py) |
+| 编排任务依赖 | [SDK 操作](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK.md) | [依赖任务](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/dependent_tasks.py) |
+| 核对中断的外部操作 | [恢复](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_RECOVERY.md) | [Effect 恢复](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/effect_recovery.py) |
+| 以新 generation 重新打开符合条件的失败或取消 Run | [同 Run 恢复](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK.md#reopen-a-failed-run-in-place) | SDK 指南中的代码 |
+| 校验 LLM 输出并安排修复 | [输出契约](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_OUTPUT_CONTRACTS.md) | 按该指南的应用校验流程接入 |
+| 消费审计事件 | [接入 FAQ](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_INTEGRATION_FAQ.md) | [持久化审计](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/durable_audit.py) |
+| 使用远程执行 | [沙箱运行时](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_RUNTIME.md)、[适配器](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_ADAPTERS.md) | 按指南配置对应服务 |
+| 查看 SQLite 积压和并发情况 | [SQLite 运维](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SQLITE_OPERATIONS.md) | 在目标主机运行并发基准脚本 |
+| 激活本地恢复副本 | [本地恢复](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/LOCAL_RECOVERY.md) | [恢复演练](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/local_restore.py) |
+| 接入并修订分离存储中的旧 Run（仅开发中） | [跨库存储接入](../docs/SPLIT_STORE_ADOPTION.md)、[当前状态](Improvement-Status-zh-CN.md) | 真实宿主隔离和旧 Run 验收尚未完成 |
+
+上面的同 Run 恢复仅指在新 generation 下重新打开符合条件的失败或取消 Run。
+它不表示更完整的旧多任务 Run 接入、修订、激活和恢复流程已经通过验收；
+该流程仍属于尚未发布的开发版本。
 
 ## 接入实际业务前
 
@@ -46,12 +51,12 @@
 不能重新打开。
 
 恢复进度会持久化。进程重启后，Host 可以继续处理 prepared 或 committed 记录。
-当前 Orchestrator 使用 schema 4。旧存储需要按存储指南支持的步骤预检并复制升级，
+已发布的 0.7.2 使用 Orchestrator schema 4。旧存储需要按存储指南支持的步骤预检并复制升级，
 不能直接当作当前写库打开。
 
-复用旧存储前先看[存储与升级](../docs/STORAGE_AND_UPGRADES.md)：
+复用旧存储前先看[存储与升级](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/STORAGE_AND_UPGRADES.md)：
 0.7 不会自动迁移旧 Orchestrator 数据库。
-部署限制见 [Windows 状态](../docs/WINDOWS_RUNTIME.md)
-和 [Linux 清理验证](../docs/PROCESS_CLEANUP_VALIDATION.md)。
+部署限制见 [Windows 状态](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/WINDOWS_RUNTIME.md)
+和 [Linux 清理验证](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/PROCESS_CLEANUP_VALIDATION.md)。
 
-由 Agent 实现接入时，请从英文 [DocsforAgents](../DocsforAgents/README.md) 开始。
+由 Agent 实现接入时，请从英文 [DocsforAgents](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/DocsforAgents/README.md) 开始。

@@ -23,7 +23,7 @@
 工作诊断有 Effect 扫描上限；超过上限时计数为未知，不是零。
 
 执行观测也只读已记录的事实，不会领取任务、续租或清理进程。时限、子任务和可选停滞通知的
-说明见[执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md)。
+说明见[执行观测与监督](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/EXECUTION_OBSERVABILITY.md)。
 
 为 Runtime 显式配置 `cancellation_journal_path` 和 `source_id`，可以持久保存取消证据（之后用来核对取消结果的记录）。
 回执存放在独立的 schema 1（数据结构版本 1）数据库中，核心存储不会自动迁移。
@@ -37,4 +37,4 @@ ID 分开显示。缺失、格式错误或来自其他执行身份的 note 仍�
 也不会结清仍待处理的沙箱销毁义务。
 取消 Task 不会自动结束 Run。
 
-完整说明见 [API 指南](../docs/SDK_DIAGNOSTICS_AND_PROJECTIONS.md)、[回执存储设计](../docs/CANCELLATION_EVIDENCE.md)、[投影示例](../examples/projection_consumer.py)和[诊断示例](../examples/capability_diagnostics.py)。
+完整说明见 [API 指南](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_DIAGNOSTICS_AND_PROJECTIONS.md)、[回执存储设计](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/CANCELLATION_EVIDENCE.md)、[投影示例](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/projection_consumer.py)和[诊断示例](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/capability_diagnostics.py)。

@@ -1,21 +1,59 @@
 # Storage, upgrades, and deployment preflight
 
-The current development tree uses Orchestrator schema 4, retaining content-addressed
+The current development tree uses Orchestrator schema 6, retaining content-addressed
 application state, history and decision-event payloads. Earlier 0.6 development
 builds used schema 2. Ordinary opening never converts either legacy schema 2 or
-older unversioned orchestration databases; schema 3 also needs the explicit copy
-upgrade to schema 4. See
+older unversioned orchestration databases; schemas 3, 4 and 5 also need the explicit copy
+upgrade to schema 6. See
 [retention and maintenance APIs](STORAGE_RETENTION.md) for explicit copy upgrades.
 Opening an unsupported or damaged orchestration store raises an error instead
 of recreating missing tables. Kernel commands and results remain protocol V2.
-The current Kernel SQLite schema is 5, including managed control, execution
-budget/supervision records and write-ahead clock sampling guards; ordinary
+The current Kernel SQLite schema is 12, including managed control, execution
+budget/supervision records, lifecycle delivery obligations and write-ahead clock sampling guards; ordinary
 opening never upgrades older Kernel stores.
-`upgrade_storage` explicitly copies supported standalone Kernel schemas 2/3/4
+`upgrade_storage` explicitly copies supported standalone Kernel schemas 2–11
 and shared stores into the current layout while preserving historical rows.
 The copy does not activate the destination or move/rebind external observation,
-settlement or cleanup journals. Preserve those files and their original source
+settlement or cleanup journals. The copy upgrade alone does not adopt an existing
+Run into managed control. Preserve those files and their original source
 bindings; the original deployment remains responsible for unresolved work.
+Schema 9 adds exact execution/attempt/fence supervisor obligations. The copy
+upgrade cannot reconstruct an obligation for a supervisor launched before the
+upgrade; the host must retain and reconcile that historical cleanup evidence.
+
+The separate settlement journal uses schema 4 for a durable recovery scan
+position and lifecycle receipt namespace. Historical schema 2 and 3 journals
+remain readable through `SettlementJournal.open_readonly`; normal writable
+opening does not upgrade them. `SettlementJournal.upgrade_v2_copy` creates a
+schema 3 copy, followed by `SettlementJournal.upgrade_v3_copy` for schema 4;
+both preserve the source and its existing Kernel-path binding. Supply
+`settlement_journal_path` consistently to
+Runtime and independently created Orchestrator and diagnostic readers; an
+explicit Runtime destination must already exist and have the correct binding.
+Copying does not retire or fence the source or rebind the journal to a different
+Kernel path. The host must exclude old writers throughout the copy and switch,
+preserve the source, and ensure every process uses the selected destination.
+The copy operation by itself does not perform a coordinated cutover.
+
+When the copied Kernel has a different path, `copy_rebind_settlement` from
+`dispatcher_sdk.execution_kernel` creates a separate settlement copy bound to
+that destination. Its trusted host verifier receives the exact operation,
+source and destination paths, source identity and schema versions. The host
+must independently verify the Kernel copy relationship, preserve the identity
+of all files, and continuously exclude writers and file replacement through the
+later cutover. The SDK checks the host authorization before copying and before
+publication; it does not establish those host facts itself. Publication requires
+hard-link and directory-sync support. If a destination already exists, including
+after a lost acknowledgement, the operation fails closed and the host must
+reconcile it; a returned copy receipt does not activate a Run or retire a source.
+
+The recovery cursor is a scheduling position, not a receipt or a claim. The
+default recovery read limit is 256 KiB; larger valid receipts remain pending
+and report their required size through `settlement_recovery_diagnostic`. A host
+can configure `settlement_recovery_max_record_bytes` and
+`settlement_recovery_timeout_seconds` for automatic recovery, or call
+`recover_completions` with an adequate `max_record_bytes` and timeout. The
+diagnostic is a timestamped previous observation, not current settlement state.
 
 The notification inbox has its own schema version 1, recorded in
 `notification_inbox_meta`. Existing inbox tables must match that schema,
@@ -63,7 +101,7 @@ its writers before running it, then use `upgrade_storage` to publish a new file.
    input or state that the application explicitly chooses to carry forward.
 
 A backup or SQL dump preserves the source layout; restoring it does not convert
-an old Orchestrator schema into schema 4. There is no built-in in-place migration
+an old Orchestrator schema into schema 6. There is no built-in in-place migration
 for an unversioned store and no automatic replay into a new one. If Kernel and
 Orchestrator tables share one file, an unchanged Kernel schema does not make that
 file's old Orchestrator tables compatible with the new Orchestrator.
@@ -261,10 +299,11 @@ database space or erase delivery obligations.
 ## Validation status
 
 The Windows measurements below belong to the earlier candidate documented in
-[Windows runtime](WINDOWS_RUNTIME.md). Current schema-5, clock-guard and
+[Windows runtime](WINDOWS_RUNTIME.md). Earlier schema-5, clock-guard and
 observability acceptance is tracked in
 [the acceptance index](EXECUTION_OBSERVABILITY_ACCEPTANCE.md); the older suite
-does not validate those additions.
+does not validate those additions. That earlier evidence does not establish
+schema-8 or old Run adoption acceptance.
 
 The storage and inbox tests cover WAL-backed snapshots, refusal to overwrite,
 legacy SQL export, schema rejection, pending-command binding checks, fencing,

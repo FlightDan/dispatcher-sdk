@@ -42,6 +42,7 @@ _CLEANUP_SECONDS = 5.0
 _POLL_SECONDS = 0.01
 _KILL_ON_JOB_CLOSE = 0x2000
 _JOB_LIST_ATTRIBUTE = 0x0002000D
+_MAX_AUTHORITY_BYTES = 1024
 _CREATE_SUSPENDED = 0x00000004
 _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 _CREATE_NO_WINDOW = 0x08000000
@@ -126,6 +127,8 @@ class _WinAPI:
             "GetExitCodeProcess": ([H, ctypes.POINTER(D)], B),
             "IsProcessInJob": ([H, H, ctypes.POINTER(B)], B),
             "OpenProcess": ([D, B, D], H),
+            "GetCurrentProcess": ([], H),
+            "DuplicateHandle": ([H, H, H, ctypes.POINTER(H), D, B, D], B),
         }
         for name, (arguments, result) in signatures.items():
             function = getattr(self.dll, name)
@@ -179,11 +182,12 @@ def _create_suspended(api: _WinAPI, arguments: list[str], *,
         api.check(api.dll.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)),
                   "SetInformationJobObject(extended limits)")
         size = ctypes.c_size_t()
-        api.dll.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+        attribute_count = 1
+        api.dll.InitializeProcThreadAttributeList(None, attribute_count, 0, ctypes.byref(size))
         if not size.value:
             api.check(False, "InitializeProcThreadAttributeList(size)")
         attributes = ctypes.create_string_buffer(size.value)
-        api.check(api.dll.InitializeProcThreadAttributeList(attributes, 1, 0, ctypes.byref(size)),
+        api.check(api.dll.InitializeProcThreadAttributeList(attributes, attribute_count, 0, ctypes.byref(size)),
                   "InitializeProcThreadAttributeList")
         initialized = True
         jobs = (wintypes.HANDLE * 1)(job)
@@ -227,6 +231,7 @@ class WindowsProcessHandle:
         self._exitcode: Optional[int] = None
         self._worker_pid: Optional[int] = None
         self._worker_process: Any = None
+        self._retained_directory: str | None = None
 
     @property
     def revocation_reason(self) -> Optional[str]:
@@ -249,7 +254,7 @@ class WindowsProcessHandle:
             result = self._api.dll.ResumeThread(self._info.hThread)
             if result == 0xFFFFFFFF:
                 self._api.check(False, "ResumeThread")
-            self._api.dll.CloseHandle(self._info.hThread)
+            self._api.check(self._api.dll.CloseHandle(self._info.hThread), "CloseHandle worker thread")
             self._info.hThread = None
 
     def exited(self) -> bool:
@@ -364,17 +369,23 @@ class WindowsProcessHandle:
 
     def close(self) -> None:
         with self._lock:
-            if self._closed:
-                return
-            try:
+            if not self._closed:
                 if not self.terminate():
                     raise RuntimeError("Windows Job did not reach zero active processes")
-            finally:
-                for resource in (self._worker_process, self._info.hThread, self._info.hProcess, self._job):
+                # Commit each successful release individually. A failed close
+                # must retain that handle for retry without closing an already
+                # released (and potentially reused) numeric handle twice.
+                for owner, name in ((self, "_worker_process"), (self._info, "hThread"),
+                                    (self._info, "hProcess"), (self, "_job")):
+                    resource = getattr(owner, name)
                     if resource:
-                        self._api.dll.CloseHandle(resource)
-                self._worker_process = None
+                        self._api.check(self._api.dll.CloseHandle(resource), "CloseHandle " + name)
+                        setattr(owner, name, None)
                 self._closed = True
+            directory = getattr(self, "_retained_directory", None)
+            if directory is not None:
+                shutil.rmtree(directory)
+                self._retained_directory = None
 
 
 class _Watchdog:
@@ -396,6 +407,8 @@ class _Watchdog:
                 ticks.argtypes, ticks.restype = [], ctypes.c_ulonglong
                 self._elapsed_clock = lambda: ticks() / 1000.
         self.cleanup = False
+        self.business_phase = False
+        self.business_cutoff = False
         self.clock_error: BudgetClockUnknownError | None = None
         self.lock = threading.Lock()
         try:
@@ -450,10 +463,11 @@ class _Watchdog:
             return min(self.inherited_hard_deadline, self._bound_locked(deadline, hard=True))
 
     def business_deadline(self, seconds: float, *, envelope: BudgetEnvelope | None = None,
-                          deadline: float | None = None) -> float:
+                          deadline: float | None = None, entered: bool = False) -> float:
         with self.lock:
             if self.expired or time.monotonic() >= self.deadline:
                 self.expired = True
+                self.business_cutoff = self.business_phase
                 self.changed.set()
                 return self.deadline
             if envelope is not None:
@@ -465,6 +479,7 @@ class _Watchdog:
             self._retain_sample_locked()
             self.deadline = min(self.inherited_work_deadline, self._bound_locked(
                 time.monotonic() + seconds if deadline is None else deadline))
+            self.business_phase = entered
             self.changed.set()
             return self.deadline
 
@@ -492,6 +507,7 @@ class _Watchdog:
                 self.changed.clear()
                 if remaining <= 0:
                     self.expired = True
+                    self.business_cutoff = self.business_phase and not self.cleanup
             if remaining > 0:
                 self.changed.wait(min(remaining, 0.05))
                 continue
@@ -523,7 +539,7 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 @contextmanager
-def _worker_directory():
+def _worker_directory(retained=None):
     directory = tempfile.mkdtemp(prefix="dispatcher-windows-")
     primary_failure = None
     try:
@@ -532,32 +548,86 @@ def _worker_directory():
         primary_failure = (error, error.__traceback__)
         raise
     finally:
-        # Containment is checked before leaving this scope. A separate process
-        # (for example a file scanner) can still briefly hold a diagnostic file.
-        deadline = time.monotonic() + _CLEANUP_SECONDS
-        while True:
-            try:
-                # Older TemporaryDirectory cleanup can replace a sharing
-                # violation with NotADirectoryError while handling the error.
-                shutil.rmtree(directory)
-                break
-            except BaseException as error:
-                if (isinstance(error, PermissionError) and getattr(error, "winerror", None) in (32, 33)
-                        and time.monotonic() < deadline):
-                    time.sleep(_POLL_SECONDS)
-                    continue
-                if primary_failure is not None:
-                    original, original_traceback = primary_failure
-                    # Preserve an earlier native-cleanup cause if directory
-                    # cleanup also fails while the same primary propagates.
-                    try:
-                        if (error is not original and error.__cause__ is None
-                                and original.__cause__ is not error):
-                            error.__cause__ = original.__cause__
-                    except BaseException:
-                        pass
-                    raise original.with_traceback(original_traceback) from error
-                raise
+        if not (retained is not None and retained[0]):
+            # Containment is checked before leaving this scope. A separate process
+            # (for example a file scanner) can still briefly hold a diagnostic file.
+            deadline = time.monotonic() + _CLEANUP_SECONDS
+            while True:
+                try:
+                    # Older TemporaryDirectory cleanup can replace a sharing
+                    # violation with NotADirectoryError while handling the error.
+                    shutil.rmtree(directory)
+                    break
+                except BaseException as error:
+                    if (isinstance(error, PermissionError) and getattr(error, "winerror", None) in (32, 33)
+                            and time.monotonic() < deadline):
+                        time.sleep(_POLL_SECONDS)
+                        continue
+                    if primary_failure is not None:
+                        original, original_traceback = primary_failure
+                        # Preserve an earlier native-cleanup cause if directory
+                        # cleanup also fails while the same primary propagates.
+                        try:
+                            if (error is not original and error.__cause__ is None
+                                    and original.__cause__ is not error):
+                                error.__cause__ = original.__cause__
+                        except BaseException:
+                            pass
+                        raise original.with_traceback(original_traceback) from error
+                    raise
+
+
+def _finish_worker_handle(handle, contained, retained_directory, directory, on_finished):
+    """Keep the handle and directory owned until both containment and close succeed."""
+    closed = False
+    try:
+        if contained:
+            handle.close()
+            closed = True
+    finally:
+        if not closed:
+            retained_directory[0] = True
+            handle._retained_directory = directory
+        elif on_finished is not None:
+            on_finished(handle)
+
+
+def _duplicate_worker_authority(api, handle, native_handle: int) -> int:
+    """Give only the suspended worker a pipe reader, or fail closed."""
+    with handle._lock:
+        if handle._closed or handle._contained or handle._revocation_reason is not None:
+            raise RuntimeError("protected worker stopped before authority handoff")
+        target_handle = wintypes.HANDLE()
+        api.check(api.dll.DuplicateHandle(api.dll.GetCurrentProcess(), native_handle,
+            handle._info.hProcess, ctypes.byref(target_handle), 0, True, 2),
+            "DuplicateHandle protected worker authority")
+        if not target_handle.value:
+            raise RuntimeError("protected worker authority handle unavailable")
+        return int(target_handle.value)
+
+
+@contextmanager
+def _authority_pipe(authority_verifier, worker_credential):
+    """Own both ends until the inheritable reader is handed to a child."""
+    try:
+        data = pickle.dumps((authority_verifier, worker_credential), protocol=4)
+    except Exception:
+        raise RuntimeError("protected worker authority serialization failed") from None
+    if len(data) > _MAX_AUTHORITY_BYTES:
+        raise ValueError("protected worker authority exceeds transport limit")
+    import msvcrt
+    read_fd, write_fd = os.pipe()
+    try:
+        native_handle = msvcrt.get_osfhandle(read_fd)
+        if os.write(write_fd, data) != len(data):
+            raise RuntimeError("protected worker authority pipe write incomplete")
+        os.close(write_fd)
+        write_fd = None
+        yield native_handle
+    finally:
+        os.close(read_fd)
+        if write_fd is not None:
+            os.close(write_fd)
 
 
 def _worker_main(directory: str) -> None:
@@ -571,6 +641,10 @@ def _worker_main(directory: str) -> None:
         # Pickles are private, trusted runtime input, never accepted remotely.
         # User imports/unpickling happen only after atomic Job assignment.
         request = pickle.loads((root / "request.pickle").read_bytes())
+        authority_handle = None
+        if request.get("authority_required"):
+            authority_handle = int((root / "authority_handle").read_text(encoding="ascii"))
+            os.set_handle_inheritable(authority_handle, False)
         sys.path[:] = request["sys_path"]
         if request["main_module"] or request["main_path"]:
             import runpy
@@ -583,8 +657,23 @@ def _worker_main(directory: str) -> None:
             module.__dict__.update(main)
             sys.modules["__main__"] = sys.modules["__mp_main__"] = module
         handler, command, lease, now, envelope, service_spec = pickle.loads(request["invocation"])
+        authority_verifier = worker_credential = None
+        if authority_handle is not None:
+            # The inherited read handle is the only authority transport. Its
+            # parent write end is already closed; no credential reaches disk.
+            import msvcrt
+            fd = msvcrt.open_osfhandle(authority_handle, os.O_RDONLY)
+            try:
+                with os.fdopen(fd, "rb") as pipe:
+                    authority_data = pipe.read(_MAX_AUTHORITY_BYTES + 1)
+                if len(authority_data) > _MAX_AUTHORITY_BYTES:
+                    raise ValueError("authority payload too large")
+                authority_verifier, worker_credential = pickle.loads(authority_data)
+            except Exception:
+                raise RuntimeError("protected worker authority bootstrap failed") from None
         stage = "worker_setup"
-        kernel = SQLiteKernel(request["db_path"], now=now, durability=request["durability"])
+        kernel = SQLiteKernel(request["db_path"], now=now, durability=request["durability"],
+                              authority_verifier=authority_verifier, worker_credential=worker_credential)
         effects = HandlerEffects(kernel, lease, lambda: True)
         context = HandlerContext(command, lease, effects,
                                  budget_envelope=envelope, service_spec=service_spec)
@@ -675,6 +764,8 @@ def invoke_windows_handler(
     on_entered: Optional[Callable[[dict[str, Any]], None]] = None,
     on_phase: Optional[Callable[[str, dict[str, Any]], None]] = None,
     capture_budget: Any = None,
+    authority_verifier: Any = None,
+    worker_credential: Any = None,
 ) -> dict[str, Any]:
     """Spawn one native Windows worker and publish only after Job containment."""
     profile = validate_durability(durability)
@@ -694,13 +785,16 @@ def invoke_windows_handler(
         start_deadline = tracker.bound(time.monotonic() + start_timeout)
         budget_envelope = tracker.envelope
     except BudgetClockUnknownError as exc:
+        _observe_phase(on_phase, 'supervisor_not_invoked', {'source': 'runtime_pre_spawn'})
         return publish({"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
                                "control_error": True, "retryable": False, "effect_ids": [],
                                "details": _control_error_details(exc.__cause__ or exc)}, tracker.envelope)
     if start_deadline <= time.monotonic():
+        _observe_phase(on_phase, 'supervisor_not_invoked', {'source': 'runtime_pre_spawn'})
         return publish({"kind": "timeout", "phase": "admission", "effect_ids": []}, budget_envelope)
     api = _WinAPI()
-    with _worker_directory() as directory:
+    retained_directory = [False]
+    with _worker_directory(retained_directory) as directory:
         root = Path(directory)
         main = sys.modules.get("__main__")
         main_path = getattr(main, "__file__", None)
@@ -711,6 +805,7 @@ def invoke_windows_handler(
             main_path = None
         request = {"db_path": os.path.abspath(db_path), "durability": profile,
                    "sys_path": list(sys.path), "main_path": main_path, "main_module": main_module,
+                   "authority_required": authority_verifier is not None or worker_credential is not None,
                    "invocation": pickle.dumps((handler, command, lease, now, budget_envelope, service_spec), protocol=4)}
         (root / "request.pickle").write_bytes(pickle.dumps(request, protocol=4))
         # sys.path may be configured by an embedder/test runner without PYTHONPATH.
@@ -727,6 +822,7 @@ def invoke_windows_handler(
         entry = None
         invocation_permitted = False
         work_expired = False
+        completion_timestamp_unknown = False
         native_cutoff = None
         outcome = None
         contained_at = None
@@ -772,6 +868,13 @@ def invoke_windows_handler(
                 registered = bool(on_started(handle))
                 if not registered:
                     handle.revoke("runtime_closed")
+            if ((authority_verifier is not None or worker_credential is not None)
+                    and not watchdog.expired and handle.revocation_reason is None):
+                # Duplicate a non-inheritable host handle directly into the
+                # suspended target. No unrelated host spawn can inherit it.
+                with _authority_pipe(authority_verifier, worker_credential) as native_handle:
+                    target_handle = _duplicate_worker_authority(api, handle, native_handle)
+                    _atomic_write(root / "authority_handle", str(target_handle))
             handle.resume()
             while not watchdog.expired and handle.revocation_reason is None:
                 if not invocation_permitted and (root / "ready").exists():
@@ -805,7 +908,7 @@ def invoke_windows_handler(
                                                 actual.checkpoint, actual.started_at)
                         budget_envelope = actual
                     deadline = watchdog.business_deadline(command.timeout_seconds, envelope=budget_envelope,
-                                                         deadline=entry["deadline_monotonic"])
+                                                         deadline=entry["deadline_monotonic"], entered=True)
                     if budget_envelope is not None:
                         tracker.entered(budget_envelope)
                     hard_deadline = watchdog.hard_deadline_bound(entry["hard_deadline_monotonic"])
@@ -820,8 +923,10 @@ def invoke_windows_handler(
                         time.sleep(_POLL_SECONDS)
                         continue
                     completed = completion.get("completed_monotonic")
-                    if (deadline is None or type(completed) not in {int, float} or not math.isfinite(completed)
-                            or completed >= deadline):
+                    if deadline is None or type(completed) not in {int, float} or not math.isfinite(completed):
+                        completion_timestamp_unknown = True
+                        break
+                    if completed >= deadline:
                         work_expired = True
                         break
                     outcome = json.loads(completion["outcome_json"])
@@ -894,7 +999,8 @@ def invoke_windows_handler(
                             outcome = available
                             if name == "returned.json":
                                 returned = timely
-                                work_expired = not timely
+                                work_expired = (deadline is not None and type(completed) in {int, float}
+                                                and math.isfinite(completed) and not timely)
                                 if returned:
                                     watchdog.cleanup_deadline(hard_deadline if hard_deadline is not None else deadline)
                                 continue
@@ -919,10 +1025,12 @@ def invoke_windows_handler(
             primary_failure = (exc, exc.__traceback__)
             raise
         finally:
+            contained = False
             try:
                 try:
                     if not handle.terminate():
                         raise RuntimeError("Windows Job did not reach zero active processes")
+                    contained = True
                     contained_at = time.monotonic()
                     if on_cleanup_confirmed is not None:
                         on_cleanup_confirmed()
@@ -931,11 +1039,7 @@ def invoke_windows_handler(
                         if watchdog is not None:
                             watchdog.close()
                     finally:
-                        try:
-                            handle.close()
-                        finally:
-                            if registered and on_finished is not None:
-                                on_finished(handle)
+                        _finish_worker_handle(handle, contained, retained_directory, directory, on_finished)
             except BaseException as exc:
                 primary = (primary_failure if primary_failure is not None else
                            publication_error[1:] if publication_error is not None else None)
@@ -969,6 +1073,20 @@ def invoke_windows_handler(
                     watchdog.clock_error = exc
         if handle.revocation_reason is not None:
             return publish({"kind": "authority_revoked", "reason": handle.revocation_reason, "effect_ids": []}, budget_envelope, entry)
+        def return_observation():
+            try:
+                path = root / "returned.json"
+                if path.stat().st_size > 256 * 1024:
+                    return {"state": "unknown", "reason": "return_packet_exceeds_bound"}
+                return {"state": "observed", "returned_json": path.read_text(encoding="utf-8")}
+            except (OSError, UnicodeError) as exc:
+                return {"state": "unknown", "reason": type(exc).__name__}
+        if completion_timestamp_unknown:
+            return publish({"kind": "error", "code": "handler_completion_time_unknown",
+                            "message": "worker completion timestamp is missing or invalid",
+                            "control_error": True, "completion_time_known": False,
+                            "supervisor_return_observation": return_observation(),
+                            "retryable": False, "effect_ids": []}, budget_envelope, entry)
         known_work_expired = (not returned and budget_envelope is not None and
             budget_envelope.view(sample=budget_envelope.checkpoint).remaining_work_seconds == 0)
         native_cutoff_expired = (native_cutoff is not None and (native_cutoff.hard or not returned))
@@ -1033,7 +1151,41 @@ def invoke_windows_handler(
                     watchdog.clock_error.__cause__ or watchdog.clock_error)
                 if native_cutoff is not None:
                     timeout["budget_capture_error"]["native_cutoff"] = native_cutoff.to_dict()
-            return publish(timeout, budget_envelope, entry)
+            # After containment no writer remains. A return published before
+            # the watchdog fired may not have been read by the driver loop.
+            # Never resolve the obligation if that packet is timely or its
+            # timing cannot be established against the entered work bound.
+            return_allows_cutoff = False
+            observation = return_observation()
+            try:
+                if observation["state"] == "observed":
+                    returned_packet = json.loads(observation["returned_json"])
+                    returned_at = returned_packet.get("completed_monotonic")
+                    return_allows_cutoff = (watchdog is not None and watchdog.business_phase
+                        and deadline is not None and type(returned_at) in {int, float}
+                        and math.isfinite(returned_at) and returned_at >= deadline)
+                elif observation.get("reason") == "FileNotFoundError":
+                    return_allows_cutoff = root.is_dir()
+            except (ValueError, TypeError, AttributeError):
+                pass
+            if not return_allows_cutoff:
+                return publish({"kind": "error", "code": "handler_completion_disposition_unknown",
+                                "message": "worker return cannot be resolved as a proven timeout",
+                                "control_error": True, "completion_time_known": False,
+                                "supervisor_return_observation": observation,
+                                "retryable": False, "effect_ids": []},
+                               budget_envelope, entry)
+            published = publish(timeout, budget_envelope, entry)
+            proven_cutoff = (entry is not None and not returned and
+                (known_work_expired or (work_expired and watchdog is not None and watchdog.business_phase) or
+                 (native_cutoff is not None and not native_cutoff.hard) or
+                 (watchdog is not None and watchdog.expired and watchdog.business_cutoff and not watchdog.cleanup
+                  and getattr(watchdog, 'clock_error', None) is None)))
+            if (contained and proven_cutoff and return_allows_cutoff and published.get('kind') == 'timeout'
+                    and not published.get('control_error') and published.get('budget_capture_error') is None
+                    and (watchdog is None or getattr(watchdog, 'clock_error', None) is None)):
+                _observe_phase(on_phase, 'supervisor_result_accepted', {})
+            return published
         # The worker can atomically publish between the loop's file check and
         # its exit check. After containment no writer remains, so recover that
         # final publication without weakening cancellation or deadline checks.
@@ -1053,7 +1205,12 @@ def invoke_windows_handler(
             if (entry is None and outcome.get("code") == "handler_process_start_failure"
                     and type(outcome.get("details")) is dict and outcome["details"].get("exception_type")):
                 _observe_phase(on_phase, "worker_bootstrap_failed", outcome["details"])
-            return publish(outcome, budget_envelope, entry)
+            published = publish(outcome, budget_envelope, entry)
+            if (contained and returned and entry is not None and published.get('kind') in ('ok', 'error')
+                    and not published.get('control_error') and published.get('budget_capture_error') is None
+                    and (watchdog is None or getattr(watchdog, 'clock_error', None) is None)):
+                _observe_phase(on_phase, 'supervisor_result_accepted', {})
+            return published
         return publish({"kind": "error", "code": "handler_process_exit" if deadline else "handler_process_start_failure",
                 "message": "Windows worker exited without a completed outcome",
                 "retryable": False, "details": {"exitcode": handle.exitcode, "stderr_tail": tail},

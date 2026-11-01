@@ -85,7 +85,7 @@ class StallSupervisor:
                     "policy_id": policy.policy_id, "version": policy.version}
         if (identity.attempt, identity.fence) != (authority["attempt"], authority["fence"]):
             raise ObservationError("subscription identity is stale")
-        with self.journal._transaction() as (connection, now):
+        with self.journal._transaction(operation="stall.watch") as (connection, now):
             existing = connection.execute("SELECT * FROM obs_policies WHERE policy_id=? AND version=? AND execution_id=? AND attempt=? AND fence=?",
                                           (policy.policy_id, policy.version, *identity_key)).fetchone()
             if existing is not None:
@@ -137,7 +137,7 @@ class StallSupervisor:
             # A short sidecar control transaction serializes desired policy
             # selection. It is separate from all per-byte capture and can be
             # recovered if Kernel selection committed before this commit.
-            with self.journal._transaction() as (connection, _):
+            with self.journal._transaction(operation="stall._select_policies") as (connection, _):
                 current = connection.execute("SELECT state,revision FROM obs_policies WHERE policy_id=? AND version=? AND execution_id=? AND attempt=? AND fence=?",
                                              (row["policy_id"], row["version"], row["execution_id"], row["attempt"], row["fence"])).fetchone()
                 if current["state"] not in ("registering_policy", "pending_execution") or current["revision"] != row["revision"]:
@@ -273,7 +273,7 @@ class StallSupervisor:
             reason = "metric_counter_regressed"
         now = sample.wall_at
         key = (row["policy_id"], row["version"], row["execution_id"], row["attempt"], row["fence"])
-        with self.journal._transaction() as (connection, _):
+        with self.journal._transaction(operation="stall._evaluate") as (connection, _):
             current = connection.execute("SELECT * FROM obs_policies WHERE policy_id=? AND version=? AND execution_id=? AND attempt=? AND fence=?", key).fetchone()
             if current["revision"] != row["revision"] or current["state"] != "active":
                 return
@@ -369,7 +369,7 @@ class StallSupervisor:
             except Exception as error:
                 self._last_error = f"{type(error).__name__}: {error}"
                 continue
-            with self.journal._transaction() as (connection, _):
+            with self.journal._transaction(operation="stall._clear_pending") as (connection, _):
                 changed = connection.execute("UPDATE obs_episodes SET state=? WHERE episode_id=? AND state='ending'",
                                              (details["end_state"], row["episode_id"])).rowcount
                 if changed:
@@ -387,13 +387,13 @@ class StallSupervisor:
                 current = self.kernel.supervision_status(row["execution_id"])
                 stale = ((current["attempt"], current["fence"]) != (row["attempt"], row["fence"])
                          or current["progress_revision"] != row["progress_revision"] or current["execution_state"] != "running")
-                with self.journal._transaction() as (connection, now):
+                with self.journal._transaction(operation="stall._register_pending") as (connection, now):
                     if stale:
                         self._end_episode(connection, row["episode_id"], now, "superseded")
                     else:
                         connection.execute("UPDATE obs_outbox SET last_error=? WHERE episode_id=?", (_json({"type": type(error).__name__, "message": str(error)}), row["episode_id"]))
                 continue
-            with self.journal._transaction() as (connection, _):
+            with self.journal._transaction(operation="stall._register_pending") as (connection, _):
                 changed = connection.execute("UPDATE obs_episodes SET state='active' WHERE episode_id=? AND state='registering'", (row["episode_id"],)).rowcount
                 if changed:
                     connection.execute("UPDATE obs_outbox SET state='pending',last_error=NULL,revision=revision+1 WHERE episode_id=? AND state='awaiting_authority'", (row["episode_id"],))
@@ -405,7 +405,7 @@ class StallSupervisor:
         if not self._delivery_lock.acquire(blocking=False):
             return {"state": "pending", "reason": "delivery_capacity_occupied"}
         try:
-            with self.journal._transaction() as (connection, now):
+            with self.journal._transaction(operation="stall.deliver_pending") as (connection, now):
                 connection.execute("UPDATE obs_outbox SET state=CASE WHEN attempts>=max_attempts THEN 'dead' ELSE 'pending' END,"
                                    "lease_id=NULL,owner=NULL,expires_at=NULL,next_attempt_at=?,revision=revision+1 "
                                    "WHERE state='delivering' AND expires_at<=?", (now, now))
@@ -427,7 +427,7 @@ class StallSupervisor:
                 error = {"type": type(caught).__name__,
                     "message": raw_message[:1024].decode("utf-8", errors="ignore"),
                     "truncated": len(raw_message) > 1024}
-            with self.journal._transaction() as (connection, now):
+            with self.journal._transaction(operation="stall.deliver_pending") as (connection, now):
                 current = connection.execute("SELECT * FROM obs_outbox WHERE notification_id=?", (row["notification_id"],)).fetchone()
                 if current["state"] != "delivering" or current["lease_id"] != lease_id or current["expires_at"] <= now:
                     return {"state": "stale", "notification_id": row["notification_id"]}
@@ -440,7 +440,7 @@ class StallSupervisor:
             self._delivery_lock.release()
 
     def retry_dead(self, notification_id: str, *, expected_revision: int) -> dict[str, Any]:
-        with self.journal._transaction() as (connection, now):
+        with self.journal._transaction(operation="stall.retry_dead") as (connection, now):
             row = connection.execute("SELECT * FROM obs_outbox WHERE notification_id=?", (notification_id,)).fetchone()
             if row is None:
                 raise KeyError(notification_id)

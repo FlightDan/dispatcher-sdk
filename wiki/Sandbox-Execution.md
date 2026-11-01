@@ -42,6 +42,6 @@ Real-container validation covered the full adapter flow, response-loss probes,
 nonzero exit, truncation and quoted artifact paths. It is functional evidence,
 not a production security or performance certification.
 
-Read the [runtime contract](../docs/SANDBOX_RUNTIME.md),
-[adapter limits](../docs/SANDBOX_ADAPTERS.md) and
-[validation record](../docs/OPENSANDBOX_VALIDATION.md) before deployment.
+Read the [runtime contract](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_RUNTIME.md),
+[adapter limits](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_ADAPTERS.md) and
+[validation record](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/OPENSANDBOX_VALIDATION.md) before deployment.

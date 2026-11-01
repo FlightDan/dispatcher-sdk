@@ -37,6 +37,10 @@ _EXECUTION_STATES = (
 _OUTBOX_STATES = ("pending", "delivering", "delivered", "dead")
 _NOTIFICATION_STATES = ("pending", "delivering", "delivered", "dead")
 _INBOX_STATES = ("pending", "processing", "consumed", "dead")
+_DIAGNOSTIC_TABLES = (
+    "kernel_executions", "kernel_result_outbox", "sdk_schema_meta", "sdk_outbox",
+    "sdk_watches", "sdk_notifications", "notification_inbox_messages",
+)
 
 
 class _Snapshot:
@@ -100,7 +104,11 @@ def _state_counts(
     snapshot: _Snapshot, table: str, states: tuple[str, ...]
 ) -> dict[str, int]:
     # table is selected only from fixed SDK table names in this module.
-    rows = snapshot.rows(f"SELECT state,COUNT(*) FROM {table} GROUP BY state")
+    placeholders = ",".join("?" for _ in states)
+    rows = snapshot.rows(
+        f"SELECT state,COUNT(*) FROM {table} WHERE state IN ({placeholders}) GROUP BY state",
+        states,
+    )
     observed = {str(row[0]): int(row[1]) for row in rows}
     return {state: observed.get(state, 0) for state in states}
 
@@ -291,7 +299,9 @@ def collect_sqlite_diagnostics(
             tables = {
                 str(row[0])
                 for row in snapshot.rows(
-                    "SELECT name FROM sqlite_schema WHERE type='table'"
+                    "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ("
+                    + ",".join("?" for _ in _DIAGNOSTIC_TABLES) + ")",
+                    _DIAGNOSTIC_TABLES,
                 )
             }
             page_size = int(snapshot.value("PRAGMA page_size"))

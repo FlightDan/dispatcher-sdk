@@ -811,7 +811,7 @@ class CompletionClockTests(unittest.TestCase):
                         path = self.root / ("malformed-"+str(index)+"-"+scalar_type+".sqlite3")
                         with sqlite3.connect(path) as writer:
                             writer.execute("CREATE TABLE kernel_schema_meta(component,schema_version)")
-                            writer.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',5)")
+                            writer.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',10)")
                             writer.execute("CREATE TABLE kernel_clock(singleton,watermark)")
                             writer.execute("INSERT INTO kernel_clock VALUES(1,?)", (self.floor(),))
                             writer.execute("CREATE TABLE kernel_executions(execution_id,attempt,fence)")

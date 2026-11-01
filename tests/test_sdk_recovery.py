@@ -282,6 +282,32 @@ class SDKRecoveryTests(unittest.TestCase):
         limits = self.runtime.kernel.get_execution_limits("execution")
         self.assertEqual(limits["entry_state"], "confirmed")
         self.assertIsNotNone(limits["envelope"]["started_at"])
+        # The spawned process owned the thread-mode producer and was joined
+        # above. Recover only that exact generation, while recording that its
+        # final diagnostic evidence may have been lost with the process.
+        kernel = self.runtime.kernel
+        producers = kernel.lifecycle_list_open_producers()['producers']
+        matches = [p for p in producers if (p['execution_id'], p['attempt'], p['fence']) ==
+                   (running.execution_id, running.attempt, running.fence)]
+        self.assertEqual(len(matches), 1)
+        token = matches[0]['token']
+        journal = self.runtime._settlement_journal
+        def verify(credential, operation, identity, event):
+            proof = (event or {}).get('proof', {})
+            committed = operation == 'ack' and journal.lifecycle_receipt_committed(
+                {key: identity[key] for key in ('execution_id', 'attempt', 'fence')},
+                event['phase'], event['payload'], store_id=event['store_id'],
+                outbox_sequence=event['sequence'])
+            return {'allowed': True, 'expires_at': kernel._wall_time() + 1000,
+                    'producer_dead': operation == 'recover' and proof.get('joined') is True,
+                    'evidence_unknown_acknowledged': proof.get('unknown_acknowledged') is True,
+                    'receiver_committed': committed}
+        kernel._lifecycle_verifier = verify
+        identity = (running.execution_id, running.attempt, running.fence)
+        self.assertTrue(kernel.lifecycle_recover_producer(token,
+            {'joined': True, 'unknown_acknowledged': True}, identity=identity))
+        self.runtime._retry_diagnostic_notes(time.monotonic() + 2, wait_for_writer=True)
+        self.assertIsNone(kernel.lifecycle_peek(execution_id=running.execution_id))
         return running
 
     def assert_effect_replay(self, running):

@@ -273,7 +273,8 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
                 # it proves expiry even with a coarse native monotonic clock.
                 expiry = time.monotonic() + timeout_seconds
                 yield actual
-                if options.get('write') and not expired_bodies:
+                if (options.get('write') and not expired_bodies
+                        and actual.execute('SELECT state FROM settlement_records').fetchone()[0] == 'recorded'):
                     # The real UPDATE has run. Expire its existing pre-COMMIT
                     # window so the production guard must roll it back.
                     expired_bodies.append({'timeout_seconds': timeout_seconds,

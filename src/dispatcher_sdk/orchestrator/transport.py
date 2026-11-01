@@ -12,6 +12,110 @@ from .contracts import OrchestrationError, TERMINAL, canonical, integer
 
 
 class TransportMixin:
+    def _acquire_dispatch_permit(self, row, intent):
+        """Serialize dispatch permission with the Orchestrator control barrier."""
+        identity_reader = getattr(self.kernel, "kernel_store_identity", None)
+        if not callable(identity_reader):
+            raise OrchestrationError("managed dispatch Kernel identity is unknown")
+        kernel_store_id = identity_reader()
+        if type(kernel_store_id) is not str or not kernel_store_id:
+            raise OrchestrationError("managed dispatch Kernel identity is unknown")
+        with self._transaction() as connection:
+            control = connection.execute(
+                "SELECT m.control_state,m.control_epoch,m.generation,t.drain_execution_ids "
+                "FROM sdk_managed_runs m JOIN sdk_managed_control_transitions t "
+                "ON t.run_id=m.run_id AND t.control_epoch=m.control_epoch WHERE m.run_id=?",
+                (row["run_id"],),
+            ).fetchone()
+            if control is None:
+                raise OrchestrationError("managed dispatch control is missing")
+            generation = int(intent.get("generation", 0))
+            if control["generation"] != generation:
+                return False
+            allowed = (control["control_state"] == "active" or
+                       (control["control_state"] == "pausing" and
+                        intent["execution_id"] in json.loads(control["drain_execution_ids"])))
+            if not allowed:
+                return False
+            previous = connection.execute(
+                "SELECT * FROM sdk_dispatch_permits WHERE sequence=?", (row["sequence"],)
+            ).fetchone()
+            if previous is not None:
+                if (previous["run_id"], previous["execution_id"], previous["generation"]) != (
+                        row["run_id"], intent["execution_id"], generation):
+                    raise OrchestrationError("dispatch permit identity mismatch")
+                if previous["kernel_store_id"] != kernel_store_id:
+                    raise OrchestrationError("dispatch permit Kernel identity changed")
+                return "accepted" if previous["state"] == "accepted" else None
+            now = float(self.clock())
+            connection.execute(
+                "INSERT INTO sdk_dispatch_permits VALUES(?,?,?,?,?,?,'in_flight',?,?)",
+                (row["sequence"], row["run_id"], intent["execution_id"], generation,
+                 control["control_epoch"], kernel_store_id, now, now),
+            )
+            return "new"
+
+    def _finish_dispatch_permit(self, sequence, state):
+        kernel_store_id = None
+        if state == "accepted":
+            identity_reader = getattr(self.kernel, "kernel_store_identity", None)
+            if not callable(identity_reader):
+                raise OrchestrationError("managed dispatch Kernel identity is unknown")
+            kernel_store_id = identity_reader()
+        with self._transaction() as connection:
+            if state == "accepted":
+                row = connection.execute("SELECT kernel_store_id FROM sdk_dispatch_permits WHERE sequence=?", (sequence,)).fetchone()
+                if row is None or row[0] != kernel_store_id:
+                    raise OrchestrationError("dispatch permit Kernel identity changed")
+            connection.execute(
+                "UPDATE sdk_dispatch_permits SET state=?,updated_at=? "
+                "WHERE sequence=? AND state!='accepted'",
+                (state, float(self.clock()), sequence),
+            )
+
+    def reconcile_dispatch_permits(self, run_id, *, limit=100):
+        """Record exact Kernel receipts; missing or inaccessible receipts remain unknown."""
+        integer(limit, "limit")
+        if limit < 1:
+            raise OrchestrationError("limit must be positive")
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT p.sequence,p.generation,p.kernel_store_id,o.payload FROM sdk_dispatch_permits p "
+                "JOIN sdk_outbox o ON o.sequence=p.sequence "
+                "WHERE p.run_id=? AND p.state!='accepted' ORDER BY p.sequence LIMIT ?",
+                (run_id, limit),
+            ).fetchall()
+        finally:
+            connection.close()
+        accepted = 0
+        for row in rows:
+            intent = json.loads(row["payload"])
+            try:
+                if self.kernel.kernel_store_identity() != row["kernel_store_id"]:
+                    raise OrchestrationError("dispatch permit Kernel identity changed")
+                command = self._delivery_command(intent)
+                provenance_reader = getattr(self.kernel, "managed_admission_provenance", None)
+                if callable(provenance_reader):
+                    provenance = provenance_reader(command, run_id=run_id, generation=row["generation"], max_bytes=262144)
+                    if type(provenance) is not dict or provenance.get("provenance") != "accepted":
+                        raise OrchestrationError("dispatch acceptance is unknown")
+                    snapshot = provenance.get("snapshot")
+                else:
+                    snapshot = self.kernel.managed_execution_receipt(
+                        command, run_id=run_id, generation=row["generation"])
+                    if snapshot.state == "cancelled":
+                        raise OrchestrationError("cancelled execution does not prove dispatch acceptance")
+                self._check_delivery_snapshot(snapshot, command)
+                if self.kernel.kernel_store_identity() != row["kernel_store_id"]:
+                    raise OrchestrationError("dispatch permit Kernel identity changed")
+            except Exception:
+                self._finish_dispatch_permit(row["sequence"], "unknown")
+            else:
+                self._finish_dispatch_permit(row["sequence"], "accepted")
+                accepted += 1
+        return accepted
+
     @staticmethod
     def _managed_delivery_intent(intent):
         """Expose delivery identity without the command payload or cancel reason."""
@@ -105,14 +209,18 @@ class TransportMixin:
                                if managed else json.loads(row["payload"])),
                     "error": detail})
 
-    def _delivery_command(self, intent):
+    def _delivery_command(self, intent, *, max_bytes=None):
         command = ExecutionCommandV2.from_dict(intent["command"])
         if command.execution_id != intent["execution_id"]:
             raise OrchestrationError("delivery command identity mismatch")
         connection = self._connect()
         try:
-            row = connection.execute("SELECT command FROM sdk_executions WHERE execution_id=?",
-                                     (command.execution_id,)).fetchone()
+            if max_bytes is None:
+                row = connection.execute("SELECT command FROM sdk_executions WHERE execution_id=?",
+                                         (command.execution_id,)).fetchone()
+            else:
+                row = connection.execute("SELECT CASE WHEN length(CAST(command AS BLOB))<=? THEN command END AS command FROM sdk_executions WHERE execution_id=?",
+                                         (max_bytes, command.execution_id)).fetchone()
         finally:
             connection.close()
         if row is None or row["command"] != canonical(command.to_dict()):
@@ -147,12 +255,13 @@ class TransportMixin:
                 "ORDER BY attempts,sequence").fetchall()
             managed_controls = {
                 row["run_id"]: (
-                    row["control_state"],
-                    frozenset(json.loads(row["drain_execution_ids"])),
+                    row["control_state"] if row["drain_execution_ids"] is not None else "unknown",
+                    frozenset(json.loads(row["drain_execution_ids"]))
+                    if row["drain_execution_ids"] is not None else frozenset(),
                 )
                 for row in connection.execute(
                     "SELECT m.run_id,m.control_state,t.drain_execution_ids "
-                    "FROM sdk_managed_runs m JOIN sdk_managed_control_transitions t "
+                    "FROM sdk_managed_runs m LEFT JOIN sdk_managed_control_transitions t "
                     "ON t.run_id=m.run_id AND t.control_epoch=m.control_epoch "
                     "WHERE m.run_id IN (SELECT run_id FROM sdk_outbox WHERE delivered=0)"
                 )
@@ -181,24 +290,37 @@ class TransportMixin:
         count = 0
         for row, intent in selected:
             execution_id = intent["execution_id"]
+            kernel = self.kernel
+            managed_dispatch = intent["kind"] == "dispatch" and row["run_id"] in managed_runs
             try:
+                permit = None
+                if managed_dispatch:
+                    permit = self._acquire_dispatch_permit(row, intent)
+                    if not permit:
+                        continue
+                    if self.kernel is not kernel:
+                        raise OrchestrationError("managed dispatch Kernel participant changed")
                 command = self._delivery_command(intent)
                 if intent["kind"] == "dispatch":
                     if row["run_id"] in managed_runs:
-                        try:
-                            self.kernel.get(execution_id)
-                        except ExecutionNotFoundError:
-                            snapshot = (self.runtime or self.kernel).submit_managed(
+                        if permit == "accepted":
+                            snapshot = kernel.managed_execution_receipt(
                                 command, run_id=row["run_id"],
                                 generation=int(intent.get("generation", 0)),
                             )
                         else:
-                            # Replay must also verify the Kernel registration;
-                            # matching command bytes alone do not prove control.
-                            snapshot = self.kernel.submit_managed(
-                                command, run_id=row["run_id"],
-                                generation=int(intent.get("generation", 0)),
-                            )
+                            try:
+                                kernel.get(execution_id)
+                            except ExecutionNotFoundError:
+                                snapshot = (self.runtime or kernel).submit_managed(
+                                    command, run_id=row["run_id"],
+                                    generation=int(intent.get("generation", 0)),
+                                )
+                            else:
+                                snapshot = kernel.managed_execution_receipt(
+                                    command, run_id=row["run_id"],
+                                    generation=int(intent.get("generation", 0)),
+                                )
                     else:
                         try:
                             snapshot = self.kernel.get(execution_id)
@@ -207,6 +329,10 @@ class TransportMixin:
                     # An already accepted command, especially a cancelled one,
                     # must not be submitted through runtime validation again.
                     self._check_delivery_snapshot(snapshot, command)
+                    if managed_dispatch:
+                        if self.kernel is not kernel:
+                            raise OrchestrationError("managed dispatch Kernel participant changed")
+                        self._finish_dispatch_permit(row["sequence"], "accepted")
                 elif intent["kind"] == "cancel":
                     self._cancel_execution(
                         execution_id, intent["reason"], command,
@@ -216,6 +342,8 @@ class TransportMixin:
                 else:
                     raise OrchestrationError("unknown persisted delivery intent")
             except Exception as error:
+                if managed_dispatch:
+                    self._finish_dispatch_permit(row["sequence"], "unknown")
                 self._delivery_failed(row, error)
                 continue
             # This is deliberately outside the operational-error handler: a

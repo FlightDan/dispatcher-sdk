@@ -137,11 +137,11 @@ class RuntimeSettlementTests(unittest.TestCase):
         self.assertIn(retained[0]["result_id"], json.dumps(observed["settlement_obligations"]))
         return runtime, writer, call_log, retained[0], obligations[0]
 
-    def recover(self, runtime, name):
+    def recover(self, runtime, name, *, max_record_bytes=256 * 1024):
         end = time.monotonic() + 3
         reports = []
         while time.monotonic() < end:
-            reports.extend(runtime.recover_completions(timeout_seconds=.5))
+            reports.extend(runtime.recover_completions(timeout_seconds=.5, max_record_bytes=max_record_bytes))
             current = runtime.kernel.get(name)
             receipt = runtime._settlement_journal.inspect(name, timeout_seconds=.5)
             if current.result is not None and receipt and receipt[0]["state"] == "recorded":
@@ -210,8 +210,13 @@ class RuntimeSettlementTests(unittest.TestCase):
                 late_commits = [event for event in attempted["journal_admissions"]
                     if event["commit"] and "error" not in event
                     and event["returned"] > maintenance["deadline"]]
-                self.assertTrue(late_commits, maintenance)
-                self.assertTrue(any(report["state"] == "superseded" for report in reports), maintenance)
+                if maintenance.get('precommit_body'):
+                    # This fixture deliberately sleeps past the deadline
+                    # inside an uncommitted transaction to test rollback.
+                    self.assertTrue(any(report["state"] == "pending" for report in reports), maintenance)
+                else:
+                    self.assertTrue(late_commits, maintenance)
+                    self.assertTrue(any(report["state"] == "superseded" for report in reports), maintenance)
             else:
                 self.assertLessEqual(attempted["returned"], maintenance["deadline"], maintenance)
             return reports
@@ -458,7 +463,10 @@ class RuntimeSettlementTests(unittest.TestCase):
             self.assertTrue(report["settlement_obligations"][0]["truncated"])
         self.assertEqual(before, runtime._settlement_journal.pending(timeout_seconds=.5)[0])
         writer.rollback()
-        recovered, _ = self.recover(runtime, "oversized-diagnostic")
+        bounded = runtime.recover_completions(timeout_seconds=.5)
+        self.assertTrue(any(item.get("required_bytes", 0) > 256 * 1024 for item in bounded))
+        self.assertEqual(sum(item.get("execution_id") == "oversized-diagnostic" for item in bounded), 1)
+        recovered, _ = self.recover(runtime, "oversized-diagnostic", max_record_bytes=1024 * 1024)
         self.assertEqual(recovered.result.to_dict(), original)
         self.assertEqual(len(calls.read_text().splitlines()), 1)
 
@@ -498,8 +506,10 @@ class RuntimeSettlementTests(unittest.TestCase):
 
     def test_restart_records_original_outcome_without_reinvoking_handler(self):
         runtime, writer, calls, original, _ = self.run_with_result_writer_locked("restart")
-        runtime.close()
+        with self.assertRaisesRegex(RuntimeError, "diagnostic facts not confirmed durable"):
+            runtime.close()
         writer.rollback()
+        runtime.close()
         reopened = self.open("restart")
         current, _ = self.recover(reopened, "restart")
         self.assertEqual(current.result.to_dict(), original)
@@ -519,8 +529,10 @@ class RuntimeSettlementTests(unittest.TestCase):
         observation = dict(runtime.observation_storage)
         journal_path = runtime._settlement_journal.path
         source_id = runtime._settlement_journal.source_id
-        runtime.close()
+        with self.assertRaisesRegex(RuntimeError, "diagnostic facts not confirmed durable"):
+            runtime.close()
         writer.rollback()
+        runtime.close()
         before = StorageMigrationTests._stored_rows(source)
         destination = self.root / "upgrade-copy.sqlite3"
         with maintenance_lease(source, "tests", "pending-outcome-copy") as lease:
@@ -530,7 +542,9 @@ class RuntimeSettlementTests(unittest.TestCase):
         for field in ("automatic_activation", "automatic_cutover",
                       "external_stores_included", "observation_journal_included"):
             self.assertFalse(report[field])
-        self.assertEqual((report["source_version"], report["target_version"]), (5, 5))
+        from dispatcher_sdk.execution_kernel._sqlite_schema import KERNEL_STORAGE_SCHEMA_VERSION
+        self.assertEqual((report["source_version"], report["target_version"]),
+                         (KERNEL_STORAGE_SCHEMA_VERSION, KERNEL_STORAGE_SCHEMA_VERSION))
         pending = SettlementJournal.open_readonly(journal_path, source_id=source_id,
             kernel_path=source, timeout_seconds=.5).inspect(name, timeout_seconds=.5)
         self.assertEqual(len(pending), 1)
@@ -851,6 +865,8 @@ class RuntimeSettlementTests(unittest.TestCase):
                     row = connection.execute(
                         "SELECT state,revision FROM settlement_records WHERE execution_id=?",
                         (name,)).fetchone()
+                    if row is None or row['state'] != 'superseded':
+                        return
                     body_work.append({"connection": connection.evidence_id,
                         "state": row["state"], "revision": row["revision"],
                         "in_transaction": connection.in_transaction,
@@ -865,7 +881,7 @@ class RuntimeSettlementTests(unittest.TestCase):
         self.assertEqual("superseded", body_work[0]["state"])
         self.assertEqual(receipt["revision"] + 1, body_work[0]["revision"])
         self.assertTrue(body_work[0]["in_transaction"])
-        self.assertLessEqual(body_work[0]["timeout_seconds"], .1)
+        self.assertLessEqual(body_work[0]["timeout_seconds"], maintenance['timeout_seconds'])
         self.assertEqual(1, len(reports))
         self.assertEqual("pending", reports[0]["state"])
         self.assertTrue(reports[0]["error"].startswith("InvalidStateTransitionError:"), reports)
@@ -944,6 +960,7 @@ class RuntimeSettlementTests(unittest.TestCase):
         clock.value = receipt["lease"]["expires_at"] + 1
         writer.rollback()
         runtime.kernel.reap()
+        runtime._retry_diagnostic_notes(time.monotonic() + 1, wait_for_writer=True)
         lease = runtime.kernel.claim_and_start("independent-worker", execution_id="new-attempt")
         self.assertIsNotNone(lease)
         winner = runtime.kernel.get("new-attempt")

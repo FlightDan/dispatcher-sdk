@@ -8,8 +8,8 @@ generation.
 ## Storage design
 
 The optional Runtime cancellation journal uses a separate SQLite file that the
-caller explicitly configures. Current Kernel storage uses schema 5 and
-Orchestrator storage uses schema 4; existing sandbox storage uses schema 1.
+caller explicitly configures. Current Kernel storage uses schema 12 and
+Orchestrator storage uses schema 6; existing sandbox storage uses schema 1.
 Enabling cancellation evidence creates
 a separate schema-1 journal without migrating an existing active
 database. Existing SDK APIs keep their default behavior.
@@ -53,6 +53,11 @@ execution or replaces revision/fence checks.
   not resolve pending sandbox disposal or external effects.
 - Journal readers use a read-only connection and do not initialize a file,
   synchronize the Run, reap leases, or contact providers.
+- When both attempt and fence are supplied, execution inspection can expose
+  bounded raw supervisor handoff observations for that exact generation from
+  the selected settlement journal. Missing, malformed or oversized observations
+  remain unknown. A packet or disposition is not proof of accepted results or
+  process cleanup; the host must independently verify reconciliation decisions.
 
 The journal has no upgrade or conversion operation. Schema 1 is accepted
 as-is or rejected. A future schema requires a separate version and conversion

@@ -42,6 +42,11 @@ A host watchdog thread controls startup and execution deadlines independently
 of the handler interpreter. The worker waits for a host invocation gate after
 opening SQLite; only then does the business timeout begin. Startup imports and
 unpickling remain bounded by the startup timeout.
+Parent-side request serialization, file creation and suspended-process creation
+occur before the watchdog starts; `start_timeout` is not a hard bound on the
+caller's return time if one of those host operations blocks. A late or
+ambiguous creation still requires the exact process/Job cleanup evidence; an
+expired deadline by itself does not prove that no process was created.
 
 Revocation, termination, process waits, and handle closure share a lock.
 Termination uses `TerminateJobObject`, polls Job accounting until the active

@@ -19,6 +19,7 @@ from .inbox import NotificationInbox, InboxLease, InboxRecord, InboxState
 from .request_results import RequestResultInbox, RequestResultIdentity, RequestResultObservation
 from .origins import ExecutionHandlerBinding, ExecutionOriginReport, inspect_execution_origin
 from .run_diagnostics import RunDiagnosticReport, inspect_run_diagnostics
+from .adoption_inspection import inspect_legacy_execution_page
 from .types import (
     AddTaskOperation, AttemptSnapshot, AttemptState, CancelOperation,
     DispatchOperation, FinishOperation, NewAttemptOperation, Observation,
@@ -38,6 +39,7 @@ __all__ = [
     "RequestResultInbox", "RequestResultIdentity", "RequestResultObservation",
     "ExecutionHandlerBinding", "ExecutionOriginReport", "inspect_execution_origin",
     "RunDiagnosticReport", "inspect_run_diagnostics",
+    "inspect_legacy_execution_page",
     "OrchestratorHostTimeoutError", "StopPhase", "StopReport",
     "Orchestrator", "OrchestratorHost", "OrchestratorHostHealth", "OrchestrationError",
     "RevisionConflict", "CommandConflict", "canonical_json", "Operations", "RecoveryDetails", "RecoveryRecord",

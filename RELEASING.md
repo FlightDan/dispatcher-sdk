@@ -30,9 +30,11 @@ The workflow uses the repository's temporary GitHub token.
    matrix, rebuild packages, generate checksums or publish to PyPI.
 6. Re-read the Release, its assets and the default branch. Set `main`
    as GitHub's default only under the applicable release authorization. Record
-   final raw evidence in the acceptance index. Post-publication ledger-only
-   changes receive documentation validation; a different Git commit does not
-   qualify for a new release tag using the prior commit's package artifact.
+   final raw evidence in the acceptance index. Pushes that change only the
+   evidence-ledger files ignored by the CI path filter receive no automatic CI
+   or documentation validation; do not report them as validated. A different
+   Git commit also cannot qualify for a new release tag using the prior
+   commit's package artifact.
 
 Artifact names include their run attempt, preserving earlier attempts. Missing,
 expired or partial acceptance blocks publication. Do not replace a published

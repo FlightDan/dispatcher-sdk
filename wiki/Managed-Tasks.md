@@ -38,7 +38,7 @@ explicitly and cannot kill a blocked call.
 `task.observe()` and `task.events()` read saved execution facts without claiming
 work or changing deadlines. Handlers can report output, waits and progress through
 `context.activity`; stall policies are opt-in. See [execution activity and
-supervision](../docs/EXECUTION_OBSERVABILITY.md) for the reporting and recovery
+supervision](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/EXECUTION_OBSERVABILITY.md) for the reporting and recovery
 contracts, including the reserved managed handler.
 
 ## Results and application work
@@ -60,7 +60,7 @@ resolve it through the advanced Runtime/Orchestrator APIs.
 Construction performs a schema and unfinished-handler binding check before it
 opens writers. `DeploymentMismatchError.report` describes a rejected deployment.
 `app.health()` is cheap and in-memory; `app.diagnostics()` runs bounded read-only
-SQLite queries. See the [full API contract](../docs/MANAGED_APPLICATION.md).
+SQLite queries. See the [full API contract](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/MANAGED_APPLICATION.md).
 
 `close(timeout=...)` stops new work, drains result consumers and then stops the
 Host. A blocked callback can cause a timeout. Keep its dependencies alive and

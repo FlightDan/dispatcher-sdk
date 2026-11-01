@@ -138,6 +138,25 @@ class ObservationError(ValueError):
     """Observation storage or binding is incompatible; no business verdict."""
 
 
+@dataclass(frozen=True)
+class ObservationTransactionResult:
+    """Facts available after a failed observation write transaction.
+
+    Attached to the original exception as ``observation_transaction``. Replay
+    safety is unknown unless the specific operation provides its own contract.
+    """
+    operation: str
+    phase: str
+    sqlite_errorcode: int | None
+    sqlite_errorname: str | None
+    budget_source: str
+    transaction_entered: bool
+    rollback_confirmed: bool
+    outcome: Literal["not_applied", "applied", "unknown"]
+    replay_safe: bool | None
+    rollback_error: BaseException | None = None
+
+
 class ProcessObservation(Protocol):
     def snapshot(self) -> dict[str, Any]: ...
 
@@ -165,5 +184,5 @@ class ExecutionActivity(Protocol):
     def close(self, *, timeout: float = 1.0) -> dict[str, Any]: ...
 
 
-__all__ = ["ObservationOptions", "ManagedStallOptions", "ObservationIdentity", "StallPolicy", "ProcessState", "ObservationError",
+__all__ = ["ObservationOptions", "ManagedStallOptions", "ObservationIdentity", "StallPolicy", "ProcessState", "ObservationError", "ObservationTransactionResult",
            "ExecutionActivity", "ProcessObservation"]

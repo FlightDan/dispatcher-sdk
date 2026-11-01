@@ -2,7 +2,7 @@ name: SDK CI
 on:
   push:
     branches: ['**']
-    # Post-publishing evidence-ledger updates receive documentation checks.
+    # Skip automatic CI for pushes that only update post-publishing evidence ledgers.
     # A changed Git commit still cannot reuse packages for a new release tag.
     paths-ignore:
       - docs/EXECUTION_OBSERVABILITY_ACCEPTANCE.md

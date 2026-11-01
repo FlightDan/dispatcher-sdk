@@ -43,10 +43,18 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
 
     Each call opens its own SQLite connection. Application callbacks and Kernel
     calls never execute while an orchestration write transaction is held.
+
+    ``projection_verifier``, when configured, is a trusted host callable. For
+    streamed reads it receives the credential and actual ProjectionStorage and
+    must authenticate the exact pointer, both store identities, Run and revision
+    while continuously enforcing immutable retention and preventing replacement.
+    A logical store identity does not distinguish physical copies.
     """
 
     def __init__(self, db_path, kernel, *, runtime=None, clock=time.time,
-                 failpoint=None, max_result_deliveries=5, durability: Durability = "full"):
+                 failpoint=None, max_result_deliveries=5, durability: Durability = "full",
+                 control_verifier=None, control_lease_verifier=None, projection_verifier=None,
+                 settlement_journal_path=None):
         self.durability = validate_durability(durability)
         if str(db_path) == ":memory:":
             raise OrchestrationError("orchestration requires a durable SQLite file")
@@ -57,10 +65,37 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
         self._owns_runtime = False
         if runtime is not None and runtime.kernel is not kernel:
             raise OrchestrationError("runtime and orchestrator must share the Kernel")
+        runtime_binding = getattr(runtime, 'settlement_storage', None)
+        runtime_path = runtime_binding.get('path') if isinstance(runtime_binding, dict) else None
+        selected_path = None if settlement_journal_path is None else str(Path(settlement_journal_path).expanduser().resolve())
+        if runtime_path is not None:
+            runtime_path = str(Path(runtime_path).expanduser().resolve())
+            if selected_path is not None and selected_path != runtime_path:
+                raise OrchestrationError('runtime and orchestrator settlement journal paths differ')
+            selected_path = runtime_path
+        self.settlement_journal_path = selected_path
         self.clock = clock
         self.max_result_deliveries = max_result_deliveries
         self._failpoint = failpoint or (lambda name: None)
+        from .control_authorization import ControlAuthorizer
+        self.control_authorizer = (ControlAuthorizer(self, control_verifier)
+                                   if control_verifier is not None else None)
+        if control_lease_verifier is not None and not callable(control_lease_verifier):
+            raise TypeError("control_lease_verifier must be callable")
+        self.control_lease_verifier = control_lease_verifier
+        if projection_verifier is not None and not callable(projection_verifier):
+            raise TypeError("projection_verifier must be callable")
+        self.projection_verifier = projection_verifier
         self._initialize_store()
+
+    def iter_installed_application_projection(self, run_id, *, revision, storage, credential):
+        """Stream an installed current or historical projection under host retention proof.
+
+        Exhaust the returned iterator to validate that every page was read.
+        Streamed decision installation is not yet supported by this interface.
+        """
+        from .projection_stream import iter_installed_projection
+        return iter_installed_projection(self, run_id, revision=revision, storage=storage, credential=credential)
 
     def close(self):
         """Close a runtime created by open_sqlite; injected runtimes stay caller-owned."""
@@ -142,7 +177,7 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
 
     @classmethod
     def open_sqlite(cls, path, handlers, *, durability: Durability = "full",
-                    clock=time.time, **runtime_options) -> Orchestrator:
+                    clock=time.time, projection_verifier=None, **runtime_options) -> Orchestrator:
         """Open one durable stack; this Orchestrator owns its Runtime lifetime."""
         from ..execution_kernel import Runtime
 
@@ -156,7 +191,8 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
         runtime_options.setdefault("now", clock)
         runtime = Runtime(str(path), handlers, durability=durability, **runtime_options)
         try:
-            sdk = cls(path, runtime.kernel, runtime=runtime, clock=clock, durability=durability)
+            sdk = cls(path, runtime.kernel, runtime=runtime, clock=clock, durability=durability,
+                      projection_verifier=projection_verifier)
         except BaseException as error:
             try:
                 runtime.close()
@@ -228,17 +264,117 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
     def inspect_cancellation(self, run_id: str, *, task_id: str | None = None,
                              execution_id: str | None = None, source_id: str | None = None,
                              cancellation_journal_path: str | Path | None = None,
+                             settlement_journal_path: str | Path | None = None,
                              limit: int = 100, after_task_id: str | None = None) -> CancellationRecoveryReport:
         """Read cancellation facts with their execution and recovery generations."""
         return inspect_cancellation(self, run_id, task_id=task_id, execution_id=execution_id,
             source_id=source_id, cancellation_journal_path=cancellation_journal_path,
+            settlement_journal_path=settlement_journal_path,
             limit=limit, after_task_id=after_task_id)
+
+    def apply_managed_operations(self, run_id: str, *, command_id: str,
+                                 expected_revision: int, expected_generation: int,
+                                 expected_control_epoch: int, source_resume_operation_id: str,
+                                 credential, lease_credential, operations: list[_OperationInput],
+                                 application_state=_UNSET, subscription=None,
+                                 expected_cursor=None, advance_to=None,
+                                 delegation_id: str | None = None) -> RunSnapshot:
+        """Commit one controlled application decision for a resumed split-store Run.
+
+        The host verifier must continuously hold the source resume's exclusive
+        lease through commit, including serialization against cancellation,
+        revocation and control changes. New commands retain caller identities;
+        their execution IDs must use the managed prefix and correlation must be
+        the original Run ID. This transaction does not deliver or execute work.
+        """
+        from ..execution_kernel import ExecutionCommandV2
+        from .control_authorization import ControlAuthorizer
+        from .control_lease import check_control_lease, observe_control_clock
+        from .managed import _effective_orchestrator_control_lease
+
+        identifier(run_id, "run_id")
+        identifier(source_resume_operation_id, "source_resume_operation_id")
+        integer(expected_generation, "expected_generation")
+        integer(expected_control_epoch, "expected_control_epoch")
+        if type(operations) is not list:
+            raise OrchestrationError("operations must be a list")
+        for operation in operations:
+            op = validate_operation(operation)
+            if op["kind"] in ("add_task", "new_attempt"):
+                command = ExecutionCommandV2.from_dict(op["command"])
+                if not command.execution_id.startswith("sdk-managed:") or command.correlation_id != run_id:
+                    raise OrchestrationError("new managed command identity differs from Run")
+        authorizer = self.control_authorizer
+        if type(authorizer) is not ControlAuthorizer or authorizer.orchestrator is not self:
+            raise OrchestrationError("trusted control authorizer is required")
+        participant = self.kernel
+        identity_reader = getattr(participant, "kernel_store_identity", None)
+        gate_reader = getattr(participant, "get_run_control", None)
+        if not callable(identity_reader) or not callable(gate_reader):
+            raise OrchestrationError("Kernel control participant is unavailable")
+        observe_control_clock(self)
+        verified = authorizer.verify(credential)
+
+        def check(connection):
+            authorizer.check_in_transaction(connection, verified, run_id, "apply_operations", delegation_id)
+            row = connection.execute(
+                "SELECT r.envelope,r.kernel_receipt,r.orchestrator_receipt,o.run_id,"
+                "o.kernel_store_id,o.orchestrator_store_id,o.orchestrator_incarnation "
+                "FROM sdk_revision_resumes r JOIN sdk_control_operations o ON o.operation_id=r.decision_id "
+                "WHERE r.operation_id=?", (source_resume_operation_id,)).fetchone()
+            identity = connection.execute("SELECT store_id,incarnation FROM sdk_storage_identity WHERE singleton=1").fetchone()
+            control = connection.execute("SELECT control_state,control_epoch,generation FROM sdk_managed_runs WHERE run_id=?", (run_id,)).fetchone()
+            if row is None or row["kernel_receipt"] is None or row["orchestrator_receipt"] is None:
+                raise OrchestrationError("completed source resume is required")
+            local = json.loads(row["orchestrator_receipt"])
+            remote = json.loads(row["kernel_receipt"])
+            envelope = json.loads(row["envelope"])
+            expected = {"operation_id": source_resume_operation_id, "run_id": run_id,
+                        "kernel_store_id": row["kernel_store_id"], "orchestrator_store_id": row["orchestrator_store_id"],
+                        "orchestrator_incarnation": row["orchestrator_incarnation"]}
+            if (type(remote) is not dict or remote.get("kind") != "revision_resume" or
+                    type(remote.get("decision")) is not dict or
+                    any(remote["decision"].get(key) != value for key, value in expected.items()) or
+                    remote["decision"].get("generation") != expected_generation or
+                    remote["decision"].get("target_control_epoch") != expected_control_epoch or
+                    row["run_id"] != run_id or identity is None or tuple(identity) !=
+                    (row["orchestrator_store_id"], row["orchestrator_incarnation"]) or
+                    control is None or tuple(control) != ("active", expected_control_epoch, expected_generation) or
+                    (local.get("operation_id"), local.get("run_id"), local.get("generation"), local.get("control_epoch"), local.get("state"),
+                     local.get("kernel_store_id"), local.get("orchestrator_store_id"), local.get("orchestrator_incarnation")) !=
+                    (source_resume_operation_id, run_id, expected_generation, expected_control_epoch, "active",
+                     row["kernel_store_id"], row["orchestrator_store_id"], row["orchestrator_incarnation"])):
+                raise RevisionConflict("managed resume source or control changed")
+            lease_id, lease_fence = _effective_orchestrator_control_lease(connection, source_resume_operation_id, envelope)
+            check_control_lease(self, connection, lease_credential,
+                                {**expected, "lease_id": lease_id, "lease_fence": lease_fence})
+            gate = gate_reader(run_id)
+            if (self.kernel is not participant or identity_reader() != row["kernel_store_id"] or
+                    type(gate) is not dict or (gate.get("state"), gate.get("control_epoch"), gate.get("generation")) !=
+                    ("active", expected_control_epoch, expected_generation)):
+                raise RevisionConflict("managed Kernel control changed")
+
+        return self._apply_operations(run_id, command_id=command_id, expected_revision=expected_revision,
+            expected_generation=expected_generation, operations=operations, application_state=application_state,
+            subscription=subscription, expected_cursor=expected_cursor, advance_to=advance_to,
+            managed={"check": check, "source_resume_operation_id": source_resume_operation_id,
+                     "expected_control_epoch": expected_control_epoch})
 
     def apply_operations(self, run_id: str, *, command_id: str, expected_revision: int,
                          operations: list[_OperationInput],
                          application_state=_UNSET, subscription=None,
                          expected_cursor=None, advance_to=None,
                          expected_generation: int | None = None) -> RunSnapshot:
+        return self._apply_operations(run_id, command_id=command_id,
+            expected_revision=expected_revision, operations=operations,
+            application_state=application_state, subscription=subscription,
+            expected_cursor=expected_cursor, advance_to=advance_to,
+            expected_generation=expected_generation)
+
+    def _apply_operations(self, run_id: str, *, command_id: str, expected_revision: int,
+                          operations: list[_OperationInput], application_state=_UNSET,
+                          subscription=None, expected_cursor=None, advance_to=None,
+                          expected_generation: int | None = None, managed=None) -> RunSnapshot:
         identifier(run_id, "run_id")
         identifier(command_id, "command_id")
         integer(expected_revision, "expected_revision")
@@ -262,13 +398,19 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             request["expected_generation"] = expected_generation
         if application_state is not _UNSET:
             request["application_state"] = clone(application_state)
+        if managed is not None:
+            request.update(kind="apply_managed_operations",
+                           source_resume_operation_id=managed["source_resume_operation_id"],
+                           expected_control_epoch=managed["expected_control_epoch"])
         fingerprint = digest(request)
         with self._transaction() as connection:
+            if managed is not None:
+                managed["check"](connection)
             replay = self._replay(connection, run_id, command_id, fingerprint)
             if replay is not None:
                 return replay
             state = self._load(connection, run_id)
-            if connection.execute(
+            if managed is None and connection.execute(
                 "SELECT 1 FROM sdk_managed_runs WHERE run_id=?", (run_id,)
             ).fetchone() is not None:
                 raise OrchestrationError(
@@ -332,6 +474,8 @@ class Orchestrator(StoreMixin, TransportMixin, ResultsMixin, NotificationsMixin,
             self._save(connection, state, changes=changes)
             self._event(connection, state, "application.decided", request)
             self._write_receipt(connection, run_id, command_id, fingerprint, state)
+            if managed is not None:
+                managed["check"](connection)
             return state
 
     def read_events(self, run_id: str, *, after: int = 0, limit: int = 100,

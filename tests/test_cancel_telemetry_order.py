@@ -12,7 +12,19 @@ import unittest
 from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel import Kernel
-from tests.test_execution_kernel_v2_runtime import make_command, started_then_late_write_with_pid
+from tests.test_execution_kernel_v2_runtime import make_command
+
+
+def gated_late_write_with_pid(payload, context):
+    Path(payload["started"]).write_text("started", encoding="utf-8")
+    Path(payload["pid"]).write_text(str(os.getpid()), encoding="utf-8")
+    while not Path(payload["release"]).exists():
+        time.sleep(.005)
+    Path(payload["late"]).write_text("late", encoding="utf-8")
+    return {"unexpected": True}
+
+
+gated_late_write_with_pid.__execution_kernel_revision__ = "cancel-telemetry-gated-v1"
 
 
 @unittest.skipUnless(
@@ -23,25 +35,27 @@ class CancellationTelemetryOrderTests(unittest.TestCase):
     def test_diagnostic_writer_cannot_delay_process_revocation(self):
         root = retained_directory("sdk-cancel-telemetry-order-")
         trace = []
-        evidence = {"artifact": str(root), "command_timeout": 2.0,
-                    "business_sleep": .3, "diagnostic_writer_hold": .4}
+        evidence = {"artifact": str(root), "command_timeout": 15.0,
+                    "writer_release_timeout": 5.0}
+        revoked_event = threading.Event()
 
         def mark(event, **details):
             trace.append({"event": event, "wall": time.time(),
                           "monotonic": time.monotonic(), **details})
 
         stack = Kernel.open_sqlite(root / "kernel.sqlite3",
-            {("lifecycle", 1): started_then_late_write_with_pid}, isolation_mode="process")
+            {("lifecycle", 1): gated_late_write_with_pid}, isolation_mode="process")
         driver = None
         writer_thread = None
         writer_errors = []
         try:
             started, pid_file, late = (root / name for name in
                                       ("started.txt", "handler.pid", "late.txt"))
+            release = root / "release.txt"
             command = make_command("cancel-telemetry", stack.registry_revision,
-                handler_id="lifecycle", timeout=2.0,
+                handler_id="lifecycle", timeout=15.0,
                 payload={"started": str(started), "pid": str(pid_file),
-                         "late": str(late), "sleep": .3})
+                         "late": str(late), "release": str(release)})
             stack.submit(command)
             outcomes, errors = [], []
 
@@ -75,6 +89,7 @@ class CancellationTelemetryOrderTests(unittest.TestCase):
                     return original_revoke(reason)
                 finally:
                     mark("supervisor_revoke_end")
+                    revoked_event.set()
 
             def cancel(*args, **kwargs):
                 mark("kernel_cancel_begin")
@@ -91,8 +106,8 @@ class CancellationTelemetryOrderTests(unittest.TestCase):
                     mark("diagnostic_note_end", phase=phase)
 
             # Contend only the independent diagnostic store, never Kernel
-            # execution authority. Its admission window exceeds the existing
-            # handler's late write without changing either business timeout.
+            # execution authority. Keep the writer held until revocation has
+            # finished, with a bounded fallback to avoid hanging on regression.
             writer = sqlite3.connect(stack._settlement_journal.path,
                                      isolation_level=None, check_same_thread=False)
             writer.execute("BEGIN IMMEDIATE")
@@ -100,7 +115,7 @@ class CancellationTelemetryOrderTests(unittest.TestCase):
 
             def release_writer():
                 try:
-                    time.sleep(.4)
+                    evidence["writer_saw_revocation"] = revoked_event.wait(5.0)
                     writer.rollback()
                 except BaseException as error:
                     writer_errors.append(str(error))
@@ -122,11 +137,13 @@ class CancellationTelemetryOrderTests(unittest.TestCase):
             self.assertFalse(driver.is_alive(), str(root))
             self.assertFalse(writer_thread.is_alive(), str(root))
             self.assertEqual(writer_errors, [])
+            self.assertTrue(evidence["writer_saw_revocation"], str(root))
             self.assertEqual(errors, [])
             self.assertEqual(cancelled.state, "cancelled")
             self.assertEqual(outcomes, [cancelled])
             with self.assertRaises(ProcessLookupError):
                 os.kill(handler_pid, 0)
+            release.write_text("release", encoding="utf-8")
             time.sleep(.35)
             evidence.update(started_mtime=started.stat().st_mtime,
                 late_exists=late.exists(), late_mtime=late.stat().st_mtime if late.exists() else None,

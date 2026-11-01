@@ -244,6 +244,37 @@ class SandboxRuntimeTests(unittest.TestCase):
         runtime.submit(command)
         return runtime, handler
 
+    def authorize_recovery_retry(self, runtime):
+        """Host authorizes retry only after observing this invocation's cleanup."""
+        snapshot = runtime.kernel.get("x")
+        identity = {"execution_id": "x", "attempt": snapshot.attempt, "fence": snapshot.fence}
+        self.assertEqual(snapshot.state, "recovery_required")
+        with self.trace_lock:
+            calls = deepcopy(list(self.trace))
+        invocations = [event for event in calls if event["operation"] == "native_invoke"]
+        self.assertEqual(len(invocations), 1)
+        self.assertEqual(invocations[0].get("returned", {}).get("kind"), "recovery_required")
+        self.assertEqual(sum(event["operation"] == "on_cleanup_confirmed" and
+                             "returned" in event for event in calls), 1)
+        evidence = runtime._settlement_journal.inspect_supervisor_handoff(identity, timeout_seconds=1)
+        self.assertEqual(evidence['facts']['supervisor_reap']['state'], 'observed')
+        obligation = runtime.kernel.inspect_supervisor_obligations("x")['obligations']
+        self.assertEqual([(item['attempt'], item['fence'], item['state']) for item in obligation],
+                         [(snapshot.attempt, snapshot.fence, 'unresolved')])
+        decision = {**identity, 'cleanup': 'confirmed', 'outcome': 'unknown',
+                    'disposition': 'retry_authorized',
+                    'evidence': 'fixture observed native cleanup and deferred outcome'}
+        credential = object()
+        def verify(candidate):
+            if candidate is not credential:
+                raise ValueError('unexpected host credential')
+            return {'principal': 'fixture-host', 'expires_at': time.time() + 60,
+                    'permissions': [('x', 'kernel:resolve_supervisor')],
+                    'supervisor_resolution': decision}
+        runtime.kernel._authority_verifier = verify
+        self.assertTrue(runtime.kernel.resolve_supervisor_obligation(
+            credential, expected_resolution=decision)['resolved'])
+
     def test_result_is_durable_before_cleanup_and_committed_before_success(self):
         runtime, handler = self.runtime()
         with runtime:
@@ -364,6 +395,7 @@ class SandboxRuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.run_once().state, "recovery_required")
             old = handler.journal().get("x")
             self.assertTrue(old["cleanup_confirmed"])
+            self.authorize_recovery_retry(runtime)
             effect = runtime.kernel.get_effect(handler.effect_id("x"))
             runtime.kernel.resolve_effect(effect.effect_id, expected_revision=effect.revision,
                 decision="not_applied", response=None, recovery_id="retry-confirmed-safe")
@@ -382,6 +414,7 @@ class SandboxRuntimeTests(unittest.TestCase):
         with runtime:
             snapshot = runtime.run_once()
             self.assertEqual(snapshot.state, "recovery_required")
+            self.authorize_recovery_retry(runtime)
             record = handler.journal().get("x")
             self.assertEqual(runtime.kernel.get_effect(handler.effect_id("x")).state, "committed")
             effect_id = handler.effect_id("x") + ":dispose:" + record["operation_key"]
@@ -398,6 +431,7 @@ class SandboxRuntimeTests(unittest.TestCase):
         runtime, handler = self.runtime("lost_start")
         with runtime:
             self.assertEqual(runtime.run_once().state, "recovery_required")
+            self.authorize_recovery_retry(runtime)
             record = handler.journal().get("x")
             effect = runtime.kernel.get_effect(handler.effect_id("x"))
             observed = {"state": "succeeded", "exit_code": 0, "output": {"verified": True},
@@ -412,6 +446,7 @@ class SandboxRuntimeTests(unittest.TestCase):
         runtime, handler = self.runtime("lost_start")
         with runtime:
             self.assertEqual(runtime.run_once().state, "recovery_required")
+            self.authorize_recovery_retry(runtime)
             effect = runtime.kernel.get_effect(handler.effect_id("x"))
             runtime.kernel.resolve_effect(effect.effect_id, expected_revision=effect.revision,
                 decision="applied", recovery_id="invalid-observation", response={

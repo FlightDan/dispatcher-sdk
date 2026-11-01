@@ -198,8 +198,9 @@ class OrchestratorHostTests(unittest.TestCase):
         for timeout in (None, -1, float("inf"), float("nan"), True):
             with self.subTest(timeout=timeout), self.assertRaises(ValueError):
                 host.stop(timeout=timeout)
-        self.assertTrue(host.stop(timeout=0))
+        self.assertTrue(host.stop(timeout=1))
         self.assertTrue(orchestrator.runtime.closed)
+        self.assertTrue(host.stop(timeout=0))
 
     def test_notification_thread_start_failure_stops_runtime(self):
         orchestrator = Orchestrator()

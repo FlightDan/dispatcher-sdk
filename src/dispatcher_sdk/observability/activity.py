@@ -60,6 +60,7 @@ class ActivityRecorder:
         self._gaps = 0
         self._dropped_events = 0
         self._last_error: str | None = None
+        self._uncertain_write: str | None = None
         self._wait_error: str | None = None
         self._wait_error_at: float | None = None
         self._wait_error_revision = 0
@@ -86,6 +87,9 @@ class ActivityRecorder:
                     source_scope=self.source_scope, metric_coverage=self.metric_coverage)
             except Exception as error:
                 self._last_error = f"{type(error).__name__}: {error}"
+                result = getattr(error, "observation_transaction", None)
+                if result is not None and result.outcome != "not_applied":
+                    self._uncertain_write = self._last_error
         if start:
             self.start()
 
@@ -394,6 +398,9 @@ class ActivityRecorder:
 
     @staticmethod
     def _transient_storage_error(error: Exception) -> bool:
+        result = getattr(error, "observation_transaction", None)
+        if result is not None and result.outcome != "not_applied":
+            return False
         return (is_sqlite_contention(error)
                 or (isinstance(error, _ObservationWriteBudgetExceeded) and error.rollback_confirmed))
 
@@ -405,6 +412,9 @@ class ActivityRecorder:
         if not self._flush_lock.acquire(blocking=False):
             return {"state": "pending", "reason": "flush_busy", "retryable": True}
         try:
+            if self._uncertain_write is not None:
+                return {"state": "degraded", "reason": "write_outcome_unknown",
+                        "error": self._uncertain_write, "retryable": False}
             batch = batch_holder[0] if batch_holder else self._prepare_batch()
             if batch_holder is not None and not batch_holder:
                 batch_holder.append(batch)
@@ -425,6 +435,9 @@ class ActivityRecorder:
             except Exception as error:
                 with self._lock:
                     self._last_error = f"{type(error).__name__}: {error}"
+                    result = getattr(error, "observation_transaction", None)
+                    if result is not None and result.outcome != "not_applied":
+                        self._uncertain_write = self._last_error
                     if any(event["kind"] in ("wait_begin", "wait_end") for event in selected):
                         self._wait_failure(self._last_error, captured_at)
                 return {"state": "degraded", "reason": "persistence_failed", "error": self._last_error,
@@ -594,6 +607,9 @@ class ActivityRecorder:
                         break
                     except Exception as error:
                         result.update(state="degraded", reason="source_close_failed", error=str(error))
+                        transaction = getattr(error, "observation_transaction", None)
+                        if transaction is not None and transaction.outcome != "not_applied":
+                            self._uncertain_write = str(error)
                         if not self._transient_storage_error(error):
                             break
                         threading.Event().wait(min(.005, remaining()))

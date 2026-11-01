@@ -239,7 +239,10 @@ class ParentBudgetFloorTests(unittest.TestCase):
     def test_supervisor_only_expiry_survives_terminal_packet_and_rejects_native_retry(self):
         self.run_observer_expiry('supervisor')
 
-    def run_observer_expiry(self, scope):
+    def test_host_authorized_retry_rejects_spent_budget_after_real_cleanup(self):
+        self.run_observer_expiry('supervisor', require_host_resolution=True)
+
+    def run_observer_expiry(self, scope, *, require_host_resolution=False):
         root = retained_directory('sdk-' + scope + '-budget-floor-')
         clock = ParentWaitClock(root) if scope == 'parent' else SupervisorGuardClock(root)
         evidence = {'timeout_seconds': 10, 'lease_seconds': 90,
@@ -257,6 +260,17 @@ class ParentBudgetFloorTests(unittest.TestCase):
                 if callback is not None:
                     callback(packet)
             kwargs['on_entered'] = entered
+            if require_host_resolution:
+                phase_callback = kwargs.get('on_phase')
+                def observe_phase(name, details):
+                    if name == 'supervisor_result_accepted':
+                        # Retain the real callback observation but deliberately
+                        # withhold its automatic acceptance handoff. The real
+                        # native cleanup callback still runs and must persist.
+                        evidence['withheld_acceptance'] = {'phase': name, 'details': details}
+                    elif phase_callback is not None:
+                        phase_callback(name, details)
+                kwargs['on_phase'] = observe_phase
             return invoke(*args, **kwargs)
 
         try:
@@ -279,6 +293,46 @@ class ParentBudgetFloorTests(unittest.TestCase):
                     # Drive the original queued retry once, preserving its
                     # policy and cutoff; a spent window must refuse business.
                     second = runtime.run_once(execution_id='original')
+                    if require_host_resolution:
+                        self.assertIn('withheld_acceptance', evidence)
+                        self.assertIsNone(second, evidence)
+                    if second is None:
+                        # A parent-enforced cutoff can reap the supervisor
+                        # without its accepting a timeout disposition. The
+                        # exact cleanup receipt alone does not authorize
+                        # replay; this fixture acts as the explicit host.
+                        identity = {'execution_id': 'original', 'attempt': first.attempt, 'fence': first.fence}
+                        obligations = runtime.kernel.inspect_supervisor_obligations('original')['obligations']
+                        self.assertTrue(any(item['attempt'] == first.attempt and item['fence'] == first.fence
+                                            and item['state'] == 'unresolved' for item in obligations), evidence)
+                        handoff = runtime._settlement_journal.inspect_supervisor_handoff(identity, timeout_seconds=1)
+                        evidence['host_handoff'] = handoff
+                        if handoff['facts']['supervisor_reap']['state'] == 'observed':
+                            self.assertEqual(handoff['facts']['supervisor_reap']['evidence'],
+                                             {'state': 'confirmed', 'source': 'runtime_supervisor_reaped'}, evidence)
+                            decision = {**identity, 'cleanup': 'confirmed', 'outcome': 'unknown',
+                                        'disposition': 'retry_authorized',
+                                        'evidence': 'fixture observed exact supervisor cleanup and timeout receipt'}
+                            credential = object()
+                            def verify(candidate):
+                                if candidate is not credential:
+                                    raise ValueError('unexpected host credential')
+                                return {'principal': 'fixture-host', 'expires_at': 1000,
+                                        'permissions': [('original', 'kernel:resolve_supervisor')],
+                                        'supervisor_resolution': decision}
+                            runtime.kernel._authority_verifier = verify
+                            evidence['host_resolution'] = runtime.kernel.resolve_supervisor_obligation(
+                                credential, expected_resolution=decision)
+                            second = runtime.run_once(execution_id='original')
+                        else:
+                            # No post-containment fact exists. Keep this exact
+                            # generation fenced instead of inferring cleanup
+                            # from supervisor exit or a timed-out result.
+                            evidence['host_resolution'] = 'unknown_cleanup_not_authorized'
+                            self.assertIsNone(runtime.run_once(execution_id='original'))
+                            current = runtime.kernel.get('original')
+                            self.assertEqual((current.state, current.attempt, current.fence),
+                                             ('queued', first.attempt, first.fence))
                     evidence['second'] = None if second is None else second.to_dict()
                     evidence['second_limits'] = runtime.kernel.get_execution_limits('original')
                     evidence['calls'] = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
@@ -303,9 +357,19 @@ class ParentBudgetFloorTests(unittest.TestCase):
                     self.assertEqual(evidence['first_budget_after_rollback']['remaining_work_seconds'], 0, evidence)
                     self.assertEqual([call['attempt'] for call in evidence['calls']], [1], evidence)
                     self.assertNotEqual(evidence['calls'][0]['pid'], os.getpid(), evidence)
-                    self.assertIsNotNone(second, evidence)
-                    self.assertEqual(second.state, 'dead', evidence)
-                    self.assertEqual(second.result.error.details['last_result']['status'], 'timed_out', evidence)
+                    if second is None:
+                        self.assertFalse(require_host_resolution, evidence)
+                        self.assertEqual(evidence['host_resolution'], 'unknown_cleanup_not_authorized')
+                    else:
+                        if require_host_resolution:
+                            self.assertTrue(evidence['host_resolution']['resolved'], evidence)
+                            self.assertEqual(second.attempt, 2, evidence)
+                            retry_details = second.result.error.details['last_result']['error']['details']
+                            self.assertEqual(retry_details['phase'], 'entry_authority', evidence)
+                            self.assertEqual(retry_details['remaining_work_seconds'], 0, evidence)
+                            self.assertEqual(retry_details['limiting_source'], 'execution', evidence)
+                        self.assertEqual(second.state, 'dead', evidence)
+                        self.assertEqual(second.result.error.details['last_result']['status'], 'timed_out', evidence)
                     self.assertEqual(evidence['first_limits']['envelope']['constraints'],
                         evidence['second_limits']['envelope']['constraints'], evidence)
                     first_receipt_after = next(item for item in evidence['final_receipts'] if item['identity']['attempt'] == 1)

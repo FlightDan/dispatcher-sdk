@@ -51,6 +51,7 @@ from .contracts import (
     ExecutionResultV2,
 )
 from .errors import (
+    BudgetScanContinuation,
     CASConflictError,
     EffectRecoveryRequiredError,
     HandlerContractMismatchError,
@@ -78,7 +79,8 @@ from .sandbox import SandboxHandler, SandboxJournal
 from .sandbox_contracts import SandboxOutcomeUnknown
 from ._sandbox_registry import register_journals, journal_paths
 from .cancellation import CancellationJournal, _LocalCancellationDiagnostics
-from .settlement import SettlementConflictError, SettlementJournal, merge_diagnostic_notes, merge_script_output
+from .settlement import (SettlementBindingError, SettlementBusyError, SettlementConflictError,
+                         SettlementJournal, merge_diagnostic_notes, merge_script_output)
 from .pending_settlements import PendingSettlements, SettlementAdmission
 from .script_output import ScriptOutputRecovery
 
@@ -89,6 +91,10 @@ class _ProcessRegistration(threading.Event):
     cleanup_confirmed = False
 
 
+class _UnpersistedDiagnosticsError(RuntimeError):
+    """Volatile diagnostic facts still lack a journal acknowledgement."""
+
+
 class _UnpersistedSettlementsError(RuntimeError):
     """Local cleanup finished, but original result retention is unresolved."""
 
@@ -97,8 +103,26 @@ class _ObservationCleanupPendingError(RuntimeError):
     """Stopped SDK storage workers have not yet released runtime storage."""
 
 
+class _ProcessCleanupPendingError(RuntimeError):
+    """An exact-generation native handle remains owned by this runtime."""
+
+
 class InProcessRuntime:
-    """A local coordinator whose handlers are bound to exact historical keys."""
+    """A local coordinator whose handlers are bound to exact historical keys.
+
+    Process mode refuses launches unless a pre-spawn intent is committed to
+    the settlement journal. Setting ``require_durable_cleanup_intent=False``
+    preserves compatibility when the journal is unavailable but removes that
+    durability guarantee. Even a committed intent cannot recover process
+    handles or prove cleanup after a crash.
+
+    Background settlement recovery uses a 256 KiB read limit and a .25 second
+    window by default. Hosts may raise these using
+    ``settlement_recovery_max_record_bytes`` and
+    ``settlement_recovery_timeout_seconds``. The most recent bounded background
+    failure is exposed by ``settlement_recovery_diagnostic`` as a past
+    observation; it does not establish the current state of the obligation.
+    """
 
     def __init__(
         self,
@@ -115,12 +139,31 @@ class InProcessRuntime:
         cancellation_journal_path: str | None = None,
         source_id: str | None = None,
         observation_path: str | None = None,
+        settlement_journal_path: str | None = None,
+        settlement_recovery_max_record_bytes: int = 256 * 1024,
+        settlement_recovery_timeout_seconds: float = .25,
         observation_options: ObservationOptions | None = None,
         child_capacity: int = 1,
         max_child_depth: int = 1,
         process_memory_limit_bytes: int | None = None,
         allow_children: bool = True,
+        authority_verifier: Any = None,
+        worker_credential: Any = None,
+        lifecycle_verifier: Any = None,
+        require_durable_cleanup_intent: bool = True,
     ) -> None:
+        if type(require_durable_cleanup_intent) is not bool:
+            raise TypeError("require_durable_cleanup_intent must be a bool")
+        if (type(settlement_recovery_max_record_bytes) is not int or
+                not 1 <= settlement_recovery_max_record_bytes < (1 << 63)):
+            raise ValueError("settlement_recovery_max_record_bytes must be a positive bounded integer")
+        if (type(settlement_recovery_timeout_seconds) not in (int, float) or
+                not math.isfinite(settlement_recovery_timeout_seconds) or settlement_recovery_timeout_seconds <= 0):
+            raise ValueError("settlement_recovery_timeout_seconds must be finite and positive")
+        self._settlement_recovery_max_record_bytes = settlement_recovery_max_record_bytes
+        self._settlement_recovery_timeout_seconds = float(settlement_recovery_timeout_seconds)
+        self._settlement_recovery_diagnostic = None
+        self.require_durable_cleanup_intent = require_durable_cleanup_intent
         if (cancellation_journal_path is None) != (source_id is None):
             raise ValueError("cancellation_journal_path and source_id must be provided together")
         self.durability = validate_durability(durability)
@@ -132,6 +175,8 @@ class InProcessRuntime:
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self._now = now
+        self._authority_verifier = authority_verifier
+        self._worker_credential = worker_credential
         fork_available = os.name == "posix" and "fork" in multiprocessing.get_all_start_methods()
         process_available = fork_available or os.name == "nt"
         if isolation_mode == "auto":
@@ -172,6 +217,8 @@ class InProcessRuntime:
         self._close_complete = threading.Event()
         self._close_retry_lock = threading.Lock()
         self._close_error: BaseException | None = None
+        self._deferred_diagnostic_kernel_close = False
+        self._kernel_storage_closed = False
         self._stop_event = threading.Event()
         self._active_runs = 0
         self._process_supervisors: dict[tuple[str, int, int], Any] = {}
@@ -215,6 +262,31 @@ class InProcessRuntime:
         self._settlement_journal: SettlementJournal | None = None
         self._settlement_error: str | None = None
         self._diagnostic_errors: dict[str, str] = {}
+        # Volatile ownership only. A crash can lose these notes; no durable
+        # receipt is inferred until the journal acknowledges the same ID.
+        self._diagnostic_pending_lock = threading.Lock()
+        self._diagnostic_retry_lock = threading.Lock()
+        self._diagnostic_pending: dict[str, tuple[dict[str, Any], str, dict[str, Any]]] = {}
+        self._diagnostic_pending_overflow = False
+        self._diagnostic_failed_executions: set[str] = set()
+        self._diagnostic_unknown_handoffs: set[tuple[str, int, int]] = set()
+        self._diagnostic_handoff_cursor = None
+        self._diagnostic_pending_capacity = 256
+        # Producer reservations are durable in the Kernel; the local mapping
+        # only directs facts from this driver to its reserved slots.
+        self._lifecycle_producers: dict[tuple[str, int, int], str] = {}
+        self._lifecycle_token_generations: dict[str, tuple[str, int, int]] = {}
+        self._lifecycle_active_tokens: set[str] = set()
+        self._lifecycle_note_tokens: dict[str, str] = {}
+        self._diagnostic_received: set[str] = set()
+        self._lifecycle_enqueued: set[str] = set()
+        self._lifecycle_finished: set[str] = set()
+        self._lifecycle_context = threading.local()
+        self._lifecycle_scan_cursor = 0
+        self._lifecycle_delivery_error: str | None = None
+        # Protected by the lifecycle lock; at most one bounded untargeted
+        # scan predicate is retained between scheduler polls.
+        self._budget_scan_continuation = None
         self._local_cancellation_diagnostics = _LocalCancellationDiagnostics(self.observation_options)
         self._settlement_thread: threading.Thread | None = None
         self._settlement_lock = threading.Lock()
@@ -235,6 +307,9 @@ class InProcessRuntime:
             now=now,
             default_lease_seconds=lease_seconds,
             outbox_max_attempts=outbox_max_attempts,
+            authority_verifier=authority_verifier,
+            worker_credential=worker_credential,
+            lifecycle_verifier=lifecycle_verifier,
         )
         try:
             self.cancellation_journal: CancellationJournal | None = None
@@ -261,16 +336,26 @@ class InProcessRuntime:
             self._observation_source_id = self._sandbox_store_id or uuid.uuid4().hex
             self._observation_path = observation_path or self.kernel.db_path + ".observations.sqlite3"
             try:
-                settlement_path = (os.path.join(self._temporary_observation.name, "settlements.sqlite3")
+                if settlement_journal_path is not None and not str(settlement_journal_path).strip():
+                    raise ValueError("settlement_journal_path must be nonempty")
+                settlement_path = settlement_journal_path if settlement_journal_path is not None else (os.path.join(self._temporary_observation.name, "settlements.sqlite3")
                     if self.kernel.db_path == ":memory:" and self._temporary_observation is not None
                     else self.kernel.db_path + ".settlements.sqlite3")
-                self._settlement_journal = SettlementJournal(settlement_path,
+                self._settlement_storage = {'path': str(Path(settlement_path).expanduser().resolve()),
+                    'source_id': self._observation_source_id,
+                    'kernel_path': (self.kernel.db_path if self.kernel.db_path == ':memory:' else str(Path(self.kernel.db_path).resolve())),
+                    'available': False}
+                constructor = SettlementJournal if settlement_journal_path is None else SettlementJournal.open_existing
+                self._settlement_journal = constructor(settlement_path,
                     source_id=self._observation_source_id, kernel_path=self.kernel.db_path)
+                self._settlement_storage['available'] = True
                 from .scripts import SCRIPT_HANDLER_ID, SCRIPT_HANDLER_VERSION, script_handler
                 if self.handlers.get((SCRIPT_HANDLER_ID, SCRIPT_HANDLER_VERSION)) is script_handler:
                     self._script_output_recovery = ScriptOutputRecovery(
                         self.kernel.db_path, self._settlement_journal)
             except Exception as exc:
+                if settlement_journal_path is not None or isinstance(exc, SettlementBindingError):
+                    raise
                 self._settlement_error = f"{type(exc).__name__}: {exc}"
             try:
                 self.observation_journal = ObservationJournal(self._observation_path,
@@ -302,7 +387,12 @@ class InProcessRuntime:
                 self._retry_close_cleanup()
             return
         try:
-            self.request_stop()
+            try:
+                self.request_stop()
+            except _ProcessCleanupPendingError:
+                # Keep closing the other services; after active invocations
+                # leave, retry the exact retained handles below.
+                pass
             if self._stall_supervisor is not None:
                 self._stall_supervisor.close(timeout=1.0)
             if self._child_service is not None:
@@ -313,6 +403,8 @@ class InProcessRuntime:
                 while self._active_runs:
                     self._lifecycle_condition.wait()
             self._persist_pending_settlements(time.monotonic() + 1, limit=64)
+            if hasattr(self, "_diagnostic_pending_lock"):
+                self._retry_diagnostic_notes(time.monotonic() + 1)
             observation_pending = self._drain_observation_workers(time.monotonic() + 1.0)
             try:
                 unresolved = self.recover_sandboxes(all_pages=True)
@@ -322,12 +414,30 @@ class InProcessRuntime:
                     raise _UnpersistedSettlementsError("runtime closed with original outcomes not yet durably persisted")
                 if observation_pending:
                     raise _ObservationCleanupPendingError("runtime storage cleanup remains pending")
+                self._retry_process_cleanup()
+                if hasattr(self, "_diagnostic_pending_lock") and self._diagnostics_block_admission():
+                    raise _UnpersistedDiagnosticsError("runtime closed with diagnostic facts not confirmed durable")
             finally:
                 # A live Context may still own the exact captured floor and
                 # token. Its bounded factual ACK needs this Kernel on retry.
-                if not observation_pending:
-                    self._close_kernel_storage()
-                if self._temporary_observation is not None and not observation_pending:
+                diagnostics_pending = ((hasattr(self, "_diagnostic_pending_lock") and
+                                        self._diagnostics_block_admission()) or
+                                       bool(self._pending_settlements.identities()))
+                self._deferred_diagnostic_kernel_close = bool(diagnostics_pending)
+                if not observation_pending and not diagnostics_pending:
+                    original = sys.exc_info()[1]
+                    try:
+                        self._close_kernel_storage()
+                    except BaseException as close_error:
+                        if original is None:
+                            raise
+                        self._deferred_diagnostic_kernel_close = True
+                        note = f"Kernel close also failed: {type(close_error).__name__}: {close_error}"
+                        if hasattr(original, "add_note"):
+                            original.add_note(note)
+                        else:
+                            original.kernel_close_error = close_error
+                if self._temporary_observation is not None and self._kernel_storage_closed and not observation_pending:
                     self._temporary_observation.cleanup()
         except BaseException as exc:
             self._close_error = exc
@@ -338,6 +448,7 @@ class InProcessRuntime:
     def _close_kernel_storage(self) -> None:
         try:
             self.kernel.close()
+            self._kernel_storage_closed = True
         except (BudgetClockUnknownError, TimeoutError) as error:
             if (isinstance(error, TimeoutError)
                     or str(error) == "budget_clock_cleanup_pending"):
@@ -350,10 +461,10 @@ class InProcessRuntime:
                 or self._observation_cleanup_pending
                 or isinstance(self._close_error, _ObservationCleanupPendingError)):
             observation_pending = self._drain_observation_workers(time.monotonic() + 1.0)
-            if not observation_pending:
+            if not observation_pending and isinstance(self._close_error, _ObservationCleanupPendingError):
+                self._close_error = None
+            if not observation_pending and not self._deferred_diagnostic_kernel_close:
                 self._close_kernel_storage()
-                if isinstance(self._close_error, _ObservationCleanupPendingError):
-                    self._close_error = None
                 if self._temporary_observation is not None:
                     self._temporary_observation.cleanup()
         if isinstance(self._close_error, _UnpersistedSettlementsError):
@@ -364,8 +475,86 @@ class InProcessRuntime:
         # still-running collector's storage ownership.
         if observation_pending and self._close_error is None:
             self._close_error = _ObservationCleanupPendingError("runtime storage cleanup remains pending")
+        self._retry_process_cleanup()
+        if isinstance(self._close_error, _ProcessCleanupPendingError):
+            self._close_error = None
+        if hasattr(self, "_diagnostic_pending_lock") and not self._kernel_storage_closed:
+            self._retry_diagnostic_notes(time.monotonic() + 1)
+            if self._diagnostics_block_admission():
+                if self._close_error is None:
+                    self._close_error = _UnpersistedDiagnosticsError("runtime closed with diagnostic facts not confirmed durable")
+            elif isinstance(self._close_error, _UnpersistedDiagnosticsError):
+                self._close_error = None
+            if (self._deferred_diagnostic_kernel_close and not observation_pending
+                    and not self._diagnostics_block_admission()
+                    and not self._pending_settlements.identities()):
+                self._close_kernel_storage()
+                self._deferred_diagnostic_kernel_close = False
+                if self._temporary_observation is not None:
+                    self._temporary_observation.cleanup()
         if self._close_error is not None:
             raise self._close_error
+
+    def _retry_process_cleanup(self) -> None:
+        with self._lifecycle_lock:
+            retained = tuple(self._process_supervisors.items())
+        failures = []
+        first_error = None
+        for generation, supervisor in retained:
+            try:
+                if not supervisor.revoke("runtime_closed"):
+                    failures.append((generation, "termination_unconfirmed"))
+                    continue
+                close = getattr(supervisor, "close", None)
+                if callable(close):
+                    close()
+                with self._lifecycle_lock:
+                    if self._process_supervisors.get(generation) is supervisor:
+                        del self._process_supervisors[generation]
+            except Exception as exc:
+                failures.append((generation, f"{type(exc).__name__}: {exc}"))
+                if first_error is None:
+                    first_error = exc
+        if failures:
+            raise _ProcessCleanupPendingError(f"native process cleanup remains unresolved: {failures!r}") from first_error
+
+    def _stop_obligations_snapshot(self) -> dict[str, Any]:
+        """Best-effort local snapshot; never wait for a runtime or storage lock.
+
+        Registrations are only a subset of claimed executions. Retained
+        outcomes are process-local and exclude durable journal obligations.
+        """
+        identities = None
+        if self._lifecycle_lock.acquire(blocking=False):
+            try:
+                if self._thread_lock.acquire(blocking=False):
+                    try:
+                        identities = tuple(sorted(set(self._process_registration_events)
+                            | set(self._process_supervisors)
+                            | set(self._thread_authority_by_execution)))
+                    finally:
+                        self._thread_lock.release()
+            finally:
+                self._lifecycle_lock.release()
+        diagnostic_count = None
+        unknown_handoff_count = None
+        failed_execution_count = None
+        diagnostic_overflow = None
+        if self._diagnostic_pending_lock.acquire(blocking=False):
+            try:
+                diagnostic_count = len(self._diagnostic_pending)
+                unknown_handoff_count = len(self._diagnostic_unknown_handoffs)
+                failed_execution_count = len(self._diagnostic_failed_executions)
+                diagnostic_overflow = self._diagnostic_pending_overflow
+            finally:
+                self._diagnostic_pending_lock.release()
+        return {"active_execution_identities": identities,
+                "pending_settlement_count": self._pending_settlements.try_pending_count(),
+                "pending_diagnostic_count": diagnostic_count,
+                "unknown_diagnostic_handoff_count": unknown_handoff_count,
+                "failed_diagnostic_execution_count": failed_execution_count,
+                "diagnostic_retention_overflow": diagnostic_overflow,
+                "obligation_scope": "in_process_partial"}
 
     def _retain_observation_workers(self, recorder: ActivityRecorder) -> None:
         with self._lifecycle_condition:
@@ -481,7 +670,7 @@ class InProcessRuntime:
 
         with self._lifecycle_lock:
             self._stop_event.set()
-            supervisors = tuple(self._process_supervisors.values())
+            supervisors = tuple(self._process_supervisors.items())
             for execution_id in self._process_registration_events:
                 self._revoked_executions.setdefault(
                     execution_id, "runtime_closed"
@@ -492,8 +681,16 @@ class InProcessRuntime:
                 executor = self._thread_executor
                 child_executor = self._child_thread_executor
                 contexts = tuple(self._thread_contexts.values())
-        for supervisor in supervisors:
-            supervisor.revoke("runtime_closed")
+        failures = []
+        first_error = None
+        for generation, supervisor in supervisors:
+            try:
+                if not supervisor.revoke("runtime_closed"):
+                    failures.append((generation, "termination_unconfirmed"))
+            except Exception as exc:
+                failures.append((generation, f"{type(exc).__name__}: {exc}"))
+                if first_error is None:
+                    first_error = exc
         if executor is not None:
             # Running Python threads cannot be killed. Their Kernel authority
             # is revoked and the run_once wrapper is woken promptly.
@@ -507,6 +704,8 @@ class InProcessRuntime:
                 self._retain_observation_context(context)
                 if isinstance(context.activity, ActivityRecorder):
                     self._retain_observation_workers(context.activity)
+        if failures:
+            raise _ProcessCleanupPendingError(f"native process cleanup remains unresolved: {failures!r}") from first_error
 
     def _start_services(self) -> None:
         with self._lifecycle_lock:
@@ -529,10 +728,27 @@ class InProcessRuntime:
         while not self._stop_event.is_set():
             self._release_completed_thread_slots()
             try:
-                self.recover_completions(timeout_seconds=.25)
+                self._retry_diagnostic_notes(time.monotonic() + .1)
+                reports = self.recover_completions(timeout_seconds=self._settlement_recovery_timeout_seconds,
+                    max_record_bytes=self._settlement_recovery_max_record_bytes)
+                for report in reports:
+                    if report.get('error') or report.get('state') in ('unknown', 'error', 'unpersisted'):
+                        self._settlement_recovery_diagnostic = {
+                            'state': report.get('state'),
+                            'execution_id': (report.get('execution_id') or '')[:1024] or None,
+                            'error': str(report.get('error') or 'recovery outcome unknown')[:1024],
+                            'required_bytes': report.get('required_bytes'), 'observed_at': time.time()}
             except Exception as exc:
                 self._settlement_error = f"{type(exc).__name__}: {exc}"
+                self._settlement_recovery_diagnostic = {'state': 'unknown', 'execution_id': None,
+                    'error': self._settlement_error[:1024], 'required_bytes': None, 'observed_at': time.time()}
             self._stop_event.wait(.25)
+
+    @property
+    def settlement_recovery_diagnostic(self) -> dict[str, Any] | None:
+        """Last bounded background diagnostic; its timestamp marks a past observation."""
+        value = self._settlement_recovery_diagnostic
+        return None if value is None else dict(value)
 
     def _recover_script_output(self, deadline: float) -> None:
         """Publish retained artifact facts without affecting business results."""
@@ -577,6 +793,16 @@ class InProcessRuntime:
         return tuple(item for item in items if type(item) is dict
             and item.get("state") == "unknown" and item.get("captured_envelope") is not None)
 
+    @staticmethod
+    def _has_uncaptured_budget_checkpoint(evidence):
+        checkpoint = evidence.get("budget_checkpoint")
+        if type(checkpoint) is not dict:
+            return False
+        items = ((checkpoint,) if "state" in checkpoint else
+                 (checkpoint.get("parent"), checkpoint.get("supervisor")))
+        return any(type(item) is dict and item.get("state") == "unknown"
+                   and item.get("captured_envelope") is None for item in items)
+
     def _finish_received_budget_checkpoints(self, record, deadline: float) -> None:
         """Publish received facts before resolving their durable obligation."""
         for checkpoint in self._received_budget_checkpoints(record["evidence"]):
@@ -590,9 +816,13 @@ class InProcessRuntime:
             self.kernel._finish_received_budget_sample(token, record["identity"]["execution_id"],
                 envelope, timeout_seconds=remaining)
 
-    def recover_completions(self, *, limit: int = 50,
-                            timeout_seconds: float = .5) -> tuple[dict[str, Any], ...]:
-        """Retry retained result CAS operations, without invoking any handler."""
+    def recover_completions(self, *, limit: int = 50, timeout_seconds: float = .5,
+                            max_record_bytes: int = 256 * 1024) -> tuple[dict[str, Any], ...]:
+        """Retry result CAS operations; hosts may raise the bounded read budget for large receipts."""
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("limit must be an integer between 1 and 50")
+        if type(max_record_bytes) is not int or not 1 <= max_record_bytes < (1 << 63):
+            raise ValueError("max_record_bytes must be a positive bounded integer")
         duration = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
         if self._settlement_journal is None:
             return ({"state": "unknown", "error": self._settlement_error},)
@@ -601,23 +831,44 @@ class InProcessRuntime:
             return ({"state": "pending", "error": "completion recovery busy"},)
         reports = []
         try:
+            reports.extend(self._reconcile_recorded_handoffs(deadline, limit=limit, max_record_bytes=max_record_bytes))
             reports.extend(self._persist_pending_settlements(deadline, limit=limit))
             self._drain_recovery_completion_readers(deadline)
             self._recover_script_output(min(deadline, time.monotonic() + .025))
             if time.monotonic() >= deadline:
                 return tuple(reports)
-            records = self._settlement_journal.pending(limit=limit,
-                timeout_seconds=min(.1, max(.001, deadline-time.monotonic())))
-            for record in records:
+            seen = set()
+            for _ in range(limit):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or self._closed:
                     break
-                identity = record["identity"]
+                try:
+                    record = self._settlement_journal.next_pending_round_robin(
+                        timeout_seconds=remaining, max_record_bytes=max_record_bytes)
+                except SettlementBusyError as error:
+                    reports.append({"state": "pending", "error": str(error)})
+                    break
+                if record is None:
+                    break
+                identity = record.get("identity")
+                if identity is not None:
+                    key = (identity["execution_id"], identity["attempt"], identity["fence"])
+                    if key in seen:
+                        break
+                    seen.add(key)
+                if record.get("oversized"):
+                    reports.append({**({} if identity is None else identity), "state": "pending",
+                                    "required_bytes": record['required_bytes'],
+                                    "error": "settlement recovery record exceeds bounded read limit"})
+                    continue
                 key = (identity["execution_id"], identity["attempt"], identity["fence"])
                 with self._settlement_inflight_lock:
                     if key in self._settlement_inflight:
                         continue
-                operation_deadline = min(deadline, time.monotonic() + .1)
+                # Explicitly budgeted large receipts may need the caller's
+                # remaining window for the actual Kernel CAS and journal write.
+                operation_deadline = (deadline if max_record_bytes > 256 * 1024
+                                      else min(deadline, time.monotonic() + .1))
 
                 def operation_timeout():
                     remaining = operation_deadline - time.monotonic()
@@ -625,11 +876,18 @@ class InProcessRuntime:
                         raise TimeoutError("completion recovery operation window elapsed")
                     # Subtracting large clock anchors can round above the
                     # literal cap; never forward more than that original cap.
-                    return min(.1, remaining)
+                    return min(timeout_seconds if max_record_bytes > 256 * 1024 else .1, remaining)
 
+                received_checkpoints_finished = False
+                confirmed = False
                 try:
                     lease = ExecutionLease.from_dict(record["lease"])
                     self._finish_received_budget_checkpoints(record, operation_deadline)
+                    received_checkpoints_finished = True
+                    deferred_kind = None if record["deferred"] is None else record["deferred"].get("kind")
+                    if deferred_kind != "recovery_required" and self._has_uncaptured_budget_checkpoint(record["evidence"]):
+                        reports.append({**identity, "state": "pending", "error": "budget checkpoint has no captured sample"})
+                        continue
                     if (record["deferred"] is not None
                             and record["deferred"]["kind"] in {
                                 "script_output_recovery", "budget_checkpoint_recovery"}):
@@ -684,9 +942,14 @@ class InProcessRuntime:
                                     resolved = record["evidence"]["resolved_result"]
                                 result = ExecutionResultV2.from_dict(resolved)
                                 retained = record["evidence"].get("budget_envelope")
+                                not_invoked = record['evidence'].get('supervisor_not_invoked') == {
+                                    'source': 'runtime_pre_spawn', 'process_creation': 'not_invoked'}
                                 completed = self.kernel._complete_sdk_result(lease, result,
                                     budget_envelope=None if retained is None else BudgetEnvelope.from_dict(retained),
-                                    timeout_seconds=operation_timeout(), settlement=True)
+                                    timeout_seconds=operation_timeout(), settlement=True,
+                                    supervisor_not_invoked=not_invoked,
+                                    supervisor_registration_uncertain=not_invoked and record['evidence'].get('supervisor_registration_uncertain') is True)
+                                confirmed = not_invoked
                             elif original["kind"] != "recovery_required":
                                 raise ValueError("unknown deferred completion kind")
                             else:
@@ -698,22 +961,76 @@ class InProcessRuntime:
                         else:
                             result = ExecutionResultV2.from_dict(record["result"])
                             retained_budget = record["evidence"].get("budget_envelope")
+                            confirmed = record['evidence'].get('supervisor_completion') == {
+                                'cleanup': 'confirmed', 'source': 'runtime_supervisor_reaped',
+                                'result': 'accepted'}
+                            not_invoked = record['evidence'].get('supervisor_not_invoked') == {
+                                'source': 'runtime_pre_spawn', 'process_creation': 'not_invoked'}
+                            pending_native = record['evidence'].get('supervisor_completion_pending_checkpoint') == {
+                                'cleanup': 'confirmed', 'source': 'runtime_supervisor_reaped',
+                                'result': 'captured'}
+                            confirmed = confirmed or (pending_native and bool(
+                                self._received_budget_checkpoints(record['evidence'])))
                             completed = self.kernel._complete_sdk_result(lease, result,
                                 budget_envelope=(None if retained_budget is None else
                                     BudgetEnvelope.from_dict(retained_budget)),
-                                timeout_seconds=operation_timeout(), settlement=True)
+                                timeout_seconds=operation_timeout(), settlement=True,
+                                supervisor_cleanup_confirmed=confirmed,
+                                supervisor_not_invoked=not_invoked,
+                                supervisor_registration_uncertain=not_invoked and record['evidence'].get('supervisor_registration_uncertain') is True)
+                            confirmed = confirmed or not_invoked
                     state = "recovery_required" if completed.state == "recovery_required" else "recorded"
                     evidence = {**record["evidence"], "execution_state": completed.state,
                         "execution_revision": completed.revision}
                     if result is not None:
                         evidence["result_id"] = result.result_id
                     self._settlement_journal.settle(record, state, evidence, timeout_seconds=operation_timeout())
+                    if state == "recorded" and result is not None and confirmed:
+                        self._resolve_diagnostic_handoff(lease)
                     reports.append({**identity, "state": state, **evidence})
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
+                    committed_candidate = record['result']
+                    if (committed_candidate is None and type(record.get('deferred')) is dict
+                            and record['deferred'].get('kind') == 'completion_time_unknown'):
+                        committed_candidate = record['evidence'].get('resolved_result')
+                    if (isinstance(exc, (StaleFenceError, InvalidStateTransitionError))
+                            and committed_candidate is not None
+                            and (record['evidence'].get('supervisor_completion') == {
+                                'cleanup': 'confirmed', 'source': 'runtime_supervisor_reaped', 'result': 'accepted'}
+                                or record['evidence'].get('supervisor_not_invoked') == {
+                                    'source': 'runtime_pre_spawn', 'process_creation': 'not_invoked'}
+                                or (record['evidence'].get('supervisor_completion_pending_checkpoint') == {
+                                    'cleanup': 'confirmed', 'source': 'runtime_supervisor_reaped', 'result': 'captured'}
+                                    and received_checkpoints_finished
+                                    and bool(self._received_budget_checkpoints(record['evidence']))))):
+                        try:
+                            original_result = ExecutionResultV2.from_dict(committed_candidate)
+                            accepted = self.kernel._is_committed_supervisor_result(
+                                lease, original_result, timeout_seconds=operation_timeout(),
+                                max_record_bytes=max_record_bytes)
+                            if accepted:
+                                self._settlement_journal.settle(record, 'recorded',
+                                    {**record['evidence'], 'result_id': original_result.result_id,
+                                     'reconciled': 'exact_committed_supervisor_result'},
+                                    timeout_seconds=operation_timeout())
+                                self._resolve_diagnostic_handoff(lease)
+                                reports.append({**identity, 'state': 'recorded',
+                                                'result_id': original_result.result_id})
+                                continue
+                        except Exception as proof_error:
+                            if (self._storage_contention(proof_error) or
+                                    isinstance(proof_error, (TimeoutError, SettlementConflictError))):
+                                reports.append({**identity, 'state': 'pending',
+                                                'error': f'{type(proof_error).__name__}: {proof_error}'})
+                                continue
+                            raise
                     if isinstance(exc, SettlementConflictError):
                         # Another maintainer owns the newer durable revision.
                         # Do not overwrite it or publish our uncommitted result.
+                        reports.append({**identity, "state": "pending", "error": error})
+                        continue
+                    if isinstance(exc, BudgetClockUnknownError):
                         reports.append({**identity, "state": "pending", "error": error})
                         continue
                     if self._storage_contention(exc) or isinstance(exc, TimeoutError):
@@ -744,19 +1061,290 @@ class InProcessRuntime:
         """Retain diagnostics even when the activity writer is unavailable."""
         execution_id = (identity.execution_id if hasattr(identity, "execution_id")
                         else identity["execution_id"])
+        key = {"execution_id": execution_id, "attempt": identity.attempt,
+               "fence": identity.fence} if hasattr(identity, "attempt") else dict(identity)
+        note_id = str(uuid.uuid4())
+        retained = False
         try:
-            if self._settlement_journal is None:
-                raise RuntimeError(self._settlement_error or "diagnostic journal unavailable")
-            key = {"execution_id": execution_id, "attempt": identity.attempt,
-                   "fence": identity.fence} if hasattr(identity, "attempt") else identity
-            self._settlement_journal.note(key, phase, evidence, timeout_seconds=timeout_seconds)
-            return True
+            # Freeze the event before handing it to either writer or retry.
+            encoded = json.dumps(evidence, ensure_ascii=False, allow_nan=False)
+            if len(encoded.encode("utf-8")) > 1024 * 1024:
+                raise ValueError("diagnostic note exceeds local retention limit")
+            frozen = json.loads(encoded)
+            with self._diagnostic_pending_lock:
+                if self._diagnostic_pending_overflow:
+                    raise RuntimeError("diagnostic retention already incomplete")
+                if len(self._diagnostic_pending) >= self._diagnostic_pending_capacity:
+                    self._diagnostic_pending_overflow = True
+                    raise RuntimeError("diagnostic retention capacity exhausted")
+                self._diagnostic_pending[note_id] = (key, phase, frozen)
+                generation = (key['execution_id'], key['attempt'], key['fence'])
+                producer = (getattr(self._lifecycle_context, 'producer', None)
+                            if getattr(self._lifecycle_context, 'cancellation', False)
+                            else self._lifecycle_producers.get(generation))
+                self._lifecycle_note_tokens[note_id] = producer or uuid.uuid4().hex
+                retained = True
+            # One ordered writer drains the queue; later notes must never
+            # bypass a failed earlier fact, even while another worker retries.
+            self._retry_diagnostic_notes(time.monotonic() + timeout_seconds, wait_for_writer=True,
+                                         priority_execution_id=execution_id)
+            with self._diagnostic_pending_lock:
+                saved = note_id not in self._diagnostic_pending or note_id in self._diagnostic_received
+            if not saved and self._settlement_journal is None:
+                self._diagnostic_errors[execution_id] = self._settlement_error or "diagnostic journal unavailable"
+            return saved
         except Exception as exc:
+            if not retained:
+                # Preserve a scoped unknown when the fact itself cannot be
+                # retained. Shared-capacity overflow remains global.
+                with self._diagnostic_pending_lock:
+                    if not self._diagnostic_pending_overflow:
+                        if len(self._diagnostic_failed_executions) >= self._diagnostic_pending_capacity:
+                            self._diagnostic_pending_overflow = True
+                        else:
+                            self._diagnostic_failed_executions.add(execution_id)
             self._diagnostic_errors[execution_id] = f"{type(exc).__name__}: {exc}"
             return False
 
+    def _retry_diagnostic_notes(self, deadline: float, *, wait_for_writer: bool = False,
+                                priority_execution_id: str | None = None) -> None:
+        acquired = (self._diagnostic_retry_lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+                    if wait_for_writer else self._diagnostic_retry_lock.acquire(blocking=False))
+        if not acquired:
+            return
+        try:
+            # Persist local facts first, preserving per-execution order. A
+            # stable event ID survives a lost append or receiver ACK.
+            failed: set[str] = set()
+            with self._diagnostic_pending_lock:
+                entries = list(self._diagnostic_pending.items())
+            for note_id, (identity, phase, evidence) in entries:
+                if time.monotonic() >= deadline:
+                    break
+                if identity['execution_id'] in failed:
+                    continue
+                if priority_execution_id is not None and identity['execution_id'] != priority_execution_id:
+                    continue
+                with self._diagnostic_pending_lock:
+                    token = self._lifecycle_note_tokens[note_id]
+                    generation = (identity['execution_id'], identity['attempt'], identity['fence'])
+                    self._lifecycle_token_generations[token] = generation
+                    standalone = token not in self._lifecycle_active_tokens
+                    enqueued = note_id in self._lifecycle_enqueued
+                operation = 'reserve'
+                try:
+                    if enqueued:
+                        continue
+                    if standalone:
+                        if self.kernel.lifecycle_reserve(*generation, token, slots=1,
+                                timeout_seconds=max(.000001, deadline-time.monotonic())) is None:
+                            raise RuntimeError('lifecycle outbox capacity exhausted')
+                    operation = 'append'
+                    _, delivered = self.kernel.lifecycle_append(token, note_id, phase, evidence,
+                        identity=generation, include_status=True,
+                        timeout_seconds=max(.000001, deadline-time.monotonic()))
+                    with self._diagnostic_pending_lock:
+                        self._lifecycle_enqueued.add(note_id)
+                    if standalone:
+                        with self._diagnostic_pending_lock:
+                            self._lifecycle_finished.add(token)
+                    if delivered:
+                        with self._diagnostic_pending_lock:
+                            self._diagnostic_pending.pop(note_id, None)
+                            self._lifecycle_note_tokens.pop(note_id, None)
+                            self._diagnostic_received.discard(note_id)
+                            self._lifecycle_enqueued.discard(note_id)
+                except Exception as exc:
+                    self._diagnostic_errors[identity['execution_id']] = f'lifecycle {operation}: {type(exc).__name__}: {exc}'
+                    failed.add(identity['execution_id'])
+            failed_receivers: set[str] = set()
+            wrapped = False
+            while self._settlement_journal is not None and time.monotonic() < deadline:
+                identity = {'execution_id': '<unknown>'}
+                operation = 'peek'
+                event = None
+                try:
+                    event = self.kernel.lifecycle_peek(execution_id=priority_execution_id,
+                        exclude_execution_ids=tuple(failed_receivers),
+                        after_sequence=0 if priority_execution_id is not None else self._lifecycle_scan_cursor,
+                        timeout_seconds=max(.000001, deadline-time.monotonic()))
+                    self._lifecycle_delivery_error = None
+                    if event is None:
+                        if priority_execution_id is None and self._lifecycle_scan_cursor and not wrapped:
+                            self._lifecycle_scan_cursor = 0
+                            wrapped = True
+                            continue
+                        break
+                    if 'continuation' in event:
+                        if priority_execution_id is None:
+                            self._lifecycle_scan_cursor = event['continuation']
+                            continue
+                        break
+                    if priority_execution_id is None:
+                        self._lifecycle_scan_cursor = event['sequence']
+                    identity = {key: event[key] for key in ('execution_id', 'attempt', 'fence')}
+                    operation = 'journal note'
+                    receiver_store_id = event.get('receiver_store_id') or self.kernel.kernel_store_identity()
+                    self._settlement_journal.lifecycle_note(identity, event['phase'], event['payload'],
+                        store_id=receiver_store_id, outbox_sequence=event['sequence'],
+                        legacy_note_id=event.get('receiver_note_id'),
+                        timeout_seconds=min(.1, max(.000001, deadline-time.monotonic())))
+                    with self._diagnostic_pending_lock:
+                        if event['event_id'] in self._diagnostic_pending:
+                            self._diagnostic_received.add(event['event_id'])
+                    operation = 'ack'
+                    if not self.kernel.lifecycle_ack(event['sequence'], event['event_id'],
+                            timeout_seconds=max(.000001, deadline-time.monotonic())):
+                        break
+                    with self._diagnostic_pending_lock:
+                        self._diagnostic_pending.pop(event['event_id'], None)
+                        self._lifecycle_note_tokens.pop(event['event_id'], None)
+                        self._diagnostic_received.discard(event['event_id'])
+                        self._lifecycle_enqueued.discard(event['event_id'])
+                except Exception as exc:
+                    self._diagnostic_errors[identity['execution_id']] = f'lifecycle {operation}: {type(exc).__name__}: {exc}'
+                    if operation == 'peek':
+                        self._lifecycle_delivery_error = f'{type(exc).__name__}: {exc}'
+                    if (priority_execution_id is not None and
+                            (self._storage_contention(exc) or isinstance(exc, TimeoutError)) and
+                            time.monotonic() < deadline):
+                        self._stop_event.wait(min(.01, max(0.0, deadline - time.monotonic())))
+                        continue
+                    if identity['execution_id'] == '<unknown>' or len(failed_receivers) >= 127:
+                        break
+                    failed_receivers.add(identity['execution_id'])
+            # A different Runtime may have acknowledged our event. Reconcile
+            # local ownership against the durable receipt without re-appending.
+            with self._diagnostic_pending_lock:
+                candidates = tuple(self._lifecycle_enqueued)
+            for note_id in candidates:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    with self._diagnostic_pending_lock:
+                        token = self._lifecycle_note_tokens.get(note_id)
+                        generation = self._lifecycle_token_generations.get(token) if token is not None else None
+                    if self.kernel.lifecycle_event_delivered(note_id,
+                            identity=generation,
+                            timeout_seconds=max(.000001, deadline-time.monotonic())):
+                        with self._diagnostic_pending_lock:
+                            self._diagnostic_pending.pop(note_id, None)
+                            self._lifecycle_note_tokens.pop(note_id, None)
+                            self._diagnostic_received.discard(note_id)
+                            self._lifecycle_enqueued.discard(note_id)
+                except Exception:
+                    break
+            with self._diagnostic_pending_lock:
+                finished = [token for token in self._lifecycle_finished
+                            if token not in self._lifecycle_note_tokens.values()]
+            for token in finished:
+                try:
+                    with self._diagnostic_pending_lock:
+                        generation = self._lifecycle_token_generations.get(token)
+                    self.kernel.lifecycle_finish(token, identity=generation,
+                        timeout_seconds=max(.000001, deadline-time.monotonic()))
+                    with self._diagnostic_pending_lock:
+                        self._lifecycle_finished.discard(token)
+                        self._lifecycle_active_tokens.discard(token)
+                        self._lifecycle_producers = {key: value for key, value in self._lifecycle_producers.items() if value != token}
+                        self._lifecycle_token_generations.pop(token, None)
+                except Exception:
+                    pass
+        finally:
+            self._diagnostic_retry_lock.release()
+
+    def _diagnostics_block_admission(self, execution_id: str | None = None) -> bool:
+        with self._diagnostic_pending_lock:
+            if (self._diagnostic_pending_overflow or
+                    len(self._diagnostic_pending) >= self._diagnostic_pending_capacity or
+                    len(self._diagnostic_unknown_handoffs) >= self._diagnostic_pending_capacity):
+                return True
+            pending = self._diagnostic_pending
+            if self._settlement_journal is None and pending:
+                return True
+            if execution_id is None:
+                # Untargeted Kernel claim cannot exclude affected IDs.
+                return bool(pending) or bool(self._diagnostic_failed_executions) or bool(self._diagnostic_unknown_handoffs)
+            return (execution_id in self._diagnostic_failed_executions or any(
+                item[0] == execution_id for item in self._diagnostic_unknown_handoffs) or any(
+                item[0]["execution_id"] == execution_id for item in pending.values()))
+
+    def _diagnostic_claim_exclusions(self, execution_id: str | None) -> tuple[bool, tuple[str, ...]]:
+        """Capture bounded exclusions immediately before an atomic Kernel claim."""
+        with self._diagnostic_pending_lock:
+            if (self._diagnostic_pending_overflow or
+                    len(self._diagnostic_pending) >= self._diagnostic_pending_capacity or
+                    len(self._diagnostic_unknown_handoffs) >= self._diagnostic_pending_capacity):
+                return True, ()
+            if self._settlement_journal is None and self._diagnostic_pending:
+                return True, ()
+            excluded = self._diagnostic_failed_executions | {item[0] for item in self._diagnostic_unknown_handoffs} | {
+                item[0]["execution_id"] for item in self._diagnostic_pending.values()}
+            if len(excluded) > 512:
+                return True, ()
+            return execution_id is not None and execution_id in excluded, tuple(sorted(excluded))
+
+    def _resolve_diagnostic_handoff(self, lease: ExecutionLease) -> None:
+        """Release only this generation after its accepted receipt is recorded."""
+        with self._diagnostic_pending_lock:
+            self._diagnostic_unknown_handoffs.discard((lease.execution_id, lease.attempt, lease.fence))
+
+    def _reconcile_recorded_handoffs(self, deadline: float, *, limit: int,
+                                     max_record_bytes: int) -> list[dict[str, Any]]:
+        """Reconcile a lost recorded ACK against exact durable Kernel facts."""
+        if self._settlement_journal is None:
+            return []
+        with self._diagnostic_pending_lock:
+            ordered = sorted(self._diagnostic_unknown_handoffs)
+            cursor = self._diagnostic_handoff_cursor
+            start = next((i for i, key in enumerate(ordered) if cursor is None or key > cursor), 0)
+            count = min(limit, len(ordered))
+            keys = (ordered[start:] + ordered[:start])[:count]
+        reports = []
+        for key in keys:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with self._diagnostic_pending_lock:
+                self._diagnostic_handoff_cursor = key
+            try:
+                operation_timeout = remaining if max_record_bytes > 256 * 1024 else min(.1, remaining)
+                with self._settlement_journal._connection(operation_timeout) as connection:
+                    row = connection.execute(
+                        "SELECT state,payload_kind,length(CAST(lease_json AS BLOB))+"
+                        "length(CAST(payload_json AS BLOB))+length(CAST(evidence_json AS BLOB)) AS bytes "
+                        "FROM settlement_records WHERE execution_id=? AND attempt=? AND fence=?", key).fetchone()
+                    if row is None or row['state'] != 'recorded' or row['payload_kind'] != 'result' or row['bytes'] > max_record_bytes:
+                        continue
+                    row = connection.execute('SELECT lease_json,payload_json,evidence_json FROM settlement_records '
+                                             'WHERE execution_id=? AND attempt=? AND fence=?', key).fetchone()
+                    lease = ExecutionLease.from_dict(json.loads(row['lease_json']))
+                    result = ExecutionResultV2.from_dict(json.loads(row['payload_json']))
+                if (lease.execution_id, lease.attempt, lease.fence) != key:
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                operation_timeout = remaining if max_record_bytes > 256 * 1024 else min(.1, remaining)
+                if not self.kernel._is_committed_supervisor_result(lease, result, timeout_seconds=operation_timeout,
+                                                                    max_record_bytes=max_record_bytes):
+                    continue
+                self._resolve_diagnostic_handoff(lease)
+                reports.append({'execution_id': key[0], 'attempt': key[1], 'fence': key[2],
+                                'state': 'recorded', 'result_id': result.result_id})
+            except Exception:
+                # Unknown evidence is never admission authority.
+                continue
+        return reports
+
+    @property
+    def settlement_storage(self) -> dict[str, Any]:
+        """Return the selected, source-bound settlement journal identity."""
+        return dict(self._settlement_storage)
+
     def _service_spec(self, lease: ExecutionLease) -> dict[str, Any]:
         resources = {"process_memory_limit_bytes": self.process_memory_limit_bytes,
+                     "settlement_binding": self.settlement_storage,
                      "allow_children": self.allow_children}
         if not self.allow_children:
             resources["child_service_error"] = "child execution is disabled for this runtime"
@@ -776,6 +1364,7 @@ class InProcessRuntime:
             row = self.kernel._connection.execute(
                 "SELECT run_id,generation FROM kernel_managed_executions WHERE execution_id=?",
                 (lease.execution_id,)).fetchone()
+        spec["managed_execution"] = row is not None
         if row is not None:
             spec.update(run_id=row[0], generation=row[1])
         try:
@@ -886,43 +1475,175 @@ class InProcessRuntime:
 
     def submit_child(self, command: ExecutionCommandV2, *, parent_lease: ExecutionLease,
                      budget_envelope: BudgetEnvelope, timeout_seconds: float | None = None):
+        """Submit using one admission budget; an admitted operation can finish later."""
+        started = time.monotonic() if timeout_seconds is not None else None
         if timeout_seconds is not None:
             timeout_seconds = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
+        def remaining():
+            if started is None:
+                return None
+            value = timeout_seconds - (time.monotonic() - started)
+            if value <= 0:
+                raise TimeoutError("child lifecycle admission timed out")
+            return value
         self._assert_registry_current()
+        remaining()
         if not self._binding_matches(command):
             raise RegistryRevisionMismatchError("child handler binding differs from runtime")
-        started = time.monotonic()
         admission = (self._lifecycle_lock if timeout_seconds is None else
-            self._bounded_lifecycle(timeout_seconds, message="child lifecycle admission timed out"))
+            self._bounded_lifecycle(remaining(), message="child lifecycle admission timed out"))
         with admission:
             if self._closed:
                 raise RuntimeError("runtime is closed")
-            remaining = None if timeout_seconds is None else timeout_seconds - (time.monotonic() - started)
-            if remaining is not None and remaining <= 0:
-                raise TimeoutError("child lifecycle admission timed out")
             return self.kernel.submit_child(command, parent_lease, budget_envelope,
-                                            timeout_seconds=remaining)
+                                            timeout_seconds=remaining())
 
     def adopt_child(self, execution_id: str, *, parent_lease: ExecutionLease,
                     budget_envelope: BudgetEnvelope, timeout_seconds: float | None = None):
+        """Adopt using one admission budget; an admitted operation can finish later."""
+        started = time.monotonic() if timeout_seconds is not None else None
         if timeout_seconds is not None:
             timeout_seconds = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
+        def remaining():
+            if started is None:
+                return None
+            value = timeout_seconds - (time.monotonic() - started)
+            if value <= 0:
+                raise TimeoutError("child lifecycle admission timed out")
+            return value
         self._assert_registry_current()
-        started = time.monotonic()
         admission = (self._lifecycle_lock if timeout_seconds is None else
-            self._bounded_lifecycle(timeout_seconds, message="child lifecycle admission timed out"))
+            self._bounded_lifecycle(remaining(), message="child lifecycle admission timed out"))
         with admission:
             if self._closed:
                 raise RuntimeError("runtime is closed")
-            remaining = None if timeout_seconds is None else timeout_seconds - (time.monotonic() - started)
-            if remaining is not None and remaining <= 0:
-                raise TimeoutError("child lifecycle admission timed out")
-            with self.kernel._control_lock(remaining):
+            with self.kernel._control_lock(remaining()):
                 target = self.kernel.get(execution_id)
+                remaining()
                 if not self._binding_matches(target.command):
                     raise RegistryRevisionMismatchError("adopted child handler binding differs from runtime")
                 return self.kernel.adopt_child(execution_id, parent_lease, budget_envelope,
-                                              timeout_seconds=remaining)
+                                              timeout_seconds=remaining())
+
+    def recover_claim_lifecycle(self, execution_id: str, attempt: int, fence: int, *,
+                                timeout_seconds: float = .5) -> dict[str, Any]:
+        """Project one exact, committed Kernel start event into the journal.
+
+        This explicit recovery does not reconstruct a handler outcome or prove
+        process cleanup. Its source event was committed with the claim and can
+        be projected repeatedly, including by independent restarted runtimes.
+        An exact durable supervisor obligation, if present, is projected
+        separately; it does not establish that a worker was created. A
+        committed SDK cleanup resolution is projected as its own fact, not
+        as a reconstructed process-tree receipt.
+        """
+        if type(execution_id) is not str or not execution_id.strip():
+            raise ValueError("execution_id must be non-empty")
+        if any(type(value) is not int or value < 1 for value in (attempt, fence)):
+            raise ValueError("attempt and fence must be positive integers")
+        duration = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
+        deadline = time.monotonic() + duration
+        identity = {"execution_id": execution_id, "attempt": attempt, "fence": fence}
+        report: dict[str, Any] = {"identity": identity, "state": "unknown",
+                                  "process_cleanup": "unknown", "outcome": "unknown",
+                                  "supervisor_obligation": {"state": "unknown"},
+                                  "supervisor_resolution": {"state": "unknown"}}
+        if self._settlement_journal is None:
+            return {**report, "reason": "settlement_journal_unavailable"}
+        connection = None
+        try:
+            connection = sqlite3.connect(Path(self.kernel.db_path).resolve().as_uri() + "?mode=ro",
+                uri=True, timeout=max(.000001, deadline - time.monotonic()))
+            connection.row_factory = sqlite3.Row
+            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+            connection.execute("BEGIN")
+            reopened_store = connection.execute(
+                "SELECT store_id FROM kernel_store_identity WHERE singleton=1").fetchone()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {**report, "reason": "recovery_timeout"}
+            live_store = self.kernel.kernel_store_identity(timeout_seconds=remaining)
+            if reopened_store is None or reopened_store[0] != live_store:
+                return {**report, "reason": "kernel_store_identity_mismatch"}
+            obligation = None
+            obligation_read = False
+            try:
+                obligation = connection.execute("""SELECT registered_at, length(CAST(resolution_json AS BLOB)) AS resolution_bytes
+                    FROM kernel_supervisor_obligations
+                    WHERE execution_id=? AND attempt=? AND fence=?""",
+                    (execution_id, attempt, fence)).fetchone()
+                obligation_read = True
+                if obligation is None:
+                    report["supervisor_obligation"] = {"state": "unknown", "reason": "obligation_missing"}
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        report["supervisor_obligation"] = {"state": "unknown", "reason": "recovery_timeout"}
+                    else:
+                        evidence = {"source": "kernel_supervisor_obligation",
+                                    "registered_at": obligation["registered_at"]}
+                        note_id = json.dumps(["kernel-supervisor-obligation", execution_id, attempt, fence],
+                                             ensure_ascii=False, separators=(",", ":"))
+                        receipt = self._settlement_journal.note(identity, "kernel_supervisor_obligation_recovered",
+                            evidence, note_id=note_id, timeout_seconds=remaining)
+                        report["supervisor_obligation"] = {"state": "recorded", "receipt": receipt}
+            except Exception as exc:
+                report["supervisor_obligation"] = {"state": "unknown", "reason": "recovery_unavailable",
+                    "error": f"{type(exc).__name__}: {exc}"}
+            try:
+                if not obligation_read:
+                    report["supervisor_resolution"] = {"state": "unknown", "reason": "recovery_unavailable"}
+                elif obligation is None or obligation["resolution_bytes"] is None:
+                    report["supervisor_resolution"] = {"state": "unknown", "reason": "resolution_missing"}
+                elif obligation["resolution_bytes"] > 65536:
+                    report["supervisor_resolution"] = {"state": "unknown", "reason": "resolution_too_large"}
+                else:
+                    resolution_row = connection.execute("""SELECT resolution_json FROM kernel_supervisor_obligations
+                        WHERE execution_id=? AND attempt=? AND fence=?""",
+                        (execution_id, attempt, fence)).fetchone()
+                    resolution = json.loads(resolution_row["resolution_json"])
+                    if (type(resolution) is not dict or set(resolution) != {"source", "result_id", "status"}
+                            or resolution["source"] != "sdk_confirmed_supervisor_cleanup"
+                            or type(resolution["result_id"]) is not str or not resolution["result_id"].strip()
+                            or type(resolution["status"]) is not str or not resolution["status"].strip()):
+                        report["supervisor_resolution"] = {"state": "unknown", "reason": "resolution_not_sdk_cleanup"}
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            report["supervisor_resolution"] = {"state": "unknown", "reason": "recovery_timeout"}
+                        else:
+                            note_id = json.dumps(["kernel-supervisor-resolution", execution_id, attempt, fence],
+                                                 ensure_ascii=False, separators=(",", ":"))
+                            receipt = self._settlement_journal.note(identity, "kernel_supervisor_resolution_recovered",
+                                resolution, note_id=note_id, timeout_seconds=remaining)
+                            report["supervisor_resolution"] = {"state": "recorded", "receipt": receipt}
+            except Exception as exc:
+                report["supervisor_resolution"] = {"state": "unknown", "reason": "recovery_unavailable",
+                    "error": f"{type(exc).__name__}: {exc}"}
+            rows = connection.execute("""SELECT sequence,event_id,revision,created_at FROM kernel_events
+                WHERE execution_id=? AND event_type='started' AND from_state='leased' AND to_state='running'
+                AND json_type(data_json,'$.attempt')='integer' AND json_extract(data_json,'$.attempt')=?
+                AND json_type(data_json,'$.fence')='integer' AND json_extract(data_json,'$.fence')=?
+                ORDER BY revision LIMIT 2""", (execution_id, attempt, fence)).fetchall()
+            if not rows:
+                return {**report, "reason": "kernel_claim_event_missing"}
+            if len(rows) != 1:
+                return {**report, "reason": "kernel_claim_event_ambiguous"}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {**report, "reason": "recovery_timeout"}
+            row = rows[0]
+            evidence = {"source": "kernel_started_event", "event_id": row["event_id"],
+                        "event_sequence": row["sequence"], "event_revision": row["revision"],
+                        "event_created_at": row["created_at"]}
+            receipt = self._settlement_journal.note(identity, "kernel_claim_recovered", evidence,
+                note_id="kernel-claim:" + row["event_id"], timeout_seconds=remaining)
+            return {**report, "state": "recorded", "receipt": receipt}
+        except Exception as exc:
+            return {**report, "reason": "recovery_unavailable", "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if connection is not None:
+                connection.close()
 
     def observe(self, execution_id: str, *, timeout: float | None = None,
                 attempt: int | None = None, fence: int | None = None) -> dict[str, Any]:
@@ -997,7 +1718,20 @@ class InProcessRuntime:
         finally:
             if connection is not None:
                 connection.close()
+        exact_handoff = attempt is not None and fence is not None and attempt > 0 and fence > 0
+        if exact_handoff:
+            handoff_identity = {"execution_id": execution_id, "attempt": attempt, "fence": fence}
+            report["supervisor_handoff"] = {"identity": handoff_identity, "authority": "not_established",
+                "facts": {}, "unknown_reason": "inspection_unavailable"}
         if self._settlement_journal is not None:
+            if exact_handoff:
+                try:
+                    budget.check()
+                    report["supervisor_handoff"] = self._settlement_journal.inspect_supervisor_handoff(
+                        handoff_identity, timeout_seconds=min(.1, max(.001, duration-budget.elapsed_seconds)),
+                        max_bytes=min(256 * 1024, max(1024, self.observation_options.query_bytes // 2)))
+                except Exception as exc:
+                    report.update(complete=False, supervisor_handoff_error=f"{type(exc).__name__}: {exc}")
             try:
                 budget.check()
                 report["settlement_obligations"] = self._settlement_journal.inspect(execution_id,
@@ -1036,6 +1770,8 @@ class InProcessRuntime:
             report.update(complete=False, settlement_obligations_error=self._settlement_error)
         if execution_id in self._diagnostic_errors:
             report.update(complete=False, diagnostic_receipt_error=self._diagnostic_errors[execution_id])
+        if self._lifecycle_delivery_error is not None:
+            report.update(complete=False, lifecycle_delivery_error=self._lifecycle_delivery_error)
         local_obligations = tuple(identity for identity in self._pending_settlements.identities()
                                   if identity["execution_id"] == execution_id)
         if local_obligations:
@@ -1147,6 +1883,41 @@ class InProcessRuntime:
         expected_supervision: dict[str, Any] | None = None,
         timeout_seconds: float = 1,
     ):
+        """Cancel while retaining ownership of all resulting diagnostics."""
+        with self._lifecycle_condition:
+            if self._closed:
+                raise RuntimeError("runtime is closed")
+            self._active_runs += 1
+        try:
+            self._lifecycle_context.cancellation = True
+            self._lifecycle_context.producer = None
+            self._lifecycle_context.uncertain = False
+            self._lifecycle_context.evidence_lost = False
+            return self._cancel_active(execution_id, expected_revision=expected_revision,
+                reason=reason, expected_supervision=expected_supervision, timeout_seconds=timeout_seconds)
+        finally:
+            producer = getattr(self._lifecycle_context, 'producer', None)
+            if producer is not None and not getattr(self._lifecycle_context, 'uncertain', False):
+                with self._diagnostic_pending_lock:
+                    self._lifecycle_finished.add(producer)
+                self._retry_diagnostic_notes(time.monotonic() + .01)
+            self._lifecycle_context.cancellation = False
+            self._lifecycle_context.producer = None
+            self._lifecycle_context.uncertain = False
+            self._lifecycle_context.evidence_lost = False
+            with self._lifecycle_condition:
+                self._active_runs -= 1
+                self._lifecycle_condition.notify_all()
+
+    def _cancel_active(
+        self,
+        execution_id: str,
+        *,
+        expected_revision: int,
+        reason: str = "execution cancelled",
+        expected_supervision: dict[str, Any] | None = None,
+        timeout_seconds: float = 1,
+    ):
         """Externally cancel one execution with revision-CAS authority.
 
         An explicitly configured cancellation journal preserves stage evidence
@@ -1237,6 +2008,15 @@ class InProcessRuntime:
                 if remaining > 0:
                     diagnostic_saved = self._diagnostic_note(cancellation_identity, "cancellation_"+stage,
                         {**evidence, "captured_at": captured_at}, timeout_seconds=min(.1, remaining))
+                    if not diagnostic_saved:
+                        with self._diagnostic_pending_lock:
+                            if (self._diagnostic_pending_overflow or
+                                    execution_id in self._diagnostic_failed_executions):
+                                self._lifecycle_context.uncertain = True
+                                self._lifecycle_context.evidence_lost = True
+                else:
+                    self._lifecycle_context.uncertain = True
+                    self._lifecycle_context.evidence_lost = True
             if observation_available and self.observation_journal is not None and cancellation_identity is not None:
                 remaining = control_deadline - time.monotonic()
                 if remaining > 0:
@@ -1263,6 +2043,22 @@ class InProcessRuntime:
                 raise RuntimeError("runtime is closed")
             before = bounded_control(lambda timeout: self.kernel.get(execution_id))
             cancellation_identity = ObservationIdentity(execution_id, before.attempt, before.fence)
+            # Reserve before authority changes so a crash during cleanup leaves
+            # an exact-generation unknown. Diagnostic admission is best effort:
+            # it must not prevent cancellation or subsequent local cleanup.
+            token = uuid.uuid4().hex
+            budget = control_deadline - time.monotonic()
+            if budget > .03:
+                try:
+                    reserved = self.kernel.lifecycle_reserve(execution_id, before.attempt, before.fence,
+                        token, slots=16, timeout_seconds=min(.02, budget - .01))
+                    if reserved is not None:
+                        self._lifecycle_context.producer = token
+                        with self._diagnostic_pending_lock:
+                            self._lifecycle_active_tokens.add(token)
+                            self._lifecycle_token_generations[token] = (execution_id, before.attempt, before.fence)
+                except Exception as exc:
+                    self._diagnostic_errors[execution_id] = f'lifecycle cancellation reserve: {type(exc).__name__}: {exc}'
             pending_evidence.append(("requested", {"state": "requested",
                 "expected_revision": expected_revision, "reason": reason}, requested_at))
             if self.cancellation_journal is not None:
@@ -1272,6 +2068,7 @@ class InProcessRuntime:
                         isolation_mode=self.isolation_mode, timeout_seconds=min(.1, remaining_control()))
                 except Exception as exc:
                     evidence_errors.append(exc)
+            self._lifecycle_context.uncertain = True
             try:
                 cancelled = bounded_control(lambda timeout: self.kernel.cancel(
                     execution_id,
@@ -1290,6 +2087,7 @@ class InProcessRuntime:
                 # A raised operation may even follow a commit. Preserve its
                 # facts without inferring authority or opening new diagnostic
                 # write windows after the original control deadline.
+                self._lifecycle_context.uncertain = True
                 self._local_cancellation_diagnostics.capture_raised_operation(
                     cancellation_identity, pending_evidence, receipt_id, exc)
                 raise
@@ -1347,6 +2145,8 @@ class InProcessRuntime:
             record("failure", {"phase": "evidence_write", "type": type(evidence_errors[0]).__name__,
                 "message": str(evidence_errors[0])})
             raise RuntimeError("cancellation changed authority but its durable evidence could not be saved") from evidence_errors[0]
+        if not self._lifecycle_context.evidence_lost:
+            self._lifecycle_context.uncertain = False
         if recovery_error is not None:
             raise recovery_error
         assert cancelled is not None
@@ -1670,9 +2470,52 @@ class InProcessRuntime:
             self._diagnostic_note(lease, "process_cleanup", {
                 "state": "not_invoked", "source": "runtime_admission_denied"})
             return preparation_error
+        # A crash after this receipt and before registration leaves an explicit
+        # unknown; the receipt itself is not evidence that a process started.
+        # Strict mode requires the exact-generation obligation to be durable
+        # before spawn. The explicit compatibility opt-out cannot promise
+        # restart discovery when the journal is unavailable.
+        saved = False
+        if self._settlement_journal is not None:
+            saved = self._diagnostic_note(lease, "supervisor_spawn_intent", {
+                "source": "runtime_pre_spawn", "cleanup": "unknown"},
+                timeout_seconds=max(.000001, startup_deadline-time.monotonic()))
+        if self.require_durable_cleanup_intent and not saved:
+            return {"kind": "error", "code": "cleanup_obligation_unavailable",
+                    "message": "supervisor cleanup obligation could not be durably recorded",
+                    "retryable": False, "control_error": True, "effect_ids": [], "details": {}}
+        if time.monotonic() >= startup_deadline:
+            return {"kind": "error", "code": "entry_admission_timeout",
+                    "message": "handler startup window elapsed before supervisor registration",
+                    "retryable": False, "control_error": True, "effect_ids": [], "details": {}}
+        obligation_registered = False
+        try:
+            self.kernel.register_supervisor_obligation(lease,
+                timeout_seconds=max(.000001, startup_deadline-time.monotonic()))
+            obligation_registered = True
+        except Exception as exc:
+            self._diagnostic_note(lease, "supervisor_obligation_registration_failed", {
+                "source": "kernel_pre_spawn", "cleanup": "not_invoked",
+                "registration": "unknown", "error_type": type(exc).__name__})
+            if self.require_durable_cleanup_intent:
+                return {"kind": "error", "code": "cleanup_obligation_unavailable",
+                        "message": "kernel supervisor obligation could not be durably registered",
+                        "retryable": False, "control_error": True, "effect_ids": [], "details": {},
+                        "budget_envelope": None if prepared_budget is None else prepared_budget.to_dict(),
+                        "_sdk_supervisor_not_invoked": True,
+                        "_sdk_supervisor_registration_uncertain": True}
+        if time.monotonic() >= startup_deadline:
+            return {"kind": "error", "code": "entry_admission_timeout",
+                    "message": "handler startup window elapsed before process spawn",
+                    "retryable": False, "control_error": True, "effect_ids": [], "details": {},
+                    "budget_envelope": None if prepared_budget is None else prepared_budget.to_dict(),
+                    "_sdk_supervisor_not_invoked": obligation_registered}
         entry_errors: list[Exception] = []
         entry_ack: dict[str, Any] = {}
         native_cleanup_confirmed = False
+        native_result_accepted = False
+        native_result_captured_pending = False
+        native_not_invoked = False
 
         def acknowledge_entry(packet: dict[str, Any]) -> None:
             entry_ack.update(packet)
@@ -1695,19 +2538,26 @@ class InProcessRuntime:
 
         def register(supervisor: Any) -> bool:
             with self._lifecycle_lock:
+                # Retain even when authority was revoked during startup: a
+                # failed termination still needs an exact-generation owner.
+                self._process_supervisors[generation] = supervisor
                 reason = self._revoked_executions.pop(generation, None)
                 if reason is None and (
                     self._closed or self._stop_event.is_set()
                 ):
                     reason = "runtime_closed"
-                if reason is None:
-                    self._process_supervisors[generation] = supervisor
-                    with self._lifecycle_condition:
-                        recorder = self._execution_recorders.get(generation)
-                    if recorder is not None:
-                        recorder.observe_process(supervisor, role="supervisor", process_id="supervisor")
-                        recorder.phase("worker_created")
-                    return True
+            # A started supervisor is now owned by this exact execution even
+            # when cancellation won the start/register race. This note is a
+            # registration fact, not a claim of readiness or cleanup.
+            self._diagnostic_note(lease, "supervisor_registered", {
+                "source": "runtime_registration", "revocation_requested": reason is not None})
+            if reason is None:
+                with self._lifecycle_condition:
+                    recorder = self._execution_recorders.get(generation)
+                if recorder is not None:
+                    recorder.observe_process(supervisor, role="supervisor", process_id="supervisor")
+                    recorder.phase("worker_created")
+                return True
             # The caller that requested cancellation waits for the outer
             # invocation to finish.  Do the kill synchronously here so a
             # process which wins the start/register race cannot run with
@@ -1742,9 +2592,35 @@ class InProcessRuntime:
         if os.name == "nt":
             from ._windows_runtime import invoke_windows_handler
             invoke = invoke_windows_handler
+        supervisor_options = {}
+        if os.name != "nt" and self._settlement_journal is not None:
+            supervisor_options["settlement_binding"] = {
+                "path": self._settlement_journal.path,
+                "source_id": self._settlement_journal.source_id,
+                "kernel_path": self._settlement_journal.kernel_path,
+            }
         def worker_phase(phase: str, details: dict[str, Any]) -> None:
+            nonlocal native_result_accepted, native_result_captured_pending, native_not_invoked
+            if phase == 'supervisor_result_accepted':
+                native_result_accepted = True
+            elif phase == 'supervisor_result_captured_pending_checkpoint':
+                native_result_captured_pending = True
+            elif phase == 'supervisor_not_invoked':
+                native_not_invoked = True
             self._activity_phase(lease, phase, **details)
             self._diagnostic_note(lease, phase, details)
+            if (phase == "supervisor_outcome_observed"
+                    and details.get("state") == "unknown"
+                    and "outcome_json" not in details):
+                # No bounded copy exists to retry; do not admit another
+                # attempt for this execution in the current Runtime.
+                with self._diagnostic_pending_lock:
+                    key = (lease.execution_id, lease.attempt, lease.fence)
+                    if (key not in self._diagnostic_unknown_handoffs and
+                            len(self._diagnostic_unknown_handoffs) >= self._diagnostic_pending_capacity):
+                        self._diagnostic_pending_overflow = True
+                    else:
+                        self._diagnostic_unknown_handoffs.add(key)
         outcome = invoke(
             db_path=self.kernel.db_path,
             durability=self.durability,
@@ -1759,9 +2635,19 @@ class InProcessRuntime:
             budget_envelope=prepared_budget,
             capture_budget=_KernelBudgetCapture(self.kernel, lease.execution_id),
             service_spec=self._service_spec(lease),
+            authority_verifier=self._authority_verifier,
+            worker_credential=self._worker_credential,
             on_entered=acknowledge_entry,
             on_phase=worker_phase,
+            **supervisor_options,
         )
+        # Overwrite any handler-provided field: only this invocation's
+        # supervisor and reaping callbacks own the observation.
+        outcome = {**outcome, '_sdk_supervisor_completion_confirmed':
+                   native_cleanup_confirmed and native_result_accepted,
+                   '_sdk_supervisor_completion_pending_checkpoint':
+                   native_cleanup_confirmed and native_result_captured_pending,
+                   '_sdk_supervisor_not_invoked': native_not_invoked and obligation_registered}
         from .scripts import SCRIPT_HANDLER_ID, SCRIPT_HANDLER_VERSION, script_handler
         if (handler is script_handler
                 and (command.handler_id, command.handler_contract_version)
@@ -2182,6 +3068,26 @@ class InProcessRuntime:
         except (TimeoutError, sqlite3.OperationalError):
             persisted = []
         outcome = dict(outcome)
+        supervisor_not_invoked = (
+            self.isolation_mode == 'process'
+            and outcome.pop('_sdk_supervisor_not_invoked', False) is True
+            and outcome.get('kind') in ('error', 'timeout'))
+        supervisor_registration_uncertain = (
+            supervisor_not_invoked and outcome.pop('_sdk_supervisor_registration_uncertain', False) is True)
+        native_pending_checkpoint = (
+            self.isolation_mode == 'process'
+            and outcome.pop('_sdk_supervisor_completion_pending_checkpoint', False) is True
+            and bool(received_checkpoints)
+            and outcome.get('kind') in ('ok', 'error')
+            and not outcome.get('control_error')
+            and outcome.get('completion_time_known') is not False)
+        supervisor_completion_confirmed = (
+            self.isolation_mode == 'process'
+            and outcome.pop('_sdk_supervisor_completion_confirmed', False) is True
+            and outcome.get('kind') in ('ok', 'error', 'timeout')
+            and not outcome.get('control_error')
+            and outcome.get('budget_capture_error') is None
+            and outcome.get('completion_time_known') is not False)
         reported = outcome.get("effect_ids", [])
         if type(reported) is list and all(type(item) is str for item in reported):
             outcome["effect_ids"] = list(dict.fromkeys(reported + persisted))
@@ -2207,7 +3113,19 @@ class InProcessRuntime:
         evidence = {"telemetry_flush": outcome.get("telemetry_flush"), "outcome_kind": outcome.get("kind"),
                     "budget_envelope": retained_budget,
                     "budget_checkpoint": outcome.get("budget_checkpoint"),
-                    "budget_capture_error": outcome.get("budget_capture_error")}
+                    "budget_capture_error": outcome.get("budget_capture_error"),
+                    "budget_capture_diagnostic": outcome.get("budget_capture_diagnostic")}
+        if supervisor_completion_confirmed and not deferred:
+            evidence['supervisor_completion'] = {'cleanup': 'confirmed',
+                'source': 'runtime_supervisor_reaped', 'result': 'accepted'}
+        if supervisor_not_invoked:
+            evidence['supervisor_not_invoked'] = {'source': 'runtime_pre_spawn',
+                'process_creation': 'not_invoked'}
+            if supervisor_registration_uncertain:
+                evidence['supervisor_registration_uncertain'] = True
+        if native_pending_checkpoint and not deferred:
+            evidence['supervisor_completion_pending_checkpoint'] = {'cleanup': 'confirmed',
+                'source': 'runtime_supervisor_reaped', 'result': 'captured'}
         if "script_output_recovery" in outcome:
             evidence["script_output_recovery"] = outcome["script_output_recovery"]
         retained_key = self._pending_settlements.retain(admission, lease, payload, evidence)
@@ -2251,6 +3169,10 @@ class InProcessRuntime:
                     self._activity_phase(lease, "result_pending", durable_receipt=True,
                         error=self._settlement_error)
                     return snapshot
+            if deferred_kind != "recovery_required" and self._has_uncaptured_budget_checkpoint(evidence):
+                self._activity_phase(lease, "result_pending", durable_receipt=record is not None,
+                    error="budget checkpoint has no captured sample", receipt_error=self._settlement_error)
+                return snapshot
             if deferred_kind in {"script_output_recovery", "budget_checkpoint_recovery"}:
                 try:
                     with self.kernel._control_lock(operation_timeout()):
@@ -2283,7 +3205,11 @@ class InProcessRuntime:
             assert result is not None
             try:
                 completed = self.kernel._complete_sdk_result(lease, result,
-                    budget_envelope=budget, timeout_seconds=operation_timeout())
+                    budget_envelope=budget, timeout_seconds=operation_timeout(),
+                    supervisor_cleanup_confirmed=(supervisor_completion_confirmed
+                        or (native_pending_checkpoint and record is not None)) and not deferred,
+                    supervisor_not_invoked=supervisor_not_invoked and not deferred,
+                    supervisor_registration_uncertain=supervisor_registration_uncertain and not deferred)
             except Exception as exc:
                 if isinstance(exc, (StaleFenceError, InvalidStateTransitionError, ResultConflictError)):
                     # Cancellation/reap may have won while the independent
@@ -2291,6 +3217,11 @@ class InProcessRuntime:
                     # immutable winner instead of surfacing a worker failure.
                     with self.kernel._control_lock(.1):
                         return self.kernel.get(lease.execution_id)
+                if isinstance(exc, BudgetClockUnknownError):
+                    self._activity_phase(lease, "result_pending", result_id=result.result_id,
+                        durable_receipt=record is not None,
+                        error=f"{type(exc).__name__}: {exc}", receipt_error=self._settlement_error)
+                    return snapshot
                 if not self._storage_contention(exc) and not isinstance(exc, TimeoutError):
                     raise
                 self._activity_phase(lease, "result_pending", result_id=result.result_id,
@@ -2303,6 +3234,8 @@ class InProcessRuntime:
                     self._settlement_journal.settle(record, state,
                         {**record["evidence"], "execution_state": completed.state, "execution_revision": completed.revision,
                          "result_id": result.result_id}, timeout_seconds=.1)
+                    if state == "recorded" and (supervisor_completion_confirmed or native_pending_checkpoint or supervisor_not_invoked):
+                        self._resolve_diagnostic_handoff(lease)
                 except Exception as exc:
                     self._settlement_error = f"{type(exc).__name__}: {exc}"
             elif (completed.result is not None and completed.result.result_id == result.result_id
@@ -2349,7 +3282,16 @@ class InProcessRuntime:
             and self._context_observation_pending(context) for context in contexts)
 
     def run_once(self, *, execution_id: str | None = None):
+        """Run at most one claim, subject to volatile diagnostic backpressure.
+
+        A call already past the final pre-claim check can race a new failed
+        receipt from another worker. Existing claims are never revoked by this
+        backpressure. Pending notes and overflow state do not survive a crash.
+        """
         self._start_services()
+        self._retry_diagnostic_notes(time.monotonic() + .1)
+        if self._diagnostic_claim_exclusions(execution_id)[0]:
+            return None
         self.recover_completions(timeout_seconds=.25)
         admission = self._pending_settlements.acquire()
         if admission is None:
@@ -2377,6 +3319,10 @@ class InProcessRuntime:
         while True:
             thread_slot_owned = False
             process_execution_started = False
+            running_lease = None
+            lifecycle_producer_id = uuid.uuid4().hex
+            phase = "claim"
+            outcome_state = "unknown"
             if self.isolation_mode == "thread":
                 if not self._acquire_thread_slot(child=targeted_child):
                     # Every running/timed-out call owns one slot until its
@@ -2389,15 +3335,45 @@ class InProcessRuntime:
                         .1, message="child lifecycle admission timed out"):
                     if self._closed:
                         return last_rejected
-                    running_lease = self.kernel.claim_and_start(
-                        self.worker_id,
-                        lease_seconds=self.lease_seconds,
-                        start_safety_seconds=self._handler_start_timeout() + 5.0,
-                        registry_revisions=(self.registry_revision, *self.handler_revisions.values()),
-                        execution_id=execution_id,
-                        timeout_seconds=None if execution_id is None else .1,
-                        child_pool=targeted_child,
-                    )
+                    # Another worker may have lost its journal receipt since
+                    # this call passed its first admission check.
+                    blocked, exclusions = self._diagnostic_claim_exclusions(execution_id)
+                    if blocked:
+                        return last_rejected
+                    revisions = (self.registry_revision, *self.handler_revisions.values())
+                    predicate = revisions
+                    stored = self._budget_scan_continuation
+                    if execution_id is None and stored is not None and stored[0] != predicate:
+                        self._budget_scan_continuation = stored = None
+                    scan_args = {}
+                    if execution_id is None and stored is not None:
+                        scan_args['budget_scan_cursor'] = stored[1]
+                    try:
+                        running_lease = self.kernel.claim_and_start(
+                            self.worker_id,
+                            lease_seconds=self.lease_seconds,
+                            start_safety_seconds=self._handler_start_timeout() + 5.0,
+                            registry_revisions=revisions,
+                            execution_id=execution_id,
+                            exclude_execution_ids=exclusions,
+                            timeout_seconds=None if execution_id is None else .1,
+                            child_pool=targeted_child,
+                            lifecycle_producer_id=lifecycle_producer_id,
+                            lifecycle_slots=128,
+                            **scan_args,
+                        )
+                    except BudgetScanContinuation as continuation:
+                        if execution_id is None:
+                            self._budget_scan_continuation = (predicate, continuation.cursor)
+                        raise
+                    if execution_id is None:
+                        self._budget_scan_continuation = None
+                    if running_lease is not None:
+                        generation = (running_lease.execution_id, running_lease.attempt, running_lease.fence)
+                        with self._diagnostic_pending_lock:
+                            self._lifecycle_producers[generation] = lifecycle_producer_id
+                            self._lifecycle_active_tokens.add(lifecycle_producer_id)
+                            self._lifecycle_token_generations[lifecycle_producer_id] = generation
                     if (
                         running_lease is not None
                         and self.isolation_mode == "process"
@@ -2410,6 +3386,14 @@ class InProcessRuntime:
                         process_execution_started = True
                 if running_lease is None:
                     return last_rejected
+                phase = "claimed_setup"
+                # Persist the exact claimed generation before any handler can
+                # start. After a crash this is evidence of a claim only: it
+                # does not imply handler entry, an outcome, or tree cleanup.
+                if not self._diagnostic_note(running_lease, "execution_claimed", {
+                        "state": "claimed", "source": "runtime_claim"},
+                        timeout_seconds=self._handler_start_timeout()):
+                    raise _UnpersistedDiagnosticsError("claimed execution diagnostic not confirmed durable")
                 snapshot = self.kernel.get(running_lease.execution_id)
                 self._begin_activity(running_lease)
                 command = snapshot.command
@@ -2422,6 +3406,7 @@ class InProcessRuntime:
                 assert handler is not None
                 started_at = snapshot.started_at
                 assert started_at is not None
+                phase = "invocation"
                 if self.isolation_mode == "process":
                     outcome = self._invoke_process(handler, command, running_lease)
                 else:
@@ -2433,6 +3418,7 @@ class InProcessRuntime:
                     # remains true for a timeout: the Python thread may still
                     # be running and must continue to consume its slot.
                     thread_slot_owned = False
+                outcome_state = "produced"
                 self._activity_phase(running_lease, "handler_outcome", kind=outcome.get("kind"),
                     code=outcome.get("code"), limiting_source=outcome.get("limiting_source"),
                     details=outcome.get("details"), telemetry_flush=outcome.get("telemetry_flush"),
@@ -2443,7 +3429,34 @@ class InProcessRuntime:
                     "kind": outcome.get("kind"), "code": outcome.get("code"),
                     "details": outcome.get("details"), "telemetry_flush": flush,
                     "telemetry_incomplete": isinstance(flush, dict) and flush.get("state") != "confirmed"})
+                phase = "settlement"
                 return self._settle_outcome(snapshot, running_lease, outcome, admission)
+            except Exception as exc:
+                if running_lease is None:
+                    try:
+                        exc.execution_context = {"execution_assignment": "execution_unassigned",
+                            "worker_id": self.worker_id, "phase": phase}
+                    except (AttributeError, TypeError):
+                        pass
+                    raise
+                generation = (running_lease.execution_id, running_lease.attempt, running_lease.fence)
+                with self._lifecycle_lock:
+                    registration = self._process_registration_events.get(generation)
+                    cleanup = ("confirmed" if registration is not None and registration.cleanup_confirmed
+                               else "unknown") if self.isolation_mode == "process" else "not_applicable"
+                saved = self._diagnostic_note(running_lease, "worker_invocation_escaped", {
+                    "phase": phase, "exception_type": type(exc).__name__, "message": str(exc)[:2048],
+                    "outcome": outcome_state, "process_cleanup": cleanup})
+                # Keep existing exception types (including control/CAS errors)
+                # while attaching the exact claim to the original exception.
+                try:
+                    exc.execution_context = {"execution_id": running_lease.execution_id,
+                        "attempt": running_lease.attempt, "fence": running_lease.fence,
+                        "phase": phase, "process_cleanup": cleanup, "diagnostic_saved": saved}
+                    exc.add_note(f"execution context: {exc.execution_context!r}")
+                except (AttributeError, TypeError):
+                    pass
+                raise
             finally:
                 self._recover_script_output(time.monotonic() + .1)
                 if process_execution_started:
@@ -2483,6 +3496,16 @@ class InProcessRuntime:
                         self._thread_finished(finished_authority, generation)
                 if thread_slot_owned:
                     self._release_thread_slot(child=targeted_child)
+                if running_lease is not None:
+                    with self._diagnostic_pending_lock:
+                        # A fact that could not be retained must leave the
+                        # claim-time producer open across a driver restart.
+                        # Its open reservation is the durable admission fence;
+                        # only host-authorized producer recovery can close it.
+                        if (not self._diagnostic_pending_overflow and
+                                running_lease.execution_id not in self._diagnostic_failed_executions):
+                            self._lifecycle_finished.add(lifecycle_producer_id)
+                    self._retry_diagnostic_notes(time.monotonic() + .1)
 
 
 Runtime = InProcessRuntime

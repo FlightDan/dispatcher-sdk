@@ -10,15 +10,33 @@ from typing import Optional
 from .errors import StorageIsolationError
 
 
-KERNEL_STORAGE_SCHEMA_VERSION = 5
+KERNEL_STORAGE_SCHEMA_VERSION = 12
 
 
 KERNEL_TABLES = frozenset(
     {
         "kernel_schema_meta",
         "kernel_clock",
+        "kernel_lifecycle_retired",
+        "kernel_lifecycle_metadata",
+        "kernel_lifecycle_producers",
+        "kernel_lifecycle_outbox",
         "kernel_run_controls",
         "kernel_managed_executions",
+        "kernel_control_pause_receipts",
+        "kernel_control_pause_pages",
+        "kernel_run_authorities",
+        "kernel_revision_installs",
+        "kernel_legacy_imports",
+        "kernel_legacy_import_pages",
+        "kernel_legacy_pending_commands",
+        "kernel_revision_content_pages",
+        "kernel_resume_receipts",
+        "kernel_activation_receipts",
+        "kernel_initial_admission_bindings",
+        "kernel_budget_policies",
+        "kernel_budget_dependencies",
+        "kernel_store_identity",
         "kernel_executions",
         "kernel_events",
         "kernel_result_outbox",
@@ -28,6 +46,11 @@ KERNEL_TABLES = frozenset(
         "kernel_supervision",
         "kernel_progress_keys",
         "kernel_budget_samples",
+        "kernel_supervisor_obligations",
+        "kernel_projection_declarations",
+        "kernel_projection_receipts",
+        "kernel_projection_requirements",
+        "kernel_control_takeovers",
     }
 )
 
@@ -350,10 +373,224 @@ CREATE INDEX IF NOT EXISTS kernel_budget_samples_execution
     ON kernel_budget_samples(execution_id, token);
 """
 KERNEL_INDEXES = KERNEL_INDEXES | {"kernel_budget_samples_execution"}
+KERNEL_INDEXES = KERNEL_INDEXES | {"kernel_effects_execution_state", "kernel_pause_membership_order"}
 SCHEMA_SQL = (KERNEL_SCHEMA_V4
               .replace("schema_version = 4", "schema_version = 5", 1)
               .replace("VALUES ('execution_kernel', 4)", "VALUES ('execution_kernel', 5)", 1)
               .replace("COMMIT;", BUDGET_SAMPLE_SCHEMA_SQL + "COMMIT;", 1))
+KERNEL_SCHEMA_V5 = SCHEMA_SQL
+SCHEMA_SQL = (KERNEL_SCHEMA_V5
+              .replace("schema_version = 5", "schema_version = 6", 1)
+              .replace("VALUES ('execution_kernel', 5)", "VALUES ('execution_kernel', 6)", 1)
+              .replace("length(trim(execution_id)) > 0 AND substr(execution_id, 1, 12) = 'sdk-managed:'",
+                       "length(trim(execution_id)) > 0", 1))
+KERNEL_SCHEMA_V6 = SCHEMA_SQL
+SCHEMA_SQL = (KERNEL_SCHEMA_V6
+              .replace("schema_version = 6", "schema_version = 7", 1)
+              .replace("VALUES ('execution_kernel', 6)", "VALUES ('execution_kernel', 7)", 1)
+              .replace("COMMIT;", """CREATE TABLE IF NOT EXISTS kernel_store_identity (
+    singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+    store_id TEXT NOT NULL CHECK (length(trim(store_id)) > 0)
+);
+INSERT OR IGNORE INTO kernel_store_identity VALUES (1, lower(hex(randomblob(16))));
+CREATE TABLE IF NOT EXISTS kernel_control_pause_receipts (
+    operation_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(operation_id)) > 0),
+    run_id TEXT NOT NULL CHECK (length(trim(run_id)) > 0),
+    expected_epoch INTEGER NOT NULL CHECK (typeof(expected_epoch) = 'integer' AND expected_epoch >= 0),
+    generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation >= 0),
+    receipt_json TEXT NOT NULL CHECK (length(receipt_json) > 0),
+    FOREIGN KEY (run_id) REFERENCES kernel_run_controls(run_id)
+);
+COMMIT;""", 1))
+KERNEL_SCHEMA_V7 = SCHEMA_SQL
+SCHEMA_SQL = (KERNEL_SCHEMA_V7
+              .replace("schema_version = 7", "schema_version = 8", 1)
+              .replace("VALUES ('execution_kernel', 7)", "VALUES ('execution_kernel', 8)", 1)
+              .replace("COMMIT;", """CREATE TABLE IF NOT EXISTS kernel_control_pause_pages (
+    operation_id TEXT NOT NULL,
+    round_id INTEGER NOT NULL CHECK (typeof(round_id) = 'integer' AND round_id >= 0),
+    page_seq INTEGER NOT NULL CHECK (typeof(page_seq) = 'integer' AND page_seq >= 0),
+    page_json TEXT NOT NULL CHECK (length(page_json) > 0),
+    PRIMARY KEY (operation_id, round_id, page_seq),
+    FOREIGN KEY (operation_id) REFERENCES kernel_control_pause_receipts(operation_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_run_authorities (
+    run_id TEXT NOT NULL PRIMARY KEY,
+    generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation >= 0),
+    control_epoch INTEGER NOT NULL CHECK (typeof(control_epoch) = 'integer' AND control_epoch >= 0),
+    principal TEXT NOT NULL CHECK (length(trim(principal)) > 0),
+    expires_at REAL NOT NULL CHECK (typeof(expires_at) IN ('integer','real') AND expires_at >= 0),
+    revoked_at REAL,
+    FOREIGN KEY (run_id) REFERENCES kernel_run_controls(run_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_revision_installs (
+    decision_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(decision_id)) > 0),
+    run_id TEXT NOT NULL,
+    barrier_operation_id TEXT NOT NULL UNIQUE,
+    receipt_json TEXT NOT NULL CHECK (length(receipt_json) > 0),
+    FOREIGN KEY (run_id) REFERENCES kernel_run_controls(run_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_legacy_imports (
+    operation_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(operation_id)) > 0),
+    run_id TEXT NOT NULL UNIQUE,
+    receipt_json TEXT NOT NULL CHECK (length(receipt_json) > 0),
+    FOREIGN KEY (run_id) REFERENCES kernel_run_controls(run_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_legacy_import_pages (
+    operation_id TEXT NOT NULL,
+    page_seq INTEGER NOT NULL CHECK (typeof(page_seq) = 'integer' AND page_seq >= 0),
+    receipt_json TEXT NOT NULL CHECK (length(receipt_json) > 0),
+    PRIMARY KEY (operation_id, page_seq),
+    FOREIGN KEY (operation_id) REFERENCES kernel_legacy_imports(operation_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_legacy_pending_commands (
+    execution_id TEXT NOT NULL PRIMARY KEY,
+    command_json TEXT NOT NULL CHECK (length(command_json) > 0),
+    FOREIGN KEY (execution_id) REFERENCES kernel_managed_executions(execution_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_revision_content_pages (
+    operation_id TEXT NOT NULL,
+    content_kind TEXT NOT NULL,
+    page_seq INTEGER NOT NULL CHECK (typeof(page_seq) = 'integer' AND page_seq >= 0),
+    receipt_json TEXT NOT NULL CHECK (length(receipt_json) > 0),
+    PRIMARY KEY (operation_id, content_kind, page_seq)
+);
+CREATE TABLE IF NOT EXISTS kernel_resume_receipts (
+    operation_id TEXT NOT NULL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    barrier_operation_id TEXT NOT NULL,
+    completion_operation_id TEXT NOT NULL,
+    receipt_json TEXT NOT NULL CHECK (length(receipt_json) > 0),
+    FOREIGN KEY (run_id) REFERENCES kernel_run_controls(run_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_activation_receipts (
+    operation_id TEXT NOT NULL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    receipt_json TEXT NOT NULL CHECK (length(receipt_json) > 0),
+    FOREIGN KEY (run_id) REFERENCES kernel_run_controls(run_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_initial_admission_bindings (
+    run_id TEXT NOT NULL PRIMARY KEY,
+    binding_json TEXT NOT NULL CHECK (length(binding_json) > 0),
+    FOREIGN KEY (run_id) REFERENCES kernel_run_controls(run_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_budget_policies (
+    run_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    policy_json TEXT NOT NULL CHECK (length(policy_json) > 0),
+    PRIMARY KEY (run_id, generation),
+    FOREIGN KEY (run_id) REFERENCES kernel_run_controls(run_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_budget_dependencies (
+    execution_id TEXT NOT NULL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    declaration_json TEXT NOT NULL CHECK (length(declaration_json) > 0),
+    FOREIGN KEY (run_id) REFERENCES kernel_run_controls(run_id)
+);
+CREATE INDEX IF NOT EXISTS kernel_effects_execution_state
+    ON kernel_effects(execution_id, state, effect_id);
+CREATE INDEX IF NOT EXISTS kernel_pause_membership_order
+    ON kernel_managed_executions(run_id, execution_id);
+COMMIT;""", 1))
+
+KERNEL_SCHEMA_V8 = SCHEMA_SQL
+SCHEMA_SQL = (KERNEL_SCHEMA_V8
+              .replace("schema_version = 8", "schema_version = 9", 1)
+              .replace("VALUES ('execution_kernel', 8)", "VALUES ('execution_kernel', 9)", 1)
+              .replace("COMMIT;", """CREATE TABLE IF NOT EXISTS kernel_supervisor_obligations (
+    execution_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (typeof(attempt) = 'integer' AND attempt >= 0),
+    fence INTEGER NOT NULL CHECK (typeof(fence) = 'integer' AND fence >= 0),
+    registered_at REAL NOT NULL,
+    resolution_json TEXT,
+    PRIMARY KEY (execution_id, attempt, fence),
+    FOREIGN KEY (execution_id) REFERENCES kernel_executions(execution_id)
+);
+COMMIT;""", 1))
+
+KERNEL_SCHEMA_V9 = SCHEMA_SQL
+SCHEMA_SQL = (KERNEL_SCHEMA_V9
+              .replace("schema_version = 9", "schema_version = 10", 1)
+              .replace("VALUES ('execution_kernel', 9)", "VALUES ('execution_kernel', 10)", 1)
+              .replace("COMMIT;", """CREATE TABLE IF NOT EXISTS kernel_projection_declarations (
+    execution_id TEXT NOT NULL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    declaration_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kernel_projection_requirements (
+    run_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    decision_id TEXT NOT NULL,
+    requirements_json TEXT NOT NULL,
+    PRIMARY KEY (run_id, generation)
+);
+CREATE TABLE IF NOT EXISTS kernel_projection_receipts (
+    decision_id TEXT NOT NULL,
+    participant_id TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    PRIMARY KEY (decision_id, participant_id, scope_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_control_takeovers (
+    run_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    new_fence INTEGER NOT NULL,
+    takeover_id TEXT NOT NULL UNIQUE,
+    claim_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    PRIMARY KEY (run_id, new_fence),
+    UNIQUE (operation_id, new_fence)
+);
+COMMIT;""", 1))
+
+
+KERNEL_SCHEMA_V10 = SCHEMA_SQL
+KERNEL_INDEXES = KERNEL_INDEXES | {"kernel_lifecycle_producer_execution", "kernel_lifecycle_pending"}
+SCHEMA_SQL = (KERNEL_SCHEMA_V10
+    .replace("schema_version = 10", "schema_version = 11", 1)
+    .replace("VALUES ('execution_kernel', 10)", "VALUES ('execution_kernel', 11)", 1)
+    .replace("COMMIT;", """CREATE TABLE IF NOT EXISTS kernel_lifecycle_producers (
+    token TEXT NOT NULL PRIMARY KEY,
+    execution_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    fence INTEGER NOT NULL CHECK (fence >= 0),
+    slots INTEGER NOT NULL CHECK (slots >= 0),
+    state TEXT NOT NULL CHECK (state IN ('open','closed')),
+    FOREIGN KEY (execution_id) REFERENCES kernel_executions(execution_id)
+);
+CREATE TABLE IF NOT EXISTS kernel_lifecycle_outbox (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    token TEXT NOT NULL,
+    event_id TEXT NOT NULL UNIQUE,
+    phase TEXT NOT NULL,
+    payload_json TEXT,
+    delivered INTEGER NOT NULL CHECK (delivered IN (0,1)),
+    CHECK (delivered=1 OR payload_json IS NOT NULL),
+    FOREIGN KEY (token) REFERENCES kernel_lifecycle_producers(token)
+);
+CREATE INDEX IF NOT EXISTS kernel_lifecycle_producer_execution ON kernel_lifecycle_producers(execution_id,state,token);
+CREATE INDEX IF NOT EXISTS kernel_lifecycle_pending ON kernel_lifecycle_outbox(token,delivered,sequence);
+COMMIT;""", 1))
+
+
+KERNEL_SCHEMA_V11 = SCHEMA_SQL
+SCHEMA_SQL = (KERNEL_SCHEMA_V11
+    .replace("schema_version = 11", "schema_version = 12", 1)
+    .replace("VALUES ('execution_kernel', 11)", "VALUES ('execution_kernel', 12)", 1)
+    .replace("COMMIT;", """CREATE TABLE IF NOT EXISTS kernel_lifecycle_metadata (
+    singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+    legacy_max_sequence INTEGER NOT NULL CHECK (legacy_max_sequence >= 0)
+);
+INSERT OR IGNORE INTO kernel_lifecycle_metadata VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS kernel_lifecycle_retired (
+    execution_id TEXT NOT NULL PRIMARY KEY,
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    fence INTEGER NOT NULL CHECK (fence >= 0),
+    FOREIGN KEY (execution_id) REFERENCES kernel_executions(execution_id)
+);
+COMMIT;""", 1))
 
 
 def _schema_v2_from_v3() -> str:
@@ -397,6 +634,36 @@ KERNEL_SCHEMA_V2 = _schema_v2_from_v3()
 
 
 EXPECTED_COLUMNS = {
+    "kernel_lifecycle_metadata": (("singleton", "INTEGER", 1, 1), ("legacy_max_sequence", "INTEGER", 1, 0)),
+    "kernel_lifecycle_retired": (("execution_id", "TEXT", 1, 1), ("attempt", "INTEGER", 1, 0), ("fence", "INTEGER", 1, 0)),
+    "kernel_lifecycle_producers": (("token", "TEXT", 1, 1), ("execution_id", "TEXT", 1, 0), ("attempt", "INTEGER", 1, 0), ("fence", "INTEGER", 1, 0), ("slots", "INTEGER", 1, 0), ("state", "TEXT", 1, 0)),
+    "kernel_lifecycle_outbox": (("sequence", "INTEGER", 0, 1), ("token", "TEXT", 1, 0), ("event_id", "TEXT", 1, 0), ("phase", "TEXT", 1, 0), ("payload_json", "TEXT", 0, 0), ("delivered", "INTEGER", 1, 0)),
+    "kernel_projection_requirements": (("run_id", "TEXT", 1, 1), ("generation", "INTEGER", 1, 2), ("decision_id", "TEXT", 1, 0), ("requirements_json", "TEXT", 1, 0)),
+    "kernel_projection_declarations": (("execution_id", "TEXT", 1, 1), ("run_id", "TEXT", 1, 0), ("generation", "INTEGER", 1, 0), ("declaration_json", "TEXT", 1, 0)),
+    "kernel_projection_receipts": (("decision_id", "TEXT", 1, 1), ("participant_id", "TEXT", 1, 2), ("scope_id", "TEXT", 1, 3), ("receipt_json", "TEXT", 1, 0)),
+    "kernel_supervisor_obligations": (("execution_id", "TEXT", 1, 1), ("attempt", "INTEGER", 1, 2), ("fence", "INTEGER", 1, 3), ("registered_at", "REAL", 1, 0), ("resolution_json", "TEXT", 0, 0)),
+    "kernel_budget_policies": (("run_id", "TEXT", 1, 1), ("generation", "INTEGER", 1, 2), ("policy_json", "TEXT", 1, 0)),
+    "kernel_budget_dependencies": (("execution_id", "TEXT", 1, 1), ("run_id", "TEXT", 1, 0), ("generation", "INTEGER", 1, 0), ("declaration_json", "TEXT", 1, 0)),
+    "kernel_revision_content_pages": (("operation_id", "TEXT", 1, 1), ("content_kind", "TEXT", 1, 2), ("page_seq", "INTEGER", 1, 3), ("receipt_json", "TEXT", 1, 0)),
+    "kernel_resume_receipts": (("operation_id", "TEXT", 1, 1), ("run_id", "TEXT", 1, 0), ("barrier_operation_id", "TEXT", 1, 0), ("completion_operation_id", "TEXT", 1, 0), ("receipt_json", "TEXT", 1, 0)),
+    "kernel_activation_receipts": (("operation_id", "TEXT", 1, 1), ("run_id", "TEXT", 1, 0), ("receipt_json", "TEXT", 1, 0)),
+    "kernel_initial_admission_bindings": (("run_id", "TEXT", 1, 1), ("binding_json", "TEXT", 1, 0)),
+    "kernel_legacy_pending_commands": (("execution_id", "TEXT", 1, 1), ("command_json", "TEXT", 1, 0)),
+    "kernel_legacy_import_pages": (("operation_id", "TEXT", 1, 1), ("page_seq", "INTEGER", 1, 2), ("receipt_json", "TEXT", 1, 0)),
+    "kernel_legacy_imports": (("operation_id", "TEXT", 1, 1), ("run_id", "TEXT", 1, 0), ("receipt_json", "TEXT", 1, 0)),
+    "kernel_revision_installs": (("decision_id", "TEXT", 1, 1), ("run_id", "TEXT", 1, 0),
+        ("barrier_operation_id", "TEXT", 1, 0), ("receipt_json", "TEXT", 1, 0)),
+    "kernel_run_authorities": (("run_id", "TEXT", 1, 1), ("generation", "INTEGER", 1, 0),
+        ("control_epoch", "INTEGER", 1, 0), ("principal", "TEXT", 1, 0),
+        ("expires_at", "REAL", 1, 0), ("revoked_at", "REAL", 0, 0)),
+    "kernel_control_pause_pages": (("operation_id", "TEXT", 1, 1),
+        ("round_id", "INTEGER", 1, 2), ("page_seq", "INTEGER", 1, 3), ("page_json", "TEXT", 1, 0)),
+    "kernel_store_identity": (("singleton", "INTEGER", 1, 1), ("store_id", "TEXT", 1, 0)),
+    "kernel_control_pause_receipts": (
+        ("operation_id", "TEXT", 1, 1), ("run_id", "TEXT", 1, 0),
+        ("expected_epoch", "INTEGER", 1, 0), ("generation", "INTEGER", 1, 0),
+        ("receipt_json", "TEXT", 1, 0),
+    ),
     "kernel_budget_samples": (
         ("token", "TEXT", 1, 1), ("execution_id", "TEXT", 1, 0),
         ("reason", "TEXT", 1, 0),
@@ -489,7 +756,7 @@ EXPECTED_COLUMNS = {
 SQL_REQUIREMENTS = {
     "kernel_schema_meta": (
         "check(component='execution_kernel')",
-        "typeof(schema_version)='integer'andschema_version=5",
+        "typeof(schema_version)='integer'andschema_version=12",
     ),
     "kernel_clock": (
         "check(singleton=1)",
@@ -510,7 +777,6 @@ SQL_REQUIREMENTS = {
     ),
     "kernel_managed_executions": (
         "length(trim(execution_id))>0",
-        "substr(execution_id,1,12)='sdk-managed:'",
         "length(trim(run_id))>0",
         "typeof(generation)='integer'andgeneration>=0",
         "typeof(drain_allowed)='integer'anddrain_allowedin(0,1)",
@@ -570,6 +836,10 @@ SQL_REQUIREMENTS = {
 
 
 EXPECTED_INDEX_SQL = {
+    "kernel_lifecycle_producer_execution": "createindexkernel_lifecycle_producer_executiononkernel_lifecycle_producers(execution_id,state,token)",
+    "kernel_lifecycle_pending": "createindexkernel_lifecycle_pendingonkernel_lifecycle_outbox(token,delivered,sequence)",
+    "kernel_effects_execution_state": "createindexkernel_effects_execution_stateonkernel_effects(execution_id,state,effect_id)",
+    "kernel_pause_membership_order": "createindexkernel_pause_membership_orderonkernel_managed_executions(run_id,execution_id)",
     "kernel_budget_samples_execution": "createindexkernel_budget_samples_executiononkernel_budget_samples(execution_id,token)",
     "kernel_executions_idempotency": "createuniqueindexkernel_executions_idempotencyonkernel_executions(idempotency_key)",
     "kernel_executions_claim": "createindexkernel_executions_claimonkernel_executions(state,registry_revision,next_attempt_at,created_at)",
@@ -607,6 +877,26 @@ def validate_kernel_schema_v2(connection: sqlite3.Connection) -> None:
     """Require the exact Kernel v2 schema before an explicit copy upgrade."""
 
     v2_tables = KERNEL_TABLES - {
+        "kernel_lifecycle_metadata",
+        "kernel_lifecycle_retired",
+        "kernel_lifecycle_producers", "kernel_lifecycle_outbox",
+        "kernel_control_takeovers",
+        "kernel_projection_declarations", "kernel_projection_receipts", "kernel_projection_requirements",
+        "kernel_supervisor_obligations",
+        "kernel_revision_content_pages",
+        "kernel_resume_receipts",
+        "kernel_activation_receipts",
+        "kernel_initial_admission_bindings",
+        "kernel_budget_policies",
+        "kernel_budget_dependencies",
+        "kernel_legacy_pending_commands",
+        "kernel_legacy_import_pages",
+        "kernel_legacy_imports",
+        "kernel_revision_installs",
+        "kernel_run_authorities",
+        "kernel_control_pause_pages",
+        "kernel_control_pause_receipts",
+        "kernel_store_identity",
         "kernel_run_controls",
         "kernel_managed_executions",
         "kernel_execution_limits",
@@ -827,7 +1117,7 @@ def upgrade_kernel_schema_v4_to_v5(connection: sqlite3.Connection) -> None:
         try:
             validate_kernel_schema_v4(connection)
             connection.execute("DROP TABLE kernel_schema_meta")
-            connection.execute(_schema_statement_for("kernel_schema_meta"))
+            connection.execute(_schema_statement_for("kernel_schema_meta", KERNEL_SCHEMA_V5))
             connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',5)")
             connection.execute(_schema_statement_for("kernel_budget_samples"))
             connection.execute(_schema_statement_for("kernel_budget_samples_execution"))
@@ -836,7 +1126,7 @@ def upgrade_kernel_schema_v4_to_v5(connection: sqlite3.Connection) -> None:
                 "SELECT 'legacy:' || l.execution_id,l.execution_id,'legacy_unprotected' "
                 "FROM kernel_execution_limits l JOIN kernel_executions e ON e.execution_id=l.execution_id "
                 "WHERE e.state IN ('queued','leased','running','recovery_required')")
-            validate_schema(connection, KERNEL_TABLES)
+            validate_kernel_schema_v5(connection)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -845,12 +1135,12 @@ def upgrade_kernel_schema_v4_to_v5(connection: sqlite3.Connection) -> None:
         connection.row_factory = previous_row_factory
 
 
-def _expected_object_sql() -> dict[str, str]:
+def _expected_object_sql(schema_sql: str = SCHEMA_SQL, *, tables=KERNEL_TABLES, indexes=KERNEL_INDEXES) -> dict[str, str]:
     """Extract canonical DDL from the bootstrap script without SQL parsing."""
 
     expected: dict[str, str] = {}
-    names = KERNEL_TABLES | KERNEL_INDEXES
-    for statement in SCHEMA_SQL.split(";"):
+    names = tables | indexes
+    for statement in schema_sql.split(";"):
         normalized = _normalize_sql(statement)
         for name in names:
             if (
@@ -880,6 +1170,28 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
 
 def _table_columns(connection: sqlite3.Connection, table: str) -> tuple[tuple, ...]:
     statements = {
+        "kernel_lifecycle_metadata": "PRAGMA table_info(kernel_lifecycle_metadata)",
+        "kernel_lifecycle_retired": "PRAGMA table_info(kernel_lifecycle_retired)",
+        "kernel_lifecycle_producers": "PRAGMA table_info(kernel_lifecycle_producers)",
+        "kernel_lifecycle_outbox": "PRAGMA table_info(kernel_lifecycle_outbox)",
+        "kernel_projection_requirements": "PRAGMA table_info(kernel_projection_requirements)",
+        "kernel_projection_declarations": "PRAGMA table_info(kernel_projection_declarations)",
+        "kernel_projection_receipts": "PRAGMA table_info(kernel_projection_receipts)",
+        "kernel_supervisor_obligations": "PRAGMA table_info(kernel_supervisor_obligations)",
+        "kernel_budget_policies": "PRAGMA table_info(kernel_budget_policies)",
+        "kernel_budget_dependencies": "PRAGMA table_info(kernel_budget_dependencies)",
+        "kernel_revision_content_pages": "PRAGMA table_info(kernel_revision_content_pages)",
+        "kernel_resume_receipts": "PRAGMA table_info(kernel_resume_receipts)",
+        "kernel_activation_receipts": "PRAGMA table_info(kernel_activation_receipts)",
+        "kernel_initial_admission_bindings": "PRAGMA table_info(kernel_initial_admission_bindings)",
+        "kernel_legacy_pending_commands": "PRAGMA table_info(kernel_legacy_pending_commands)",
+        "kernel_legacy_import_pages": "PRAGMA table_info(kernel_legacy_import_pages)",
+        "kernel_legacy_imports": "PRAGMA table_info(kernel_legacy_imports)",
+        "kernel_revision_installs": "PRAGMA table_info(kernel_revision_installs)",
+        "kernel_run_authorities": "PRAGMA table_info(kernel_run_authorities)",
+        "kernel_control_pause_pages": "PRAGMA table_info(kernel_control_pause_pages)",
+        "kernel_store_identity": "PRAGMA table_info(kernel_store_identity)",
+        "kernel_control_pause_receipts": "PRAGMA table_info(kernel_control_pause_receipts)",
         "kernel_budget_samples": "PRAGMA table_info(kernel_budget_samples)",
         "kernel_schema_meta": "PRAGMA table_info(kernel_schema_meta)",
         "kernel_clock": "PRAGMA table_info(kernel_clock)",
@@ -901,10 +1213,28 @@ def _table_columns(connection: sqlite3.Connection, table: str) -> tuple[tuple, .
 def validate_schema(
     connection: sqlite3.Connection,
     kernel_names: set[str] | frozenset[str],
+    *,
+    _schema_sql: str = SCHEMA_SQL,
+    _version: int = KERNEL_STORAGE_SCHEMA_VERSION,
+    _requirements: dict = SQL_REQUIREMENTS,
 ) -> None:
-    if set(kernel_names) != set(KERNEL_TABLES):
-        missing = sorted(KERNEL_TABLES - set(kernel_names))
-        extra = sorted(set(kernel_names) - KERNEL_TABLES)
+    tables = KERNEL_TABLES if _version >= 8 else KERNEL_TABLES - {"kernel_control_pause_pages", "kernel_run_authorities", "kernel_revision_installs", "kernel_legacy_imports", "kernel_legacy_import_pages", "kernel_legacy_pending_commands", "kernel_revision_content_pages", "kernel_resume_receipts", "kernel_activation_receipts", "kernel_initial_admission_bindings", "kernel_budget_policies", "kernel_budget_dependencies"}
+    if _version < 12:
+        tables = tables - {"kernel_lifecycle_retired", "kernel_lifecycle_metadata"}
+    if _version < 11:
+        tables = tables - {"kernel_lifecycle_producers", "kernel_lifecycle_outbox"}
+    if _version < 10:
+        tables = tables - {"kernel_projection_declarations", "kernel_projection_receipts", "kernel_projection_requirements", "kernel_control_takeovers"}
+    if _version < 9:
+        tables = tables - {"kernel_supervisor_obligations"}
+    if _version < 7:
+        tables = tables - {"kernel_control_pause_receipts", "kernel_store_identity"}
+    indexes = KERNEL_INDEXES if _version >= 8 else KERNEL_INDEXES - {"kernel_effects_execution_state", "kernel_pause_membership_order"}
+    if _version < 11:
+        indexes = indexes - {"kernel_lifecycle_producer_execution", "kernel_lifecycle_pending"}
+    if set(kernel_names) != set(tables):
+        missing = sorted(tables - set(kernel_names))
+        extra = sorted(set(kernel_names) - tables)
         raise StorageIsolationError(
             "incompatible execution-kernel table set; "
             f"missing={missing!r}, unexpected={extra!r}"
@@ -913,21 +1243,25 @@ def validate_schema(
         """SELECT name, type, sql FROM sqlite_master
            WHERE name LIKE 'kernel_%' ORDER BY name"""
     ).fetchall()
-    expected_objects = KERNEL_TABLES | KERNEL_INDEXES
+    expected_objects = tables | indexes
     if {row["name"] for row in objects} != expected_objects:
         raise StorageIsolationError("incompatible execution-kernel schema object set")
     for table, expected in EXPECTED_COLUMNS.items():
+        if table not in tables:
+            continue
         if _table_columns(connection, table) != expected:
             raise StorageIsolationError(f"incompatible column schema: {table}")
     sql_by_name = {row["name"]: _normalize_sql(row["sql"] or "") for row in objects}
-    expected_sql = _expected_object_sql()
+    expected_sql = _expected_object_sql(_schema_sql, tables=tables, indexes=indexes)
     for name, expected in expected_sql.items():
         if sql_by_name.get(name) != expected:
             raise StorageIsolationError(f"incompatible exact schema definition: {name}")
-    for table, fragments in SQL_REQUIREMENTS.items():
+    for table, fragments in _requirements.items():
         if any(_normalize_sql(fragment) not in sql_by_name[table] for fragment in fragments):
             raise StorageIsolationError(f"weakened or incompatible CHECK schema: {table}")
     for name, expected in EXPECTED_INDEX_SQL.items():
+        if name not in indexes:
+            continue
         if sql_by_name.get(name) != expected:
             raise StorageIsolationError(f"incompatible index definition: {name}")
     meta = connection.execute(
@@ -938,12 +1272,16 @@ def validate_schema(
         len(meta) != 1
         or meta[0]["component"] != "execution_kernel"
         or type(meta[0]["schema_version"]) is not int
-        or meta[0]["schema_version"] != KERNEL_STORAGE_SCHEMA_VERSION
+        or meta[0]["schema_version"] != _version
         or meta[0][2] != "integer"
     ):
         raise StorageIsolationError(
-            f"kernel_schema_meta must contain exactly execution_kernel schema v{KERNEL_STORAGE_SCHEMA_VERSION}"
+            f"kernel_schema_meta must contain exactly execution_kernel schema v{_version}"
         )
+    if _version >= 7:
+        identity = connection.execute("SELECT singleton,store_id FROM kernel_store_identity").fetchall()
+        if len(identity) != 1 or identity[0][0] != 1 or not isinstance(identity[0][1], str) or not identity[0][1].strip():
+            raise StorageIsolationError("kernel store identity is missing or malformed")
     clock = connection.execute(
         """SELECT singleton, watermark, event_sequence,
                   typeof(watermark), typeof(event_sequence)
@@ -970,9 +1308,311 @@ def validate_schema(
         raise StorageIsolationError("kernel global event sequence is inconsistent")
 
 
+def validate_kernel_schema_v5(connection: sqlite3.Connection) -> None:
+    """Validate the exact historical layout for explicit copy upgrades."""
+    requirements = dict(SQL_REQUIREMENTS)
+    requirements["kernel_schema_meta"] = (
+        "check(component='execution_kernel')",
+        "typeof(schema_version)='integer'andschema_version=5",
+    )
+    requirements["kernel_managed_executions"] = (
+        *SQL_REQUIREMENTS["kernel_managed_executions"],
+        "substr(execution_id,1,12)='sdk-managed:'",
+    )
+    previous_row_factory = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        names = {name for name in existing_table_names(connection) if name.startswith("kernel_")}
+        validate_schema(connection, names, _schema_sql=KERNEL_SCHEMA_V5,
+                        _version=5, _requirements=requirements)
+    finally:
+        connection.row_factory = previous_row_factory
+
+
+def upgrade_kernel_schema_v5_to_v6(connection: sqlite3.Connection) -> None:
+    """Replace the managed membership constraint in a private copy."""
+    if connection.in_transaction:
+        raise RuntimeError("Kernel schema upgrade requires an idle connection")
+    previous_row_factory = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            validate_kernel_schema_v5(connection)
+            connection.execute("CREATE TEMP TABLE managed_v5 AS SELECT * FROM kernel_managed_executions")
+            connection.execute("DROP TABLE kernel_managed_executions")
+            connection.execute(_schema_statement_for("kernel_managed_executions", KERNEL_SCHEMA_V6))
+            connection.execute("INSERT INTO kernel_managed_executions SELECT * FROM managed_v5")
+            connection.execute("DROP TABLE managed_v5")
+            connection.execute(_schema_statement_for("kernel_managed_executions_run", KERNEL_SCHEMA_V6))
+            connection.execute("DROP TABLE kernel_schema_meta")
+            connection.execute(_schema_statement_for("kernel_schema_meta", KERNEL_SCHEMA_V6))
+            connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',6)")
+            validate_kernel_schema_v6(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        connection.row_factory = previous_row_factory
+
+
+def validate_kernel_schema_v6(connection: sqlite3.Connection) -> None:
+    requirements = dict(SQL_REQUIREMENTS)
+    requirements["kernel_schema_meta"] = (
+        "check(component='execution_kernel')",
+        "typeof(schema_version)='integer'andschema_version=6",
+    )
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        names = {name for name in existing_table_names(connection) if name.startswith("kernel_")}
+        validate_schema(connection, names, _schema_sql=KERNEL_SCHEMA_V6,
+                        _version=6, _requirements=requirements)
+    finally:
+        connection.row_factory = previous
+
+
+def upgrade_kernel_schema_v6_to_v7(connection: sqlite3.Connection) -> None:
+    """Install the local pause receipt table in an isolated copy."""
+    if connection.in_transaction:
+        raise RuntimeError("Kernel schema upgrade requires an idle connection")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            validate_kernel_schema_v6(connection)
+            connection.execute(_schema_statement_for("kernel_store_identity", KERNEL_SCHEMA_V7))
+            connection.execute("INSERT INTO kernel_store_identity VALUES(1,lower(hex(randomblob(16))))")
+            connection.execute(_schema_statement_for("kernel_control_pause_receipts", KERNEL_SCHEMA_V7))
+            connection.execute("DROP TABLE kernel_schema_meta")
+            connection.execute(_schema_statement_for("kernel_schema_meta", KERNEL_SCHEMA_V7))
+            connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',7)")
+            validate_kernel_schema_v7(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        connection.row_factory = previous
+
+
+def validate_kernel_schema_v7(connection: sqlite3.Connection) -> None:
+    requirements = dict(SQL_REQUIREMENTS)
+    requirements["kernel_schema_meta"] = ("check(component='execution_kernel')",
+        "typeof(schema_version)='integer'andschema_version=7")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        names = {name for name in existing_table_names(connection) if name.startswith("kernel_")}
+        validate_schema(connection, names, _schema_sql=KERNEL_SCHEMA_V7, _version=7, _requirements=requirements)
+    finally:
+        connection.row_factory = previous
+
+
+def upgrade_kernel_schema_v7_to_v8(connection: sqlite3.Connection) -> None:
+    if connection.in_transaction:
+        raise RuntimeError("Kernel schema upgrade requires an idle connection")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            validate_kernel_schema_v7(connection)
+            connection.execute(_schema_statement_for("kernel_control_pause_pages"))
+            connection.execute(_schema_statement_for("kernel_run_authorities"))
+            connection.execute(_schema_statement_for("kernel_revision_installs"))
+            connection.execute(_schema_statement_for("kernel_legacy_imports"))
+            connection.execute(_schema_statement_for("kernel_legacy_import_pages"))
+            connection.execute(_schema_statement_for("kernel_legacy_pending_commands"))
+            connection.execute(_schema_statement_for("kernel_revision_content_pages"))
+            connection.execute(_schema_statement_for("kernel_resume_receipts"))
+            connection.execute(_schema_statement_for("kernel_activation_receipts"))
+            connection.execute(_schema_statement_for("kernel_initial_admission_bindings"))
+            connection.execute(_schema_statement_for("kernel_budget_policies"))
+            connection.execute(_schema_statement_for("kernel_budget_dependencies"))
+            connection.execute(_schema_statement_for("kernel_effects_execution_state"))
+            connection.execute(_schema_statement_for("kernel_pause_membership_order"))
+            connection.execute("DROP TABLE kernel_schema_meta")
+            connection.execute(_schema_statement_for("kernel_schema_meta", KERNEL_SCHEMA_V8))
+            connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',8)")
+            validate_kernel_schema_v8(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        connection.row_factory = previous
+
+
+def validate_kernel_schema_v8(connection: sqlite3.Connection) -> None:
+    requirements = dict(SQL_REQUIREMENTS)
+    requirements["kernel_schema_meta"] = ("check(component='execution_kernel')", "typeof(schema_version)='integer'andschema_version=8")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        names = {name for name in existing_table_names(connection) if name.startswith("kernel_")}
+        validate_schema(connection, names, _schema_sql=KERNEL_SCHEMA_V8, _version=8, _requirements=requirements)
+    finally:
+        connection.row_factory = previous
+
+
+def upgrade_kernel_schema_v8_to_v9(connection: sqlite3.Connection) -> None:
+    if connection.in_transaction:
+        raise RuntimeError("Kernel schema upgrade requires an idle connection")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            validate_kernel_schema_v8(connection)
+            connection.execute(_schema_statement_for("kernel_supervisor_obligations", KERNEL_SCHEMA_V9))
+            connection.execute("DROP TABLE kernel_schema_meta")
+            connection.execute(_schema_statement_for("kernel_schema_meta", KERNEL_SCHEMA_V9))
+            connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',9)")
+            validate_kernel_schema_v9(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        connection.row_factory = previous
+
+
+def validate_kernel_schema_v9(connection: sqlite3.Connection) -> None:
+    requirements = dict(SQL_REQUIREMENTS)
+    requirements["kernel_schema_meta"] = ("check(component='execution_kernel')", "typeof(schema_version)='integer'andschema_version=9")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        names = {name for name in existing_table_names(connection) if name.startswith("kernel_")}
+        validate_schema(connection, names, _schema_sql=KERNEL_SCHEMA_V9, _version=9, _requirements=requirements)
+    finally:
+        connection.row_factory = previous
+
+
+def upgrade_kernel_schema_v9_to_v10(connection: sqlite3.Connection) -> None:
+    if connection.in_transaction:
+        raise RuntimeError("Kernel schema upgrade requires an idle connection")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            validate_kernel_schema_v9(connection)
+            connection.execute(_schema_statement_for("kernel_projection_declarations", KERNEL_SCHEMA_V10))
+            connection.execute(_schema_statement_for("kernel_projection_receipts", KERNEL_SCHEMA_V10))
+            connection.execute(_schema_statement_for("kernel_projection_requirements", KERNEL_SCHEMA_V10))
+            connection.execute(_schema_statement_for("kernel_control_takeovers", KERNEL_SCHEMA_V10))
+            connection.execute("DROP TABLE kernel_schema_meta")
+            connection.execute(_schema_statement_for("kernel_schema_meta", KERNEL_SCHEMA_V10))
+            connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',10)")
+            validate_kernel_schema_v10(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        connection.row_factory = previous
+
+
+def validate_kernel_schema_v10(connection):
+    requirements = dict(SQL_REQUIREMENTS)
+    requirements["kernel_schema_meta"] = ("check(component='execution_kernel')", "typeof(schema_version)='integer'andschema_version=10")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        names = {name for name in existing_table_names(connection) if name.startswith("kernel_")}
+        validate_schema(connection, names, _schema_sql=KERNEL_SCHEMA_V10, _version=10, _requirements=requirements)
+    finally:
+        connection.row_factory = previous
+
+
+def upgrade_kernel_schema_v10_to_v11(connection):
+    if connection.in_transaction:
+        raise RuntimeError("Kernel schema upgrade requires an idle connection")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            validate_kernel_schema_v10(connection)
+            connection.execute(_schema_statement_for("kernel_lifecycle_producers"))
+            connection.execute(_schema_statement_for("kernel_lifecycle_outbox"))
+            connection.execute(_schema_statement_for("kernel_lifecycle_producer_execution"))
+            connection.execute(_schema_statement_for("kernel_lifecycle_pending"))
+            connection.execute("DROP TABLE kernel_schema_meta")
+            connection.execute(_schema_statement_for("kernel_schema_meta", KERNEL_SCHEMA_V11))
+            connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',11)")
+            validate_kernel_schema_v11(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        connection.row_factory = previous
+
+
+def validate_kernel_schema_v11(connection):
+    requirements = dict(SQL_REQUIREMENTS)
+    requirements["kernel_schema_meta"] = ("check(component='execution_kernel')", "typeof(schema_version)='integer'andschema_version=11")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        names = {name for name in existing_table_names(connection) if name.startswith("kernel_")}
+        validate_schema(connection, names, _schema_sql=KERNEL_SCHEMA_V11, _version=11, _requirements=requirements)
+    finally:
+        connection.row_factory = previous
+
+
+def upgrade_kernel_schema_v11_to_v12(connection):
+    if connection.in_transaction:
+        raise RuntimeError("Kernel schema upgrade requires an idle connection")
+    previous = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            validate_kernel_schema_v11(connection)
+            connection.execute(_schema_statement_for("kernel_lifecycle_metadata"))
+            connection.execute("INSERT INTO kernel_lifecycle_metadata SELECT 1, COALESCE(MAX(sequence),0) FROM kernel_lifecycle_outbox")
+            connection.execute(_schema_statement_for("kernel_lifecycle_retired"))
+            connection.execute("DROP TABLE kernel_schema_meta")
+            connection.execute(_schema_statement_for("kernel_schema_meta"))
+            connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',12)")
+            validate_schema(connection, KERNEL_TABLES)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    finally:
+        connection.row_factory = previous
+
+
 def install_authorizer(connection: sqlite3.Connection):
     read_tables = KERNEL_TABLES | {"sqlite_master", "sqlite_schema"}
     insert_tables = {
+        "kernel_lifecycle_retired",
+        "kernel_lifecycle_producers", "kernel_lifecycle_outbox",
+        "kernel_control_takeovers",
+        "kernel_projection_declarations",
+        "kernel_projection_receipts",
+        "kernel_projection_requirements",
+        "kernel_supervisor_obligations",
+        "kernel_revision_content_pages",
+        "kernel_resume_receipts",
+        "kernel_activation_receipts",
+        "kernel_initial_admission_bindings",
+        "kernel_budget_policies",
+        "kernel_budget_dependencies",
+        "kernel_legacy_pending_commands",
+        "kernel_legacy_import_pages",
+        "kernel_legacy_imports",
+        "kernel_revision_installs",
+        "kernel_run_authorities",
+        "kernel_control_pause_pages",
+        "kernel_control_pause_receipts",
         "kernel_budget_samples",
         "kernel_run_controls",
         "kernel_managed_executions",
@@ -986,6 +1626,11 @@ def install_authorizer(connection: sqlite3.Connection):
         "kernel_progress_keys",
     }
     update_columns = {
+        "kernel_lifecycle_retired": {"attempt", "fence"},
+        "kernel_lifecycle_producers": {"state", "slots"},
+        "kernel_lifecycle_outbox": {"delivered", "payload_json"},
+        "kernel_supervisor_obligations": {"resolution_json"},
+        "kernel_run_authorities": {"revoked_at", "generation", "control_epoch", "principal", "expires_at"},
         "kernel_execution_limits": {"envelope_json", "parent_execution_id", "parent_attempt", "parent_fence", "depth",
             "entry_state", "entry_attempt", "entry_fence"},
         "kernel_supervision": {
@@ -1068,7 +1713,7 @@ def install_authorizer(connection: sqlite3.Connection):
             elif action == sqlite3.SQLITE_UPDATE:
                 allowed = second in update_columns.get(first or "", set())
             else:
-                allowed = first == "kernel_budget_samples"
+                allowed = first in {"kernel_budget_samples", "kernel_lifecycle_producers", "kernel_lifecycle_outbox"}
             return sqlite3.SQLITE_OK if allowed else sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 

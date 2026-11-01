@@ -35,6 +35,10 @@ failure even when all resources subsequently close. A successful resource stop
 does not erase a prior failure. The orchestrator's last timeout status remains
 visible until a successful retry; phase/thread observations can still advance.
 Monotonic timestamps are local to this process, not portable wall-clock evidence.
+The local obligation snapshot reports retained diagnostic count, unknown
+handoff count, failed diagnostic execution count and retention overflow
+separately. `OrchestratorHost.stop_report` forwards these fields; `None` means
+the bounded snapshot could not inspect them, not zero obligations.
 Worker counts describe futures still tracked by the host, including completed
 calls awaiting collection, not an enumeration of execution IDs.
 
@@ -108,7 +112,7 @@ adjacent continuation IDs. It does not construct an Orchestrator writer, load a
 whole Run or traverse filesystem catalogs. Same-store continuation keeps execution
 identity queryable without copying descriptors into each new segment.
 
-The reader targets the current Orchestrator schema 4 layout; older stores need
+The reader targets the current Orchestrator schema 6 layout; older stores need
 the documented explicit copy upgrade. Payload bytes, SQL work and elapsed
 time have explicit limits; content-object decoding participates in payload limits.
 The encoded-byte allowance is cumulative across roots and referenced objects,

@@ -7,7 +7,7 @@ handler binding remain explicitly unknown.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import math
 from pathlib import Path
@@ -61,6 +61,10 @@ class RunDiagnosticReport:
     timed_out: bool
     error_code: str | None
     elapsed_seconds: float
+    phase_elapsed_seconds: dict[str, float] = field(default_factory=dict)
+    stopped_phase: str | None = None
+    next_task_id: str | None = None
+    next_wait_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -90,8 +94,19 @@ class _ReportBuilder:
         self.complete = False
         self.timed_out = False
         self.error_code = None
+        self.phase = "open"
+        self.phase_started = time.monotonic()
+        self.phase_elapsed: dict[str, float] = {}
+
+    def start_phase(self, name: str) -> None:
+        now = time.monotonic()
+        self.phase_elapsed[self.phase] = max(0.0, now - self.phase_started)
+        self.phase = name
+        self.phase_started = now
 
     def freeze(self, budget: InspectionBudget) -> RunDiagnosticReport:
+        timings = dict(self.phase_elapsed)
+        timings[self.phase] = max(0.0, time.monotonic() - self.phase_started)
         return RunDiagnosticReport(
             run_id=self.run_id,
             observed_at=self.observed_at,
@@ -115,6 +130,10 @@ class _ReportBuilder:
             timed_out=self.timed_out,
             error_code=self.error_code,
             elapsed_seconds=budget.elapsed_seconds,
+            phase_elapsed_seconds=timings,
+            stopped_phase=self.phase if self.error_code is not None else None,
+            next_task_id=(self.tasks[-1]["task_id"] if self.tasks_has_more and self.tasks else None),
+            next_wait_id=(self.waits[-1]["wait_id"] if self.waits_has_more and self.waits else None),
         )
 
 
@@ -576,6 +595,7 @@ def inspect_run_diagnostics(
     try:
         budget.check()
         connection = _open_reader(path, budget)
+        report.start_phase("schema")
         try:
             # This validator compares the complete stored SDK DDL with its
             # declared schema using a private in-memory reference database.
@@ -591,6 +611,7 @@ def inspect_run_diagnostics(
 
         report.schema_status = "verified"
         report.schema_version = ORCHESTRATOR_SCHEMA_VERSION
+        report.start_phase("run_summary")
         marker = _rows(
             connection,
             budget,
@@ -644,13 +665,17 @@ def inspect_run_diagnostics(
             "managed_control": managed_summary,
         }
 
+        report.start_phase("task_count")
         (report.task_count, report.task_count_lower_bound,
          report.task_count_complete) = _task_count(
             connection, budget, run_id, task_count_scan_limit)
+        report.start_phase("tasks")
         report.tasks, report.tasks_has_more, report.tasks_complete = _task_page(
             connection, budget, run_id, after_task_id, task_limit)
+        report.start_phase("waits")
         report.waits, report.waits_has_more, report.waits_complete = _wait_page(
             connection, budget, run_id, after_wait_id, wait_limit)
+        report.start_phase("blockers")
         report.blockers, report.blockers_complete = _blocker_report(
             connection, budget, run_id, blocker_limit)
         budget.check()

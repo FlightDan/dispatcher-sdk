@@ -9,6 +9,7 @@ from dispatcher_sdk.execution_kernel import (
 )
 from dispatcher_sdk.execution_kernel._sqlite_schema import (
     KERNEL_SCHEMA_V3, upgrade_kernel_schema_v3_to_v4, upgrade_kernel_schema_v4_to_v5,
+    upgrade_kernel_schema_v5_to_v6,
 )
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, sample_clock
 
@@ -95,6 +96,21 @@ class SupervisionControlTests(unittest.TestCase):
                 SQLiteKernel(path)
             upgrade_kernel_schema_v3_to_v4(connection)
             upgrade_kernel_schema_v4_to_v5(connection)
+            self.assertEqual(connection.execute(
+                "SELECT schema_version FROM kernel_schema_meta").fetchone()[0], 5)
+            upgrade_kernel_schema_v5_to_v6(connection)
+            from dispatcher_sdk.execution_kernel._sqlite_schema import upgrade_kernel_schema_v6_to_v7
+            upgrade_kernel_schema_v6_to_v7(connection)
+            from dispatcher_sdk.execution_kernel._sqlite_schema import upgrade_kernel_schema_v7_to_v8
+            upgrade_kernel_schema_v7_to_v8(connection)
+            from dispatcher_sdk.execution_kernel._sqlite_schema import upgrade_kernel_schema_v8_to_v9
+            upgrade_kernel_schema_v8_to_v9(connection)
+            from dispatcher_sdk.execution_kernel._sqlite_schema import upgrade_kernel_schema_v9_to_v10
+            upgrade_kernel_schema_v9_to_v10(connection)
+            from dispatcher_sdk.execution_kernel._sqlite_schema import upgrade_kernel_schema_v10_to_v11
+            upgrade_kernel_schema_v10_to_v11(connection)
+            from dispatcher_sdk.execution_kernel._sqlite_schema import upgrade_kernel_schema_v11_to_v12
+            upgrade_kernel_schema_v11_to_v12(connection)
             self.assertEqual(connection.execute(
                 "SELECT watermark FROM kernel_clock"
             ).fetchone()[0], 12)

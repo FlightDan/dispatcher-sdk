@@ -24,7 +24,8 @@ from .._inspection import InspectionBudgetExceeded
 from .._sqlite_errors import is_sqlite_contention
 from .budget import BudgetEnvelope, BudgetClockUnknownError, sample_clock
 from .contracts import ExecutionCommandV2, ExecutionLease, RetryPolicy
-from .errors import ExecutionNotFoundError, StaleFenceError, InvalidStateTransitionError
+from .errors import (CASConflictError, ExecutionNotFoundError, StaleFenceError,
+                     InvalidStateTransitionError, StorageIsolationError)
 
 
 CHILD_SCHEMA = """
@@ -55,6 +56,9 @@ _MAX_RECORD_BYTES = 256 * 1024
 
 
 def _transient_control_error(error: Exception) -> bool:
+    transaction = getattr(error, "observation_transaction", None)
+    if transaction is not None and transaction.outcome != "not_applied":
+        return False
     if (isinstance(error, BudgetClockUnknownError)
             and str(error) == "budget_clock_sample_unresolved:sampling"):
         # Wait for a live owner's publication within the original child window.
@@ -374,6 +378,18 @@ def _verify_parent(kernel: Any, lease: ExecutionLease) -> None:
         kernel.verify(lease)
 
 
+def _parent_durably_revoked(kernel: Any, lease: ExecutionLease) -> bool:
+    """Use committed state/generation, never a transient wall-clock expiry."""
+    try:
+        lock = getattr(kernel, "_control_lock", None)
+        with lock(.1) if lock is not None else nullcontext():
+            snapshot = kernel.get(lease.execution_id)
+    except ExecutionNotFoundError:
+        return False
+    return (snapshot.state not in {"leased", "running"} or
+            (snapshot.attempt, snapshot.fence) != (lease.attempt, lease.fence))
+
+
 def _inspect_parent_revocation(kernel: Any, lease: ExecutionLease) -> None:
     """Give known lease revocation precedence over reconstruction of its clock.
 
@@ -391,8 +407,16 @@ def _inspect_parent_revocation(kernel: Any, lease: ExecutionLease) -> None:
         with lock(.1) if lock is not None else nullcontext():
             inspect(lease)
     except (StaleFenceError, InvalidStateTransitionError, ExecutionNotFoundError) as exc:
-        raise ChildExecutionError("parent_authority_revoked", str(exc),
-                                  execution_id=lease.execution_id) from exc
+        # The readonly lease check includes an uncommitted wall-clock sample.
+        # A forward jump alone must never cancel a still-live child.
+        try:
+            revoked = _parent_durably_revoked(kernel, lease)
+        except Exception as error:
+            raise ChildExecutionError("parent_revocation_unknown", str(error),
+                                      execution_id=lease.execution_id) from error
+        if revoked:
+            raise ChildExecutionError("parent_authority_revoked", str(exc),
+                                      execution_id=lease.execution_id) from exc
     except Exception as exc:
         if not _transient_control_error(exc):
             raise
@@ -451,9 +475,13 @@ def _wait_parent_entry(kernel: Any, lease: ExecutionLease, envelope: BudgetEnvel
             stop.wait(duration)
 
 
+_LEGACY_SETTLEMENT = object()
+
+
 class _Store:
-    def __init__(self, journal: Any) -> None:
+    def __init__(self, journal: Any, settlement_binding: Any = _LEGACY_SETTLEMENT) -> None:
         self.journal = journal
+        self.settlement_binding = settlement_binding
         self.source_id = _identifier(journal.source_id, "source_id")
         self._local = threading.local()
         self._floors = {}
@@ -462,17 +490,29 @@ class _Store:
     def _facts(self, *, writer=False, timeout_seconds=.1):
         kernel_path = getattr(self.journal, "kernel_path", None)
         if kernel_path is None:
+            if self.settlement_binding is not _LEGACY_SETTLEMENT:
+                raise BudgetClockUnknownError('selected child budget checkpoint binding is unavailable')
             return None
         from .settlement import SettlementJournal
-        path = str(kernel_path) + ".settlements.sqlite3"
+        if self.settlement_binding is _LEGACY_SETTLEMENT:
+            path = str(kernel_path) + ".settlements.sqlite3"
+        else:
+            binding = self.settlement_binding
+            if (not isinstance(binding, Mapping) or binding.get('available') is not True
+                    or not isinstance(binding.get('path'), (str, Path))
+                    or binding.get('source_id') != self.source_id
+                    or not isinstance(binding.get('kernel_path'), (str, Path))
+                    or Path(binding['kernel_path']).resolve() != Path(kernel_path).resolve()):
+                raise BudgetClockUnknownError('selected child budget checkpoint storage is unavailable')
+            path = binding['path']
         if not Path(path).exists():
-            if writer:
+            if writer or self.settlement_binding is not _LEGACY_SETTLEMENT:
                 raise BudgetClockUnknownError("independent child budget checkpoint storage is unavailable")
             # Direct public capabilities may predate the optional receipt
             # store. Their original durable request remains usable; a known
             # failed forward-checkpoint write still fails explicitly above.
             return None
-        factory = SettlementJournal if writer else SettlementJournal.open_readonly
+        factory = SettlementJournal.open_existing if writer else SettlementJournal.open_readonly
         return factory(path, source_id=self.source_id, kernel_path=kernel_path,
                        timeout_seconds=timeout_seconds)
 
@@ -599,7 +639,7 @@ class _Store:
         # floor advances. Independent notes preserve it when telemetry is busy.
         encoded = _encode(narrowed.to_dict())
         try:
-            with self.journal._transaction(timeout_seconds=.1) as (connection, now):
+            with self.journal._transaction(timeout_seconds=.1, operation="child_budget_checkpoint") as (connection, now):
                 existing = connection.execute(
                     "SELECT budget_json FROM sdk_child_requests WHERE source_id=? AND wait_id=?",
                     (self.source_id, row["wait_id"])).fetchone()
@@ -639,8 +679,8 @@ class _Store:
 
     def transaction(self):
         window = getattr(self._local, "window", None)
-        return self.journal._transaction() if window is None else self.journal._transaction(
-            timeout_seconds=window.timeout())
+        return self.journal._transaction(operation="child_request_update") if window is None else self.journal._transaction(
+            timeout_seconds=window.timeout(), operation="child_request_update")
 
     def request(self, parent_id: str, request_id: str) -> dict[str, Any] | None:
         with self.read() as connection:
@@ -707,7 +747,7 @@ class HandlerChildren:
             journal = ObservationJournal(self.service_spec["journal_path"],
                 kernel_path=self.service_spec["kernel_path"],
                 source_id=self.service_spec["source_id"], options=options)
-        self.store = _Store(journal)
+        self.store = _Store(journal, self.service_spec.get('settlement_binding', _LEGACY_SETTLEMENT))
 
     def _active(self, window=None, *, delivery: bool = False) -> None:
         try:
@@ -861,7 +901,9 @@ class HandlerChildren:
         _identifier(request_id, "request_id")
         timeout = _positive(timeout_seconds, "timeout_seconds")
         envelope = self._budget(request_id, timeout)
-        prefix = "sdk-managed:child:" if self.command.execution_id.startswith("sdk-managed:") else "sdk-child:"
+        managed = (self.service_spec.get("managed_execution") is True
+                   or self.command.execution_id.startswith("sdk-managed:"))
+        prefix = "sdk-managed:child:" if managed else "sdk-child:"
         child_id = f"{prefix}{uuid.uuid4()}"
         bindings = self.service_spec.get("bindings", {})
         revision = bindings.get((handler_id, handler_contract_version), self.service_spec.get("registry_revision"))
@@ -935,6 +977,14 @@ class HandlerChildren:
             previous_deadline = window._delivery_deadline
             window._delivery_deadline = time.monotonic() + .1
             try:
+                # Read the current retained cause under the same bounded
+                # factual-delivery allowance, even if the business window
+                # expired before the first ordinary journal observation.
+                try:
+                    pending = self._pending_revocation_diagnostic(row, window._delivery_deadline)
+                    window._child_pending_diagnostic = pending
+                except Exception:
+                    pass
                 from .child_factual_read import uses_independent_reader
                 if uses_independent_reader(self.kernel):
                     # Factual delivery borrows exact captured floors. It must
@@ -949,16 +999,41 @@ class HandlerChildren:
                             and str(proof_error) == "child result proof admission budget elapsed")):
                     # Keep the original wait outcome and its identity while
                     # retaining why the bounded delivery proof was unknown.
+                    pending = getattr(window, "_child_pending_diagnostic", None)
+                    if pending is not None:
+                        raise ChildExecutionError(pending["code"], pending["message"],
+                                                  execution_id=row["child_execution_id"]) from proof_error
                     raise exc from proof_error
                 raise
             finally:
                 window._delivery_deadline = previous_deadline
             if completed is None:
+                pending = getattr(window, "_child_pending_diagnostic", None)
+                if pending is not None:
+                    raise ChildExecutionError(pending["code"], pending["message"],
+                                              execution_id=row["child_execution_id"]) from exc
                 raise
             # The durable request remains the service's publication obligation.
             # Reading a proved result neither acknowledges that write nor
             # releases an unresolved child reservation.
             return self._result(completed)
+
+    def _pending_revocation_diagnostic(self, row, deadline):
+        class DeliveryWindow:
+            def timeout(self):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("child result proof admission budget elapsed")
+                return remaining
+        with self.store.bound(DeliveryWindow()):
+            current = self.store.request(self.command.execution_id, row["request_id"])
+        if current is None or current["state"] not in _OPEN:
+            return None
+        error = json.loads(current["error_json"] or "{}")
+        cause = error.get("cause")
+        if type(cause) is dict and cause.get("code") == "parent_revocation_unknown":
+            return {"code": "parent_revocation_unknown", "message": "parent revocation state is unknown"}
+        return None
 
     def _complete_result_after_publication(self, row, window):
         """Retain the existing custom/in-memory Kernel settlement fallback."""
@@ -1074,6 +1149,11 @@ class HandlerChildren:
 
     def _await_window(self, row: Mapping[str, Any], window: _RetryWindow) -> dict[str, Any]:
         while True:
+            # A captured floor owned by this window must be published before
+            # the read-only authority check can pass its sampling guard.
+            # Resume only the retained token; do not arm a new sample here.
+            if window._pending_sample is not None:
+                window._resume_sample()
             self._active(window, delivery=True)
             current = _retry(window, lambda: self.store.request(self.command.execution_id, row["request_id"]), store=self.store)
             if current is None:
@@ -1092,6 +1172,13 @@ class HandlerChildren:
                 error = json.loads(current["error_json"] or "{}")
                 raise ChildExecutionError(error.get("code", "child_wait_failed"), error.get("message", current["state"]),
                                           execution_id=current["child_execution_id"])
+            error = json.loads(current["error_json"] or "{}")
+            cause = error.get("cause")
+            # The registration remains live; report only the recognized,
+            # sanitized cause if the original wait window eventually expires.
+            window._child_pending_diagnostic = (
+                {"code": "parent_revocation_unknown", "message": "parent revocation state is unknown"}
+                if type(cause) is dict and cause.get("code") == "parent_revocation_unknown" else None)
             remaining = window.remaining()
             if remaining is None:
                 raise BudgetClockUnknownError("child clock continuity cannot be established")
@@ -1102,22 +1189,36 @@ class HandlerChildren:
 
 
 class ChildService:
-    """Recoverable coordinator with at most ``capacity`` targeted child workers."""
+    """Recoverable coordinator with at most ``capacity`` targeted child workers.
+
+    A host may supply a ``budget_declaration_provider`` that is contractually bounded and nonblocking
+    (or set ``runtime.child_budget_declaration_provider`` before work starts).
+    It receives ``command``, ``parent_lease`` and ``timeout_seconds`` and
+    returns either ``None`` or ``(credential, declaration)``. The Kernel
+    independently verifies the credential and exact declaration; this hook
+    neither grants budget admission nor extends the parent's work deadline.
+    """
 
     def __init__(self, runtime: Any, journal: Any, *, capacity: int = 1,
-                 max_depth: int = 1, poll_interval: float = .05) -> None:
+                 max_depth: int = 1, poll_interval: float = .05,
+                 budget_declaration_provider=None) -> None:
         for name, value in (("capacity", capacity), ("max_depth", max_depth)):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        self.runtime, self.store = runtime, _Store(journal)
+        self.runtime, self.store = runtime, _Store(journal, getattr(runtime, 'settlement_storage', _LEGACY_SETTLEMENT))
+        if budget_declaration_provider is not None and not callable(budget_declaration_provider):
+            raise TypeError("budget_declaration_provider must be callable")
+        self.budget_declaration_provider = budget_declaration_provider
         self.capacity, self.max_depth = capacity, max_depth
         self.poll_interval = _positive(poll_interval, "poll_interval")
         self.owner = f"child-service:{uuid.uuid4()}"
         self._stop, self._wake = threading.Event(), threading.Event()
         self._lock = threading.Lock()
         self._pool: ThreadPoolExecutor | None = None
+        self._revocation_pool: ThreadPoolExecutor | None = None
         self._thread: threading.Thread | None = None
         self._futures: dict[str, tuple[Future[Any], dict[str, Any]]] = {}
+        self._revocation_futures: dict[str, Future[Any]] = {}
         self._last_error: str | None = None
         self._last_renewal = 0.0
 
@@ -1128,6 +1229,7 @@ class ChildService:
             if self._stop.is_set():
                 raise RuntimeError("child service has been closed")
             self._pool = ThreadPoolExecutor(max_workers=self.capacity, thread_name_prefix="sdk-child")
+            self._revocation_pool = ThreadPoolExecutor(max_workers=self.capacity, thread_name_prefix="sdk-child-revoke")
             self._thread = threading.Thread(target=self._coordinate, name="sdk-child-coordinator", daemon=True)
             self._thread.start()
         return self
@@ -1149,6 +1251,22 @@ class ChildService:
         with self._lock:
             if self._pool is None or self._stop.is_set():
                 return
+            for key, future in tuple(self._revocation_futures.items()):
+                if future.done():
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        self._last_error = f"{type(exc).__name__}: {exc}"
+                    del self._revocation_futures[key]
+            # Child execution workers can be inside run_once until their
+            # descendants finish. Independently inspect only those bounded
+            # active requests, with at most one monitor per request.
+            if self._revocation_pool is not None:
+                for key, (future, row) in self._futures.items():
+                    if (not future.done() and key not in self._revocation_futures
+                            and len(self._revocation_futures) < self.capacity):
+                        self._revocation_futures[key] = self._revocation_pool.submit(
+                            self._cancel_if_parent_revoked, row)
             for key, (future, _) in tuple(self._futures.items()):
                 if future.done():
                     try:
@@ -1198,6 +1316,32 @@ class ChildService:
                 future = self._pool.submit(self._execute, record)
                 self._futures[record["wait_id"]] = (future, record)
 
+    def _cancel_if_parent_revoked(self, row: dict[str, Any]) -> None:
+        lease = ExecutionLease.from_dict(json.loads(row["parent_lease_json"]))
+        try:
+            _inspect_parent_revocation(self.runtime.kernel, lease)
+        except ChildExecutionError as exc:
+            if exc.code != "parent_authority_revoked":
+                raise
+        else:
+            return
+        # The durable request alone does not prove submission or adoption.
+        # Check the target's committed relationship against the exact parent
+        # generation before issuing the normal revision-fenced cancellation.
+        lock = getattr(self.runtime.kernel, "_control_lock", None)
+        try:
+            with lock(.1) if lock is not None else nullcontext():
+                limits = self.runtime.kernel.get_execution_limits(row["child_execution_id"])
+                if limits is None or (limits.get("parent_execution_id"), limits.get("parent_attempt"),
+                        limits.get("parent_fence")) != (lease.execution_id, lease.attempt, lease.fence):
+                    return
+                snapshot = self.runtime.kernel.get(row["child_execution_id"])
+        except ExecutionNotFoundError:
+            return
+        if snapshot.state not in _TERMINAL and snapshot.state != "recovery_required":
+            self.runtime.cancel(row["child_execution_id"], expected_revision=snapshot.revision,
+                                reason="parent authority revoked", timeout_seconds=.5)
+
     def _observe_waits(self) -> None:
         # Observation-only waits never consume a child execution worker. This
         # avoids filling the one child slot with a caller observing another
@@ -1232,7 +1376,7 @@ class ChildService:
                     if not view.remaining_work_seconds:
                         raise ChildExecutionError("child_wait_timeout", "observed wait exhausted its work deadline")
             except Exception as exc:
-                if _transient_control_error(exc):
+                if _transient_control_error(exc) or getattr(exc, "code", None) == "parent_revocation_unknown":
                     self._last_error = f"{type(exc).__name__}: {exc}"
                     continue
                 try:
@@ -1255,6 +1399,77 @@ class ChildService:
             with lock(.1) if lock is not None else nullcontext():
                 snapshot = self.runtime.kernel.get(child_id)
         return None if snapshot.result is None else snapshot.result.to_dict()
+
+    def _declare_child_budget(self, command: ExecutionCommandV2, lease: ExecutionLease,
+                              window: _RetryWindow) -> None:
+        """Ask the host for an exact declaration before Kernel child admission.
+
+        The host callback must be bounded and nonblocking; this synchronous call
+        cannot forcibly interrupt it. Kernel authenticates the returned credential
+        and the immutable declaration independently.
+        """
+        provider = self.budget_declaration_provider
+        if provider is None:
+            provider = getattr(self.runtime, "child_budget_declaration_provider", None)
+        if provider is None:
+            return
+        if not callable(provider):
+            raise ChildExecutionError("child_budget_declaration_invalid", "child budget declaration provider is invalid")
+        encoded_command = json.dumps(command.to_dict(), sort_keys=True, ensure_ascii=False,
+                                     allow_nan=False, separators=(",", ":"))
+        timeout = window.timeout()
+        try:
+            supplied = provider(command=json.loads(encoded_command), parent_lease=lease,
+                                timeout_seconds=timeout)
+        except ChildExecutionError as exc:
+            # Provider messages and arbitrary codes may contain credentials.
+            # Preserve only known codes and emit fixed, non-secret diagnostics.
+            known = {
+                "child_wait_timeout": "child budget declaration timed out",
+                "child_budget_exhausted": "child budget is exhausted",
+                "parent_budget_exhausted": "parent budget is exhausted",
+                "parent_budget_missing": "parent budget is unavailable",
+                "parent_authority_revoked": "parent authority is revoked",
+                "parent_revocation_unknown": "parent revocation state is unknown",
+            }
+            code = exc.code if exc.code in known else "child_budget_declaration_unavailable"
+            raise ChildExecutionError(code, known.get(code, "host child budget declaration is unavailable")) from None
+        except BudgetClockUnknownError:
+            raise ChildExecutionError("child_budget_clock_unknown", "child budget clock is unknown") from None
+        except StorageIsolationError:
+            raise ChildExecutionError("child_budget_authority_unknown", "child budget authority is unavailable or denied") from None
+        except CASConflictError:
+            raise ChildExecutionError("child_budget_conflict", "child budget declaration conflicts with current state") from None
+        except Exception:
+            raise ChildExecutionError("child_budget_declaration_unavailable", "host child budget declaration is unavailable") from None
+        try:
+            if supplied is None:
+                return
+            if type(supplied) is not tuple or len(supplied) != 2:
+                raise ValueError("invalid declaration response")
+            credential, declaration = supplied
+            if credential is None or type(declaration) is not dict:
+                raise ValueError("invalid declaration response")
+            encoded = json.dumps(declaration, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) > 65536:
+                raise ValueError("declaration exceeds its bound")
+            declaration = json.loads(encoded)
+            if (declaration.get("execution_id") != command.execution_id
+                    or json.dumps(declaration.get("command"), sort_keys=True, ensure_ascii=False,
+                                  allow_nan=False, separators=(",", ":")) != encoded_command):
+                raise ValueError("declaration does not match child command")
+        except Exception:
+            raise ChildExecutionError("child_budget_declaration_invalid", "host child budget declaration is unavailable or invalid") from None
+        # Recheck the original work window after the host returns; a slow host
+        # cannot renew the parent's deadline or admit a late declaration.
+        window.timeout()
+        try:
+            _retry(window, lambda: self.runtime.kernel.declare_budget_dependencies(
+                credential, expected_declaration=declaration), kernel=self.runtime.kernel)
+        except StorageIsolationError:
+            raise ChildExecutionError("child_budget_authority_unknown", "child budget authority is unavailable or denied") from None
+        except CASConflictError:
+            raise ChildExecutionError("child_budget_conflict", "child budget declaration conflicts with current state") from None
 
     def _execute(self, row: dict[str, Any]) -> None:
         submitted = row["action"] == "observe"
@@ -1290,6 +1505,7 @@ class ChildService:
                 raise ChildExecutionError("child_wait_timeout", "child inherited work deadline is exhausted")
             if row["action"] == "run":
                 child_command = ExecutionCommandV2.from_dict(json.loads(row["command_json"]))
+                self._declare_child_budget(child_command, lease, window)
                 _retry(window, lambda: self.runtime.submit_child(child_command,
                     parent_lease=lease, budget_envelope=window.envelope, timeout_seconds=window.timeout()))
                 submitted = True
@@ -1331,6 +1547,19 @@ class ChildService:
         except Exception as exc:
             code = getattr(exc, "code", None) or "child_execution_control_error"
             original_result = None
+            if code == "parent_revocation_unknown":
+                self._retain_registration(row, exc, exc)
+                return
+            if lease is not None and (isinstance(exc, (StaleFenceError, InvalidStateTransitionError))
+                    or code == "parent_authority_revoked"):
+                try:
+                    revoked = _parent_durably_revoked(self.runtime.kernel, lease)
+                except Exception as lookup_error:
+                    self._retain_registration(row, exc, lookup_error)
+                    return
+                if not revoked:
+                    self._retain_registration(row, exc, RuntimeError("parent revocation is not durable"))
+                    return
             if row["action"] == "adopt" and not submitted and lease is not None:
                 try:
                     lock = getattr(self.runtime.kernel, "_control_lock", None)
@@ -1362,6 +1591,8 @@ class ChildService:
                 "owner_expires_at=NULL WHERE source_id=? AND parent_execution_id=? AND request_id=? "
                 "AND state IN ('pending','running')",
                 (_encode({"code": "registration_or_cleanup_pending", "message": str(error)[:2048],
+                    "cause": ({"code": "parent_revocation_unknown", "message": "parent revocation state is unknown"}
+                              if isinstance(error, ChildExecutionError) and error.code == "parent_revocation_unknown" else None),
                     "cleanup_error": f"{type(cleanup_error).__name__}: {cleanup_error}"[:2048]}),
                  now, self.store.source_id, row["parent_execution_id"], row["request_id"]))
 
@@ -1380,7 +1611,8 @@ class ChildService:
         if not self._lock.acquire(blocking=False):
             return True
         try:
-            return any(not future.done() for future, _ in self._futures.values())
+            return (any(not future.done() for future, _ in self._futures.values()) or
+                    any(not future.done() for future in self._revocation_futures.values()))
         finally:
             self._lock.release()
 
@@ -1395,21 +1627,28 @@ class ChildService:
         futures = ()
         workers = ()
         pool = None
+        revocation_pool = None
+        revocations = ()
         if inspected:
             try:
                 workers = tuple(self._futures.values())
                 futures = tuple(future for future, _ in workers)
                 pool = self._pool
+                revocation_pool = self._revocation_pool
+                revocations = tuple(self._revocation_futures.values())
             finally:
                 self._lock.release()
-        if futures:
-            wait(futures, timeout=max(0, deadline - time.monotonic()))
+        if futures or revocations:
+            wait((*futures, *revocations), timeout=max(0, deadline - time.monotonic()))
         # A coordinator may still hold the scheduling lock inside SQLite.
         # Its stop flag prevents new submissions after that operation returns;
         # a later close can finish pool shutdown after ownership is inspectable.
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
-        unfinished = sum(not future.done() for future in futures) if inspected else None
+        if revocation_pool is not None:
+            revocation_pool.shutdown(wait=False, cancel_futures=True)
+        unfinished = (sum(not future.done() for future in (*futures, *revocations))
+                      if inspected else None)
         actions = [row["action"] for future, row in workers if not future.done()] if inspected else None
         return {"state": "stopped", "capacity": self.capacity, "max_depth": self.max_depth,
             "active_workers": unfinished, "last_error": self._last_error, "actions": actions,

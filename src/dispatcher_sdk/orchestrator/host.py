@@ -255,6 +255,16 @@ class OrchestratorHost:
             pending_delivery_persisted=None,
             can_continue_waiting=runtime_waitable or thread_alive,
             errors=() if runtime_report is None else runtime_report.errors,
+            last_progress_at=None if runtime_report is None else runtime_report.last_progress_at,
+            active_execution_identities=None if runtime_report is None else runtime_report.active_execution_identities,
+            pending_settlement_count=None if runtime_report is None else runtime_report.pending_settlement_count,
+            pending_effect_count=None if runtime_report is None else runtime_report.pending_effect_count,
+            pending_cleanup_count=None if runtime_report is None else runtime_report.pending_cleanup_count,
+            pending_diagnostic_count=None if runtime_report is None else runtime_report.pending_diagnostic_count,
+            unknown_diagnostic_handoff_count=None if runtime_report is None else runtime_report.unknown_diagnostic_handoff_count,
+            failed_diagnostic_execution_count=None if runtime_report is None else runtime_report.failed_diagnostic_execution_count,
+            diagnostic_retention_overflow=None if runtime_report is None else runtime_report.diagnostic_retention_overflow,
+            obligation_scope="not_inspected" if runtime_report is None else runtime_report.obligation_scope,
         )
 
     def _notification_phase_snapshot_locked(self, now: float) -> StopPhase:

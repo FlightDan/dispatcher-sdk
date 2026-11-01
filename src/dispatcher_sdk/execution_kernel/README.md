@@ -10,7 +10,7 @@ fields, non-finite values, stale leases, and result identity conflicts as hard
 failures.
 
 Version 2 refers to the public execution-record contract. The current SQLite
-storage layout is a separate version, schema 5.
+storage layout is a separate version, schema 12.
 
 ## Storage and delivery assumptions
 
@@ -19,7 +19,7 @@ storage layout is a separate version, schema 5.
 - Application-owned tables may coexist in the SQLite file. Kernel connections
   are authorizer-limited to `kernel_*` and SQLite internals and cannot read or
   write application tables. Partial or altered Kernel schemas and anything except
-  the exact `kernel_schema_meta` schema-5 marker are rejected; the Kernel performs
+  the exact `kernel_schema_meta` schema-11 marker are rejected; the Kernel performs
   no implicit schema migration.
 - File-backed writers default to WAL and `synchronous=FULL`. The explicit
   `durability="normal"` profile selects NORMAL on each writer connection.

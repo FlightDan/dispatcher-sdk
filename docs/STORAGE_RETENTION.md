@@ -1,8 +1,13 @@
 # Storage retention and maintenance APIs
 
 These APIs describe the current development tree, not an already published
-release. New Orchestrator stores use schema 4 and Kernel stores use schema 5;
+release. New Orchestrator stores use schema 6 and Kernel stores use schema 12;
 Kernel commands/results remain protocol V2.
+Settlement Journal schema 4 supports separate, explicit lifecycle receipt
+pruning after a Kernel generation has been durably retired. This deletes the
+selected diagnostic notes, so the host must first satisfy its evidence
+retention policy. It does not alter the Orchestrator retention policy below or
+bound unrelated metadata. See [development integration](SDK_DEVELOPMENT_INTEGRATION.md).
 The [full improvement plan](STORAGE_RETENTION_IMPROVEMENT_PLAN.md) is broader
 than the capabilities implemented here.
 
@@ -92,13 +97,14 @@ when needed. It copies committed WAL contents, converts values in bounded
 row batches, verifies logical equality and the target schema, then flushes and
 publishes a new file without overwriting any existing destination. Other
 compatible components in that SQLite file are preserved; supported Kernel
-schemas 2/3/4 are explicitly upgraded to 5. Standalone Kernel schemas 2/3/4 are
+schemas 2/3/4/5 are explicitly upgraded to 6. Standalone Kernel schemas 2/3/4/5 are
 also supported. External observation, settlement and cleanup journals are not
 copied or rebound, and original bindings and unresolved work remain owned by the
-original deployment. Unknown legacy retention
+original deployment. Copying a store does not by itself adopt an existing Run
+into managed control. Unknown legacy retention
 timestamps are not invented.
 
-`compact_database` accepts current Orchestrator schema 4 and compacts a private copy. Sequence high
+`compact_database` accepts current Orchestrator schema 6 and compacts a private copy. Sequence high
 watermarks survive deletion of tail rows and compaction. Both functions require
 a real, active lease and perform a conservative free-space precheck. They leave
 the source in place and do not perform an application deployment cutover.
@@ -240,3 +246,38 @@ unchanged state, changing siblings, and omitted subsequent state submissions.
 
 See the [recorded validation results](STORAGE_RETENTION_VALIDATION.md) for the
 measured environment, commands and remaining verification limits.
+
+Kernel lifecycle delivery keeps each undelivered event until the receiver has
+committed it and its acknowledgement is authorized. Operators may explicitly
+call `lifecycle_prune_delivered(through_sequence, after_sequence=0, limit=128)`
+to discard delivered payloads up to a chosen replay cutoff. The operation is
+paged; continue from the returned `continuation` until it is `None`. Pruned
+IDs remain as compact tombstones, so ID metadata continues to grow. Reusing a
+pruned event ID in an append raises `LifecycleReceiptExpiredError`: the SDK no
+longer has the payload needed to compare that replay. This does not remove
+receiver journal evidence or unresolved producer reservations.
+
+For protected Runs, lifecycle operations require a host-supplied
+`lifecycle_verifier(credential, operation, identity, event)` callback. It must
+validate the exact identity and operation independently of business admission.
+ACK authorization also requires `receiver_committed=True` only after the host
+has verified that exact event in its trusted receiver journal. A callback must
+honor its own time bound: synchronous Python callbacks cannot be interrupted by
+the SDK deadline. Dead producer recovery additionally requires host-verified
+`producer_dead=True` and `evidence_unknown_acknowledged=True`; an elapsed
+timeout alone is not proof. Recovery closes the reservation and records an
+unknown-evidence event, while leaving prior undelivered events for delivery.
+`lifecycle_list_open_producers(after_rowid=0, limit=128)` pages the open
+reservations visible to the caller's host verifier. An open reservation is an
+unresolved obligation, not proof that its owner is dead or that a lifecycle
+event occurred. `lifecycle_recover_producer(token, proof)` requires the host
+verifier to establish the specific producer's death and explicitly acknowledge
+possible missing evidence; its proof format and verification remain host
+responsibilities. The unknown event does not prove cleanup or recreate a result.
+When configured, the verifier also receives unmanaged producer operations.
+Before allowing `reserve`, the host must durably and idempotently bind the
+producer token to its trusted owner identity. The verifier is called again
+before commit, and a Kernel transaction may roll back after the host binding;
+the host must tolerate an unused binding. A restarted host uses this binding
+to assess the discovered producer. The callback is a trusted host integration,
+not protection against a caller controlling the database or constructor.

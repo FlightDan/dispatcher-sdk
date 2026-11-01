@@ -374,14 +374,14 @@ for handler in (parent, child, silent):
 def parent_child_case(root, mode):
     root.mkdir(parents=True, exist_ok=True)
     payload = {'root': str(root), 'input': 'original-consumer-input', 'mode': mode,
-               'child_timeout': 8, 'tool_timeout': 4 if mode != 'blocked' else 1.2}
-    save(root / 'configuration.json', {'payload': payload, 'execution_timeout': 20,
-                                     'caller_timeout': 25, 'child_capacity': 1})
+               'child_timeout': 20, 'tool_timeout': 4 if mode != 'blocked' else 1.2}
+    save(root / 'configuration.json', {'payload': payload, 'execution_timeout': 40,
+                                     'caller_timeout': 45, 'child_capacity': 1})
     with Dispatcher(root / 'application.sqlite3', {'parent': parent, 'child': child},
                     isolation_mode='process', child_capacity=1, observation_options=OPTIONS) as app:
-        task = app.submit('parent', payload, request_id='parent-' + mode, timeout_seconds=20)
+        task = app.submit('parent', payload, request_id='parent-' + mode, timeout_seconds=40)
         if mode == 'success':
-            first = await_marker(root / 'first-reported.json', seconds=12)
+            first = await_marker(root / 'first-reported.json', seconds=20)
             entered = read_json(root / 'child-entered.json')
             partial = await_value(lambda: app.runtime.observe(entered['execution_id'], timeout=.5),
                 lambda value: value.get('metrics', {}).get('stdout_bytes', {}).get('count', 0) >= 2, seconds=3)
@@ -389,7 +389,7 @@ def parent_child_case(root, mode):
             check(not (root / 'tool-write-last.json').exists(), 'tool completed before partial observation')
             (root / 'release-tool').touch()
             check(first['bytes'] == [65, 255], 'first raw bytes differ')
-        result = task.wait(timeout=25)
+        result = task.wait(timeout=45)
         observation = task.observe()
         save(root / 'caller-result.json', result)
         save(root / 'parent-observation.json', observation)

@@ -1149,6 +1149,51 @@ class NativeObservabilityAcceptanceTests(unittest.TestCase):
             self.assertEqual("confirmed", limits["entry_state"])
             self.assertEqual(original.to_dict()["constraints"], limits["envelope"]["constraints"])
             restarted.kernel.reap()
+            # The controller exited after its native invocation had reported
+            # exact cleanup, but before it could close its lifecycle producer
+            # or persist its returned outcome. Authenticate both host
+            # decisions using the retained receipt and joined controller.
+            native_receipt = json.loads((self.root / 'controller-native-receipt.json').read_text())
+            lease = entered['identity']
+            identity = {key: lease[key] for key in ('execution_id', 'attempt', 'fence')}
+            self.assertEqual({key: native_receipt['lease'][key] for key in identity}, identity)
+            self.assertTrue(native_receipt['cleanup_confirmed'])
+            self.assertFalse(native_receipt['supervisor_registered'])
+            self.assertFalse(native_receipt['durable_guards'])
+            handoff = restarted._settlement_journal.inspect_supervisor_handoff(identity, timeout_seconds=1)
+            self.assertEqual(handoff['facts']['supervisor_reap']['state'], 'observed', handoff)
+            self.assertEqual(handoff['facts']['supervisor_reap']['evidence'],
+                             {'state': 'confirmed', 'source': 'runtime_supervisor_reaped'})
+            decision = {**identity, 'cleanup': 'confirmed', 'outcome': 'unknown',
+                        'disposition': 'retry_authorized',
+                        'evidence': 'joined controller retained exact native cleanup receipt'}
+            credential = object()
+            def authority(candidate):
+                if candidate is not credential:
+                    raise ValueError('unexpected host credential')
+                return {'principal': 'fixture-host', 'expires_at': entered['identity']['expires_at'] + 1000,
+                        'permissions': [(identity['execution_id'], 'kernel:resolve_supervisor')],
+                        'supervisor_resolution': decision}
+            restarted.kernel._authority_verifier = authority
+            restarted.kernel.resolve_supervisor_obligation(credential, expected_resolution=decision)
+            journal = restarted._settlement_journal
+            def lifecycle_verifier(_credential, operation, actual, event):
+                proof = (event or {}).get('proof', {})
+                committed = operation == 'ack' and journal.lifecycle_receipt_committed(
+                    {key: actual[key] for key in identity}, event['phase'], event['payload'],
+                    store_id=event['store_id'], outbox_sequence=event['sequence'])
+                return {'allowed': True, 'expires_at': entered['identity']['expires_at'] + 1000,
+                        'producer_dead': operation == 'recover' and proof.get('controller_joined') is True,
+                        'evidence_unknown_acknowledged': proof.get('unknown_acknowledged') is True,
+                        'receiver_committed': committed}
+            restarted.kernel._lifecycle_verifier = lifecycle_verifier
+            producers = restarted.kernel.lifecycle_list_open_producers()['producers']
+            matching = [item for item in producers if all(item[key] == value for key, value in identity.items())]
+            self.assertEqual(len(matching), 1)
+            self.assertTrue(restarted.kernel.lifecycle_recover_producer(matching[0]['token'],
+                {'controller_joined': True, 'unknown_acknowledged': True}, identity=tuple(identity.values())))
+            restarted._retry_diagnostic_notes(time.monotonic() + 2, wait_for_writer=True)
+            self.assertIsNone(restarted.kernel.lifecycle_peek(execution_id=identity['execution_id']))
             clock.value = entered["wall"] - 10
             now = sample_clock(wall_time=clock.value)
             self.assertEqual(original.checkpoint.domain_id, now.domain_id)
@@ -1184,7 +1229,7 @@ class NativeObservabilityAcceptanceTests(unittest.TestCase):
             self.assertEqual("succeeded", result["status"])
             self.assertEqual({"completed": True}, result["value"])
 
-    def test_native_cross_store_registration_crash_recovers_unused_capacity(self):
+    def test_native_cross_store_registration_crash_retains_capacity_without_parent_revocation(self):
         handlers = {"work": native_registration_parent, "child": native_registration_child}
         runtime = Kernel.open_sqlite(self.root / "kernel.sqlite3", handlers,
             isolation_mode="process", child_capacity=1, observation_options=self.options)
@@ -1228,12 +1273,23 @@ class NativeObservabilityAcceptanceTests(unittest.TestCase):
                 isolation_mode="process", child_capacity=1, now=clock, observation_options=self.options) as recovered:
             recovered.kernel.reap()
             self.assertIsNone(recovered.run_once(), "recovery unexpectedly admitted business")
+            # The controller died while native work was active. Lease expiry
+            # alone cannot prove that the supervisor tree was contained; the
+            # unresolved obligation prevents a durable parent revocation.
+            # Recovery needs host-verified containment for this exact attempt
+            # before it can establish the revocation and release capacity.
+            parent = recovered.kernel.get(command.execution_id)
+            self.assertEqual('running', parent.state)
+            obligation = recovered.kernel.inspect_supervisor_obligations(command.execution_id)['obligations']
+            self.assertTrue(any(item['attempt'] == parent.attempt and item['fence'] == parent.fence
+                                and item['state'] == 'unresolved' for item in obligation))
             end = time.monotonic() + 3
             while True:
                 report = recovered.observe(command.execution_id, timeout=1)
                 requests = report.get("child_requests", [])
                 waits = report.get("child_waits", [])
-                if requests and all(row["state"] not in {"pending", "running"} for row in requests) and all(row["state"] != "open" for row in waits):
+                if (requests and requests[0].get('error_json') and
+                        json.loads(requests[0]['error_json']).get('code') == 'registration_or_cleanup_pending'):
                     break
                 if time.monotonic() >= end:
                     self.fail(report)
@@ -1241,10 +1297,10 @@ class NativeObservabilityAcceptanceTests(unittest.TestCase):
             write_json(self.root / "recovered-registration.json", report)
             self.assertEqual(1, len(requests))
             self.assertEqual(pending["child_execution_id"], requests[0]["child_execution_id"])
-            self.assertEqual("failed", requests[0]["state"])
-            self.assertEqual("parent_authority_revoked", json.loads(requests[0]["error_json"])["code"])
+            self.assertEqual("pending", requests[0]["state"])
+            self.assertIn('parent revocation is not durable', json.loads(requests[0]["error_json"])["cleanup_error"])
             self.assertEqual(1, len(waits))
-            self.assertEqual("failed", waits[0]["state"])
+            self.assertEqual("open", waits[0]["state"])
             self.assertEqual(partial["child_waits"][0]["deadline_at"], waits[0]["deadline_at"])
             limits = recovered.kernel.get_execution_limits(command.execution_id)
             self.assertEqual(original.to_dict()["constraints"], limits["envelope"]["constraints"])

@@ -28,16 +28,16 @@
 | 最后一个活动批次已写入，但进程观测不完整 | 检查关闭回执中的进程采集完成状态、线程状态和采集错误。批次已写入或 source 已关闭不能证明进程采集完整；之后等待线程退出也不能提升原回执的确认状态。 |
 | 沙箱一直等待清理 | 查看 journal 和 provider，再执行有界恢复。资源销毁不能替代外部业务副作用裁决。 |
 
-具体规则和恢复流程见[任务提交](../docs/TASK_SUBMISSION.md)、
-[恢复](../docs/SDK_RECOVERY.md)、[收件箱](../docs/NOTIFICATION_INBOX.md)、
-[存储](../docs/STORAGE_AND_UPGRADES.md)、[本地恢复](../docs/LOCAL_RECOVERY.md)
-和[沙箱运行时](../docs/SANDBOX_RUNTIME.md)。观测缺口和停滞通知的说明见
-[执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md)。
+具体规则和恢复流程见[任务提交](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/TASK_SUBMISSION.md)、
+[恢复](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_RECOVERY.md)、[收件箱](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/NOTIFICATION_INBOX.md)、
+[存储](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/STORAGE_AND_UPGRADES.md)、[本地恢复](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/LOCAL_RECOVERY.md)
+和[沙箱运行时](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_RUNTIME.md)。观测缺口和停滞通知的说明见
+[执行观测与监督](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/EXECUTION_OBSERVABILITY.md)。
 
 反馈问题时，请提供 SDK 版本或 commit、Python 版本、平台、隔离模式、相关身份和状态，
-以及最小复现（能重现问题的最小示例）。[公共观测消费者](../examples/sdk_observability_acceptance.py)
+以及最小复现（能重现问题的最小示例）。[公共观测消费者](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/sdk_observability_acceptance.py)
 会保留子调用和进度调用的原始异常堆栈、SQLite 错误码和原有预算。使用
 `--evidence-dir <新的空目录>` 指定证据目录；诊断记录不会重试失败调用。
 请先移除凭据和私有数据。
 一般问题请提交到 [GitHub Issues](https://github.com/FlightDan/dispatcher-sdk/issues)，
-漏洞请使用[安全报告渠道](../SECURITY.md)。
+漏洞请使用[安全报告渠道](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/SECURITY.md)。

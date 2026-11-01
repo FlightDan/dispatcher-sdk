@@ -95,16 +95,23 @@ catch_base_exception_then_write.__execution_kernel_revision__ = (
 
 
 def spawn_late_child(payload, context):
+    child_code = (
+        "import pathlib,sys,time; time.sleep(float(sys.argv[2])); "
+        "pathlib.Path(sys.argv[1]).write_text('late', encoding='utf-8')"
+    )
+    if payload.get("release_path"):
+        child_code = (
+            "import pathlib,sys,time; gate=pathlib.Path(sys.argv[2]); "
+            "exec('while not gate.exists():\\n time.sleep(.01)'); "
+            "pathlib.Path(sys.argv[1]).write_text('late', encoding='utf-8')"
+        )
     child = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            (
-                "import pathlib,sys,time; time.sleep(float(sys.argv[2])); "
-                "pathlib.Path(sys.argv[1]).write_text('late', encoding='utf-8')"
-            ),
+            child_code,
             payload["path"],
-            str(payload["child_sleep"]),
+            payload.get("release_path", str(payload["child_sleep"])),
         ],
         start_new_session=payload["new_session"],
     )
@@ -1131,6 +1138,7 @@ class RuntimeTests(unittest.TestCase):
         for new_session in modes:
             with self.subTest(new_session=new_session), tempfile.TemporaryDirectory() as temp:
                 marker = Path(temp) / f"success-child-{new_session}.txt"
+                release = Path(temp) / "release-child"
                 stack = Kernel.open_sqlite(
                     Path(temp) / "kernel.sqlite3",
                     {("spawn", 1): spawn_late_child},
@@ -1142,18 +1150,20 @@ class RuntimeTests(unittest.TestCase):
                             f"success-child-{new_session}",
                             stack.registry_revision,
                             handler_id="spawn",
-                            timeout=1.0,
+                            timeout=15.0,
                             payload={
                                 "path": str(marker),
                                 "child_sleep": 0.15,
                                 "handler_sleep": 0.0,
                                 "new_session": new_session,
+                                "release_path": str(release),
                             },
                         )
                     )
                     result = stack.run_once()
                     self.assertEqual(result.state, "succeeded")
-                    time.sleep(0.25)
+                    release.touch()
+                    time.sleep(0.5)
                     self.assertFalse(marker.exists())
                 finally:
                     stack.close()

@@ -266,34 +266,103 @@ def _capture_budget_floor(envelope: BudgetEnvelope, capture: Any,
 def _finish_budget_capture(capture: Any, envelope: BudgetEnvelope | None,
                            *, timeout_seconds: float = .1):
     """Publish one owned fact after containment, without observing wall time."""
-    pending = getattr(capture, "_pending", None)
-    if pending is None:
-        return envelope, {"state": "confirmed"}
-    token, captured = pending
-    if captured is None:
-        # An interrupted arm has no fact to acknowledge. Re-entering its
-        # capture would rethrow a retained native alarm and prevent the
-        # supervisor from publishing even its containment/timeout receipt.
-        # Keep the guard and original error; this is no new observation.
-        error = getattr(capture, "_error", None)
-        if error is None:
-            error = BudgetClockUnknownError("budget_clock_sample_unresolved:sampling")
-        return envelope, {"state": "unknown", "token": token,
-            "captured_envelope": None, "error": _control_error_details(error.__cause__ or error)}
-    envelope = captured if envelope is None else envelope.with_clock_floor(captured.checkpoint)
-    try:
-        published = capture.finish_pending(envelope, timeout_seconds=timeout_seconds)
-        return published, {"state": "confirmed", "token": token}
-    except Exception as error:
-        return envelope, {"state": "unknown", "token": token,
-            "captured_envelope": None if captured is None else captured.to_dict(),
-            "error": _control_error_details(error.__cause__ or error)}
+    deadline = time.monotonic() + max(0., timeout_seconds)
+    def finish(pending, current):
+        if pending is None:
+            return current, {"state": "confirmed"}
+        token, captured = pending
+        if captured is None:
+            error = getattr(capture, "_error", None)
+            if error is None:
+                error = BudgetClockUnknownError("budget_clock_sample_unresolved:sampling")
+            return current, {"state": "unknown", "token": token,
+                "captured_envelope": None, "error": _control_error_details(error.__cause__ or error)}
+        current = captured if current is None else current.with_clock_floor(captured.checkpoint)
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("budget capture publication window elapsed")
+            published = capture.finish_pending(current, timeout_seconds=remaining)
+            return published, {"state": "confirmed", "token": token}
+        except Exception as error:
+            return current, {"state": "unknown", "token": token,
+                "captured_envelope": captured.to_dict(),
+                "owned_transient": (isinstance(capture, _KernelBudgetCapture)
+                    and (isinstance(error.__cause__ or error, TimeoutError)
+                         or is_sqlite_contention(error.__cause__ or error))),
+                "error": _control_error_details(error.__cause__ or error)}
+    if isinstance(capture, _KernelBudgetCapture):
+        if not capture._lock.acquire(timeout=max(0., deadline - time.monotonic())):
+            return envelope, {"state": "unknown", "error": {"cause": "TimeoutError",
+                "error": "budget capture owner admission timed out"}}
+        try:
+            pending = capture._pending
+            if pending is None:
+                if capture._published_token is None:
+                    return envelope, {"state": "confirmed"}
+                published = capture._published
+                if published is None:
+                    return envelope, {"state": "unknown", "token": capture._published_token}
+                envelope = published if envelope is None else envelope.with_clock_floor(published.checkpoint)
+                return envelope, {"state": "confirmed", "token": capture._published_token}
+            # The lock is reentrant. Keep ownership through publication so a
+            # different sample cannot be labelled with this token.
+            return finish(pending, envelope)
+        finally:
+            capture._lock.release()
+    return finish(getattr(capture, "_pending", None), envelope)
 
 
 def _transient_capture_error(error: BaseException) -> bool:
     cause = error.__cause__ or error
     return (is_sqlite_contention(cause) or isinstance(cause, TimeoutError)
         or str(error) == "budget_clock_sample_unresolved:sampling")
+
+
+def _confirmed_transient_capture_error(capture: Any, error: BaseException | None,
+                                       checkpoint: dict[str, Any]) -> bool:
+    """Recognize only an owned transient refusal whose sample is settled.
+
+    A failed admission before arming has no sample to settle. Once a token
+    exists, its exact acknowledgement is required; a missing sampled value,
+    a different token, and clock failures remain unknown.
+    """
+    if not isinstance(capture, _KernelBudgetCapture) or error is None:
+        return False
+    cause = error.__cause__ or error
+    if not (isinstance(cause, TimeoutError) or is_sqlite_contention(cause)):
+        return False
+    if checkpoint.get("state") != "confirmed" or not capture._lock.acquire(blocking=False):
+        return False
+    try:
+        if capture._pending is not None:
+            return False
+        token = getattr(error, "budget_sample_token", None)
+        if token is None:
+            return getattr(error, "budget_sample_envelope", None) is None
+        return checkpoint.get("token") == token
+    finally:
+        capture._lock.release()
+
+
+def _recoverable_captured_checkpoint(capture: Any, error: BaseException | None,
+                                    checkpoint: Any) -> bool:
+    """Recognize only the exact owned sample retained after a transient failure."""
+    if (not isinstance(capture, _KernelBudgetCapture) or type(checkpoint) is not dict
+            or checkpoint.get("state") != "unknown"
+            or checkpoint.get("owned_transient") is not True
+            or type(checkpoint.get("token")) is not str
+            or not checkpoint["token"].strip()
+            or type(checkpoint.get("captured_envelope")) is not dict):
+        return False
+    if error is None:
+        return True
+    cause = error.__cause__ or error
+    captured = getattr(error, "budget_sample_envelope", None)
+    return ((isinstance(cause, TimeoutError) or is_sqlite_contention(cause))
+            and getattr(error, "budget_sample_token", None) == checkpoint["token"]
+            and isinstance(captured, BudgetEnvelope)
+            and captured.to_dict() == checkpoint["captured_envelope"])
 
 
 @dataclass(frozen=True)
@@ -664,6 +733,9 @@ class _DeadlineGuard:
         self.envelope, self.now = envelope, now
         self.capture_budget, self.guarded = capture_budget, guarded or capture_budget is not None
         self.capture_error: BaseException | None = None
+        self._capture_in_progress = False
+        self._capture_alarm_cutoff: float | None = None
+        self._startup_capture_deferral = False
         # The alarm is the sole writer of this slot. Interrupted normal code
         # must never overwrite the only observation of a forward clock jump.
         self._alarm_envelope: BudgetEnvelope | None = None
@@ -718,15 +790,23 @@ class _DeadlineGuard:
                         if self.capture_budget is None:
                             raise BudgetClockUnknownError("budget_clock_capture_unavailable")
                         try:
-                            envelope = _capture_budget_until(
-                                envelope, self.capture_budget, self.deadline, hard=self.cleanup,
-                                on_capture=self._retain_capture, stop_retry=stop_retry)
+                            self._capture_in_progress = True
+                            self._capture_alarm_cutoff = None
+                            try:
+                                envelope = _capture_budget_until(
+                                    envelope, self.capture_budget, self.deadline, hard=self.cleanup,
+                                    on_capture=self._retain_capture, stop_retry=stop_retry)
+                            finally:
+                                self._capture_in_progress = False
+                                self._capture_alarm_cutoff = None
                         except BaseException as exc:
                             self.capture_error = exc
                             captured = getattr(exc, "budget_sample_envelope", None)
                             if captured is not None:
                                 self._retain_capture(envelope.with_clock_floor(captured.checkpoint))
                             retained = self.snapshot()
+                            if self.remaining() <= 0:
+                                raise _DeadlineExpired() from exc
                             if retained is not None:
                                 view = retained.view(sample=retained.checkpoint)
                                 exhausted = view.remaining_hard_seconds if self.cleanup else view.remaining_work_seconds
@@ -795,6 +875,23 @@ class _DeadlineGuard:
             raise _DeadlineExpired()
         # A periodic wake also checks suspend-inclusive elapsed bounds.
         signal.setitimer(signal.ITIMER_REAL, min(remaining, 0.05))
+
+    def alarm(self) -> None:
+        remaining = self.remaining()
+        if remaining > 0:
+            signal.setitimer(signal.ITIMER_REAL, min(remaining, 0.05))
+            return
+        if self._startup_capture_deferral and self._capture_in_progress:
+            # The worker is still awaiting invocation. Let this initial
+            # observation retain its fact; no handler is running. A stuck
+            # clock or storage operation is still interrupted independently.
+            if self._capture_alarm_cutoff is None:
+                self._capture_alarm_cutoff = time.monotonic() + .1
+            remaining = self._capture_alarm_cutoff - time.monotonic()
+            if remaining > 0:
+                signal.setitimer(signal.ITIMER_REAL, remaining)
+                return
+        raise _DeadlineExpired()
 
 
 def _child_process_ids(parent_pid: int) -> tuple[int, ...]:
@@ -980,6 +1077,8 @@ def _worker_entry(
     durability: str = "full",
     budget_envelope: BudgetEnvelope | None = None,
     service_spec: dict | None = None,
+    authority_verifier: Any = None,
+    worker_credential: Any = None,
 ) -> int:
     kernel: Optional[SQLiteKernel] = None
     effects: Optional[HandlerEffects] = None
@@ -998,7 +1097,8 @@ def _worker_entry(
             # their original bootstrap failure through its private channel.
             handler = pickle.loads(handler)
         stage = "worker_setup"
-        kernel = SQLiteKernel(db_path, now=now, durability=durability)
+        kernel = SQLiteKernel(db_path, now=now, durability=durability,
+                              authority_verifier=authority_verifier, worker_credential=worker_credential)
         effects = HandlerEffects(kernel, lease, lambda: True)
         context = HandlerContext(command, lease, effects,
                                  budget_envelope=budget_envelope, service_spec=service_spec)
@@ -1070,22 +1170,84 @@ def _supervisor_entry(
     budget_envelope: BudgetEnvelope | None = None,
     service_spec: dict | None = None,
     startup_deadline: float | None = None,
+    authority_verifier: Any = None,
+    worker_credential: Any = None,
+    settlement_binding: dict | None = None,
 ) -> None:
     worker_pid: Optional[int] = None
     worker_channel: Any = None
     previous_alarm: Any = None
     subreaper = False
     business_outcome_json: str | None = None
+    original_worker_outcome_json: str | None = None
     guard: _DeadlineGuard | None = None
     supervisor_kernel: SQLiteKernel | None = None
     handler_entered = False
     stage = "supervisor_setup"
+    outcome_handoff = None
+    entry_evidence: dict[str, Any] | None = None
+    work_deadline_evidence: float | None = None
+    completion_evidence: float | None = None
+    containment_evidence: float | None = None
+    final_outcome_evidence: str | None = None
+    worker_tree_state = 'unknown'
+    worker_return_state = 'indeterminate'
+
+    def retain_outcome(raw: str) -> dict:
+        """Record only the worker packet; it is not a final settlement."""
+        try:
+            raw_size = len(raw.encode('utf-8'))
+        except UnicodeEncodeError:
+            return {'state': 'unknown', 'reason': 'outcome_invalid_encoding'}
+        if raw_size > 128 * 1024:
+            return {'state': 'unknown', 'reason': 'outcome_exceeds_limit'}
+        if settlement_binding is None:
+            return {'state': 'unknown', 'reason': 'journal_unavailable', 'outcome_json': raw}
+        try:
+            from .settlement import SettlementJournal
+            journal = SettlementJournal.open_existing(**settlement_binding, timeout_seconds=.05)
+            if isinstance(lease, ExecutionLease):
+                budget = None if guard is None else guard.snapshot()
+                disposition = {'worker_return': worker_return_state,
+                    'parent_decision': 'unknown', 'settlement': 'unknown',
+                    'supervisor_reap': 'unknown', 'worker_tree_cleanup': worker_tree_state,
+                    'entry_packet': entry_evidence, 'work_deadline_monotonic': work_deadline_evidence,
+                    'completed_monotonic': completion_evidence,
+                    'contained_monotonic': containment_evidence,
+                    'hard_deadline_monotonic': None if guard is None else guard.hard_deadline,
+                    'budget_envelope': None if budget is None else budget.to_dict(),
+                    'supervisor_final_outcome_json': final_outcome_evidence}
+                try:
+                    journal._record_supervisor_disposition(lease, raw, disposition, timeout_seconds=.05)
+                except (ValueError, TypeError):
+                    # Oversized or unavailable disposition cannot erase the
+                    # independent bounded raw observation.
+                    journal.record_supervisor_outcome(lease, raw, timeout_seconds=.05)
+            else:
+                journal.record_supervisor_outcome(lease, raw, timeout_seconds=.05)
+            return {'state': 'recorded'}
+        except Exception:
+            # The parent may retain and retry this bounded packet. If it has
+            # crashed, this volatile fallback is unknown after supervisor exit.
+            return {'state': 'unknown', 'reason': 'journal_write_failed', 'outcome_json': raw}
 
     def send_parent(packet: dict[str, Any]) -> None:
-        if guard is not None and packet.get("cleanup_confirmed") is True:
+        if (guard is not None and packet.get("cleanup_confirmed") is True
+                and packet.get('kind') != 'handler_contained'):
             # The tree is already contained. This bounded exact-token ACK
             # owns factual cleanup time, never another business allowance.
             signal.setitimer(signal.ITIMER_REAL, 0.0)
+            if worker_pid is not None:
+                try:
+                    if settlement_binding is None:
+                        raise RuntimeError('journal unavailable')
+                    from .settlement import SettlementJournal
+                    journal = SettlementJournal.open_existing(**settlement_binding, timeout_seconds=.05)
+                    journal.record_worker_tree_cleanup(lease, timeout_seconds=.05)
+                    cleanup_handoff = {'state': 'recorded'}
+                except Exception:
+                    cleanup_handoff = {'state': 'unknown', 'reason': 'journal_write_failed'}
+                packet = {**packet, 'worker_tree_cleanup_handoff': cleanup_handoff}
             published, checkpoint = _finish_budget_capture(guard.capture_budget, guard.snapshot())
             if published is not None:
                 guard._retain_capture(published)
@@ -1096,6 +1258,11 @@ def _supervisor_entry(
         _send_packet(parent_sender, packet)
 
     try:
+        if isinstance(authority_verifier, bytes):
+            try:
+                authority_verifier, worker_credential = pickle.loads(authority_verifier)
+            except Exception:
+                raise RuntimeError("protected worker authority bootstrap failed") from None
         os.setsid()
         subreaper = _enable_linux_subreaper()
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
@@ -1106,7 +1273,7 @@ def _supervisor_entry(
             parent_sender.close()
             status = _worker_entry(
                 db_path, handler, command, lease, now, child_channel, durability,
-                budget_envelope, service_spec,
+                budget_envelope, service_spec, authority_verifier, worker_credential,
             )
             os._exit(status)
         child_channel.close()
@@ -1118,18 +1285,11 @@ def _supervisor_entry(
         )
 
         def expire(_signum: int, _frame: Any) -> None:
-            remaining = guard.remaining()
-            if remaining > 0:
-                # A same-UID handler can signal its parent.  Treat SIGALRM as
-                # a wake-up only; the supervisor's own monotonic deadline is
-                # the authority for termination.
-                signal.setitimer(signal.ITIMER_REAL, min(remaining, 0.05))
-                return
             # Do not traverse /proc or kill the tree from a Python signal
             # handler.  The alarm can interrupt an in-progress containment
             # scan; re-entering codecs/filesystem code there is unsafe.  The
             # exception unwinds to the bounded cleanup block below.
-            raise _DeadlineExpired()
+            guard.alarm()
 
         previous_alarm = signal.signal(signal.SIGALRM, expire)
         try:
@@ -1141,10 +1301,15 @@ def _supervisor_entry(
                 # Install the independent alarm before opening SQLite. Neither
                 # connection admission nor a busy sampling writer owns its timer.
                 supervisor_kernel = SQLiteKernel(db_path, now=now, durability=durability,
-                    control_timeout_seconds=min(.1, remaining))
+                    control_timeout_seconds=min(.1, remaining), authority_verifier=authority_verifier,
+                    worker_credential=worker_credential)
                 guard.capture_budget = _KernelBudgetCapture(supervisor_kernel, lease.execution_id)
-                if guard.remaining(resample=True) <= 0:
-                    raise _DeadlineExpired()
+                guard._startup_capture_deferral = True
+                try:
+                    if guard.remaining(resample=True) <= 0:
+                        raise _DeadlineExpired()
+                finally:
+                    guard._startup_capture_deferral = False
                 guard.arm()
             ready = _receive_packet(worker_channel)
             if type(ready) is not dict or ready.get("kind") != "worker_ready":
@@ -1154,6 +1319,7 @@ def _supervisor_entry(
                 )
                 send_parent({"kind": "handler_start_failed",
                                             "cleanup_confirmed": contained and subreaper,
+                                            "pre_invocation_confirmed": True,
                                             "message": ready.get("message", "handler worker did not become ready")
                                                 if type(ready) is dict else "handler worker did not become ready",
                                             "details": ready.get("details", {}) if type(ready) is dict else {}})
@@ -1165,6 +1331,7 @@ def _supervisor_entry(
             if type(packet) is dict and packet.get("kind") == "worker_entered":
                 guard.entered(packet)
                 handler_entered = True
+                entry_evidence = dict(packet)
                 send_parent({**packet, "kind": "handler_started",
                                             "deadline_monotonic": guard.deadline,
                                             "hard_deadline_monotonic": guard.hard_deadline})
@@ -1173,11 +1340,17 @@ def _supervisor_entry(
                 packet = _receive_packet(worker_channel)
             elif type(packet) is dict and packet.get("kind") == "worker_completed":
                 # Entry can fail before granting the callable any authority.
+                if type(packet.get("outcome_json")) is str:
+                    business_outcome_json = packet["outcome_json"]
+                    original_worker_outcome_json = business_outcome_json
                 contained = _contain_tree(os.getpid(), worker_pid, guard.deadline, subreaper=subreaper)
                 if not contained:
                     raise _DeadlineExpired()
+                if business_outcome_json is not None:
+                    outcome_handoff = retain_outcome(business_outcome_json)
                 send_parent({"kind": "handler_entry_failed",
                                             "cleanup_confirmed": subreaper,
+                                            "outcome_handoff": outcome_handoff,
                                             "outcome_json": packet.get("outcome_json")})
                 return
             if (packet is None or type(packet) is not dict or
@@ -1198,13 +1371,16 @@ def _supervisor_entry(
                 return
             if (type(packet) is dict and packet.get("kind") == "worker_returned"
                     and type(packet.get("outcome_json")) is str):
-                # Retain factual return before a separate clock publication
-                # can fail. Deadline validation below still owns acceptance.
+                # Keep the packet in memory before deadline validation. The
+                # work timer must not include a journal handoff after return.
                 business_outcome_json = packet["outcome_json"]
+                original_worker_outcome_json = business_outcome_json
             if guard.remaining(resample=True) <= 0:
                 raise _DeadlineExpired()
             if type(packet) is dict and packet.get("kind") == "worker_returned":
                 completed = packet.get("completed_monotonic")
+                work_deadline_evidence = guard.deadline
+                completion_evidence = completed if type(completed) in (int, float) and math.isfinite(completed) else None
                 if (type(completed) not in {int, float} or not math.isfinite(completed)
                         or completed >= guard.deadline or type(packet.get("outcome_json")) is not str):
                     raise _DeadlineExpired()
@@ -1260,12 +1436,18 @@ def _supervisor_entry(
                 contained = _contain_tree(os.getpid(), worker_pid, deadline, subreaper=subreaper)
                 if not contained:
                     raise _DeadlineExpired()
+                containment_evidence = time.monotonic()
+                worker_tree_state = 'confirmed' if subreaper else 'unknown'
+                final_outcome_evidence = business_outcome_json
+                if original_worker_outcome_json is not None:
+                    outcome_handoff = retain_outcome(original_worker_outcome_json)
                 send_parent(
                     {
                         "kind": "handler_failed",
                         "cleanup_confirmed": subreaper,
                         "code": "handler_process_exit",
                         "message": "handler process exited before reporting an outcome",
+                        "outcome_handoff": outcome_handoff,
                     },
                 )
                 return
@@ -1293,12 +1475,34 @@ def _supervisor_entry(
             contained_at = time.monotonic()
             if contained_at >= deadline:
                 raise _DeadlineExpired()
+            containment_evidence = contained_at
+            worker_tree_state = 'confirmed' if subreaper else 'unknown'
+            if handler_entered and completion_evidence is not None and work_deadline_evidence is not None:
+                worker_return_state = 'timely'
+            final_outcome_evidence = packet['outcome_json']
+            # Deliver the already-contained result before a journal wait can
+            # consume the remaining hard deadline. The parent retains this
+            # evidence while the supervisor attempts its durable handoff.
+            deferred_handoff = {'state': 'unknown', 'reason': 'journal_handoff_pending'}
+            if original_worker_outcome_json is not None:
+                try:
+                    if len(original_worker_outcome_json.encode('utf-8')) <= 128 * 1024:
+                        deferred_handoff['outcome_json'] = original_worker_outcome_json
+                except UnicodeEncodeError:
+                    pass
+            send_parent({'kind': 'handler_contained', 'cleanup_confirmed': subreaper,
+                         'contained_monotonic': contained_at, 'outcome_json': packet['outcome_json'],
+                         'outcome_handoff': deferred_handoff})
+            stage = 'outcome_handoff'
+            if original_worker_outcome_json is not None and outcome_handoff is None:
+                outcome_handoff = retain_outcome(original_worker_outcome_json)
             send_parent(
                 {
                     "kind": "handler_completed",
                     "cleanup_confirmed": subreaper,
                     "contained_monotonic": contained_at,
                     "outcome_json": packet["outcome_json"],
+                    "outcome_handoff": outcome_handoff,
                 },
             )
         except _DeadlineExpired:
@@ -1312,7 +1516,9 @@ def _supervisor_entry(
                 if (type(available) is dict and available.get("kind") in
                         {"worker_returned", "worker_completed"}
                         and type(available.get("outcome_json")) is str):
-                    business_outcome_json = available["outcome_json"]
+                    if business_outcome_json is None:
+                        business_outcome_json = available["outcome_json"]
+                        original_worker_outcome_json = business_outcome_json
             expired_budget = guard.snapshot()
             work_budget_expired = (expired_budget is not None and
                 expired_budget.view(sample=expired_budget.checkpoint).remaining_work_seconds == 0)
@@ -1320,9 +1526,17 @@ def _supervisor_entry(
                 os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS,
                 subreaper=subreaper,
             )
+            if contained:
+                containment_evidence = time.monotonic()
+                worker_tree_state = 'confirmed' if subreaper else 'unknown'
+            if original_worker_outcome_json is not None and outcome_handoff is None:
+                outcome_handoff = (retain_outcome(original_worker_outcome_json) if contained else
+                    {'state': 'unknown', 'reason': 'containment_unconfirmed'})
             send_parent({"kind": "handler_timed_out", "cleanup_confirmed": contained and subreaper,
+                                       "timeout_phase": stage,
                                        "work_budget_expired": work_budget_expired,
                                        "business_outcome_json": business_outcome_json,
+                                       "outcome_handoff": outcome_handoff,
                                        "budget_capture_error": None if guard.capture_error is None else
                                            _control_error_details(guard.capture_error.__cause__ or guard.capture_error)})
         finally:
@@ -1336,6 +1550,12 @@ def _supervisor_entry(
                 os.getpid(), worker_pid, time.monotonic() + _CLEANUP_GRACE_SECONDS,
                 subreaper=subreaper,
             )
+            if contained:
+                containment_evidence = time.monotonic()
+                worker_tree_state = 'confirmed' if subreaper else 'unknown'
+        if original_worker_outcome_json is not None and outcome_handoff is None:
+            outcome_handoff = (retain_outcome(original_worker_outcome_json) if contained else
+                {'state': 'unknown', 'reason': 'containment_unconfirmed'})
         try:
             details = _bootstrap_diagnostic(exc, stage)
             send_parent(
@@ -1348,6 +1568,7 @@ def _supervisor_entry(
                         else "handler_process_start_failure",
                     "control_error": isinstance(exc, BudgetClockUnknownError),
                     "business_outcome_json": business_outcome_json,
+                    "outcome_handoff": outcome_handoff,
                 },
             )
         except BaseException:
@@ -1420,9 +1641,9 @@ class ProcessSupervisorHandle:
             # explicit containment packet and bounded finish-only ACK.
             return _kill_supervisor(self._process, wait_for_receipt=True)
 
-    def terminate(self) -> bool:
+    def terminate(self, *, wait_for_receipt: bool = False) -> bool:
         with self._lock:
-            return _kill_supervisor(self._process)
+            return _kill_supervisor(self._process, wait_for_receipt=wait_for_receipt)
 
 
 def invoke_process_handler(
@@ -1442,6 +1663,9 @@ def invoke_process_handler(
     on_entered: Optional[Callable[[dict[str, Any]], None]] = None,
     on_phase: Optional[Callable[[str, dict[str, Any]], None]] = None,
     capture_budget: Any = None,
+    authority_verifier: Any = None,
+    worker_credential: Any = None,
+    settlement_binding: dict | None = None,
 ) -> dict[str, Any]:
     """Run a handler behind an independently timed and reaping supervisor."""
 
@@ -1453,14 +1677,22 @@ def invoke_process_handler(
     def publish(outcome, envelope, entry=None):
         published, checkpoint = _finish_budget_capture(
             capture_budget, envelope, timeout_seconds=.1 if cleanup_allowed else 0.)
+        if (outcome.get("budget_capture_error") is not None
+                and _confirmed_transient_capture_error(capture_budget, tracker.capture_error, checkpoint)):
+            outcome = {**outcome, "budget_capture_diagnostic": outcome["budget_capture_error"]}
+            outcome.pop("budget_capture_error", None)
         supervisor_checkpoint = terminal.get("budget_checkpoint") if type(terminal) is dict else None
         capture_error = terminal.get("budget_capture_error") if type(terminal) is dict else None
         capture_errors = {}
         if outcome.get("budget_capture_error") is not None:
             capture_errors["parent"] = outcome["budget_capture_error"]
+        if checkpoint.get("state") == "unknown":
+            capture_errors["parent_checkpoint"] = checkpoint
         if capture_error is not None:
             capture_errors["supervisor"] = capture_error
-        if checkpoint.get("token") is not None or supervisor_checkpoint is not None or capture_error is not None:
+        if type(supervisor_checkpoint) is dict and supervisor_checkpoint.get("state") == "unknown":
+            capture_errors["supervisor_checkpoint"] = supervisor_checkpoint
+        if checkpoint.get("token") is not None or supervisor_checkpoint is not None or capture_errors:
             outcome = {**outcome,
                 "budget_checkpoint": {"parent": checkpoint, "supervisor": supervisor_checkpoint},
                 **({"budget_capture_error": capture_errors} if capture_errors else {})}
@@ -1468,10 +1700,12 @@ def invoke_process_handler(
     try:
         startup_deadline = tracker.bound(time.monotonic() + start_timeout)
     except BudgetClockUnknownError as exc:
+        _observe_phase(on_phase, 'supervisor_not_invoked', {'source': 'runtime_pre_spawn'})
         return publish({"kind": "error", "code": "budget_clock_unknown", "message": str(exc),
                                 "control_error": True, "retryable": False, "effect_ids": [],
                                 "details": _control_error_details(exc.__cause__ or exc)}, tracker.envelope)
     if startup_deadline <= time.monotonic():
+        _observe_phase(on_phase, 'supervisor_not_invoked', {'source': 'runtime_pre_spawn'})
         return publish({"kind": "timeout", "phase": "admission", "effect_ids": []}, tracker.envelope)
 
     # ``spawn`` avoids forking the potentially multi-threaded caller.  The
@@ -1482,7 +1716,10 @@ def invoke_process_handler(
     process = process_context.Process(
         target=_supervisor_entry,
         args=(db_path, _SerializedHandler(handler), command, lease, now, sender, durability,
-              tracker.envelope, service_spec, startup_deadline),
+              tracker.envelope, service_spec, startup_deadline,
+              _SerializedHandler((authority_verifier, worker_credential))
+                  if authority_verifier is not None or worker_credential is not None else None, None,
+              settlement_binding),
         daemon=False,
     )
     handle = ProcessSupervisorHandle(process)
@@ -1490,16 +1727,21 @@ def invoke_process_handler(
     try:
         process.start()
         cleanup_allowed = False
-    except BaseException:
+    except BaseException as exc:
         receiver.close()
         sender.close()
+        if (authority_verifier is not None or worker_credential is not None) and isinstance(exc, Exception):
+            # Spawn serialization errors can contain host credential material.
+            raise RuntimeError("protected worker spawn failed") from None
         raise
     sender.close()
     if on_started is not None:
         try:
             registered = bool(on_started(handle))
         except BaseException:
-            handle.terminate()
+            reaped = handle.terminate()
+            if reaped and on_finished is not None:
+                on_finished(handle)
             receiver.close()
             raise
         if not registered:
@@ -1510,9 +1752,26 @@ def invoke_process_handler(
     hard_deadline: float | None = None
     terminal: Optional[dict[str, Any]] = None
     cleanup_fact: Optional[dict[str, Any]] = None
+    contained_result: Optional[dict[str, Any]] = None
     startup_wait_expired = False
     admission_work_expired = False
     work_wait_expired = False
+    handoff_reported = False
+    cleanup_handoff_reported = False
+    def report_handoff(packet):
+        nonlocal handoff_reported, cleanup_handoff_reported
+        if type(packet) is not dict:
+            return
+        handoff = packet.get('outcome_handoff')
+        if not handoff_reported and type(handoff) is dict and handoff.get('state') == 'unknown':
+            _observe_phase(on_phase, 'supervisor_outcome_observed', {
+                'source': 'posix_supervisor_worker_packet', **handoff})
+            handoff_reported = True
+        cleanup = packet.get('worker_tree_cleanup_handoff')
+        if not cleanup_handoff_reported and type(cleanup) is dict and cleanup.get('state') == 'unknown':
+            _observe_phase(on_phase, 'worker_tree_cleanup_handoff_failed', {
+                'source': 'posix_supervisor_containment', 'cleanup': 'confirmed', **cleanup})
+            cleanup_handoff_reported = True
     try:
         first, startup_deadline = _wait_packet(receiver, startup_deadline, tracker)
         if type(first) is dict and first.get("kind") == "worker_ready":
@@ -1542,8 +1801,16 @@ def invoke_process_handler(
             terminal, deadline = _wait_packet(receiver, deadline, tracker)
             work_wait_expired = terminal is None and time.monotonic() >= deadline
             if type(terminal) is dict and terminal.get("kind") == "handler_returned":
+                report_handoff(terminal)
                 assert hard_deadline is not None
                 terminal, deadline = _wait_packet(receiver, hard_deadline, tracker, hard=True)
+                if type(terminal) is dict and terminal.get('kind') == 'handler_contained':
+                    contained_result = terminal
+                    terminal, deadline = _wait_packet(receiver, hard_deadline, tracker, hard=True)
+                    if (terminal is None or
+                            (type(terminal) is dict and terminal.get('kind') == 'handler_timed_out'
+                             and terminal.get('timeout_phase') == 'outcome_handoff')):
+                        terminal = {**contained_result, 'kind': 'handler_completed'}
             if terminal is None and receiver.poll(_CLEANUP_GRACE_SECONDS):
                 # The business deadline has elapsed, so a successful outcome
                 # can no longer be accepted.  The supervisor still gets a
@@ -1562,45 +1829,56 @@ def invoke_process_handler(
             # time, as for expiry after entry; never grant business time.
             if receiver.poll(_CLEANUP_GRACE_SECONDS):
                 terminal = _receive_packet(receiver)
+        report_handoff(terminal)
         observed_at = time.monotonic()
     except BudgetClockUnknownError as exc:
+        # The supervisor may still be holding the only durable-handoff
+        # attempt. Preserve the bounded packet already delivered to this
+        # parent before terminating it, without hiding the clock failure.
+        if contained_result is not None:
+            report_handoff(contained_result)
         terminal = {"kind": "handler_failed", "code": "budget_clock_unknown", "message": str(exc),
                     "control_error": True, "details": _control_error_details(exc.__cause__ or exc)}
         observed_at = time.monotonic()
     finally:
-        reaped = handle.terminate()
-        if tracker.capture_error is not None:
-            # Containment may have produced the original packet while the
-            # guarded clock write failed. Preserve ready terminal facts once.
-            recover_acceptance = _transient_capture_error(tracker.capture_error)
-            for _ in range(4):
-                if not receiver.poll(0):
-                    break
-                available = _receive_packet(receiver)
-                if (recover_acceptance and type(available) is dict
-                        and available.get("kind") == "handler_started"
-                        and type(available.get("deadline_monotonic")) in {int, float}
-                        and math.isfinite(available["deadline_monotonic"])):
-                    started, entry = True, available
-                    deadline = float(available["deadline_monotonic"])
-                    hard_deadline = float(available.get("hard_deadline_monotonic", deadline))
-                    tracker.entered(BudgetEnvelope.from_dict(available["budget_envelope"]))
-                if (type(available) is dict and available.get("cleanup_confirmed") is True
-                        and available.get("kind") in ("handler_completed", "handler_entry_failed",
-                            "handler_timed_out", "handler_failed", "handler_start_failed")):
-                    cleanup_fact = available
-                if (recover_acceptance and type(available) is dict
-                        and available.get("kind") in (
-                        "handler_completed", "handler_entry_failed", "handler_timed_out",
-                        "handler_failed", "handler_start_failed")):
-                    terminal = available
+        # A clock publication failure can bypass the normal deadline packet
+        # wait. Revoke descendants immediately, but leave the subreaper its
+        # bounded opportunity to report actual containment before killing it.
+        reaped = handle.terminate(wait_for_receipt=tracker.capture_error is not None)
+        # Containment may have produced the original packet while the
+        # guarded clock write failed. Preserve ready terminal facts once.
+        recover_acceptance = (tracker.capture_error is not None and
+                              _transient_capture_error(tracker.capture_error))
+        for _ in range(4):
+            if not receiver.poll(0):
+                break
+            available = _receive_packet(receiver)
+            report_handoff(available)
+            if (recover_acceptance and type(available) is dict
+                    and available.get("kind") == "handler_started"
+                    and type(available.get("deadline_monotonic")) in {int, float}
+                    and math.isfinite(available["deadline_monotonic"])):
+                started, entry = True, available
+                deadline = float(available["deadline_monotonic"])
+                hard_deadline = float(available.get("hard_deadline_monotonic", deadline))
+                tracker.entered(BudgetEnvelope.from_dict(available["budget_envelope"]))
+            if (type(available) is dict and available.get("cleanup_confirmed") is True
+                    and available.get("kind") in ("handler_completed", "handler_entry_failed",
+                        "handler_timed_out", "handler_failed", "handler_start_failed")):
+                cleanup_fact = available
+            if (recover_acceptance and type(available) is dict
+                    and available.get("kind") in (
+                    "handler_completed", "handler_entry_failed", "handler_timed_out",
+                    "handler_failed", "handler_start_failed")):
+                terminal = available
         receiver.close()
-        if registered and on_finished is not None:
+        if reaped and on_finished is not None:
             on_finished(handle)
     if not reaped:
         raise RuntimeError("handler supervisor could not be terminated")
     cleanup_allowed = (type(terminal) is dict and terminal.get("cleanup_confirmed") is True
-        or cleanup_fact is not None and cleanup_fact.get("cleanup_confirmed") is True)
+        or cleanup_fact is not None and cleanup_fact.get("cleanup_confirmed") is True
+        or contained_result is not None and contained_result.get("cleanup_confirmed") is True)
 
     budget_envelope = tracker.envelope
     observed_budget = terminal.get("observed_budget_envelope") if type(terminal) is dict else None
@@ -1636,10 +1914,24 @@ def invoke_process_handler(
         except (TypeError, ValueError):
             outcome = None
         if type(outcome) is dict:
+            original_capture_error = outcome.get("budget_capture_error")
             if tracker.capture_error is not None:
                 outcome["budget_capture_error"] = {"state": "unknown", "error":
                     _control_error_details(tracker.capture_error.__cause__ or tracker.capture_error)}
-            return publish(outcome, budget_envelope, entry)
+            published = publish(outcome, budget_envelope, entry)
+            if (published.get('kind') in ('ok', 'error') and not published.get('control_error')
+                    and published.get('budget_capture_error') is None):
+                _observe_phase(on_phase, 'supervisor_result_accepted', {})
+            else:
+                checkpoints = published.get("budget_checkpoint") or {}
+                errors = published.get("budget_capture_error") or {}
+                if (original_capture_error is None and published.get("kind") in ("ok", "error")
+                        and not published.get("control_error") and type(checkpoints) is dict
+                        and type(errors) is dict and set(errors) <= {"parent", "parent_checkpoint"}
+                        and _recoverable_captured_checkpoint(capture_budget, tracker.capture_error,
+                                                             checkpoints.get("parent"))):
+                    _observe_phase(on_phase, 'supervisor_result_captured_pending_checkpoint', {})
+            return published
     if (
         (type(terminal) is dict and terminal.get("kind") == "handler_timed_out")
         or (started and deadline is not None and observed_at >= deadline)
@@ -1672,7 +1964,13 @@ def invoke_process_handler(
                     ("kind", "code", "message", "details") if key in terminal}
         if type(original) is dict:
             outcome["details"] = {**outcome.get("details", {}), "business_outcome": original}
-        return publish(outcome, budget_envelope, entry)
+        published = publish(outcome, budget_envelope, entry)
+        if (started and type(terminal) is dict and terminal.get('kind') == 'handler_timed_out'
+                and cleanup_allowed and published.get('kind') == 'timeout'
+                and not published.get('control_error') and published.get('budget_capture_error') is None
+                and tracker.capture_error is None):
+            _observe_phase(on_phase, 'supervisor_result_accepted', {})
+        return published
     if type(terminal) is dict and terminal.get("kind") == "handler_entry_failed":
         try:
             outcome = json.loads(terminal["outcome_json"])
@@ -1712,7 +2010,7 @@ def invoke_process_handler(
         if type(terminal) is dict and terminal.get("message")
         else "handler supervisor did not reach invocation"
     )
-    return publish({
+    published = publish({
         "kind": "error",
         "code": "handler_process_start_failure",
         "message": message,
@@ -1721,3 +2019,9 @@ def invoke_process_handler(
             if type(terminal) is dict else {"exitcode": process.exitcode},
         "effect_ids": [],
     }, budget_envelope, entry)
+    if (type(terminal) is dict and terminal.get('kind') == 'handler_start_failed'
+            and terminal.get('pre_invocation_confirmed') is True and cleanup_allowed
+            and not published.get('control_error') and published.get('budget_capture_error') is None
+            and tracker.capture_error is None):
+        _observe_phase(on_phase, 'supervisor_result_accepted', {})
+    return published

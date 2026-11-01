@@ -18,10 +18,12 @@ class _KernelBudgetCapture:
         self._pending: tuple[str, BudgetEnvelope | None] | None = None
         self._error: BaseException | None = None
         self._published: BudgetEnvelope | None = None
+        self._published_token: str | None = None
         self._ack_token: str | None = None
 
     def _armed(self, token: str) -> None:
         self._published = None
+        self._published_token = None
         self._ack_token = None
         self._pending = (token, None)
 
@@ -31,6 +33,7 @@ class _KernelBudgetCapture:
     def _acknowledged(self, token: str, envelope: BudgetEnvelope) -> None:
         if self._pending is not None and self._pending[0] == token:
             self._published = envelope
+            self._published_token = token
             self._pending = self._error = self._ack_token = None
 
     def finish_pending(self, envelope: BudgetEnvelope, *, timeout_seconds: float) -> BudgetEnvelope:

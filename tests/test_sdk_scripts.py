@@ -204,7 +204,16 @@ class ScriptExecutionTests(unittest.TestCase):
 
     def test_nonzero_exit_is_failure_with_committed_outcome_and_stderr(self):
         self.submit("import sys\nprint('broken', file=sys.stderr)\nsys.exit(7)\n")
+        deadline = time.monotonic() + 5
         snapshot = self.runtime.run_once()
+        # Retry publication of the captured result, never script execution.
+        # Keep maintenance inside the submitted execution's original window.
+        while snapshot.state == "running" and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.runtime.recover_completions(timeout_seconds=min(.1, remaining))
+            snapshot = self.runtime.kernel.get("script-execution")
         self.assertEqual(snapshot.state, "failed")
         self.assertEqual(snapshot.result.error.code, "script_exit_nonzero")
         self.assertEqual(snapshot.result.error.details["exit_code"], 7)

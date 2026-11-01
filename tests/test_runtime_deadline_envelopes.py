@@ -19,7 +19,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import dispatcher_sdk
-from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, ClockCheckpoint, DeadlineConstraint, sample_clock
+from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError, BudgetEnvelope, ClockCheckpoint, DeadlineConstraint, sample_clock
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
 from dispatcher_sdk.execution_kernel.runtime import Runtime
@@ -375,7 +375,10 @@ class WorkerEntryConfirmationTests(unittest.TestCase):
                 evidence["original_pending_entry"] = entry
                 self.assertEqual(("pending",), entry)
                 if mode == "lock":
-                    with closing(sqlite3.connect(root / "kernel.db", timeout=.1)) as writer:
+                    # The supervisor can still be writing its own entry and
+                    # budget evidence after the worker reaches the barrier.
+                    # Wait for that writer before introducing our contention.
+                    with closing(sqlite3.connect(root / "kernel.db", timeout=1.0)) as writer:
                         with writer:
                             writer.execute("BEGIN IMMEDIATE")
                             (root / "release").write_text("released", encoding="ascii")
@@ -680,6 +683,45 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
             return original(**kwargs)
 
         return patch.object(backend, name, capture)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux subreaper containment")
+    def test_clock_failure_keeps_supervisor_alive_for_real_cleanup_receipt(self):
+        original_wait = process_runtime._wait_packet
+        entered = [False]
+        receipts = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {key: str(root / key) for key in ("entered", "escaped")}
+
+            def fail_after_entry(receiver, deadline, tracker, *, hard=False):
+                if entered[0]:
+                    limit = time.monotonic() + 5
+                    while not Path(payload["entered"]).exists() and time.monotonic() < limit:
+                        time.sleep(.01)
+                    self.assertTrue(Path(payload["entered"]).exists())
+                    error = BudgetClockUnknownError("injected clock capture failure")
+                    error.__cause__ = TimeoutError("injected publication timeout")
+                    tracker.capture_error = error
+                    raise error
+                packet, updated = original_wait(receiver, deadline, tracker, hard=hard)
+                entered[0] = isinstance(packet, dict) and packet.get("kind") == "handler_started"
+                return packet, updated
+
+            runtime = Runtime(str(root / "kernel.db"), {"child": inherited_deadline_child}, isolation_mode="process")
+            try:
+                with patch.object(process_runtime, "_wait_packet", side_effect=fail_after_entry), \
+                        self.capture_process_cleanup(receipts):
+                    command = runtime.command("child", execution_id="clock-failure", idempotency_key="clock-failure",
+                        correlation_id="clock-failure", timeout_seconds=15, payload=payload)
+                    runtime.submit(command)
+                    runtime.run_once()
+                self.assertEqual(["tree_reaped"], receipts)
+                pid = int(Path(payload["entered"]).read_text(encoding="ascii"))
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+                self.assertFalse(Path(payload["escaped"]).exists())
+            finally:
+                runtime.close()
 
     @staticmethod
     def capture_actual_descendant_stop(paths, root):

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+import time
 from typing import Any, Optional
 import uuid
 
@@ -27,6 +29,94 @@ from .transitions import TERMINAL_STATES, reduce_state
 
 
 class ExecutionCompletionMixin:
+    def _is_committed_supervisor_result(self, lease: ExecutionLease, result: ExecutionResultV2,
+                                       *, timeout_seconds: float, max_record_bytes: int = 256 * 1024) -> bool:
+        """Inspect an exact already-committed result; never perform completion."""
+        deadline = time.monotonic() + timeout_seconds
+        with self._control_lock(timeout_seconds):
+            if time.monotonic() >= deadline:
+                raise TimeoutError('supervisor result proof budget elapsed')
+            self._connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+            try:
+                self._connection.execute('BEGIN')
+                return self._committed_supervisor_retry_in_snapshot(lease, result, max_record_bytes, deadline)
+            except sqlite3.OperationalError as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('supervisor result proof budget elapsed') from exc
+                raise
+            finally:
+                self._connection.set_progress_handler(None, 0)
+                self._connection.rollback()
+
+    def _committed_supervisor_retry_in_snapshot(self, lease: ExecutionLease, result: ExecutionResultV2,
+                                                max_record_bytes: int, deadline: float) -> bool:
+        def check_time():
+            if time.monotonic() >= deadline:
+                raise TimeoutError('supervisor result proof budget elapsed')
+
+        row = self._connection.execute(
+            'SELECT attempt,fence,state,length(CAST(result_json AS BLOB)) AS result_bytes '
+            'FROM kernel_executions WHERE execution_id=?', (lease.execution_id,)).fetchone()
+        if row is None:
+            return False
+        # Later claims or cancellation cannot erase this historical receipt.
+        # A different fence at the same attempt is not this generation.
+        if (row['attempt'] < lease.attempt or
+                (row['attempt'] == lease.attempt and row['fence'] != lease.fence) or
+                (row['attempt'] > lease.attempt and row['fence'] <= lease.fence)):
+            return False
+        obligation = self._connection.execute(
+            'SELECT length(CAST(resolution_json AS BLOB)) FROM kernel_supervisor_obligations '
+            'WHERE execution_id=? AND attempt=? AND fence=?',
+            (lease.execution_id, lease.attempt, lease.fence)).fetchone()
+        if obligation is None or obligation[0] is None:
+            return False
+        if obligation[0] > max_record_bytes:
+            raise TimeoutError('supervisor resolution exceeds proof byte budget')
+        obligation = self._connection.execute(
+            'SELECT resolution_json FROM kernel_supervisor_obligations WHERE execution_id=? AND attempt=? AND fence=?',
+            (lease.execution_id, lease.attempt, lease.fence)).fetchone()
+        expected = {'source': 'sdk_confirmed_supervisor_cleanup', 'result_id': result.result_id,
+                    'status': result.status}
+        resolution = json.loads(obligation[0])
+        if resolution != expected and resolution != {**expected, 'source': 'sdk_supervisor_not_invoked'}:
+            return False
+        check_time()
+        if ((row['attempt'], row['fence']) == (lease.attempt, lease.fence)
+                and row['state'] in TERMINAL_STATES and row['result_bytes'] is not None):
+            if row['result_bytes'] > max_record_bytes:
+                raise TimeoutError('terminal result exceeds proof byte budget')
+            saved = json.loads(self._connection.execute('SELECT result_json FROM kernel_executions WHERE execution_id=?',
+                                                        (lease.execution_id,)).fetchone()[0])
+            check_time()
+            matched = encode_json(saved) == encode_json(result.to_dict())
+            check_time()
+            if matched:
+                return True
+            if (isinstance(saved, dict) and saved.get('status') == 'dead'
+                    and isinstance(saved.get('error'), dict)
+                    and saved['error'].get('code') == 'retry_exhausted'
+                    and isinstance(saved['error'].get('details'), dict)
+                    and encode_json(saved['error']['details'].get('last_result')) == encode_json(result.to_dict())):
+                check_time()
+                return True
+        event = self._connection.execute(
+            "SELECT length(CAST(data_json AS BLOB)) FROM kernel_events WHERE execution_id=? AND revision=? "
+            "AND event_type='retry_scheduled' LIMIT 1",
+            (lease.execution_id, lease.revision + 1)).fetchone()
+        if event is None:
+            return False
+        if event[0] > max_record_bytes:
+            raise TimeoutError('retry event exceeds proof byte budget')
+        event = self._connection.execute(
+            "SELECT data_json FROM kernel_events WHERE execution_id=? AND revision=? "
+            "AND event_type='retry_scheduled' LIMIT 1", (lease.execution_id, lease.revision + 1)).fetchone()
+        data = json.loads(event[0])
+        check_time()
+        matched = isinstance(data, dict) and 'result' in data and encode_json(data['result']) == encode_json(result.to_dict())
+        check_time()
+        return matched
+
     def _terminal(
         self,
         connection: sqlite3.Connection,
@@ -258,23 +348,136 @@ class ExecutionCompletionMixin:
     def _complete_sdk_result(self, lease: ExecutionLease, result: ExecutionResultV2, *,
                              budget_envelope: BudgetEnvelope | None,
                              timeout_seconds: float = .1,
-                             settlement: bool = False) -> ExecutionSnapshot:
+                             settlement: bool = False,
+                             supervisor_cleanup_confirmed: bool = False,
+                             supervisor_not_invoked: bool = False,
+                             supervisor_registration_uncertain: bool = False) -> ExecutionSnapshot:
         """Settle original SDK result and its observed budget in one transaction."""
         return self._complete_result(lease, result, timeout_seconds=timeout_seconds,
-                                     settlement=settlement, budget_envelope=budget_envelope)
+                                     settlement=settlement, budget_envelope=budget_envelope,
+                                     supervisor_cleanup_confirmed=supervisor_cleanup_confirmed,
+                                     supervisor_not_invoked=supervisor_not_invoked,
+                                     supervisor_registration_uncertain=supervisor_registration_uncertain)
+
+    def reconcile_supervisor_result(self, credential: Any, *, lease: ExecutionLease,
+                                    result: ExecutionResultV2, budget_envelope: BudgetEnvelope,
+                                    kernel_store_id: str, cleanup_evidence: str) -> ExecutionSnapshot:
+        """Apply an independently host-verified original result and cleanup decision.
+
+        A settlement journal observation alone is not authority. The configured
+        verifier must authenticate the complete decision and its permission.
+        """
+        if type(lease) is not ExecutionLease or type(result) is not ExecutionResultV2:
+            raise TypeError("reconciliation requires an exact lease and result")
+        if type(budget_envelope) is not BudgetEnvelope:
+            raise TypeError("reconciliation requires the original budget envelope")
+        if type(cleanup_evidence) is not str or not cleanup_evidence.strip():
+            raise ValueError("cleanup evidence must be non-empty")
+        if type(kernel_store_id) is not str or not kernel_store_id.strip():
+            raise ValueError("kernel store identity must be non-empty")
+        decision = {"kernel_store_id": kernel_store_id, "lease": lease.to_dict(), "result": result.to_dict(),
+                    "budget_envelope": budget_envelope.to_dict(), "cleanup": "confirmed",
+                    "cleanup_evidence": cleanup_evidence}
+        if len(encode_json(decision).encode("utf-8")) > 65536:
+            raise ValueError("reconciliation decision exceeds its bound")
+        return self._complete_result(lease, result, settlement=True, budget_envelope=budget_envelope,
+                                     host_reconciliation=(credential, decision))
 
     def _complete_result(self, lease: ExecutionLease, result: ExecutionResultV2, *,
                          timeout_seconds: float | None = None,
                          settlement: bool = False,
-                         budget_envelope: BudgetEnvelope | None = None) -> ExecutionSnapshot:
+                         budget_envelope: BudgetEnvelope | None = None,
+                         supervisor_cleanup_confirmed: bool = False,
+                         supervisor_not_invoked: bool = False,
+                         supervisor_registration_uncertain: bool = False,
+                         host_reconciliation: tuple[Any, dict] | None = None) -> ExecutionSnapshot:
         if type(lease) is not ExecutionLease:
             raise TypeError("complete requires ExecutionLease")
         if type(result) is not ExecutionResultV2:
             raise TypeError("complete requires ExecutionResultV2")
         if budget_envelope is not None and type(budget_envelope) is not BudgetEnvelope:
             raise TypeError("budget must be a BudgetEnvelope or None")
+        if type(supervisor_cleanup_confirmed) is not bool:
+            raise TypeError("supervisor_cleanup_confirmed must be a bool")
+        if type(supervisor_not_invoked) is not bool or (supervisor_not_invoked and supervisor_cleanup_confirmed):
+            raise TypeError("supervisor_not_invoked must be an exclusive bool")
+        if type(supervisor_registration_uncertain) is not bool or (supervisor_registration_uncertain and not supervisor_not_invoked):
+            raise TypeError("uncertain registration requires not-invoked proof")
         with self._transaction(timeout_seconds=timeout_seconds) as (connection, timestamp):
+            host_record = None
+            if host_reconciliation is not None:
+                credential, decision = host_reconciliation
+                def verify_host():
+                    try:
+                        proof = self._authority_verifier(credential)
+                        principal = proof["principal"]
+                        store = connection.execute("SELECT store_id FROM kernel_store_identity WHERE singleton=1").fetchone()
+                        if (type(principal) is not str or not principal.strip() or
+                            store is None or store[0] != decision["kernel_store_id"] or
+                            self._number(proof["expires_at"], "authority expiry", minimum=0.0) <= self._advance_clock(connection) or
+                            encode_json(proof["supervisor_result_reconciliation"]) != encode_json(decision) or
+                            not any(tuple(p) == (lease.execution_id, "kernel:reconcile_supervisor_result") for p in proof["permissions"])):
+                            raise ValueError("reconciliation authority differs")
+                        return principal
+                    except Exception:
+                        raise StorageIsolationError("host did not authenticate supervisor result reconciliation") from None
+                principal = verify_host()
+                def recheck_host():
+                    if verify_host() != principal:
+                        raise StorageIsolationError("supervisor result authority changed")
+                self._precommit_authority_checks.append(recheck_host)
+                host_record = encode_json({"source": "host_verified_supervisor_result", "principal": principal,
+                                           "decision": decision})
+                self._assert_budget_clock(connection, lease.execution_id)
+                if budget_envelope.checkpoint.effective_time(sample_clock(wall_time=timestamp)) is None:
+                    raise StorageIsolationError("reconciliation clock continuity is unknown")
+            def resolve_supervisor():
+                # An unacknowledged sample on this execution or an ancestor
+                # fences cleanup resolution as well as future admission. The
+                # check and resolution must share this transaction.
+                self._assert_budget_clock(connection, lease.execution_id)
+                key = (lease.execution_id, lease.attempt, lease.fence)
+                obligation = connection.execute("SELECT resolution_json FROM kernel_supervisor_obligations "
+                    "WHERE execution_id=? AND attempt=? AND fence=?", key).fetchone()
+                if obligation is None:
+                    if supervisor_registration_uncertain:
+                        return
+                    raise CASConflictError("exact supervisor obligation is unavailable")
+                resolution = host_record or encode_json({"source": "sdk_supervisor_not_invoked" if supervisor_not_invoked else "sdk_confirmed_supervisor_cleanup", "result_id": result.result_id,
+                                                         "status": result.status})
+                if obligation[0] is not None and obligation[0] != resolution:
+                    raise CASConflictError("supervisor obligation has a different resolution")
+                connection.execute("UPDATE kernel_supervisor_obligations SET resolution_json=? WHERE execution_id=? "
+                                   "AND attempt=? AND fence=? AND resolution_json IS NULL", (resolution, *key))
             row = self._get_row(connection, lease.execution_id)
+            if host_record is not None:
+                if (row["attempt"], row["fence"]) != (lease.attempt, lease.fence):
+                    raise StaleFenceError("supervisor execution generation changed")
+                obligation = connection.execute("SELECT resolution_json FROM kernel_supervisor_obligations "
+                    "WHERE execution_id=? AND attempt=? AND fence=?",
+                    (lease.execution_id, lease.attempt, lease.fence)).fetchone()
+                if obligation is None:
+                    raise CASConflictError("exact supervisor obligation is unavailable")
+                if obligation[0] is not None:
+                    if obligation[0] != host_record:
+                        raise CASConflictError("supervisor obligation has a different resolution")
+                    if row["state"] == "queued":
+                        event = connection.execute("SELECT data_json FROM kernel_events WHERE execution_id=? "
+                            "AND revision=? AND event_type='retry_scheduled' LIMIT 1",
+                            (lease.execution_id, lease.revision + 1)).fetchone()
+                        if event is None or encode_json(json.loads(event[0])["result"]) != encode_json(result.to_dict()):
+                            raise CASConflictError("original retry receipt is unavailable")
+                    elif row["state"] in TERMINAL_STATES:
+                        saved = self._result(row["result_json"])
+                        if saved is None or (saved.to_json() != result.to_json() and not (
+                            saved.status == "dead" and saved.error is not None and
+                            saved.error.code == "retry_exhausted" and
+                            encode_json(saved.error.details.get("last_result")) == encode_json(result.to_dict())
+                        )):
+                            raise CASConflictError("reconciled terminal result is no longer current")
+                    else:
+                        raise CASConflictError("reconciled result is no longer current")
+                    return self._snapshot(row)
             if row["state"] in TERMINAL_STATES:
                 current = self._result(row["result_json"])
                 # Dataclass/Python equality is not a wire identity: it folds
@@ -282,10 +485,15 @@ class ExecutionCompletionMixin:
                 # results must match the exact canonical contract payload.
                 if current is not None and current.to_json() == result.to_json():
                     if budget_envelope is not None:
+                        self._assert_budget_clock(connection, lease.execution_id)
                         # An earlier exact result receipt does not prove its
                         # independently retained floor reached Kernel storage.
                         self._validate_result(connection, row, lease, result, timestamp,
                                               budget_envelope=budget_envelope)
+                    if supervisor_cleanup_confirmed or supervisor_not_invoked or host_record is not None:
+                        if (row["attempt"], row["fence"]) != (lease.attempt, lease.fence):
+                            raise CASConflictError("supervisor execution generation changed")
+                        resolve_supervisor()
                     return self._snapshot(row)
                 if current is not None and current.result_id == result.result_id:
                     raise ResultConflictError("duplicate result_id has different content")
@@ -309,6 +517,12 @@ class ExecutionCompletionMixin:
                 operation="execution completion",
                 settlement=True,
             )
+            if budget_envelope is not None:
+                # A retained completion floor cannot establish the current
+                # clock while another sample on this lineage is unresolved.
+                # Check in the same transaction as result publication even
+                # when there is no proof permitting supervisor resolution.
+                self._assert_budget_clock(connection, lease.execution_id)
             command = self._validate_result(connection, row, lease, result, timestamp,
                                             budget_envelope=budget_envelope)
             parked = self._park_unfinished_effects(
@@ -316,13 +530,15 @@ class ExecutionCompletionMixin:
             )
             if parked is not None:
                 return parked
+            if supervisor_cleanup_confirmed or supervisor_not_invoked or host_record is not None:
+                resolve_supervisor()
             managed_deadline_elapsed = False
-            if lease.execution_id.startswith("sdk-managed:"):
-                deadline = connection.execute(
-                    "SELECT c.deadline_at FROM kernel_managed_executions m "
-                    "JOIN kernel_run_controls c ON c.run_id=m.run_id "
-                    "WHERE m.execution_id=?", (lease.execution_id,),
-                ).fetchone()
+            deadline = connection.execute(
+                "SELECT c.deadline_at FROM kernel_managed_executions m "
+                "JOIN kernel_run_controls c ON c.run_id=m.run_id "
+                "WHERE m.execution_id=?", (lease.execution_id,),
+            ).fetchone()
+            if deadline is not None:
                 managed_deadline_elapsed = deadline is not None and deadline[0] <= timestamp
             if self._retryable(result, command) and not managed_deadline_elapsed:
                 if row["attempt"] >= command.retry_policy.max_attempts:
@@ -517,13 +733,13 @@ class ExecutionCompletionMixin:
                     fence=row["fence"],
                     reason="a non-cancelled terminal execution is immutable",
                 )
-            if execution_id.startswith("sdk-managed:"):
-                control = connection.execute(
-                    "SELECT c.state FROM kernel_managed_executions m "
-                    "JOIN kernel_run_controls c ON c.run_id=m.run_id "
-                    "WHERE m.execution_id=?", (execution_id,),
-                ).fetchone()
-                if control is None:
+            control = connection.execute(
+                "SELECT c.state FROM kernel_managed_executions m "
+                "LEFT JOIN kernel_run_controls c ON c.run_id=m.run_id "
+                "WHERE m.execution_id=?", (execution_id,),
+            ).fetchone()
+            if control is not None or execution_id.startswith("sdk-managed:"):
+                if control is None or control[0] is None:
                     raise StorageIsolationError("managed cancellation lacks Run control")
                 if control[0] not in {"pausing", "paused"}:
                     raise CASConflictError(

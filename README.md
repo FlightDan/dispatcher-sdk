@@ -15,7 +15,7 @@ an interruption. The core uses only Python's standard library and SQLite.
 
 | Capability | Where it helps |
 | --- | --- |
-| Execution isolation and control | Run tasks in separate processes. In process mode, timeouts and cancellation terminate the supervised process tree to handle stuck tool calls. |
+| Execution isolation and control | Run tasks in separate processes. In process mode, timeouts and cancellation trigger platform-specific cleanup of supervised work. Cleanup can fail or remain unknown. |
 | Sandbox execution | Run scripts through a pluggable `SandboxBackend`, collect bounded output and artifacts, and persist lifecycle state for cleanup and recovery. The optional OpenSandbox adapter requires its SDK and a separate sandbox service. |
 | Durable execution | Save tasks, results, and notifications in SQLite. Queued work remains available when you close and reopen the database. |
 | Bounded retries | Configure attempt limits and backoff for retryable failures, avoiding endless reruns. |
@@ -50,10 +50,17 @@ Integration boundaries:
 - The SDK cannot undo a write or API call that has already happened. Uncertain outcomes require verification before recovery; arbitrary operations are not guaranteed to happen exactly once.
 - `Dispatcher` durably accepts and deduplicates notifications in its built-in inbox. User callbacks remain at-least-once; external calls need idempotency. Use `consume_results` for atomic local SQL and receipt settlement.
 
-The current source version is `0.7.2` and requires Python 3.10+.
-Kernel storage uses schema 5; Orchestrator storage uses schema 4. Older databases
+This checkout identifies itself as the `0.7.3` release candidate based on
+`0.7.2` and requires Python 3.10+. Acceptance and publication remain separate
+from the package version. Do not assume that a
+published 0.7.2 package contains the development APIs described in this checkout;
+read the documentation shipped with the version you install.
+Kernel storage uses schema 12; Orchestrator storage uses schema 6; new
+Settlement Journals use schema 4. Older databases
 need an explicit upgrade. Read [storage and upgrades](docs/STORAGE_AND_UPGRADES.md)
 and the [compatibility guide](docs/PUBLIC_API.md) before opening them with this version.
+The [implementation status](docs/SDK_0_7_2_IMPLEMENTATION_STATUS.md) separates
+local validation from platform coverage, host integration, and real Run acceptance.
 
 Execution observations and managed supervision are documented in the
 [execution guide](docs/EXECUTION_OBSERVABILITY.md). The
@@ -131,8 +138,9 @@ See the [0.7 design and migration notes](docs/DEV_0_7.md) and
 
 ### 1. Stop a stuck task and its child process on timeout
 
-Tool calls can block or launch additional child processes. Process mode cleans up
-the supervised process tree after a timeout so the application can run other tasks.
+Tool calls can block or launch additional child processes. After a timeout,
+process mode attempts platform-specific cleanup. Check the exact execution's
+[cleanup evidence](docs/CANCELLATION_EVIDENCE.md) before treating it as complete.
 
 In this Linux example, a function sleeps for 30 seconds and starts a child that
 also sleeps. Its execution timeout is 2 seconds. After checking that the function
@@ -248,7 +256,7 @@ the function's filesystem or network access.
 </details>
 
 Applications can also cancel tasks explicitly with `runtime.cancel`. Process mode
-cleans up the supervised process tree. Thread mode only revokes authority to
+attempts supervised cleanup; its outcome may remain unknown. Thread mode only revokes authority to
 publish results and Effects; it cannot forcibly stop a blocked thread.
 If an interruption leaves an unresolved external operation, the task may enter
 `recovery_required` instead of ending immediately. `ScriptSpec` executions register

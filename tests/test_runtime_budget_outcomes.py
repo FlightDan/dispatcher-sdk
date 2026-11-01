@@ -149,6 +149,30 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
                 evidence['first_limits'] = runtime.kernel.get_execution_limits('original')
                 evidence['first_receipts'] = runtime._settlement_journal.inspect('original', timeout_seconds=.5)
                 second = runtime.run_once(execution_id='original')
+                if isolation == 'process':
+                    # The injected timeout changes the native outcome after
+                    # containment, so the supervisor did not accept it as a
+                    # completion. Retry requires an explicit host decision.
+                    self.assertIsNone(second)
+                    identity = {'execution_id': 'original', 'attempt': first.attempt, 'fence': first.fence}
+                    handoff = runtime._settlement_journal.inspect_supervisor_handoff(identity, timeout_seconds=1)
+                    self.assertEqual(handoff['facts']['supervisor_reap']['state'], 'observed')
+                    self.assertEqual(handoff['facts']['supervisor_reap']['evidence'],
+                                     {'state': 'confirmed', 'source': 'runtime_supervisor_reaped'})
+                    self.assertIn('received_native_outcome', evidence)
+                    decision = {**identity, 'cleanup': 'confirmed', 'outcome': 'unknown',
+                                'disposition': 'retry_authorized',
+                                'evidence': 'fixture observed native return and supervisor reap'}
+                    credential = object()
+                    def verify(candidate):
+                        if candidate is not credential:
+                            raise ValueError('unexpected host credential')
+                        return {'principal': 'fixture-host', 'expires_at': time.time() + 60,
+                                'permissions': [('original', 'kernel:resolve_supervisor')],
+                                'supervisor_resolution': decision}
+                    runtime.kernel._authority_verifier = verify
+                    runtime.kernel.resolve_supervisor_obligation(credential, expected_resolution=decision)
+                    second = runtime.run_once(execution_id='original')
                 evidence['second'] = second.to_dict()
                 evidence['second_limits'] = runtime.kernel.get_execution_limits('original')
                 evidence['observed'] = json.loads((root / 'observed.json').read_text())
@@ -267,10 +291,12 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
 
             # Supported close stops automatic recovery while the real writer
             # still excludes Kernel publication; the durable receipt survives.
-            runtime.close()
+            with self.assertRaisesRegex(RuntimeError, 'diagnostic facts not confirmed durable'):
+                runtime.close()
             writer.rollback()
             writer.close()
             writer = None
+            runtime.close()
             evidence['reopened_wall'] = original.started_at
             reopened = Kernel.open_sqlite(root / 'kernel.sqlite3', {'work': observe_expired_then_roll_back},
                 isolation_mode='thread', now=HandlerClock(fixed_wall=original.started_at), lease_seconds=90)

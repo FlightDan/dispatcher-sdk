@@ -114,13 +114,13 @@ def _sandbox_facts(kernel_connection, snapshot):
     return records, issues
 
 
-def _persisted_process_cleanup(kernel_connection, kernel_path, snapshot):
+def _persisted_process_cleanup(kernel_connection, kernel_path, snapshot, *, settlement_journal_path=None):
     """Use the Runtime's durable native cleanup proof, including after restart."""
     if kernel_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name='runtime_sandbox_meta'").fetchone() is None:
         return None
     source_id = validate_registry(kernel_connection)
-    path = str(kernel_path) + ".settlements.sqlite3"
+    path = str(kernel_path) + ".settlements.sqlite3" if settlement_journal_path is None else settlement_journal_path
     journal = SettlementJournal.open_readonly(path, source_id=source_id, kernel_path=kernel_path)
     note = journal._inspect_process_cleanup({"execution_id": snapshot.execution_id,
                                            "attempt": snapshot.attempt, "fence": snapshot.fence})
@@ -138,6 +138,7 @@ def inspect_cancellation(
     orchestrator: Orchestrator, run_id: str, *, task_id: str | None = None,
     execution_id: str | None = None, source_id: str | None = None,
     cancellation_journal_path: str | Path | None = None,
+    settlement_journal_path: str | Path | None = None,
     limit: int = 100, after_task_id: str | None = None,
 ) -> CancellationRecoveryReport:
     """Inspect current task attempts, or one explicitly selected historical execution.
@@ -165,6 +166,14 @@ def inspect_cancellation(
     if cancellation_journal_path is not None and source_id is None:
         raise ValueError("a cancellation journal requires its source_id")
     kernel_path = orchestrator.kernel.db_path
+    configured = getattr(orchestrator, 'settlement_journal_path', None)
+    if settlement_journal_path is not None:
+        requested = str(Path(settlement_journal_path).expanduser().resolve())
+        if configured is not None and requested != configured:
+            raise ValueError('settlement journal path differs from configured selection')
+        settlement_journal_path = requested
+    else:
+        settlement_journal_path = configured
     if str(kernel_path) == ":memory:":
         raise OrchestrationError("cancellation report requires an existing SQLite Kernel file")
     with _read_only(orchestrator.db_path) as application:
@@ -252,7 +261,8 @@ def inspect_cancellation(
                             local = _fact("failed", "process_cleanup_failed", "cancellation_journal")
                 if local.status not in {"confirmed", "not_applicable"}:
                     try:
-                        persisted = _persisted_process_cleanup(kernel, kernel_path, snapshot)
+                        persisted = _persisted_process_cleanup(kernel, kernel_path, snapshot,
+                                                              settlement_journal_path=settlement_journal_path)
                     except (OSError, sqlite3.Error, ValueError, TimeoutError) as exc:
                         issues.append("process_cleanup_evidence_unavailable:" + type(exc).__name__)
                     else:

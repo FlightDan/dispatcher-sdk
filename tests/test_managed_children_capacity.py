@@ -35,7 +35,7 @@ class RequestJournal:
             connection.executescript(CHILD_SCHEMA)
 
     @contextmanager
-    def _transaction(self, *, timeout_seconds=None):
+    def _transaction(self, *, timeout_seconds=None, operation=None):
         connection = sqlite3.connect(self.path, timeout=self.options.write_timeout if timeout_seconds is None else min(self.options.write_timeout, timeout_seconds))
         connection.row_factory = sqlite3.Row
         try:
@@ -339,6 +339,7 @@ class ManagedChildAdmissionTests(unittest.TestCase):
     def test_service_validates_parent_before_submission_after_durable_admission(self):
         row = self.enqueue()
         self.kernel.live = False
+        self.kernel.targets["parent"] = SimpleNamespace(state="cancelled", attempt=1, fence=1)
         calls = []
         runtime = SimpleNamespace(kernel=self.kernel, submit_child=lambda *args, **kwargs: calls.append(args))
         ChildService(runtime, self.journal)._execute(row)

@@ -33,7 +33,7 @@ from .contracts import (
     ExecutionResultV2,
     ExecutionSnapshot,
 )
-from .errors import CASConflictError, ExecutionNotFoundError, StaleFenceError
+from .errors import BudgetScanContinuation, CASConflictError, ExecutionNotFoundError, StaleFenceError, StorageIsolationError
 from .event import Event
 from .transitions import TERMINAL_STATES
 
@@ -70,7 +70,17 @@ class SQLiteBase:
         outbox_max_attempts: int = 8,
         durability: Durability = "full",
         control_timeout_seconds: float | None = None,
+        authority_verifier: Any = None,
+        worker_credential: Any = None,
+        lifecycle_verifier: Any = None,
     ) -> None:
+        if authority_verifier is not None and not callable(authority_verifier):
+            raise TypeError("authority_verifier must be callable")
+        if lifecycle_verifier is not None and not callable(lifecycle_verifier):
+            raise TypeError("lifecycle_verifier must be callable")
+        self._lifecycle_verifier = lifecycle_verifier
+        self._authority_verifier = authority_verifier
+        self._worker_credential = worker_credential
         self.durability = validate_durability(durability)
         self._default_control_timeout = (None if control_timeout_seconds is None else
             self._positive_duration(control_timeout_seconds, "control_timeout_seconds"))
@@ -304,14 +314,41 @@ class SQLiteBase:
                 self._connection.rollback()
                 raise
             try:
+                self._precommit_authority_checks = []
+                self._precommit_budget_expiry = None
+                self._claim_continuation = None
                 yield self._connection, timestamp
-            except BaseException:
+                for check in self._precommit_authority_checks:
+                    check()
+                if (self._precommit_budget_expiry is not None and
+                        self._precommit_budget_expiry <= self._advance_clock(self._connection)):
+                    error = StorageIsolationError("application budget admission expired before commit")
+                    error._claim_authority_failure = True
+                    raise error
+            except BaseException as original:
+                # SQLite may roll back the entire transaction itself on errors
+                # such as SQLITE_FULL. In that case the savepoint no longer
+                # exists, and attempting to roll it back would hide the actual
+                # storage failure from the caller.
+                if not self._connection.in_transaction:
+                    raise
                 try:
+                    # Clock observations made by a failed operation must survive
+                    # its savepoint rollback, or a later wall-clock rollback
+                    # could revive an already expired authority.
+                    observed = self._connection.execute(
+                        "SELECT watermark FROM kernel_clock WHERE singleton=1").fetchone()[0]
                     self._connection.execute("ROLLBACK TO kernel_operation")
                     self._connection.execute("RELEASE kernel_operation")
+                    self._connection.execute(
+                        "UPDATE kernel_clock SET watermark=MAX(watermark, ?) WHERE singleton=1",
+                        (observed,))
                     self._connection.commit()
-                except BaseException:
+                except BaseException as cleanup_error:
                     self._connection.rollback()
+                    raise cleanup_error from original
+                if self._claim_continuation is not None and getattr(original, '_claim_authority_failure', False):
+                    raise BudgetScanContinuation(self._claim_continuation) from None
                 raise
             else:
                 try:
@@ -327,6 +364,10 @@ class SQLiteBase:
                         except BaseException:
                             pass
                     raise
+            finally:
+                self._precommit_authority_checks = None
+                self._precommit_budget_expiry = None
+                self._claim_continuation = None
 
     @staticmethod
     def _cas(cursor: sqlite3.Cursor, operation: str) -> None:

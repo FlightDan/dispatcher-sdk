@@ -32,6 +32,40 @@ def command(identity: str) -> ExecutionCommandV2:
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_summary_reads_only_known_table_names_and_states(self) -> None:
+        from dispatcher_sdk.diagnostics import _Snapshot
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "summary.sqlite3"
+            with sqlite3.connect(path) as connection:
+                connection.execute("CREATE TABLE kernel_executions(state TEXT, next_attempt_at REAL)")
+                connection.execute("CREATE TABLE kernel_clock(singleton INTEGER, watermark REAL)")
+                connection.execute("INSERT INTO kernel_clock VALUES(1, 0)")
+                connection.executemany(
+                    "INSERT INTO kernel_executions VALUES(?, 0)",
+                    [("queued",)] + [(f"unrecognized-{i}",) for i in range(1000)],
+                )
+                for i in range(100):
+                    connection.execute(f'CREATE TABLE unrelated_{i}(value TEXT)')
+
+            original_rows = _Snapshot.rows
+            returned = []
+
+            def record_rows(snapshot, sql, parameters=()):
+                rows = original_rows(snapshot, sql, parameters)
+                if "sqlite_schema" in sql or "GROUP BY state" in sql:
+                    returned.append((sql, len(rows)))
+                return rows
+
+            with patch.object(_Snapshot, "rows", new=record_rows):
+                report = inspect_diagnostics(path)
+
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["queue"]["executions"]["total"], 1)
+        self.assertEqual(report["queue"]["executions"]["ready_queued"], 1)
+        self.assertEqual(len(returned), 2)
+        self.assertTrue(all(count == 1 for _, count in returned))
+
     def test_single_file_report_counts_backlogs_without_mutating_store(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "dispatcher.sqlite3"

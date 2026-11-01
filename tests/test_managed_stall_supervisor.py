@@ -94,7 +94,7 @@ class ManagedStallSupervisorTests(unittest.TestCase):
                 except Exception as error:
                     (self.root / "cleanup-error.txt").write_text(repr(error), encoding="utf-8")
         (self.root / "release").touch()
-        from dispatcher_sdk.execution_kernel.runtime import _ObservationCleanupPendingError
+        from dispatcher_sdk.execution_kernel.runtime import _ObservationCleanupPendingError, _UnpersistedDiagnosticsError
         from dispatcher_sdk.observability.managed_supervisor import _AdmissionError
         import traceback
         for index, app in enumerate(reversed(self.apps)):
@@ -115,7 +115,7 @@ class ManagedStallSupervisorTests(unittest.TestCase):
                     (self.root / f"cleanup-close-error-{index}-{attempt}.txt").write_text(
                         traceback.format_exc(), encoding="utf-8")
                     attempt += 1
-                    retryable = isinstance(error, _ObservationCleanupPendingError) or (
+                    retryable = isinstance(error, (_ObservationCleanupPendingError, _UnpersistedDiagnosticsError)) or (
                         isinstance(error, _AdmissionError) and error.code in {
                             "supervisor_checkpoint_pending", "supervisor_cleanup_unknown"})
                     if not retryable or time.monotonic() >= deadline:

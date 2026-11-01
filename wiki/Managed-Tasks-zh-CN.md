@@ -34,7 +34,7 @@ if __name__ == "__main__":
 
 `task.observe()` 和 `task.events()` 只读取已保存的执行事实，不会领取任务或修改时限。
 Handler 可以通过 `context.activity` 报告输出、等待状态和进度；停滞策略默认关闭，需显式配置。
-报告与恢复规则（包括预留容量的托管处理器）见[执行观测与监督](../docs/EXECUTION_OBSERVABILITY.md)。
+报告与恢复规则（包括预留容量的托管处理器）见[执行观测与监督](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/EXECUTION_OBSERVABILITY.md)。
 
 ## 处理结果
 
@@ -52,7 +52,7 @@ API 时必须使用幂等键。
 Dispatcher 在打开写连接前检查 schema 和未完成任务的 handler 绑定。
 如果部署不匹配，`DeploymentMismatchError.report` 会给出原因。`app.health()` 只读取
 内存状态；`app.diagnostics()` 会执行有时间上限的 SQLite 只读查询。完整契约见
-[统一应用接口](../docs/MANAGED_APPLICATION.md)。
+[统一应用接口](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/MANAGED_APPLICATION.md)。
 
 `close(timeout=...)` 会先停止接收新工作，等待结果消费者退出，再停止 Host。
 如果回调被卡住，关闭操作会超时。不要提前销毁回调依赖，等回调返回后再次调用 `close()`。

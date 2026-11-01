@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.3
+
+- Add explicit copy upgrades to Kernel schema 12, Orchestrator schema 6 and
+  Settlement Journal schema 4. Existing stores are never silently adopted or
+  upgraded; the source writer and independent sidecars remain host-owned.
+- Add controlled split-store Run adoption, pause, revision installation,
+  activation and resume. Managed application operations atomically submit
+  tasks, update application state and advance the consumer cursor under host
+  authority, lease, generation and budget checks.
+- Persist exact-generation lifecycle producer reservations and event delivery
+  receipts. Host-authorized recovery records missing-evidence uncertainty;
+  explicit retirement and bounded pruning require a quiescent generation.
+  A provably unstarted supervisor can settle with a distinct `not_invoked`
+  resolution, while ambiguous process creation keeps cleanup unresolved.
+- Add application budget declarations, scoped admissions and durable usage
+  reconciliation, plus bounded inspection of control, cancellation, execution
+  origin and diagnostic cost. Unknown usage, incomplete scans and missing
+  receipts remain explicit rather than becoming successful evidence.
+- Improve child execution, cancellation, result handoff and stop reporting
+  across nested process runs and storage restarts. Stop reports expose bounded
+  local diagnostic uncertainty without claiming remote Run completion.
+
+Real old-Run host integration and platform CI results are tracked separately
+from these SDK changes.
+
 ## 0.7.2
 
 - The public acceptance example polls Windows marker files within its original

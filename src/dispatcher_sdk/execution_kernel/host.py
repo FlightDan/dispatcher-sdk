@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable, Protocol
 
 from .runtime import InProcessRuntime
+from .errors import BudgetScanContinuation
 
 
 class RuntimeHostBridge(Protocol):
@@ -32,6 +33,14 @@ class RuntimeHostError:
     error_type: str
     message: str
     consecutive: int
+    execution_id: str | None = None
+    attempt: int | None = None
+    fence: int | None = None
+    phase: str | None = None
+    process_cleanup: str | None = None
+    diagnostic_saved: bool | None = None
+    execution_assignment: str | None = None
+    worker_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,13 @@ class StopReport:
     ``can_continue_waiting`` describes whether an unfinished host thread was
     still observable when the snapshot was made.  It does not promise that
     waiting will finish or cancel the operation that is holding shutdown up.
+
+    ``last_progress_at`` is a process-local monotonic timestamp, not a wall
+    time or evidence of business progress.  Execution identities and durable
+    obligations are ``None`` when this bounded snapshot did not inspect them.
+    The ``in_process_partial`` scope contains only registered process/thread
+    identities and locally retained outcomes; it is not a durable or complete
+    inventory and cannot establish that cleanup is complete.
     """
 
     scope: str
@@ -94,6 +110,16 @@ class StopReport:
     pending_delivery_persisted: bool | None
     can_continue_waiting: bool
     errors: tuple[RuntimeHostError, ...] = ()
+    last_progress_at: float | None = None
+    active_execution_identities: tuple[tuple[str, int, int], ...] | None = None
+    pending_settlement_count: int | None = None
+    pending_effect_count: int | None = None
+    pending_cleanup_count: int | None = None
+    pending_diagnostic_count: int | None = None
+    unknown_diagnostic_handoff_count: int | None = None
+    failed_diagnostic_execution_count: int | None = None
+    diagnostic_retention_overflow: bool | None = None
+    obligation_scope: str = "not_inspected"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -151,6 +177,8 @@ class RuntimeHost:
         self._wake_event = threading.Event()
         self._state = "new"
         self._coordinator: threading.Thread | None = None
+        self._shutdown_owner: threading.Thread | None = None
+        self._shutdown_owner_start_retryable = False
         self._executor: ThreadPoolExecutor | None = None
         self._futures: set[Future[Any]] = set()
         self._wake_pending = False
@@ -165,6 +193,8 @@ class RuntimeHost:
         self._consecutive_errors: dict[str, int] = {}
         self._retry_at: dict[str, float] = {}
         self._runtime_stop_requested = False
+        self._runtime_stop_owner: threading.Thread | None = None
+        self._runtime_stop_owner_failed = False
         self._shutdown_lock = threading.Lock()
         self._shutdown_attempted = False
         self._shutdown_error: BaseException | None = None
@@ -281,7 +311,7 @@ class RuntimeHost:
         ):
             raise ValueError("timeout must be a non-negative number or None")
         with self._lock:
-            coordinator = self._coordinator
+            coordinator = self._coordinator or self._shutdown_owner
         if coordinator is None:
             return True
         coordinator.join(timeout)
@@ -306,7 +336,14 @@ class RuntimeHost:
         coordinator_alive = bool(
             self._coordinator is not None and self._coordinator.is_alive()
         )
+        shutdown_alive = bool(self._shutdown_owner is not None and self._shutdown_owner.is_alive())
         finished_at = self._stop_finished_at
+        progress_times = [value for value in (self._last_pump_at, self._last_sweep_at)
+                          if value is not None]
+        progress_times.extend(phase.finished_at for phase in phases
+                              if phase.status == "completed" and phase.finished_at is not None)
+        obligations = (InProcessRuntime._stop_obligations_snapshot(self.runtime)
+                       if type(self.runtime) is InProcessRuntime else {})
         return StopReport(
             scope="runtime_host",
             status=self._stop_status,
@@ -326,8 +363,10 @@ class RuntimeHost:
             notification_thread_alive=None,
             pending_delivery_count=None,
             pending_delivery_persisted=None,
-            can_continue_waiting=coordinator_alive,
+            can_continue_waiting=coordinator_alive or shutdown_alive,
             errors=tuple(self._recent_errors),
+            last_progress_at=max(progress_times, default=None),
+            **obligations,
         )
 
     @staticmethod
@@ -356,6 +395,9 @@ class RuntimeHost:
             first_stop = self._stop_started_at is None
             if first_stop:
                 self._stop_started_at = time.monotonic()
+            if self._stop_status == "failed" and self._shutdown_owner_start_retryable:
+                self._shutdown_owner_start_retryable = False
+                self._stop_status = "in_progress"
             if self._stop_status in {"completed", "failed"}:
                 return
             # The coordinator also enters this method from ``finally``.  Do
@@ -414,7 +456,7 @@ class RuntimeHost:
             if self._state == "new":
                 self._state = "stopping"
                 coordinator = None
-            elif self._state == "stopped":
+            elif self._state == "stopped" and self._shutdown_owner is None:
                 self._finish_stop("completed")
                 return True
             elif self._state == "failed" and self._coordinator is None:
@@ -427,8 +469,27 @@ class RuntimeHost:
             self._wake_event.set()
 
         if coordinator is None:
-            self._finish_stop_phase("worker_drain", skipped=True)
-            self._shutdown_resources()
+            with self._lock:
+                if self._shutdown_owner is None:
+                    if self._shutdown_owner_start_retryable:
+                        self._shutdown_owner_start_retryable = False
+                        self._stop_status = "in_progress"
+                        self._stop_finished_at = None
+                    new_owner = threading.Thread(target=self._shutdown_without_coordinator,
+                        name="runtime-host-shutdown", daemon=False)
+                    try:
+                        new_owner.start()
+                    except BaseException as exc:
+                        self._record_error("shutdown_owner_start", exc)
+                        self._shutdown_owner_start_retryable = True
+                        self._finish_stop("failed")
+                        raise
+                    self._shutdown_owner = new_owner
+                owner = self._shutdown_owner
+            owner.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+            if owner.is_alive():
+                self._finish_stop("timed_out")
+                return False
             try:
                 self._raise_shutdown_error()
             except BaseException:
@@ -447,11 +508,15 @@ class RuntimeHost:
                 # The coordinator remains the sole owner of final Bridge
                 # flushing and runtime.close, so callers can safely preserve
                 # the Orchestrator store when the bounded join returns false.
-                self._request_runtime_stop_once()
+                self._request_runtime_stop_once(wait=False)
                 coordinator.join(max(0.0, deadline - time.monotonic()))
         if coordinator.is_alive():
             self._finish_stop("timed_out")
             return False
+        with self._lock:
+            stop_owner_failed = self._runtime_stop_owner_failed
+        if stop_owner_failed:
+            self._raise_shutdown_error()
         self._shutdown_resources(flush=True)
         try:
             self._raise_shutdown_error()
@@ -460,6 +525,20 @@ class RuntimeHost:
             raise
         self._finish_stop("completed")
         return True
+
+    def _shutdown_without_coordinator(self) -> None:
+        """Retain one cleanup owner when the host never started."""
+        self._finish_stop_phase("worker_drain", skipped=True)
+        try:
+            self._shutdown_resources()
+        except BaseException as exc:
+            self._record_error("shutdown", exc)
+            with self._lock:
+                self._shutdown_error = exc
+                self._state = "failed"
+        with self._lock:
+            failed = self._shutdown_error is not None
+        self._finish_stop("failed" if failed else "completed")
 
     def _raise_shutdown_error(self) -> None:
         with self._lock:
@@ -540,6 +619,13 @@ class RuntimeHost:
                         self._state = "stopped"
 
     def _record_error(self, source: str, error: BaseException) -> None:
+        context = getattr(error, "execution_context", None)
+        if not isinstance(context, dict):
+            context = {}
+        def context_value(key: str, expected_type: type):
+            value = context.get(key)
+            return value if type(value) is expected_type else None
+
         with self._lock:
             consecutive = self._consecutive_errors.get(source, 0) + 1
             record = RuntimeHostError(
@@ -548,6 +634,14 @@ class RuntimeHost:
                 error_type=type(error).__name__,
                 message=str(error),
                 consecutive=consecutive,
+                execution_id=context_value("execution_id", str),
+                attempt=context_value("attempt", int),
+                fence=context_value("fence", int),
+                phase=context_value("phase", str),
+                process_cleanup=context_value("process_cleanup", str),
+                diagnostic_saved=context_value("diagnostic_saved", bool),
+                execution_assignment=context_value("execution_assignment", str),
+                worker_id=context_value("worker_id", str),
             )
             self._consecutive_errors[source] = consecutive
             self._retry_at[source] = record.at + min(
@@ -560,11 +654,23 @@ class RuntimeHost:
             self._recent_errors.append(record)
             del self._recent_errors[:-32]
 
-    def _request_runtime_stop_once(self) -> None:
+    def _request_runtime_stop_once(self, *, wait: bool = True) -> None:
         with self._lock:
-            if self._runtime_stop_requested:
-                return
-            self._runtime_stop_requested = True
+            if self._runtime_stop_owner is None:
+                new_owner = threading.Thread(target=self._request_runtime_stop,
+                    name="runtime-host-stop-request", daemon=False)
+                try:
+                    new_owner.start()
+                except BaseException as exc:
+                    self._record_error("runtime_stop_owner_start", exc)
+                    raise
+                self._runtime_stop_owner = new_owner
+                self._runtime_stop_requested = True
+            owner = self._runtime_stop_owner
+        if wait:
+            owner.join()
+
+    def _request_runtime_stop(self) -> None:
         request_stop = getattr(self.runtime, "request_stop", None)
         if callable(request_stop):
             try:
@@ -664,6 +770,10 @@ class RuntimeHost:
         for future in done:
             try:
                 result = future.result()
+            except BudgetScanContinuation:
+                # Runtime retained the bounded cursor for its next poll.
+                # This is incomplete scanning, not an empty queue or failure.
+                progress = True
             except BaseException as exc:
                 self._record_error("worker", exc)
             else:
@@ -786,8 +896,17 @@ class RuntimeHost:
             # close race for a still-running ``run_once``.
             self._stop_event.set()
             self._begin_stop(None)
-            self._request_runtime_stop_once()
-            self._shutdown_resources(flush=startup_ready)
+            try:
+                self._request_runtime_stop_once()
+            except BaseException as exc:
+                # Without a revocation owner, do not close resources under
+                # possibly active runtime operations.
+                with self._lock:
+                    self._runtime_stop_owner_failed = True
+                    self._shutdown_error = exc
+                    self._state = "failed"
+            else:
+                self._shutdown_resources(flush=startup_ready)
             with self._lock:
                 failed = self._shutdown_error is not None or self._state == "failed"
             self._finish_stop("failed" if failed else "completed")

@@ -36,10 +36,12 @@ from .errors import (
     HandlerUnavailableError,
     IdempotencyConflictError,
     InvalidStateTransitionError,
+    LifecycleReceiptExpiredError,
     RegistryRevisionMismatchError,
     ResultConflictError,
     StaleFenceError,
     StorageIsolationError,
+    BudgetScanContinuation,
 )
 from .event import Event
 from .kernel import Kernel
@@ -50,6 +52,7 @@ from .sqlite import ExecutionKernel, SQLiteKernel
 from .host import RuntimeHost, RuntimeHostError, RuntimeHostHealth, StopPhase, StopReport
 from .scripts import ScriptSpec, script_handler, script_handlers
 from .sandbox import SandboxHandler, SandboxJournal, sandbox_handlers
+from .settlement_migration import copy_rebind_settlement
 from .sandbox_contracts import (
     SandboxBackend, SandboxBackendError, SandboxObservation, SandboxOutcomeUnknown,
     SandboxPolicyError, SandboxResourceMissing, SandboxSpec,
@@ -70,6 +73,7 @@ __all__ = [
     "SandboxBackend", "SandboxBackendError", "SandboxHandler", "SandboxJournal",
     "SandboxObservation", "SandboxOutcomeUnknown", "SandboxPolicyError",
     "SandboxResourceMissing", "SandboxSpec", "sandbox_handlers",
+    "copy_rebind_settlement",
     "RuntimeHost",
     "RuntimeHostError",
     "RuntimeHostHealth",
@@ -91,6 +95,7 @@ __all__ = [
     "ExecutionError",
     "ExecutionKernel",
     "ExecutionKernelError",
+    "LifecycleReceiptExpiredError",
     "ExecutionLease",
     "ExecutionNotFoundError",
     "ExecutionResultV2",
@@ -114,6 +119,7 @@ __all__ = [
     "SQLiteKernel",
     "StaleFenceError",
     "StorageIsolationError",
+    "BudgetScanContinuation",
     "TERMINAL_STATES",
     "TRANSITION_MATRIX",
     "can_transition",

@@ -40,9 +40,9 @@ class ChildServiceCloseLifetimeTests(unittest.TestCase):
         original = self.journal._transaction
 
         @contextmanager
-        def observe_transaction(*, timeout_seconds=None):
+        def observe_transaction(*, timeout_seconds=None, operation=None):
             entered.set()
-            with original(timeout_seconds=timeout_seconds) as transaction:
+            with original(timeout_seconds=timeout_seconds, operation=operation) as transaction:
                 yield transaction
 
         service = ChildService(SimpleNamespace(kernel=ParentAuthority()), self.journal)
@@ -88,10 +88,10 @@ class ChildServiceCloseLifetimeTests(unittest.TestCase):
             return original_finish(store, *args, **kwargs)
 
         @contextmanager
-        def observe_transaction(*, timeout_seconds=None):
+        def observe_transaction(*, timeout_seconds=None, operation=None):
             if threading.current_thread().name.startswith("sdk-child_"):
                 storage_entered.set()
-            with original_transaction(timeout_seconds=timeout_seconds) as transaction:
+            with original_transaction(timeout_seconds=timeout_seconds, operation=operation) as transaction:
                 yield transaction
 
         writer = None

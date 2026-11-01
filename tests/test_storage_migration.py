@@ -10,8 +10,8 @@ from dispatcher_sdk.execution_kernel import (
     ExecutionCommandV2, RetryPolicy, SQLiteKernel, StorageIsolationError,
 )
 from dispatcher_sdk.execution_kernel._sqlite_schema import (
-    KERNEL_SCHEMA_V2, KERNEL_SCHEMA_V3, KERNEL_SCHEMA_V4, SCHEMA_SQL,
-    _schema_statement_for,
+    KERNEL_SCHEMA_V2, KERNEL_SCHEMA_V3, KERNEL_SCHEMA_V4, KERNEL_SCHEMA_V5, KERNEL_SCHEMA_V6, KERNEL_SCHEMA_V7, KERNEL_SCHEMA_V8, KERNEL_SCHEMA_V9, KERNEL_SCHEMA_V10, KERNEL_SCHEMA_V11, SCHEMA_SQL,
+    _schema_statement_for, validate_kernel_schema_v5,
 )
 from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError
 from dispatcher_sdk.maintenance import (
@@ -47,7 +47,16 @@ class KernelOnlyMigrationTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table' "
                     "AND name LIKE 'kernel_%' AND name NOT IN "
                     "('kernel_schema_meta','kernel_execution_limits',"
-                    "'kernel_supervision','kernel_progress_keys','kernel_budget_samples')"
+                    "'kernel_supervision','kernel_progress_keys','kernel_budget_samples',"
+                    "'kernel_store_identity','kernel_control_pause_receipts','kernel_control_pause_pages',"
+                    "'kernel_run_authorities','kernel_revision_installs','kernel_legacy_imports',"
+                    "'kernel_legacy_import_pages','kernel_legacy_pending_commands',"
+                    "'kernel_revision_content_pages','kernel_resume_receipts','kernel_activation_receipts',"
+                    "'kernel_initial_admission_bindings','kernel_budget_policies','kernel_budget_dependencies',"
+                    "'kernel_supervisor_obligations','kernel_projection_declarations',"
+                    "'kernel_projection_receipts','kernel_projection_requirements','kernel_control_takeovers',"
+                    "'kernel_lifecycle_producers','kernel_lifecycle_outbox','kernel_lifecycle_metadata',"
+                    "'kernel_lifecycle_retired')"
                 ).fetchall()
             }
 
@@ -94,37 +103,54 @@ class KernelOnlyMigrationTests(unittest.TestCase):
         self.assertEqual(self._historical_rows(self.source), original)
         self.assertEqual(self._historical_rows(self.destination), original)
         self.assertEqual(report["component"], "execution_kernel")
-        self.assertEqual((report["source_version"], report["target_version"]), (3, 5))
+        self.assertEqual((report["source_version"], report["target_version"]), (3, 12))
         self.assertFalse(report["observation_journal_included"])
         with SQLiteKernel(self.destination):
             pass
         with closing(sqlite3.connect(self.destination)) as connection:
-            self.assertEqual(connection.execute("SELECT schema_version FROM kernel_schema_meta").fetchone()[0], 5)
+            self.assertEqual(connection.execute("SELECT schema_version FROM kernel_schema_meta").fetchone()[0], 12)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM kernel_execution_limits").fetchone()[0], 0)
 
     def test_standalone_v2_and_current_sources_are_supported(self):
-        for version, schema in ((2, KERNEL_SCHEMA_V2), (4, KERNEL_SCHEMA_V4), (5, SCHEMA_SQL)):
+        for version, schema in ((2, KERNEL_SCHEMA_V2), (4, KERNEL_SCHEMA_V4),
+                                (5, KERNEL_SCHEMA_V5), (6, KERNEL_SCHEMA_V6), (7, KERNEL_SCHEMA_V7),
+                                (8, KERNEL_SCHEMA_V8), (9, KERNEL_SCHEMA_V9), (10, KERNEL_SCHEMA_V10),
+                                (11, KERNEL_SCHEMA_V11), (12, SCHEMA_SQL)):
             with self.subTest(version=version):
                 self.source = self.root / f"kernel-v{version}.sqlite3"
                 self.destination = self.root / f"upgraded-v{version}.sqlite3"
                 self._seed(schema)
-                if version in (4, 5):
+                if version in (4, 5, 6, 7, 8, 9, 10, 11, 12):
                     with closing(sqlite3.connect(self.source)) as connection:
                         connection.execute("INSERT INTO kernel_execution_limits(execution_id,envelope_json) VALUES('execution','{}')")
                         connection.execute("INSERT INTO kernel_supervision(execution_id,attempt,fence,progress_revision,episode_id) VALUES('execution',1,1,2,'episode')")
                         connection.execute("INSERT INTO kernel_progress_keys VALUES('execution',1,'progress',2)")
+                        if version == 11:
+                            connection.execute("INSERT INTO kernel_lifecycle_producers VALUES('producer','execution',1,1,1,'closed')")
+                            connection.execute("INSERT INTO kernel_lifecycle_outbox(sequence,token,event_id,phase,payload_json,delivered) VALUES(13,'producer','event-13','closed',NULL,1)")
                         connection.commit()
                 original = self._historical_rows(self.source)
                 with maintenance_lease(self.source, "tests", "kernel-upgrade") as lease:
                     report = upgrade_storage(self.source, self.destination, lease=lease)
-                self.assertEqual((report["source_version"], report["target_version"]), (version, 5))
+                self.assertEqual((report["source_version"], report["target_version"]), (version, 12))
                 copied = self._historical_rows(self.destination)
                 self.assertEqual({table: copied[table] for table in original}, original)
-                if version in (4, 5):
+                if version in (4, 5, 6, 7, 8, 9, 10, 11, 12):
                     with closing(sqlite3.connect(self.source)) as source, closing(sqlite3.connect(self.destination)) as target:
                         for table in ("kernel_execution_limits", "kernel_supervision", "kernel_progress_keys"):
                             self.assertEqual(target.execute(f"SELECT * FROM {table}").fetchall(),
                                              source.execute(f"SELECT * FROM {table}").fetchall())
+                if version in (11, 12):
+                    with closing(sqlite3.connect(self.source)) as source, closing(sqlite3.connect(self.destination)) as target:
+                        for table in ("kernel_lifecycle_producers", "kernel_lifecycle_outbox"):
+                            self.assertEqual(target.execute(f"SELECT * FROM {table}").fetchall(),
+                                             source.execute(f"SELECT * FROM {table}").fetchall())
+                        expected_watermark = 13 if version == 11 else source.execute(
+                            "SELECT legacy_max_sequence FROM kernel_lifecycle_metadata WHERE singleton=1"
+                        ).fetchone()[0]
+                        self.assertEqual(target.execute(
+                            "SELECT legacy_max_sequence FROM kernel_lifecycle_metadata WHERE singleton=1"
+                        ).fetchone()[0], expected_watermark)
                 with SQLiteKernel(self.destination):
                     pass
 
@@ -142,6 +168,51 @@ class KernelOnlyMigrationTests(unittest.TestCase):
         with closing(sqlite3.connect(self.source)) as connection:
             self.assertEqual(connection.execute("SELECT schema_version FROM kernel_schema_meta").fetchone()[0], 3)
 
+    def test_v5_copy_preserves_membership_and_rejects_old_writer_schema(self):
+        self._seed(KERNEL_SCHEMA_V5)
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.execute("INSERT INTO kernel_run_controls VALUES('run',2,1,'paused',9,4,500)")
+            connection.execute("INSERT INTO kernel_managed_executions VALUES('sdk-managed:old','run',1,0)")
+            connection.commit()
+            before_tables = {name: connection.execute(f"SELECT * FROM {name}").fetchall()
+                             for (name,) in connection.execute(
+                                 "SELECT name FROM sqlite_master WHERE type='table' "
+                                 "AND name LIKE 'kernel_%' AND name != 'kernel_schema_meta'")}
+        before = self._historical_rows(self.source)
+        with self.assertRaises(StorageIsolationError):
+            SQLiteKernel(self.source)
+        with maintenance_lease(self.source, "tests", "kernel-upgrade") as lease:
+            report = upgrade_storage(self.source, self.destination, lease=lease)
+        self.assertEqual((report["source_version"], report["target_version"]), (5, 12))
+        self.assertEqual(self._historical_rows(self.source), before)
+        self.assertEqual(self._historical_rows(self.destination), before)
+        with closing(sqlite3.connect(self.destination)) as connection:
+            for name, rows in before_tables.items():
+                self.assertEqual(connection.execute(f"SELECT * FROM {name}").fetchall(), rows)
+            with self.assertRaises(StorageIsolationError):
+                validate_kernel_schema_v5(connection)
+            connection.execute("INSERT INTO kernel_managed_executions VALUES('old-execution','run',1,0)")
+            connection.rollback()
+        with SQLiteKernel(self.destination):
+            pass
+
+    def test_v6_ordinary_nonprefixed_submit_and_claim(self):
+        command = ExecutionCommandV2("ordinary", "ordinary-key", "test-registry",
+                                     "other", None, "work", 1, RetryPolicy(), 30, {})
+        with SQLiteKernel(self.source) as kernel:
+            kernel.submit(command)
+            lease = kernel.claim("worker", registry_revision="test-registry")
+            self.assertEqual(lease.execution_id, "ordinary")
+
+    def test_v5_weakened_schema_is_not_copied(self):
+        self._seed(KERNEL_SCHEMA_V5.replace(
+            "length(trim(execution_id)) > 0 AND substr(execution_id, 1, 12) = 'sdk-managed:'",
+            "length(trim(execution_id)) > 0", 1))
+        with maintenance_lease(self.source, "tests", "kernel-upgrade") as lease:
+            with self.assertRaises(StorageMigrationError):
+                upgrade_storage(self.source, self.destination, lease=lease)
+        self.assertFalse(self.destination.exists())
+
     def test_v4_open_budget_copy_preserves_facts_and_rejects_unproven_recovery(self):
         command = ExecutionCommandV2("parent", "parent", "registry", "migration", None,
                                      "work", 1, RetryPolicy(), 30, {})
@@ -154,7 +225,35 @@ class KernelOnlyMigrationTests(unittest.TestCase):
             original = kernel.get("parent").to_dict()
         # Retain exact v4 data and layout, lacking the new sampling guard.
         with closing(sqlite3.connect(self.source)) as connection:
+            connection.execute("DROP TABLE kernel_lifecycle_outbox")
+            connection.execute("DROP TABLE kernel_lifecycle_producers")
+            connection.execute("DROP TABLE kernel_lifecycle_retired")
+            connection.execute("DROP TABLE kernel_lifecycle_metadata")
+            connection.execute("DROP TABLE kernel_control_takeovers")
+            connection.execute("DROP TABLE kernel_projection_requirements")
+            connection.execute("DROP TABLE kernel_projection_declarations")
+            connection.execute("DROP TABLE kernel_projection_receipts")
+            connection.execute("DROP TABLE kernel_supervisor_obligations")
+            connection.execute("DROP TABLE kernel_control_pause_pages")
+            connection.execute("DROP TABLE kernel_run_authorities")
+            connection.execute("DROP TABLE kernel_revision_installs")
+            connection.execute("DROP TABLE kernel_legacy_imports")
+            connection.execute("DROP TABLE kernel_legacy_import_pages")
+            connection.execute("DROP TABLE kernel_legacy_pending_commands")
+            connection.execute("DROP TABLE kernel_revision_content_pages")
+            connection.execute("DROP TABLE kernel_resume_receipts")
+            connection.execute("DROP TABLE kernel_activation_receipts")
+            connection.execute("DROP TABLE kernel_initial_admission_bindings")
+            connection.execute("DROP TABLE kernel_budget_dependencies")
+            connection.execute("DROP TABLE kernel_budget_policies")
+            connection.execute("DROP INDEX kernel_effects_execution_state")
+            connection.execute("DROP INDEX kernel_pause_membership_order")
+            connection.execute("DROP TABLE kernel_control_pause_receipts")
+            connection.execute("DROP TABLE kernel_store_identity")
             connection.execute("DROP TABLE kernel_budget_samples")
+            connection.execute("DROP TABLE kernel_managed_executions")
+            connection.execute(_schema_statement_for("kernel_managed_executions", KERNEL_SCHEMA_V4))
+            connection.execute(_schema_statement_for("kernel_managed_executions_run", KERNEL_SCHEMA_V4))
             connection.execute("DROP TABLE kernel_schema_meta")
             connection.execute(_schema_statement_for("kernel_schema_meta", KERNEL_SCHEMA_V4))
             connection.execute("INSERT INTO kernel_schema_meta VALUES('execution_kernel',4)")
@@ -276,7 +375,7 @@ class StorageMigrationTests(unittest.TestCase):
             report = upgrade_storage(self.source, self.destination, lease=lease)
 
         self.assertEqual(self._stored_rows(self.source), before_rows)
-        self.assertEqual((report["source_version"], report["target_version"]), (2, 4))
+        self.assertEqual((report["source_version"], report["target_version"]), (2, 6))
         self.assertTrue(report["source_unchanged"])
         self.assertFalse(report["automatic_cutover"])
         self.assertFalse(report["resumable"])
@@ -332,7 +431,7 @@ class StorageMigrationTests(unittest.TestCase):
         with maintenance_lease(self.source, "test", "upgrade", lease_seconds=30) as lease:
             report = upgrade_storage(self.source, self.destination, lease=lease)
 
-        self.assertEqual((report["source_version"], report["target_version"]), (3, 4))
+        self.assertEqual((report["source_version"], report["target_version"]), (3, 6))
         self.assertEqual(self._stored_rows(self.source), before_rows)
         with self.assertRaisesRegex(ValueError, "unsupported orchestration schema"):
             Orchestrator(self.source, object())
@@ -377,7 +476,7 @@ class StorageMigrationTests(unittest.TestCase):
         with maintenance_lease(self.source, "test", "upgrade", lease_seconds=30) as lease:
             report = upgrade_storage(self.source, self.destination, lease=lease)
 
-        self.assertEqual((report["source_version"], report["target_version"]), (3, 4))
+        self.assertEqual((report["source_version"], report["target_version"]), (3, 6))
         self.assertEqual(self._stored_rows(self.source), before_rows)
         with self.assertRaises(StorageIsolationError):
             SQLiteKernel(self.source)

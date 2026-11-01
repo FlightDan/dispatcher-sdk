@@ -1,11 +1,15 @@
 from collections import deque
+from concurrent.futures import Future
+from dataclasses import replace
 import json
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 from dispatcher_sdk.execution_kernel.host import RuntimeHost
+from dispatcher_sdk.execution_kernel.pending_settlements import PendingSettlements
+from dispatcher_sdk.execution_kernel.runtime import InProcessRuntime
 from dispatcher_sdk.orchestrator.host import (
     OrchestratorHost,
     OrchestratorHostTimeoutError,
@@ -75,6 +79,65 @@ def phase(report, name):
 
 
 class HostStopReportTests(unittest.TestCase):
+    def test_stop_report_exposes_only_nonblocking_local_obligations(self):
+        runtime = InProcessRuntime.__new__(InProcessRuntime)
+        runtime._lifecycle_lock = threading.RLock()
+        runtime._thread_lock = threading.RLock()
+        runtime._process_registration_events = {("running", 1, 2): object()}
+        runtime._process_supervisors = {("retained", 3, 4): object()}
+        runtime._thread_authority_by_execution = {("thread", 2, 5): object()}
+        runtime._pending_settlements = PendingSettlements()
+        runtime._diagnostic_pending_lock = threading.Lock()
+        runtime._diagnostic_pending = {}
+        runtime._diagnostic_unknown_handoffs = {('unknown', 2, 3)}
+        runtime._diagnostic_failed_executions = {'unretained'}
+        runtime._diagnostic_pending_overflow = False
+        host = RuntimeHost(runtime, Bridge(), worker_count=1)
+        host._stop_started_at = time.monotonic()
+        report = host.stop_report
+        self.assertEqual(report.obligation_scope, "in_process_partial")
+        self.assertEqual(report.active_execution_identities,
+            (("retained", 3, 4), ("running", 1, 2), ("thread", 2, 5)))
+        self.assertEqual(report.pending_settlement_count, 0)
+        self.assertEqual(report.pending_diagnostic_count, 0)
+        self.assertEqual(report.unknown_diagnostic_handoff_count, 1)
+        self.assertEqual(report.failed_diagnostic_execution_count, 1)
+        self.assertFalse(report.diagnostic_retention_overflow)
+        self.assertIsNone(report.pending_cleanup_count)
+        self.assertIsNone(report.pending_effect_count)
+
+        acquired = threading.Event()
+        release = threading.Event()
+        def hold_locks():
+            with runtime._lifecycle_lock, runtime._pending_settlements._lock:
+                acquired.set()
+                release.wait(2)
+        thread = threading.Thread(target=hold_locks)
+        thread.start()
+        try:
+            self.assertTrue(acquired.wait(1))
+            report = host.stop_report
+            self.assertIsNone(report.active_execution_identities)
+            self.assertIsNone(report.pending_settlement_count)
+        finally:
+            release.set()
+            thread.join(2)
+
+    def test_worker_failure_reports_known_execution_identity(self):
+        host = RuntimeHost(ClosingRuntime(), Bridge(), worker_count=1)
+        failure = RuntimeError("worker failed")
+        failure.execution_context = {"execution_id": "exec-1", "attempt": 2, "fence": 3,
+                                     "phase": "invocation", "process_cleanup": "unknown",
+                                     "diagnostic_saved": False}
+        future = Future()
+        future.set_exception(failure)
+        host._futures.add(future)
+        host._collect_workers()
+        error = host.health().last_error
+        self.assertEqual((error.execution_id, error.attempt, error.fence), ("exec-1", 2, 3))
+        self.assertEqual(error.process_cleanup, "unknown")
+        self.assertFalse(error.diagnostic_saved)
+
     def test_nonfinite_stop_timeouts_are_rejected_before_state_changes(self):
         for started in (False, True):
             host = RuntimeHost(ClosingRuntime(), Bridge(), worker_count=1)
@@ -118,6 +181,19 @@ class HostStopReportTests(unittest.TestCase):
         self.assertEqual(host.stop_report.status, "timed_out")
         self.assertTrue(host.stop(timeout=1))
         self.assertEqual(host.stop_report.status, "completed")
+
+    def test_orchestrator_stop_report_preserves_unknown_diagnostic_counts(self):
+        host = OrchestratorHost(Orchestrator(ClosingRuntime()))
+        host.runtime_host.stop(timeout=1)
+        base = host.runtime_host.stop_report
+        retained = replace(base, unknown_diagnostic_handoff_count=2,
+                           failed_diagnostic_execution_count=3)
+        host._stop_started_at = time.monotonic()
+        with patch.object(RuntimeHost, 'stop_report', new_callable=PropertyMock,
+                          return_value=retained):
+            report = host.stop_report
+        self.assertEqual(report.unknown_diagnostic_handoff_count, 2)
+        self.assertEqual(report.failed_diagnostic_execution_count, 3)
 
     def test_cleanup_failure_does_not_hide_a_still_running_notification_thread(self):
         entered, release = threading.Event(), threading.Event()
@@ -193,6 +269,12 @@ class HostStopReportTests(unittest.TestCase):
             self.assertIn("runtime_close", report.unfinished_phases)
             self.assertEqual(report.active_worker_count, 0)
             self.assertTrue(report.can_continue_waiting)
+            self.assertIsNotNone(report.last_progress_at)
+            self.assertIsNone(report.active_execution_identities)
+            self.assertIsNone(report.pending_settlement_count)
+            self.assertIsNone(report.pending_effect_count)
+            self.assertIsNone(report.pending_cleanup_count)
+            self.assertEqual(report.obligation_scope, "not_inspected")
             json.dumps(report.to_dict())
 
             runtime.close_release.set()

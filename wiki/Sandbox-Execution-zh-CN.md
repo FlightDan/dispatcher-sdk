@@ -33,6 +33,6 @@ OpenSandbox 适配器支持 create/find/start/inspect/collect/terminate，能够
 响应丢失、非零退出、输出截断和带引号的产物路径。这些结果说明功能和恢复边界可用，
 不等于生产安全认证或性能认证。
 
-部署前请阅读[沙箱运行时契约](../docs/SANDBOX_RUNTIME.md)、
-[适配器限制](../docs/SANDBOX_ADAPTERS.md)和
-[OpenSandbox 验证记录](../docs/OPENSANDBOX_VALIDATION.md)。
+部署前请阅读[沙箱运行时契约](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_RUNTIME.md)、
+[适配器限制](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_ADAPTERS.md)和
+[OpenSandbox 验证记录](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/OPENSANDBOX_VALIDATION.md)。

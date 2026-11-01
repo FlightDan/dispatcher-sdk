@@ -24,6 +24,7 @@ The SDK does not invoke a model or choose business routing.
 | Handle opt-in stall notices with reserved supervisor capacity | [Execution activity and supervision](../docs/EXECUTION_OBSERVABILITY.md) | [managed_stall_supervisor.py](../examples/managed_stall_supervisor.py) |
 | Execute through a remote sandbox | [Sandbox runtime](../docs/SANDBOX_RUNTIME.md), [adapters](../docs/SANDBOX_ADAPTERS.md) | Validation commands in those guides |
 | Upgrade, back up, or grow a persistent deployment | [Storage and upgrades](../docs/STORAGE_AND_UPGRADES.md) | Preflight and backup examples in that guide |
+| Evaluate split-store adoption and a paused revision | [Split-store adoption](../docs/SPLIT_STORE_ADOPTION.md), [host authority](../docs/KERNEL_HOST_AUTHORITY.md) | Development interfaces; check the [implementation status](../docs/SDK_0_7_2_IMPLEMENTATION_STATUS.md) before use |
 
 Before submitting an integration, review [contracts and pitfalls](CONTRACTS.md)
 and run the applicable [verification steps](VERIFICATION.md).
@@ -39,6 +40,9 @@ for current platform coverage and unfinished verification.
 - Read the documentation from the same checkout or release as the installed
   SDK. Check [storage compatibility](../docs/STORAGE_AND_UPGRADES.md) before
   opening an existing deployment with a different version.
+- This checkout describes unreleased `0.7.3.dev1` development interfaces.
+  The released `0.7.2` package has a different API and storage layout; do not
+  infer live host isolation or real Run acceptance from synthetic tests.
 - Keep API definitions and detailed behavior in `docs/`. When changing a
   contract, update its canonical guide and examples, then adjust these links
   and summaries as needed.

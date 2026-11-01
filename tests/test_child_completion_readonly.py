@@ -47,8 +47,8 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         path.write_text(json.dumps(self.evidence, indent=2), encoding='utf-8')
         print('child_completion_readonly_evidence=' + str(path), flush=True)
 
-    def completed_child(self, *, failure=None):
-        envelope = self.budget.derive(source='tool', origin_id='original-child-call', timeout_seconds=.5)
+    def completed_child(self, *, failure=None, timeout_seconds=.5):
+        envelope = self.budget.derive(source='tool', origin_id='original-child-call', timeout_seconds=timeout_seconds)
         command = replace(self.command, execution_id='child', idempotency_key='child',
             causation_id=self.command.execution_id)
         self.kernel.submit_child(command, self.lease, envelope)
@@ -284,8 +284,8 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
                 self.evidence['records'].append({'scenario': 'stale_parent_before_response',
                     'field': field, 'code': caught.exception.code})
 
-    def live_completed_response(self):
-        _, window, result = self.completed_child()
+    def live_completed_response(self, *, timeout_seconds=.5):
+        _, window, result = self.completed_child(timeout_seconds=timeout_seconds)
         row = self.children._enqueue(request_id='live-negative-response', child_id='child',
             action='observe', child_command=None, envelope=window.envelope, window=window)
         self.children.store.finish(row, 'completed', result=result.to_dict())
@@ -388,7 +388,7 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         self.foreign_guard_blocks_live_response(ancestor=True)
 
     def test_live_delivery_resumes_exact_pending_owner_within_original_window(self):
-        row, window, result = self.live_completed_response()
+        row, window, result = self.live_completed_response(timeout_seconds=3)
         original_deadline = window.deadline
         writer = sqlite3.connect(self.kernel.db_path, timeout=.1)
         original_begin = self.kernel._begin_budget_sample

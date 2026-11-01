@@ -152,6 +152,15 @@ class PendingSettlements:
     def identities(self) -> tuple[dict[str, Any], ...]:
         return tuple(entry.identity for entry in self.entries(limit=self._capacity))
 
+    def try_pending_count(self) -> int | None:
+        """Return the local retained count without delaying a stop report."""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            return len(self._entries)
+        finally:
+            self._lock.release()
+
 
 __all__ = ["PendingSettlements", "PendingSettlement", "SettlementAdmission",
            "SettlementKey", "PendingSettlementConflictError"]

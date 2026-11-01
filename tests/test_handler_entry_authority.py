@@ -867,25 +867,22 @@ class AdmissionContentionTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "requires POSIX process containment")
     def test_process_restore_uses_remaining_original_startup_window(self):
-        runtime, marker = self.runtime(mode="process", startup=.7,
+        runtime, marker = self.runtime(mode="process", startup=1.2,
                                        handler=self.SlowRestoreHandler())
-        ready, held, busy, failures = self.contend(runtime)
         identifier = self.submit(runtime, "slow-restore")
-        driver, results, errors = self.drive(runtime, identifier)
-        self.assertTrue(ready.wait(2))
-        writer = self.writer(runtime.kernel.db_path)
-        held.set()
-        self.assertTrue(busy.wait(1))
-        wait_end = time.monotonic() + 1
-        while len(failures) < 3 and time.monotonic() < wait_end:
-            time.sleep(.01)
-        self.assertGreaterEqual(len(failures), 3)
-        writer.rollback()
-        driver.join(2)
-        self.assertFalse(driver.is_alive())
-        self.assertEqual(errors, [])
-        self.assertEqual(results[0].state, "failed")
-        self.assertEqual(results[0].result.error.code, "handler_process_start_failure")
+        original = runtime.kernel._prepare_handler_entry
+
+        def delayed_admission(lease, **kwargs):
+            # Spend part of the original startup window before process
+            # creation without introducing an unrelated SQLite writer that
+            # could interrupt the supervisor's budget-clock capture.
+            time.sleep(.85)
+            return original(lease, **kwargs)
+
+        with patch.object(runtime.kernel, "_prepare_handler_entry", side_effect=delayed_admission):
+            result = runtime.run_once(execution_id=identifier)
+        self.assertEqual(result.state, "failed", result.to_dict())
+        self.assertEqual(result.result.error.code, "handler_process_start_failure", result.to_dict())
         self.assertFalse(marker.exists())
 
     def test_stop_interrupts_pending_admission_without_business(self):

@@ -13,7 +13,7 @@ from ..content import CONTENT_SCHEMA, decode_value, encode_value
 from .contracts import CommandConflict, OrchestrationError, HistoryExpired, EventCursorExpired, RunDisposed, TERMINAL, canonical
 
 
-ORCHESTRATOR_SCHEMA_VERSION = 4
+ORCHESTRATOR_SCHEMA_VERSION = 6
 def _schema_marker(version: int) -> str:
     return f"""
 CREATE TABLE IF NOT EXISTS sdk_schema_meta (
@@ -160,8 +160,119 @@ CREATE TABLE IF NOT EXISTS sdk_managed_cleanup_obligations (
 CREATE INDEX IF NOT EXISTS sdk_managed_cleanup_pending
  ON sdk_managed_cleanup_obligations(run_id,state,control_epoch,execution_id);
 """
-SCHEMA_V4_INSTALL = _schema_marker(ORCHESTRATOR_SCHEMA_VERSION) + SCHEMA_V4_ADDITIONS
-SCHEMA = _schema_marker(ORCHESTRATOR_SCHEMA_VERSION) + _V3_BODY + SCHEMA_V4_ADDITIONS
+SCHEMA_V4_INSTALL = _schema_marker(4) + SCHEMA_V4_ADDITIONS
+SCHEMA_V4 = _schema_marker(4) + _V3_BODY + SCHEMA_V4_ADDITIONS
+# Stream pointers are also the durable direct-JSON mode marker for a Run.
+# Retention must keep at least one pointer while its Run and current state exist;
+# historical read availability still depends on retaining the relevant pointer
+# and the host-retained projection store. Run disposal may remove all pointers.
+SCHEMA_V5_ADDITIONS = """
+CREATE TABLE IF NOT EXISTS sdk_dispatch_permits (
+ sequence INTEGER PRIMARY KEY, run_id TEXT NOT NULL, execution_id TEXT NOT NULL,
+ generation INTEGER NOT NULL, control_epoch INTEGER NOT NULL, kernel_store_id TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('in_flight','unknown','accepted')),
+ created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS sdk_dispatch_permits_run_state
+ ON sdk_dispatch_permits(run_id,state,sequence);
+CREATE TABLE IF NOT EXISTS sdk_control_operations (
+ operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, kind TEXT NOT NULL,
+ source_revision INTEGER NOT NULL, source_epoch INTEGER NOT NULL,
+ generation INTEGER NOT NULL, max_claims INTEGER NOT NULL, deadline_at REAL NOT NULL,
+ orchestrator_store_id TEXT NOT NULL,
+ orchestrator_incarnation TEXT NOT NULL, kernel_store_id TEXT NOT NULL,
+ authorized_principal TEXT NOT NULL, delegation_id TEXT,
+ phase TEXT NOT NULL CHECK(phase IN ('preparing','prepared')),
+ kernel_receipt TEXT, kernel_pause_receipt TEXT, orchestrator_pause_receipt TEXT, prepared_evidence TEXT,
+ error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS sdk_control_operations_run
+ ON sdk_control_operations(run_id,phase);
+CREATE TABLE IF NOT EXISTS sdk_control_capture_pages (
+ operation_id TEXT NOT NULL, round_id INTEGER NOT NULL, page INTEGER NOT NULL, receipt TEXT NOT NULL,
+ PRIMARY KEY(operation_id,round_id,page));
+CREATE TABLE IF NOT EXISTS sdk_control_capture_rounds (
+ operation_id TEXT NOT NULL, round_id INTEGER NOT NULL, max_items INTEGER NOT NULL,
+ PRIMARY KEY(operation_id,round_id));
+CREATE TABLE IF NOT EXISTS sdk_control_delegations (
+ delegation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, action TEXT NOT NULL,
+ principal TEXT NOT NULL, granted_by TEXT NOT NULL, expires_at REAL NOT NULL,
+ revoked_at REAL, revoked_by TEXT, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_control_authority_clock (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), observed_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_revision_decisions (
+ operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, request_id TEXT NOT NULL,
+ source_revision INTEGER NOT NULL, source_epoch INTEGER NOT NULL,
+ source_generation INTEGER NOT NULL, target_generation INTEGER NOT NULL,
+ deployment TEXT NOT NULL, migration_version TEXT NOT NULL, application_projection_version TEXT NOT NULL,
+ source_application_state TEXT NOT NULL, target_application_state TEXT NOT NULL,
+ decision TEXT NOT NULL, authorized_principal TEXT NOT NULL, delegation_id TEXT,
+ kernel_install_receipt TEXT, orchestrator_install_receipt TEXT,
+ created_at REAL NOT NULL, UNIQUE(run_id,request_id));
+CREATE TABLE IF NOT EXISTS sdk_legacy_adoptions (
+ operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE, source_revision INTEGER NOT NULL,
+ immutable_evidence TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('staging','paused')),
+ created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_legacy_adoption_pages (
+ operation_id TEXT NOT NULL, page_seq INTEGER NOT NULL, manifest TEXT NOT NULL,
+ kernel_receipt TEXT, PRIMARY KEY(operation_id,page_seq));
+CREATE TABLE IF NOT EXISTS sdk_revision_content_pages (
+ operation_id TEXT NOT NULL, content_kind TEXT NOT NULL, page_seq INTEGER NOT NULL,
+ page TEXT NOT NULL, kernel_receipt TEXT,
+ PRIMARY KEY(operation_id,content_kind,page_seq));
+CREATE TABLE IF NOT EXISTS sdk_control_lease_fences (
+ run_id TEXT PRIMARY KEY, fence INTEGER NOT NULL, lease_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_revision_activations (
+ operation_id TEXT PRIMARY KEY, decision_id TEXT NOT NULL UNIQUE,
+ envelope TEXT NOT NULL, kernel_receipt TEXT, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_revision_resumes (
+ operation_id TEXT PRIMARY KEY, decision_id TEXT NOT NULL UNIQUE,
+ envelope TEXT NOT NULL, kernel_receipt TEXT, orchestrator_receipt TEXT, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_cancellation_fences (
+ operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, generation INTEGER NOT NULL,
+ kernel_store_id TEXT NOT NULL, orchestrator_store_id TEXT NOT NULL, orchestrator_incarnation TEXT NOT NULL,
+ kernel_epoch INTEGER NOT NULL, kernel_receipt TEXT, orchestrator_receipt TEXT, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_cancellation_actions (
+ operation_id TEXT PRIMARY KEY, fence_operation_id TEXT NOT NULL, request TEXT NOT NULL,
+ receipt TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_streamed_projection_pointers (
+ run_id TEXT NOT NULL, revision INTEGER NOT NULL, pointer TEXT NOT NULL,
+ PRIMARY KEY(run_id,revision));
+CREATE TABLE IF NOT EXISTS sdk_revision_budget_policies (
+ operation_id TEXT PRIMARY KEY, policy TEXT NOT NULL, kernel_receipt TEXT NOT NULL);
+"""
+SCHEMA_V5 = _schema_marker(5) + _V3_BODY + SCHEMA_V4_ADDITIONS + SCHEMA_V5_ADDITIONS
+SCHEMA_V6_ADDITIONS = """
+CREATE TABLE IF NOT EXISTS sdk_control_lease_takeovers (
+ takeover_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, new_fence INTEGER NOT NULL,
+ claim TEXT NOT NULL, kernel_receipt TEXT, resolution TEXT, created_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS sdk_control_lease_takeovers_operation ON sdk_control_lease_takeovers(operation_id,new_fence);
+CREATE TABLE IF NOT EXISTS sdk_external_projection_requirements (
+ operation_id TEXT PRIMARY KEY, manifest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sdk_external_projection_receipts (
+ operation_id TEXT NOT NULL, participant_id TEXT NOT NULL, scope_id TEXT NOT NULL,
+ receipt TEXT NOT NULL, PRIMARY KEY(operation_id,participant_id,scope_id));
+"""
+SCHEMA = _schema_marker(6) + _V3_BODY + SCHEMA_V4_ADDITIONS + SCHEMA_V5_ADDITIONS + SCHEMA_V6_ADDITIONS
+
+
+def install_v6(connection):
+    """Install v6 on a validated private v5 copy in the caller's transaction."""
+    if tuple(connection.execute("SELECT component,version FROM sdk_schema_meta").fetchone() or ()) != ("orchestrator", 5):
+        raise OrchestrationError("v6 upgrade requires orchestration schema v5")
+    connection.execute("DROP TABLE sdk_schema_meta")
+    execute_schema(connection, _schema_marker(6) + SCHEMA_V6_ADDITIONS)
+    connection.execute("INSERT INTO sdk_schema_meta VALUES('orchestrator',6)")
+    initialize_storage_tracking(connection)
+
+
+
+def install_v5(connection):
+    """Install v5 on a validated private v4 copy within the caller's transaction."""
+    if tuple(connection.execute("SELECT component,version FROM sdk_schema_meta").fetchone() or ()) != ("orchestrator", 4):
+        raise OrchestrationError("v5 upgrade requires orchestration schema v4")
+    connection.execute("DROP TABLE sdk_schema_meta")
+    execute_schema(connection, _schema_marker(5) + SCHEMA_V5_ADDITIONS)
+    connection.execute("INSERT INTO sdk_schema_meta VALUES('orchestrator',5)")
+    initialize_storage_tracking(connection)
 
 
 def execute_schema(connection, script):
@@ -305,6 +416,8 @@ class StoreMixin:
                  "tasks": {}, "waits": {}, "signals": {}}
         attempts = []
         for row in rows:
+            if row[0] == "root" and row[1] == "application_state" and isinstance(row[2], str) and row[2].startswith("sdk-projection-stream-v1:"):
+                raise OrchestrationError("streamed application state requires iter_installed_application_projection")
             section, key, value = row[0], row[1], decode_value(connection, row[2])
             if section == "root":
                 state[key] = value
@@ -431,6 +544,40 @@ class StoreMixin:
             "INSERT INTO sdk_retention_times VALUES('revision',?,(julianday('now')-2440587.5)*86400.0)",
             (canonical([state["run_id"], state["revision"]]),))
         for section, key, value in cls._item_values(state, changes):
+            if section == "root" and key == "application_state":
+                streamed = connection.execute(
+                    "SELECT i.value FROM sdk_run_items i WHERE i.run_id=? AND i.section='root' "
+                    "AND i.item_key='application_state' AND EXISTS (SELECT 1 FROM sdk_streamed_projection_pointers p "
+                    "WHERE p.run_id=i.run_id) AND substr(i.value,1,?) != ?",
+                    (state["run_id"], len("sdk-content-v1:"), "sdk-content-v1:"),
+                ).fetchone()
+                if streamed is not None:
+                    # Preserve the installed exact bytes and historical pointer. Ordinary
+                    # reducers may carry this value forward. A changed value gets a new
+                    # direct JSON history row, so the prior pointer remains historical.
+                    try:
+                        new_value = canonical(value)
+                        unchanged = canonical(json.loads(streamed[0])) == new_value
+                    except (TypeError, ValueError, RecursionError) as error:
+                        raise OrchestrationError("installed streamed application state is invalid") from error
+                    if unchanged:
+                        continue
+                    if len(new_value.encode("utf-8")) > 64 * 1024 * 1024:
+                        raise OrchestrationError("application state exceeds the streamed projection limit")
+                    from .projection_json import _Validator, ProjectionJSONError
+                    try:
+                        validator = _Validator(64)
+                        validator.feed(new_value)
+                        validator.finish()
+                    except ProjectionJSONError as error:
+                        raise OrchestrationError("application state exceeds supported JSON limits") from error
+                    connection.execute(
+                        "UPDATE sdk_run_items SET value=? WHERE run_id=? AND section='root' AND item_key='application_state'",
+                        (new_value, state["run_id"]),
+                    )
+                    connection.execute("INSERT INTO sdk_run_history VALUES(?,?,?,?,?)",
+                        (state["run_id"], "root", "application_state", state["revision"], new_value))
+                    continue
             encoded = (encode_value(connection, value)
                        if section == "root" and key in {"application_state", "input", "definition"}
                        else canonical(value))

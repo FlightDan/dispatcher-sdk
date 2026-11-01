@@ -30,6 +30,14 @@ class StorageIsolationError(ExecutionKernelError):
     pass
 
 
+class BudgetScanContinuation(ExecutionKernelError):
+    """A bounded claim scan has more candidates; retry with ``cursor``."""
+
+    def __init__(self, cursor: dict) -> None:
+        self.cursor = cursor
+        super().__init__("application budget scan requires continuation")
+
+
 class StaleFenceError(ExecutionKernelError):
     def __init__(self, message: str, *, context: Mapping[str, Any] | None = None) -> None:
         self.context = dict(context or {})
@@ -111,3 +119,7 @@ class EffectRecoveryRequiredError(EffectIndeterminateError):
     def __init__(self, effect_id: str, message: str = "effect requires explicit recovery") -> None:
         self.effect_id = effect_id
         super().__init__(f"{message}: {effect_id}")
+
+
+class LifecycleReceiptExpiredError(ExecutionKernelError):
+    """The delivered payload was pruned after the explicit replay cutoff."""
