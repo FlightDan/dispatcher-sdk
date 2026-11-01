@@ -394,12 +394,26 @@ class ManagedStallSupervisorTests(unittest.TestCase):
         # business tasks. This keeps the pending-notice assertions above as
         # the capacity-shortage witness and prevents teardown from racing a
         # second admission or its diagnostic persistence.
-        try:
-            app._managed_stall_supervisor.close(timeout=20)
-        except _UnpersistedDiagnosticsError:
-            # Runtime.close retains diagnostic obligations and explicitly
-            # retries them on a subsequent close call.
-            app._managed_stall_supervisor.close(timeout=20)
+        close_deadline = time.monotonic() + 20
+        last_close_error = None
+        while True:
+            remaining = close_deadline-time.monotonic()
+            if remaining <= 0:
+                assert last_close_error is not None
+                raise last_close_error
+            try:
+                app._managed_stall_supervisor.close(timeout=remaining)
+                break
+            except _UnpersistedDiagnosticsError as error:
+                # Runtime.close retains diagnostic obligations and explicitly
+                # retries them on a subsequent close call. Keep retrying only
+                # within this test's original close window; unresolved facts
+                # still fail the test before business tasks are released.
+                last_close_error = error
+                remaining = close_deadline-time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(.02, remaining))
         (self.root / "release").touch()
         for task in tasks:
             self.assertEqual("released", task.wait(timeout=20)["value"])

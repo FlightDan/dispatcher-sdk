@@ -68,11 +68,13 @@ class SupervisorCleanupScanTests(unittest.TestCase):
                         return invoke(**kwargs)
                 with patch.object(runtime_module, 'invoke_process_handler', side_effect=native_with_pending_capture), \
                      patch('dispatcher_sdk.execution_kernel._windows_runtime.invoke_windows_handler', side_effect=native_with_pending_capture), \
-                     patch.object(runtime, '_finish_received_budget_checkpoints', side_effect=TimeoutError('busy')):
+                     patch.object(runtime, '_finish_received_budget_checkpoints', side_effect=TimeoutError('busy')) as finish:
                     runtime.run_once(execution_id='replay')
-                record = runtime._settlement_journal.inspect('replay', timeout_seconds=1)[0]
-                self.assertEqual(record['evidence']['supervisor_not_invoked']['process_creation'], 'not_invoked')
-                self.assertEqual(runtime.kernel.inspect_supervisor_obligations('replay')['obligations'][0]['state'], 'unresolved')
+                    record = runtime._settlement_journal.inspect('replay', timeout_seconds=1)[0]
+                    self.assertEqual(record['evidence']['supervisor_not_invoked']['process_creation'], 'not_invoked')
+                    self.assertTrue(runtime._received_budget_checkpoints(record['evidence']))
+                    finish.assert_called()
+                    self.assertEqual(runtime.kernel.inspect_supervisor_obligations('replay')['obligations'][0]['state'], 'unresolved')
                 runtime.recover_completions(timeout_seconds=1)
                 obligation = runtime.kernel.inspect_supervisor_obligations('replay')['obligations'][0]
                 self.assertEqual(obligation['resolution']['source'], 'sdk_supervisor_not_invoked')

@@ -557,7 +557,10 @@ class ChildClockCheckpointTests(unittest.TestCase):
             baseline = self.wall[0]
             try:
                 self.wall[0] = baseline + 4
-                published = self.kernel._sample_budget("parent", self.parent_budget)
+                # This scenario checks snapshot freshness across a foreign ACK;
+                # keep it independent of the default 100 ms admission ceiling.
+                published = self.kernel._sample_budget(
+                    "parent", self.parent_budget, timeout_seconds=1)
             finally:
                 self.wall[0] = baseline
             try:

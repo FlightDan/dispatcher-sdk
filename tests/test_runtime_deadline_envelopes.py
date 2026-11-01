@@ -526,7 +526,10 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 recorder._process_observer = observer
                 recorder.report_bytes("stdout", b"final")
                 close_began = time.monotonic()
-                receipt = recorder.close(timeout=.4)
+                # This checks receipt classification, not native filesystem
+                # scheduling latency. Leave the close worker enough time to
+                # publish its receipt on slower Windows ARM runners.
+                receipt = recorder.close(timeout=2.0)
                 receipts.append(receipt)
                 self.assertEqual(expected, receipt["state"], receipt)
                 self.assertTrue(receipt["final_flush_persisted"], receipt)

@@ -68,7 +68,8 @@ class ExactHandoffInspectionTests(unittest.TestCase):
                 result = make_result(runtime.kernel, lease)
                 journal.record(lease, result, evidence={}, timeout_seconds=1)
                 for i in range(60):
-                    journal.note({'execution_id': 'execution', 'attempt': 3, 'fence': 4}, 'noise', {'index': i, 'padding': 'x' * 200})
+                    journal.note({'execution_id': 'execution', 'attempt': 3, 'fence': 4},
+                                 'noise', {'index': i, 'padding': 'x' * 200}, timeout_seconds=1)
                 identity = {'execution_id': 'execution', 'attempt': 2, 'fence': 3}
                 journal.note(identity, 'supervisor_spawn_intent', {'source': 'runtime_pre_spawn', 'cleanup': 'unknown'})
                 journal.record_supervisor_outcome(identity, fixture.RAW)

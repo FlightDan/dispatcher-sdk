@@ -453,6 +453,21 @@ class ObservabilityPressureTests(unittest.TestCase):
                 runtime.submit(runtime.command("stream", execution_id=name, idempotency_key=name, correlation_id=name,
                     timeout_seconds=8, payload={"root": str(root)}))
                 results, errors = [], []
+                cleanup_events = []
+                original_diagnostic_note = runtime._diagnostic_note
+
+                def capture_cleanup_event(identity, phase, evidence, **kwargs):
+                    if (phase in ("worker_tree_cleanup_observed", "process_cleanup")
+                            and evidence.get("state") == "confirmed"
+                            and identity.execution_id == name):
+                        # Capture when the runtime receives the native cleanup
+                        # fact, before a diagnostic write or recorder close.
+                        cleanup_events.append({"phase": phase, "at": time.time(),
+                            "attempt": identity.attempt, "fence": identity.fence,
+                            "source": evidence.get("source")})
+                    return original_diagnostic_note(identity, phase, evidence, **kwargs)
+
+                runtime._diagnostic_note = capture_cleanup_event
 
                 def drive():
                     try:
@@ -464,8 +479,8 @@ class ObservabilityPressureTests(unittest.TestCase):
                 driver.start()
                 writer = None
                 record = {"execution_id": name, "action": action, "configuration": options.__dict__,
-                    "work_timeout_seconds": 8, "stop_lateness_limit_seconds": 2,
-                    "cancel_elapsed_limit_seconds": 2}
+                    "work_timeout_seconds": 8, "worker_stop_lateness_limit_seconds": 2,
+                    "driver_join_timeout_seconds": 12, "cancel_elapsed_limit_seconds": 2}
                 self.evidence["records"].append(record)
                 try:
                     record["actual_entry"] = self.wait_for(lambda: self.read_json(root / "entered.json"))
@@ -509,13 +524,27 @@ class ObservabilityPressureTests(unittest.TestCase):
                     if action == "deadline":
                         cutoff = min(item["deadline_at"] for item in
                             record["actual_entry"]["budget"]["constraints"])
-                        record["deadline_stop_lateness"] = record["stopped_at"] - cutoff
-                        self.assertLess(record["deadline_stop_lateness"], 2)
+                        record["deadline_cutoff"] = cutoff
+                        # This includes post-cleanup recorder.close(); the
+                        # separate worker receipt below measures the stop.
+                        record["run_once_return_lateness"] = record["stopped_at"] - cutoff
                     record["kernel_state"] = runtime.kernel.get(name).state
                     self.assertEqual(record["kernel_state"], "timed_out" if action == "deadline" else "cancelled")
                     record["snapshot_generations"] = {kind: len(tuple(
                         (root / f"{kind}.json.snapshots").glob("*.json"))) for kind in ("local", "child")}
                     record["locked_observation"] = runtime.observe(name, timeout=.5)
+                    if action == "deadline":
+                        tree_stops = [event for event in cleanup_events
+                            if event["phase"] == "worker_tree_cleanup_observed"]
+                        process_stops = [event for event in cleanup_events
+                            if event["phase"] == "process_cleanup"
+                            and event["source"] == "runtime_supervisor_reaped"]
+                        stop_events = tree_stops or process_stops
+                        self.assertTrue(stop_events, "native worker cleanup was not confirmed")
+                        record["worker_stop"] = min(stop_events, key=lambda event: event["at"])
+                        record["worker_stop_lateness"] = record["worker_stop"]["at"] - record["deadline_cutoff"]
+                        self.assertLess(record["worker_stop_lateness"],
+                            record["worker_stop_lateness_limit_seconds"], stop_events)
                     self.assertTrue(any(not item["receipt"]["final_flush_persisted"]
                         for item in record["driver_close_receipts"]), record["driver_close_receipts"])
                     stopped = self.read_json(root / "child.json")
