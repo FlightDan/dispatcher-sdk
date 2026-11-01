@@ -439,21 +439,15 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
     def test_close_still_fails_closed_if_diagnostic_writer_remains_busy(self):
         self.submit("close-writer-busy")
         identity = {"execution_id": "close-writer-busy", "attempt": 0, "fence": 0}
-        self.runtime._diagnostic_retry_lock.acquire()
+        self.assertTrue(self.runtime._diagnostic_retry_lock.acquire())
         try:
             self.assertFalse(self.runtime._diagnostic_note(identity, "receipt", {"state": "unknown"},
                                                            timeout_seconds=.01))
             with self.assertRaises(_UnpersistedDiagnosticsError):
                 self.runtime.close()
-        except BaseException:
-            self.runtime._diagnostic_retry_lock.release()
-            raise
-        release = threading.Timer(.3, self.runtime._diagnostic_retry_lock.release)
-        release.start()
-        try:
-            self.runtime.close()
         finally:
-            release.join()
+            self.runtime._diagnostic_retry_lock.release()
+        self.runtime.close()
         self.assertEqual([n["phase"] for n in self.reopen_notes("close-writer-busy")], ["receipt"])
 
     def test_receiver_ack_survives_outbox_ack_failure(self):

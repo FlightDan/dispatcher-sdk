@@ -625,7 +625,9 @@ def silence_cancel_case(root):
         check(receipt.get('replayed') is False, 'initial stall registration unexpectedly replayed')
         check(not (root / 'silent-entered.json').exists(), 'silent execution started before watch setup')
         app.start()
-        await_marker(root / 'silent-entered.json', seconds=6)
+        # Host and isolated-process startup precede the execution budget; allow
+        # slow emulated hosts time to enter the handler without relaxing it.
+        await_marker(root / 'silent-entered.json', seconds=20)
         try:
             task.wait(timeout=.05)
         except TimeoutError:

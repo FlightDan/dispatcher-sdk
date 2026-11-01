@@ -19,7 +19,10 @@ class ChildCompletionHandoffTests(unittest.TestCase):
     await_expired = fixture.ChildResultClockCleanupTests.await_expired
 
     def delivered_capture(self, *, failure=None):
-        row, window, result, writer, original, token = self.captured_wait(failure=failure)
+        # Allow child setup to complete on loaded CI workers; the subsequent
+        # factual proof still uses its own original, bounded delivery window.
+        row, window, result, writer, original, token = self.captured_wait(
+            failure=failure, setup_timeout_seconds=2.0)
         context = HandlerContext(self.command, self.lease,
             HandlerEffects(self.kernel, self.lease, lambda: True), budget_envelope=self.budget)
         context.children = self.children

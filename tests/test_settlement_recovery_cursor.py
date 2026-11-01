@@ -149,6 +149,7 @@ class SettlementRecoveryCursorTests(unittest.TestCase):
         with patch('dispatcher_sdk.execution_kernel.runtime.registry_revision', return_value='host-supplied'), \
              patch('dispatcher_sdk.execution_kernel.runtime.handler_revision', return_value='host-supplied'):
             runtime = Kernel.open_sqlite(path, {'work': handler}, isolation_mode='thread')
+            self.addCleanup(runtime.close)
             cmd = runtime.command('work', execution_id='large', idempotency_key='large',
                                   correlation_id='large', timeout_seconds=120, payload={})
             runtime.submit(cmd)
@@ -163,12 +164,17 @@ class SettlementRecoveryCursorTests(unittest.TestCase):
                 'cleanup': 'confirmed', 'source': 'runtime_supervisor_reaped', 'result': 'accepted'}}, timeout_seconds=1)
             # The first reopened background loop reports the default size refusal.
             runtime = Kernel.open_sqlite(path, {'work': handler}, isolation_mode='thread')
+            self.addCleanup(runtime.close)
             runtime.run_once(execution_id='no-such-execution')
             deadline = time.monotonic() + 5
-            while runtime.settlement_recovery_diagnostic is None and time.monotonic() < deadline:
-                time.sleep(.02)
             diagnostic = runtime.settlement_recovery_diagnostic
-            self.assertEqual(diagnostic['execution_id'], 'large')
+            while (not diagnostic or diagnostic.get('execution_id') != 'large' or
+                   diagnostic.get('required_bytes') is None) and time.monotonic() < deadline:
+                time.sleep(.02)
+                diagnostic = runtime.settlement_recovery_diagnostic
+            self.assertIsNotNone(diagnostic)
+            self.assertEqual(diagnostic['execution_id'], 'large', diagnostic)
+            self.assertIsNotNone(diagnostic['required_bytes'], diagnostic)
             self.assertGreater(diagnostic['required_bytes'], 256 * 1024)
             self.assertEqual(runtime.kernel.get('large').state, 'running')
             runtime.close()

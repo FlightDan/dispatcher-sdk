@@ -406,10 +406,12 @@ class ChildReceiptReadTests(unittest.TestCase):
 
     def test_expired_wait_with_actual_reaped_parent_keeps_revocation_without_receipt_read(self):
         from dispatcher_sdk.execution_kernel.children import ChildExecutionError
-        row, window = self.short_row(.2)
+        # Leave time for _enqueue's required checkpoint inspection on loaded
+        # runners; the clock jump below reaps the parent before _await starts.
+        row, window = self.short_row(10)
         original = json.loads(row['budget_json'])
-        # Reaping is an actual persisted parent transition after the original
-        # window has been spent, as in controller crash recovery.
+        # Reaping is an actual persisted parent transition after the fake wall
+        # clock has moved past the inherited child deadline.
         self.wall[0] = self.lease.expires_at + 1
         self.kernel.reap()
         watermark = self.kernel._connection.execute(

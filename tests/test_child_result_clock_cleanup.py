@@ -22,11 +22,13 @@ class ChildResultClockCleanupTests(unittest.TestCase):
     tearDown = readonly_fixture.ChildCompletionReadonlyTests.tearDown
     completed_child = readonly_fixture.ChildCompletionReadonlyTests.completed_child
 
-    def captured_wait(self, *, different_owner=False, foreign_kernel=None, context_owner=False, failure=None):
+    def captured_wait(self, *, different_owner=False, foreign_kernel=None, context_owner=False, failure=None,
+                      setup_timeout_seconds=None):
         # The explicit handler context has extra setup work on Windows ARM;
         # keep the original child window alive until the capture begins.
         row, window, result = self.completed_child(
-            failure=failure, timeout_seconds=2.0 if context_owner else .5)
+            failure=failure, timeout_seconds=(setup_timeout_seconds if setup_timeout_seconds is not None
+                                             else 2.0 if context_owner else .5))
         context = None
         if context_owner:
             context = HandlerContext(self.command, self.lease,

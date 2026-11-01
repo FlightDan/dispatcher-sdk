@@ -1,6 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+import json
+import os
 from pathlib import Path
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -31,12 +34,57 @@ def wait_for(predicate, timeout=5):
 
 class DispatcherTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.path = Path(self.temp.name) / "work.sqlite3"
+        evidence_dir = os.environ.get("SDK_ACCEPTANCE_EVIDENCE_DIR")
+        evidence_tests = {
+            "test_submit_replay_conflict_and_restart_without_exposing_run",
+            "test_terminal_replay_does_not_require_removed_handler",
+        }
+        self._evidence_apps = []
+        if evidence_dir and self._testMethodName in evidence_tests:
+            Path(evidence_dir).mkdir(parents=True, exist_ok=True)
+            root = Path(tempfile.mkdtemp(prefix="sdk-application-", dir=evidence_dir))
+            self.addCleanup(self._save_failure_evidence, root)
+        else:
+            self.temp = tempfile.TemporaryDirectory()
+            self.addCleanup(self.temp.cleanup)
+            root = Path(self.temp.name)
+        self.path = root / "work.sqlite3"
+
+    def _save_failure_evidence(self, root):
+        result = self._outcome.result
+        errors = [detail for test, detail in (*result.errors, *result.failures)
+                  if test is self or getattr(test, "test_case", None) is self]
+        if not errors:
+            shutil.rmtree(root)
+            return
+        report = {"test": self.id(), "errors": errors, "dispatchers": []}
+        for app in self._evidence_apps:
+            runtime = app.runtime
+            facts = {"state": app._state, "close_error": repr(runtime._close_error),
+                     "diagnostic_errors": dict(runtime._diagnostic_errors),
+                     "delivery_error": runtime._lifecycle_delivery_error,
+                     "obligations": runtime._stop_obligations_snapshot()}
+            if runtime._diagnostic_pending_lock.acquire(blocking=False):
+                try:
+                    facts["pending_diagnostics"] = dict(runtime._diagnostic_pending)
+                    facts["unknown_handoffs"] = list(runtime._diagnostic_unknown_handoffs)
+                    facts["failed_executions"] = list(runtime._diagnostic_failed_executions)
+                finally:
+                    runtime._diagnostic_pending_lock.release()
+            else:
+                facts["pending_diagnostics"] = "lock unavailable"
+            try:
+                facts["storage_diagnostics"] = app.diagnostics(timeout_seconds=1)
+            except Exception as error:
+                facts["storage_diagnostics_error"] = repr(error)
+            report["dispatchers"].append(facts)
+        (root / "failure-evidence.json").write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8")
+        print(f"APPLICATION_FAILURE_EVIDENCE {root}", flush=True)
 
     def open(self, **kwargs):
         dispatcher = Dispatcher(self.path, {"double": double}, isolation_mode="thread", **kwargs)
+        self._evidence_apps.append(dispatcher)
         self.addCleanup(dispatcher.close)
         return dispatcher
 
@@ -189,7 +237,9 @@ class DispatcherTests(unittest.TestCase):
     def test_terminal_replay_does_not_require_removed_handler(self):
         with self.open() as app:
             original = app.submit("double", 6, request_id="old").wait()
-        with Dispatcher(self.path, {}, isolation_mode="thread") as app:
+        app = Dispatcher(self.path, {}, isolation_mode="thread")
+        self._evidence_apps.append(app)
+        with app:
             self.assertEqual(app.submit("double", 6, request_id="old").wait(), original)
             with self.assertRaises(SubmissionConflictError):
                 app.submit("double", 9, request_id="old")
