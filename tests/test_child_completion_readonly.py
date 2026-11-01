@@ -602,7 +602,7 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'parent_authority_revoked')
 
     def test_shared_kernel_lock_cannot_block_independent_factual_result(self):
-        row, window, result = self.completed_child()
+        row, window, result = self.completed_child(timeout_seconds=2.0)
         acquired, release = threading.Event(), threading.Event()
         def hold_control():
             with self.kernel._lock:

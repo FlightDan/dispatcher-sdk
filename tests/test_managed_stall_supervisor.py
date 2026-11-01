@@ -361,6 +361,8 @@ class ManagedStallSupervisorTests(unittest.TestCase):
                 json.dumps(evidence, indent=2), encoding="utf-8")
 
     def test_reserved_capacity_shortage_leaves_second_actual_episode_pending(self):
+        from dispatcher_sdk.execution_kernel.runtime import _UnpersistedDiagnosticsError
+
         app = self.open(business_workers=2)
         tasks = []
         for name in ("first", "second"):
@@ -392,7 +394,12 @@ class ManagedStallSupervisorTests(unittest.TestCase):
         # business tasks. This keeps the pending-notice assertions above as
         # the capacity-shortage witness and prevents teardown from racing a
         # second admission or its diagnostic persistence.
-        app._managed_stall_supervisor.close(timeout=20)
+        try:
+            app._managed_stall_supervisor.close(timeout=20)
+        except _UnpersistedDiagnosticsError:
+            # Runtime.close retains diagnostic obligations and explicitly
+            # retries them on a subsequent close call.
+            app._managed_stall_supervisor.close(timeout=20)
         (self.root / "release").touch()
         for task in tasks:
             self.assertEqual("released", task.wait(timeout=20)["value"])

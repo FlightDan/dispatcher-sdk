@@ -224,6 +224,19 @@ class RuntimeObservationCleanupTests(unittest.TestCase):
                 runtime.submit(runtime.command("work", execution_id="late", idempotency_key="late",
                     correlation_id="late", timeout_seconds=.2, payload={}))
                 original = runtime.run_once()
+                # The bounded result CAS may return the original running
+                # snapshot when SQLite admission is briefly busy. Its exact
+                # outcome is retained locally and is recovered independently
+                # of the still-running handler thread.
+                if original.result is None:
+                    deadline = time.monotonic() + 2
+                    while original.result is None and time.monotonic() < deadline:
+                        remaining = deadline - time.monotonic()
+                        runtime.recover_completions(timeout_seconds=min(.2, remaining))
+                        original = runtime.kernel.get("late")
+                        if original.result is None:
+                            time.sleep(min(.01, max(0., deadline - time.monotonic())))
+                self.assertIsNotNone(original.result, original.to_dict())
                 self.assertEqual(original.result.status, "timed_out")
                 runtime.close()
                 self.assertFalse(path.exists())

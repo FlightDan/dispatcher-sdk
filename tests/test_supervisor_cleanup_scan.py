@@ -1,3 +1,4 @@
+import os
 import tempfile
 import time
 import unittest
@@ -45,14 +46,15 @@ class SupervisorCleanupScanTests(unittest.TestCase):
                 runtime.close()
 
     def test_native_early_timeout_replays_after_budget_capture_is_finished(self):
-        from dispatcher_sdk.execution_kernel import _process_runtime
+        from dispatcher_sdk.execution_kernel import _process_runtime, _windows_runtime
         with tempfile.TemporaryDirectory() as root:
             runtime = Kernel.open_sqlite(Path(root) / 'kernel.db', {'work': cleanup_handler}, isolation_mode='process')
             try:
                 command = runtime.command('work', execution_id='replay', idempotency_key='replay',
                                           correlation_id='replay', timeout_seconds=10, payload={})
                 runtime.submit(command)
-                invoke = runtime_module.invoke_process_handler
+                invoke = (_windows_runtime.invoke_windows_handler if os.name == 'nt'
+                          else runtime_module.invoke_process_handler)
                 tokens = []
                 def native_with_pending_capture(**kwargs):
                     token = runtime.kernel._begin_budget_sample('replay')
@@ -61,7 +63,8 @@ class SupervisorCleanupScanTests(unittest.TestCase):
                         return envelope, {'state': 'unknown', 'token': token,
                                           'captured_envelope': envelope.to_dict(), 'error': {'cause': 'busy'}}
                     with patch.object(_process_runtime._BudgetTracker, 'bound', return_value=time.monotonic() - 1), \
-                         patch.object(_process_runtime, '_finish_budget_capture', side_effect=fail_capture):
+                         patch.object(_process_runtime, '_finish_budget_capture', side_effect=fail_capture), \
+                         patch.object(_windows_runtime, '_finish_budget_capture', side_effect=fail_capture):
                         return invoke(**kwargs)
                 with patch.object(runtime_module, 'invoke_process_handler', side_effect=native_with_pending_capture), \
                      patch('dispatcher_sdk.execution_kernel._windows_runtime.invoke_windows_handler', side_effect=native_with_pending_capture), \

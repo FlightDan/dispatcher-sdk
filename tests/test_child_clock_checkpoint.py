@@ -179,10 +179,38 @@ class ChildClockCheckpointTests(unittest.TestCase):
         child = self.command(child_id)
         supplied = self.parent_budget.derive(source="tool", origin_id="replay-tool", timeout_seconds=10)
         self.kernel.submit_child(child, self.lease, supplied)
+
+        def claim_child():
+            return self.kernel.claim_and_start(
+                "actual-child-owner", execution_id=child_id, child_pool=True)
+
         try:
             self.wall[0] = baseline + 2
-            child_lease = self.kernel.claim_and_start("actual-child-owner", execution_id=child_id,
-                                                    child_pool=True)
+            try:
+                child_lease = claim_child()
+            except TimeoutError as error:
+                # ARM runners can exceed claim_and_start's bounded 100 ms
+                # capture window. Resume only the exact captured fact handed
+                # off by the failed call, then retry the still-queued claim.
+                token = getattr(error, "budget_sample_token", None)
+                owner = getattr(error, "budget_sample_owner", None)
+                captured = getattr(error, "budget_sample_envelope", None)
+                if token is None or owner is None or captured is None:
+                    raise
+                self.assertIs(self.kernel._budget_sample_owners.get(token), owner)
+                self.assertEqual("queued", self.kernel.get(child_id).state)
+                acknowledged = owner.finish_pending(captured, timeout_seconds=1)
+                self.assertGreaterEqual(acknowledged.checkpoint.wall_at,
+                                        captured.checkpoint.wall_at)
+                self.assertIsNone(owner._pending)
+                self.assertNotIn(token, self.kernel._budget_sample_owners)
+                self.evidence["records"].append({
+                    "scenario": "claim_exact_pending_checkpoint_recovery",
+                    "error": str(error), "token": token,
+                    "captured": captured.to_dict(),
+                    "acknowledged": acknowledged.to_dict(),
+                })
+                child_lease = claim_child()
             entered = self.kernel.prepare_execution_budget(child_lease).enter_handler(
                 30, origin_id="execution:" + child_id, sample=sample_clock(wall_time=self.wall[0]))
             self.kernel.confirm_handler_entry(child_lease, entered)

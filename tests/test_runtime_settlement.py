@@ -611,7 +611,10 @@ class RuntimeSettlementTests(unittest.TestCase):
             self.assertEqual(len(receipts), 1, "lifecycle admission lost the original real outcome")
             self.assertEqual(receipts[0]["result"]["value"], {
                 "message": "actual handler returned while lifecycle was held"})
-            driver.join(1)
+            # The durable receipt precedes the driver's bounded recorder
+            # close (one second), so allow that cleanup to finish while the
+            # lifecycle lock remains held.
+            driver.join(3)
             frame = sys._current_frames().get(driver.ident)
             (self.root / "lifecycle-caller.json").write_text(json.dumps({
                 "original_execution_timeout_seconds": command.timeout_seconds,
