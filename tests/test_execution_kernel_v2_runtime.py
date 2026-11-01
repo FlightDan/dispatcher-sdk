@@ -1956,7 +1956,13 @@ class RuntimeTests(unittest.TestCase):
             capture("after_cancel")
             self.assertFalse(driver.is_alive())
             self.assertEqual(errors, [])
-            self.assertEqual(outcomes, [cancelled])
+            # The driver can return its original running snapshot while the
+            # concurrent cancel publishes the immutable terminal winner.
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual((outcomes[0].execution_id, outcomes[0].attempt, outcomes[0].fence),
+                             (cancelled.execution_id, cancelled.attempt, cancelled.fence))
+            self.assertIn(outcomes[0].state, {"running", "cancelled"})
+            self.assertEqual(stack.kernel.get(command.execution_id), cancelled)
             self.assertEqual(cancelled.state, "cancelled")
             self.assertFalse(late.exists())
         except BaseException as error:

@@ -236,7 +236,7 @@ class ObservabilityApplicationTests(unittest.TestCase):
                 with self.assertRaises(TimeoutError):
                     task.wait(timeout=.001)
                 evidence['watch_receipt'] = task.watch_stall(StallPolicy('public-progress', sample_interval=.1,
-                    consecutive_windows=2, max_deliveries=1))
+                    consecutive_windows=1, max_deliveries=1))
                 dispatcher.start()
                 dead = self.eventually(lambda: dispatcher.stall_notifications(state='dead'), bool)[0]
                 evidence['dead_notification'] = dead

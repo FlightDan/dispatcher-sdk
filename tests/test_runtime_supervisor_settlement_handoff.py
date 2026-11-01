@@ -13,8 +13,9 @@ from dispatcher_sdk.execution_kernel.contracts import ExecutionLease
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.budget import BudgetClockUnknownError, BudgetEnvelope, sample_clock
 from dispatcher_sdk.execution_kernel import _windows_runtime
+from dispatcher_sdk.execution_kernel.pending_settlements import PendingSettlements
 from dispatcher_sdk.execution_kernel.runtime import Runtime
-from dispatcher_sdk.execution_kernel.settlement import SettlementJournal
+from dispatcher_sdk.execution_kernel.settlement import SettlementBusyError, SettlementJournal
 
 
 def windows_test_handler(payload, context):
@@ -167,28 +168,57 @@ class SupervisorSettlementHandoffTests(unittest.TestCase):
                             with tempfile.TemporaryDirectory() as tmp:
                                 path, kernel = Path(tmp) / 'settlement.db', Path(tmp) / 'kernel.db'
                                 runtime._settlement_journal = SettlementJournal(path, source_id='store', kernel_path=kernel, timeout_seconds=1)
-                                self.assertIs(runtime._settle_outcome_active(snapshot, lease, result, object()), snapshot)
+                                runtime._pending_settlements = PendingSettlements()
+                                admission = runtime._pending_settlements.acquire()
+                                self.assertIsNotNone(admission)
+                                if mode == 'watchdog_startup_returned':
+                                    write_record = runtime._settlement_journal.record
+                                    pending_first_write = [True]
+                                    def record_with_initial_contention(lease, payload, *, evidence=None,
+                                                                       timeout_seconds=.1):
+                                        if pending_first_write:
+                                            pending_first_write.clear()
+                                            raise SettlementBusyError('simulated bounded journal contention')
+                                        return write_record(lease, payload, evidence=evidence,
+                                                            timeout_seconds=timeout_seconds)
+                                    runtime._settlement_journal.record = record_with_initial_contention
+                                self.assertIs(runtime._settle_outcome_active(snapshot, lease, result, admission), snapshot)
                                 runtime._outcome_result.assert_not_called()
                                 runtime.kernel._complete_sdk_result.assert_not_called()
                                 reopened = SettlementJournal.open_readonly(path, source_id='store', kernel_path=kernel, timeout_seconds=1)
-                                deferred = reopened.pending(timeout_seconds=1)[0]['deferred']
-                                self.assertEqual(deferred['kind'], 'completion_time_unknown')
-                                self.assertEqual(deferred['outcome']['supervisor_return_observation'],
-                                                 result['supervisor_return_observation'])
-                                runtime._settlement_journal = SettlementJournal(path, source_id='store', kernel_path=kernel, timeout_seconds=1)
-                                runtime._settlement_lock = threading.RLock()
-                                runtime._settlement_inflight_lock = threading.Lock()
-                                runtime._settlement_inflight = set()
-                                runtime._persist_pending_settlements = Mock(return_value=[])
-                                runtime._drain_recovery_completion_readers = Mock()
-                                runtime._recover_script_output = Mock()
-                                runtime._bounded_lifecycle = Mock(return_value=nullcontext())
-                                runtime.kernel._positive_duration.return_value = 1
-                                runtime.kernel.get.return_value = SimpleNamespace(attempt=lease.attempt,
-                                    fence=lease.fence, state='running')
-                                reports = runtime.recover_completions(timeout_seconds=1)
-                                self.assertEqual(reports[0]['state'], 'unknown')
-                                runtime.kernel._complete_sdk_result.assert_not_called()
+                                records = reopened.pending(timeout_seconds=1)
+                                if mode == 'watchdog_startup_returned':
+                                    self.assertFalse(records)
+                                if records:
+                                    self.assertEqual(len(records), 1)
+                                    deferred = records[0]['deferred']
+                                    self.assertEqual(deferred['kind'], 'completion_time_unknown')
+                                    self.assertEqual(deferred['outcome']['supervisor_return_observation'],
+                                                     result['supervisor_return_observation'])
+                                    runtime._settlement_journal = SettlementJournal(path, source_id='store', kernel_path=kernel, timeout_seconds=1)
+                                    runtime._settlement_lock = threading.RLock()
+                                    runtime._settlement_inflight_lock = threading.Lock()
+                                    runtime._settlement_inflight = set()
+                                    runtime._persist_pending_settlements = Mock(return_value=[])
+                                    runtime._drain_recovery_completion_readers = Mock()
+                                    runtime._recover_script_output = Mock()
+                                    runtime._bounded_lifecycle = Mock(return_value=nullcontext())
+                                    runtime.kernel._positive_duration.return_value = 1
+                                    runtime.kernel.get.return_value = SimpleNamespace(attempt=lease.attempt,
+                                        fence=lease.fence, state='running')
+                                    reports = runtime.recover_completions(timeout_seconds=1)
+                                    self.assertEqual(reports[0]['state'], 'unknown')
+                                    runtime.kernel._complete_sdk_result.assert_not_called()
+                                else:
+                                    # When the bounded foreground write cannot commit, recovery
+                                    # must retain the exact original facts in the real in-memory
+                                    # fallback instead of losing the outcome.
+                                    retained, = runtime._pending_settlements.entries()
+                                    self.assertIsNotNone(runtime._settlement_error)
+                                    self.assertEqual(retained.lease, lease)
+                                    self.assertEqual(retained.payload['kind'], 'completion_time_unknown')
+                                    self.assertEqual(retained.payload['outcome']['supervisor_return_observation'],
+                                                     result['supervisor_return_observation'])
                 if mode in ('timely', 'watchdog_timeout'):
                     self.assertLess(events.index('close'), events.index('supervisor_result_accepted'))
                     self.assertLess(events.index('cleanup'), events.index('supervisor_result_accepted'))

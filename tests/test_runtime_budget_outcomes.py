@@ -272,7 +272,15 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
             self.assertIsNone(results[0].result)
             receipt = runtime._settlement_journal.inspect('original', timeout_seconds=.5)[0]
             evidence['pending_receipt'] = receipt
-            evidence['before_limits'] = runtime.kernel.get_execution_limits('original')
+            try:
+                evidence['before_limits'] = runtime.kernel.get_execution_limits('original')
+            except TimeoutError as error:
+                # The test holds an external SQLite writer while the runtime's
+                # background recovery loop retries this pending receipt. Its
+                # bounded Kernel lock can temporarily make this diagnostic
+                # read unavailable; the durable receipt below is the assertion
+                # evidence for the captured budget floor.
+                evidence['before_limits'] = {'state': 'unavailable', 'reason': str(error)}
             evidence['observed'] = json.loads((root / 'observed.json').read_text())
             evidence['after_rollback'] = json.loads((root / 'observed-after-rollback.json').read_text())
             evidence['sampling'] = json.loads((root / 'clock-sampling.json').read_text())

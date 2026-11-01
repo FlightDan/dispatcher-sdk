@@ -48,6 +48,7 @@ _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 _CREATE_NO_WINDOW = 0x08000000
 _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 258
+_WAIT_FAILED = 0xFFFFFFFF
 _MAX_JOB_PROCESSES = 4096
 
 
@@ -162,6 +163,29 @@ class _WinAPI:
             if capacity > _MAX_JOB_PROCESSES:
                 break
         raise RuntimeError("Windows Job process list exceeds its bounded enumeration")
+
+
+def _wait_for_process_exit(api: Any, process: Any, until: float) -> bool:
+    """Wait for an acquired process handle to signal within its cleanup bound."""
+    while True:
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            return False
+        milliseconds = min(0xFFFFFFFE, max(1, math.ceil(min(remaining, _POLL_SECONDS) * 1000)))
+        result = api.dll.WaitForSingleObject(process, milliseconds)
+        if result == _WAIT_OBJECT_0:
+            return True
+        if result == _WAIT_TIMEOUT:
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return False
+            # Keep polling this handle, but avoid a hot loop if a wait returns
+            # early. The original cleanup deadline is never extended.
+            time.sleep(min(_POLL_SECONDS, remaining))
+            continue
+        if result == _WAIT_FAILED:
+            api.check(False, "WaitForSingleObject descendant after termination")
+        raise RuntimeError(f"unexpected descendant process wait result: {result}")
 
 
 def _create_suspended(api: _WinAPI, arguments: list[str], *,
@@ -357,11 +381,14 @@ class WindowsProcessHandle:
                         if assigned.value and self._api.dll.WaitForSingleObject(process, 0) == _WAIT_TIMEOUT:
                             if not self._api.dll.TerminateProcess(process, 70):
                                 error = ctypes.get_last_error()
-                                # A process can exit between the wait and termination.
-                                # ERROR_ACCESS_DENIED alone cannot establish its exit.
-                                if (error != 5 or self._api.dll.WaitForSingleObject(
-                                        process, 0) != _WAIT_OBJECT_0):
-                                    raise OSError(error, f"TerminateProcess descendant: {ctypes.FormatError(error)}")
+                                # TerminateProcess can return before the process
+                                # is signalled. A retry during that interval may
+                                # return ERROR_ACCESS_DENIED, so wait on this
+                                # acquired handle within the same cleanup bound.
+                                if error == 5:
+                                    if _wait_for_process_exit(self._api, process, until):
+                                        continue
+                                raise OSError(error, f"TerminateProcess descendant: {ctypes.FormatError(error)}")
                     finally:
                         self._api.dll.CloseHandle(process)
                 time.sleep(min(_POLL_SECONDS, max(0, until - time.monotonic())))

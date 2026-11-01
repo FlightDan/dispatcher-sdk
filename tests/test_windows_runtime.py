@@ -356,28 +356,103 @@ class WindowsDescendantContainmentTests(unittest.TestCase):
                     native_error[0] = 87
                     if subsequent_wait == 0:
                         members.remove(8)
+                    elif subsequent_wait == 258 and milliseconds > 0:
+                        # Model an API timeout that does not by itself end the
+                        # cleanup window; the same acquired handle is polled.
+                        time.sleep(milliseconds / 1000)
                     return subsequent_wait
+
+                def check(result, operation):
+                    if not result:
+                        raise OSError(native_error[0], operation)
 
                 api = SimpleNamespace(dll=SimpleNamespace(OpenProcess=open_process,
                     IsProcessInJob=membership, WaitForSingleObject=wait,
                     TerminateProcess=lambda process, code: False, CloseHandle=closed.append),
                     process_ids=lambda job: tuple(members),
-                    check=lambda result, operation: self.assertTrue(result, operation))
+                    check=check)
                 handle = windows_runtime.WindowsProcessHandle(api, 99,
                     SimpleNamespace(dwProcessId=7, hProcess=107, hThread=None))
                 with patch.object(ctypes, "get_last_error", side_effect=lambda: native_error[0], create=True), \
                         patch.object(ctypes, "FormatError", side_effect=lambda code: f"native error {code}", create=True):
+                    deadline = time.monotonic() + .06
                     if recovered:
-                        self.assertTrue(handle.stop_descendants(time.monotonic() + 1))
+                        self.assertTrue(handle.stop_descendants(deadline))
                     else:
-                        with self.assertRaises(OSError) as caught:
-                            handle.stop_descendants(time.monotonic() + 1)
-                        self.assertEqual(caught.exception.errno, termination_error)
-                        self.assertIn(f"native error {termination_error}", str(caught.exception))
+                        expected_type = (RuntimeError if termination_error == 5 and subsequent_wait == 1
+                                         else OSError)
+                        with self.assertRaises(expected_type) as caught:
+                            handle.stop_descendants(deadline)
+                        expected_error = (87 if termination_error == 5 and subsequent_wait == 0xFFFFFFFF
+                                          else termination_error)
+                        if isinstance(caught.exception, OSError):
+                            self.assertEqual(caught.exception.errno, expected_error)
+                        if isinstance(caught.exception, OSError) and expected_error == termination_error:
+                            self.assertIn(f"native error {termination_error}", str(caught.exception))
                 self.assertEqual(opened, [8])
-                self.assertTrue(all(process == 108 and duration == 0 for process, duration in waits))
-                self.assertEqual(len(waits), 2 if termination_error == 5 else 1)
+                self.assertEqual(waits[0], (108, 0))
+                self.assertTrue(all(process == 108 for process, _ in waits))
+                if termination_error == 5:
+                    self.assertGreater(len(waits), 1)
+                    self.assertTrue(all(0 < duration <= 10 for _, duration in waits[1:]))
+                    if subsequent_wait == 258:
+                        self.assertGreater(len(waits), 2)
+                else:
+                    self.assertEqual(len(waits), 1)
                 self.assertEqual(closed, [108])
+
+    def test_pending_termination_access_denied_waits_on_same_acquired_handle(self):
+        opened, waits, terminated, closed = [], [], [], []
+        members = [7, 8]
+        native_error = [0]
+
+        def open_process(rights, inherit, pid):
+            handle = 108 + len(opened)
+            opened.append((pid, handle))
+            return handle
+
+        def membership(process, job, assigned):
+            assigned._obj.value = True
+            return True
+
+        def wait(process, milliseconds):
+            waits.append((process, milliseconds))
+            if process in (108, 109) and milliseconds == 0:
+                return 258
+            self.assertEqual(process, 109)
+            if sum(waited_process == 109 and duration > 0 for waited_process, duration in waits) == 1:
+                return 258
+            members.remove(8)
+            return 0
+
+        def terminate(process, code):
+            terminated.append(process)
+            if process == 108:
+                native_error[0] = 122  # Success leaves the previous error unspecified.
+                return True
+            native_error[0] = 5
+            return False
+
+        def check(result, operation):
+            if not result:
+                raise OSError(native_error[0], operation)
+
+        api = SimpleNamespace(dll=SimpleNamespace(OpenProcess=open_process,
+            IsProcessInJob=membership, WaitForSingleObject=wait,
+            TerminateProcess=terminate, CloseHandle=closed.append),
+            process_ids=lambda job: tuple(members), check=check)
+        handle = windows_runtime.WindowsProcessHandle(api, 99,
+            SimpleNamespace(dwProcessId=7, hProcess=107, hThread=None))
+        with patch.object(ctypes, "get_last_error", side_effect=lambda: native_error[0], create=True):
+            self.assertTrue(handle.stop_descendants(time.monotonic() + 1))
+
+        self.assertEqual(opened, [(8, 108), (8, 109)])
+        self.assertEqual(terminated, [108, 109])
+        self.assertEqual([process for process, _ in waits], [108, 109, 109, 109])
+        self.assertEqual(waits[0][1], 0)
+        self.assertEqual(waits[1][1], 0)
+        self.assertTrue(all(0 < duration <= 10 for _, duration in waits[2:]))
+        self.assertEqual(closed, [108, 109])
 
     def test_redirector_worker_handle_survives_flush_and_does_not_preserve_reused_pid(self):
         opened, killed, closed = [], [], []

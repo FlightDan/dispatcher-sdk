@@ -247,6 +247,47 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
                 return current
         self.fail('original .5-second received-fact maintenance window elapsed: ' + repr(maintenance))
 
+    def recover_cancel_winner(self, outcome, winner):
+        """Retry bounded receipt operations without exceeding the .5s window."""
+        began = time.monotonic()
+        deadline = began + .5
+        maintenance = {'began': began, 'deadline': deadline, 'passes': []}
+        self.evidence['records'].append({'cancel_winner_maintenance': maintenance})
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempt = {'began': time.monotonic(), 'timeout_seconds': remaining}
+            maintenance['passes'].append(attempt)
+            try:
+                attempt['reports'] = self.runtime.recover_completions(timeout_seconds=remaining)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                with self.runtime.kernel._control_lock(remaining):
+                    current = self.runtime.kernel.get('work')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                records = self.runtime._settlement_journal.inspect('work', timeout_seconds=remaining)
+                attempt['execution'] = current.to_dict()
+                attempt['receipts'] = records
+                attempt['guards'] = self.guards()
+                self.assertEqual(current.to_dict(), winner.to_dict())
+                if (not attempt['guards'] and len(records) == 1
+                        and records[0]['state'] in ('recorded', 'superseded')):
+                    attempt['returned'] = time.monotonic()
+                    self.assertLessEqual(attempt['returned'], deadline, maintenance)
+                    self.assert_published(outcome)
+                    return current
+            except Exception as error:
+                attempt['error'] = {'type': type(error).__name__, 'message': str(error)}
+                if not (self.runtime._storage_contention(error) or isinstance(error, TimeoutError)):
+                    raise
+            finally:
+                attempt['returned'] = time.monotonic()
+        self.fail('original .5-second cancel-winner maintenance window elapsed: ' + repr(maintenance))
+
     def recover_after_real_writer(self, *, expire_archive=False):
         outcome = self.produce()
         writer = sqlite3.connect(self.runtime.kernel.db_path, isolation_level=None, timeout=0.)
@@ -468,9 +509,7 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
                                             reason='actual cancellation winner')
         returned = self.settle(outcome)
         self.assert_foreground_winner_snapshot(returned, winner)
-        self.runtime.recover_completions(timeout_seconds=.5)
-        self.assertEqual(self.runtime.kernel.get('work').to_dict(), winner.to_dict())
-        self.assert_published(outcome)
+        self.recover_cancel_winner(outcome, winner)
 
     def test_reaped_winner_keeps_immutable_state_while_received_fact_is_acknowledged(self):
         outcome = self.produce()
