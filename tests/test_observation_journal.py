@@ -607,17 +607,26 @@ class ObservationJournalTests(unittest.TestCase):
         self.assertEqual(report["sources"][0]["source_id"], "new-handler")
 
     def test_independent_scopes_and_insufficient_coverage_cannot_retire_unknown_collector(self):
+        maintenance = {"began": time.monotonic(), "timeout_seconds": 1, "flushes": []}
+        self.addCleanup(self.storage_evidence.save, phase="collector_flush_maintenance", checkpoint=maintenance)
+
+        def persist_retained(recorder, stage):
+            return persist_retained_batch(self, recorder, stage=stage,
+                maintenance=maintenance, captured_at=lambda: self.clock.now)
+
         handler = self.recorder(source_id="old-handler", source_scope="handler")
         handler.enable_stream("stdout")
-        handler.flush()
+        persist_retained(handler, "old_handler")
+        initial = self.journal.inspect("execution")
+        self.assertIn("stdout_bytes", initial["metrics"])
         self.clock.now = 110
         independent = self.recorder(source_id="independent")
-        independent.flush()
+        persist_retained(independent, "independent")
         driver = self.recorder(source_id="driver", source_scope="driver")
-        driver.flush()
+        persist_retained(driver, "driver")
         partial = self.recorder(source_id="partial", source_scope="handler", metric_coverage=("heartbeat",))
         partial.heartbeat()
-        partial.flush()
+        persist_retained(partial, "partial_handler")
         report = self.journal.inspect("execution")
         self.assertIn("old-handler", [source["source_id"] for source in report["sources"]])
         self.assertEqual(next(source for source in report["sources"] if source["source_id"] == "old-handler")["continuity"], "unknown")
