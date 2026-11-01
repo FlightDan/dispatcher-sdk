@@ -749,7 +749,10 @@ class ObservationJournal:
             code = getattr(error, "sqlite_errorcode", None)
             interrupted = (type(code) is int and code & 255 == 9
                            or code is None and str(error).lower() == "interrupted")
-            if time.monotonic() >= deadline and interrupted:
+            # This connection's only interrupt source is the deadline progress
+            # handler. Preserve its raw SQLite error as the cause without
+            # relying on a second clock read after SQLite returns.
+            if interrupted:
                 expired = _ObservationWriteBudgetExceeded("observation write admission budget elapsed")
                 expired.sqlite_errorcode = getattr(error, "sqlite_errorcode", None)
                 expired.sqlite_errorname = getattr(error, "sqlite_errorname", None)

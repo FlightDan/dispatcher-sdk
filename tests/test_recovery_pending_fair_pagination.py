@@ -58,7 +58,12 @@ class RecoveryPendingFairPaginationTests(unittest.TestCase):
                     self.assertLessEqual(len(batch), 50)
                     reports.extend(batch)
                     observed = {item.get("execution_id") for item in reports if item["state"] == "pending"}
+                    later_recorded = any(item.get("execution_id") == "later" and item["state"] == "recorded"
+                                         for item in reports)
+                    # The Kernel result can commit before its journal receipt
+                    # transitions to recorded; wait for both durable outcomes.
                     if (runtime.kernel.get("later").state == "succeeded"
+                            and later_recorded
                             and {execution_id for execution_id, _ in blocked[1:]} <= observed):
                         break
                 self.assertEqual(runtime.kernel.get("later").result.to_dict(), result.to_dict())
