@@ -8,7 +8,7 @@ Python 应用中运行任务，并使用持久化状态、执行时限和显式�
 
 ## 从这里开始
 
-1. [快速开始](Quick-Start-zh-CN.md)：安装 0.7.2 并运行完整示例。
+1. [快速开始](Quick-Start-zh-CN.md)：安装 0.7.3 并运行完整示例。
 2. [托管任务](Managed-Tasks-zh-CN.md)：用 0.7 的 `Dispatcher` 接口提交任务，不必自己组装 Runtime、Orchestrator 和 Host。
 3. [核心概念](Core-Concepts-zh-CN.md)：理解 Runtime、Run、任务和宿主各自负责什么。
 4. [接入指南](Integration-Guide-zh-CN.md)：选择函数、脚本或工作流接入路径。
@@ -17,21 +17,21 @@ Python 应用中运行任务，并使用持久化状态、执行时限和显式�
 7. [常见问题](Troubleshooting-zh-CN.md)：排查待执行任务、重复通知和恢复状态。
 8. [接入工程原则](Engineering-Principles-zh-CN.md)：准备可恢复的部署和可审查的证据。
 9. [诊断与事件投影](Diagnostics-and-Projections-zh-CN.md)：检查部署身份和持久化事件，排查工作是否可用以及取消状态。
-10. [执行观测与监督](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/EXECUTION_OBSERVABILITY.md)：读取已保存的活动、时限和子任务信息，并了解可选的停滞通知。
-11. [0.7.2 改进开发状态](Improvement-Status-zh-CN.md)：区分已发布版本和当前开发版本，并查看尚未完成的验收。
+10. [执行观测与监督](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/EXECUTION_OBSERVABILITY.md)：读取已保存的活动、时限和子任务信息，并了解可选的停滞通知。
+11. [0.7.3 发布与验收状态](Improvement-Status-zh-CN.md)：查看 SDK 发布记录和仍待完成的下游验收。
 
-使用编程 Agent 接入 SDK 时，可让它先阅读英文 [DocsforAgents](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/DocsforAgents/README.md)。
-0.7.2 的详细 API 契约见 [docs/SDK.md](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK.md) 和
-[公共 API 文档](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/PUBLIC_API.md)。部分详细指南目前只有中文；Wiki 的两种
+使用编程 Agent 接入 SDK 时，可让它先阅读英文 [DocsforAgents](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/DocsforAgents/README.md)。
+0.7.3 的详细 API 契约见 [docs/SDK.md](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK.md) 和
+[公共 API 文档](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/PUBLIC_API.md)。部分详细指南目前只有中文；Wiki 的两种
 语言版本都链接到同一份权威文档。关于如何核对版本和证据、在最终验证前固定
 待发布版本，以及修改持久化对象前确认身份，见[接入工程原则](Engineering-Principles-zh-CN.md)。
 
 ## 版本与范围
 
-这些页面介绍已发布的 0.7.2 版本，运行环境要求 Python 3.10 或更高版本。
-当前改进开发代码的版本是尚未发布的 0.7.3.dev1；实现进度和未完成验收见
-[开发状态](Improvement-Status-zh-CN.md)。文档要和代码版本匹配；旧版本可能没有这里介绍的接口。
-如果要打开现有数据库，请先阅读[存储与升级](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/STORAGE_AND_UPGRADES.md)。
+这些页面介绍已发布的 0.7.3 版本，运行环境要求 Python 3.10 或更高版本。
+仍使用 0.7.2 的部署可继续查阅对应标签。SDK 发布与下游 Run 验收是不同状态：
+真实 ModPort 旧 Run 接入、宿主隔离和业务流程验收仍待完成。文档要和代码版本匹配；旧版本可能没有这里介绍的接口。
+如果要打开现有数据库，请先阅读[存储与升级](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/STORAGE_AND_UPGRADES.md)。
 
 核心组件只依赖 Python 标准库和 SQLite。OpenSandbox 是可选扩展，需要额外依赖和服务。
 进程隔离只用于控制可信代码的执行，不能当作文件系统或网络权限沙箱。

@@ -2,12 +2,11 @@
 
 [English](Storage-and-Recovery.md) | [简体中文](Storage-and-Recovery-zh-CN.md) | [首页](Home-zh-CN.md)
 
-下文的 schema 版本说明已发布的 0.7.2。0.7.3 源码候选版本
-使用 Kernel schema 12、Orchestrator schema 6 和 Settlement Journal schema 4。打开或复制升级存储前，请先查看
-[开发状态](Improvement-Status-zh-CN.md)和[存储升级契约](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/STORAGE_AND_UPGRADES.md)。
+v0.7.3 发布版使用 Kernel schema 12、Orchestrator schema 6 和 Settlement Journal schema 4。打开或复制升级存储前，请先查看
+[发布与验收状态](Improvement-Status-zh-CN.md)和[存储升级契约](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/STORAGE_AND_UPGRADES.md)。
 复制升级不会自动接入已有 Run，也不会隔离旧 writer。
 
-0.7.3 源码候选版的 schema 12 还保存生命周期生产者责任和待写事件。宿主须可信地
+schema 12 还保存生命周期生产者责任和待写事件。宿主须可信地
 核验接收回执及生产者恢复；已持久化事件可以重放，持久化前丢失的事实仍是
 未知。宿主证明某执行代次的生产者确已静默，并保留所需证据后，可显式分批退役该代次，裁剪已投递事件、已关闭生产者及对应日志回执；其他元数据不在此清理范围内，详见
 [开发接入说明](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/SDK_DEVELOPMENT_INTEGRATION.md)。
@@ -15,7 +14,7 @@
 如果 worker 在写入预算时钟采样标记后、保存采样事实前死亡，标记会在重开后保持未知，
 并阻止继续执行业务。SDK 无法重建这项丢失的时钟事实。
 
-已发布的 0.7.2 单文件部署默认使用 SQLite WAL 和 `synchronous=FULL`。Kernel SQLite 布局为
+作为历史对照，已发布的 0.7.2 单文件部署默认使用 SQLite WAL 和 `synchronous=FULL`。Kernel SQLite 布局为
 schema 5，Orchestrator 存储为 schema 4，通知收件箱使用独立的 schema 1。公开的
 Kernel 执行记录契约仍为 v2；契约版本与存储布局是两回事。
 
@@ -48,5 +47,5 @@ SDK 调用延迟。请保留 JSON 结果，作为部署证据。仓库记录的 
 激活不会替应用处理未决 Effect。排队任务可以继续；遗留租约按原有过期和 reap 流程处理。
 不要手工删除 retirement、reservation、pending 或只读标记。
 
-详细说明见 [SQLite 运维](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SQLITE_OPERATIONS.md)、
-[存储升级](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/STORAGE_AND_UPGRADES.md)和[本地恢复流程](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/LOCAL_RECOVERY.md)。
+详细说明见 [SQLite 运维](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SQLITE_OPERATIONS.md)、
+[存储升级](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/STORAGE_AND_UPGRADES.md)和[本地恢复流程](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/LOCAL_RECOVERY.md)。

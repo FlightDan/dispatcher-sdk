@@ -1,25 +1,24 @@
-# 0.7.2 改进开发状态
+# 0.7.3 发布与验收状态
 
 [English](Improvement-Status.md) | [简体中文](Improvement-Status-zh-CN.md) | [首页](Home-zh-CN.md)
 
-更新于 2026-11-02。本页概述 0.7.3 开发与验证记录；是否正式发布以 [GitHub Releases](https://github.com/FlightDan/dispatcher-sdk/releases) 为准，不代表产品验收。
+更新于 2026-11-02。本页记录 v0.7.3 发布与验证状态，以及仍待完成的下游验收。发布制品和标签见 [GitHub Releases](https://github.com/FlightDan/dispatcher-sdk/releases)。
 逐项证据和未完成事项见[实施状态](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/SDK_0_7_2_IMPLEMENTATION_STATUS.md)，
 目标范围见[改进策略](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/SDK_0_7_2_IMPROVEMENT_STRATEGY.md)。
 
 ## 版本边界
 
-- 0.7.2 是已发布的基线版本；其发布制品和标签仍代表正式发布版本。
-- 当前源码包版本为 0.7.3；正式发布状态以 GitHub Releases 为准。
-- 除非页面明确链接到开发中内容，本 Wiki 的快速开始和通用用户指南描述已发布的 0.7.2 行为。
-- 源码修改、本地安装候选 wheel、下游安装、真实 Run 接入和产品验收是不同状态。实施记录标明各项测试对应的 wheel；较早候选包的结果不能验证后续修改。
+- v0.7.2 是上一版正式发布基线；其制品和标签仍供固定使用该版本的部署查阅。
+- v0.7.3 是当前发布版。本 Wiki 的快速开始和通用用户指南介绍 v0.7.3，明确标记为历史内容的页面除外。
+- 源码修改、候选 wheel、正式发布制品、下游安装、真实 Run 接入和产品验收是不同状态。实施记录标明各项测试对应的制品；较早候选包的结果不能验证正式发布包。
 
 ## 验收状态
 
-实现仍在进行，计划阶段的退出条件尚未全部满足。当前开发树已有合成测试覆盖 Kernel 与 Orchestrator 分离存储 Run 的接入、暂停、修订、激活和恢复；跨库取消与恢复的定向竞态测试已验证本地取消意图提交后拒绝重新开放。真实旧 Run 接入、持续的宿主 writer 隔离、完整的应用投影和正常业务更新流程及宿主现场验收仍未完成。
+v0.7.3 SDK 已发布受控接口，合成测试覆盖 Kernel 与 Orchestrator 分离存储 Run 的接入、暂停、修订、激活和恢复；跨库取消与恢复的定向竞态测试验证本地取消意图提交后会拒绝重新开放。ModPort 的真实旧 Run 接入、持续的宿主 writer 隔离、完整的应用投影和正常业务更新流程及宿主现场验收仍待完成。
 
 Kernel schema 12 与 Settlement Journal schema 4 增加精确生命周期回执命名空间和显式分批代次退役。宿主必须先证明生产者静默，并保留仍需使用的诊断历史，才能裁剪。首次持久写入前丢失的事实不能还原；升级前回执有歧义时保持待处理，等待可信核对。这不代表 SDK 全部元数据已得到有界清理。
 
-隔离安装的较早 `0.7.3.dev1` 候选包已复现：旧 Run 接入受管模式后，ModPort 的后续业务提交被拒绝。开发树已增加受控业务提交接口，并完成合成旧库接入、派发和进程结算测试；ModPort 仍需适配调用与新执行身份，尚未完成现场验收。具体约束见[接入说明](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/SPLIT_STORE_ADOPTION.md)。
+隔离安装的早期预发布 `0.7.3.dev1` 候选包曾复现：旧 Run 接入受管模式后，ModPort 的后续业务提交被拒绝。v0.7.3 发布版包含受控业务提交接口；合成旧库接入、派发和进程结算已有测试覆盖。ModPort 仍需适配调用与新执行身份，现场验收仍待完成。具体约束见[接入说明](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/SPLIT_STORE_ADOPTION.md)。
 
 SDK-01 至 SDK-08 其他条目已有定向实现与测试证据，仍有详细状态记录中的缺口。定向测试通过或较早候选 wheel 通过，都不代表完整平台、故障矩阵、真实宿主或下游验收已经完成。
 
@@ -31,4 +30,4 @@ SDK-01 至 SDK-08 其他条目已有定向实现与测试证据，仍有详细�
 - 使用外部应用存储时，适配器必须提供原子源版本比较、写入 fencing 和持久回执。宿主还须约束能够读取完整 Run 投影的参与方。
 - 分别核验 handler 已进入、执行已结算和业务验收通过。SDK 实现完成或激活调用成功，本身不能证明产品接受了恢复后的工作。
 
-打开或升级开发数据库前，先阅读[存储与升级](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/STORAGE_AND_UPGRADES.md)。开发树使用 Kernel schema 12、Orchestrator schema 6 和 Settlement Journal schema 4；显式复制升级不会接入 Run、退役源库或停止已经打开的 writer。
+使用 v0.7.3 打开或升级数据库前，先阅读[存储与升级](https://github.com/FlightDan/dispatcher-sdk/blob/main/docs/STORAGE_AND_UPGRADES.md)。v0.7.3 使用 Kernel schema 12、Orchestrator schema 6 和 Settlement Journal schema 4；显式复制升级不会接入 Run、退役源库或停止已经打开的 writer。

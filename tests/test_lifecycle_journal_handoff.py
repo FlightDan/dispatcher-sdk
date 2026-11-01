@@ -13,6 +13,7 @@ from unittest.mock import patch
 from dispatcher_sdk.execution_kernel import Kernel, SQLiteKernel
 from dispatcher_sdk.execution_kernel.settlement import SettlementJournal
 from dispatcher_sdk.execution_kernel.runtime import _UnpersistedDiagnosticsError, _UnpersistedSettlementsError
+from dispatcher_sdk.execution_kernel.host import RuntimeHost
 
 
 def lifecycle_handler(payload, context):
@@ -70,6 +71,60 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
         journal = self.runtime._settlement_journal
         reopened = SettlementJournal(journal.path, source_id=journal.source_id, kernel_path=self.path)
         return reopened.inspect_notes(name, timeout_seconds=1)["notes"]
+
+    def test_host_retries_exact_pending_diagnostic_until_durable(self):
+        from types import SimpleNamespace
+
+        self.submit("host-close-retry")
+        journal = self.runtime._settlement_journal
+        original_note = journal.lifecycle_note
+        original_close = self.runtime.close
+        unavailable = [True]
+        failed_closes = []
+
+        def note(identity, phase, evidence, **kwargs):
+            if phase == "worker_invocation_escaped" and unavailable[0]:
+                raise OSError("journal unavailable")
+            return original_note(identity, phase, evidence, **kwargs)
+
+        def close():
+            try:
+                return original_close()
+            except _UnpersistedDiagnosticsError:
+                failed_closes.append(True)
+                unavailable[0] = False
+                raise
+
+        with patch.object(journal, "lifecycle_note", side_effect=note), \
+             patch.object(self.runtime, "_invoke_process", side_effect=RuntimeError("escaped")), \
+             patch.object(self.runtime, "close", side_effect=close):
+            with self.assertRaisesRegex(RuntimeError, "escaped"):
+                self.runtime.run_once(execution_id="host-close-retry")
+            event = self.runtime.kernel.lifecycle_peek(execution_id="host-close-retry")
+            self.assertEqual(event["phase"], "worker_invocation_escaped")
+            store_id = self.runtime.kernel.kernel_store_identity()
+            bridge = SimpleNamespace(pump=lambda **_: None, sweep=lambda **_: None)
+            host = RuntimeHost(self.runtime, bridge)
+            self.assertTrue(host.stop(timeout=5))
+        self.assertEqual(len(failed_closes), 1)
+        self.assertFalse(self.runtime._diagnostics_block_admission())
+        notes = self.reopen_notes("host-close-retry")
+        self.assertEqual(len([n for n in notes if n["phase"] == "worker_invocation_escaped"]), 1)
+        self.assertTrue(self.runtime._kernel_storage_closed)
+        with sqlite3.connect(self.path) as connection:
+            row = connection.execute(
+                "SELECT event_id, delivered FROM kernel_lifecycle_outbox WHERE sequence=?",
+                (event["sequence"],)).fetchone()
+        self.assertEqual(row, (event["event_id"], 1))
+        with sqlite3.connect(journal.path) as connection:
+            receipt = connection.execute(
+                "SELECT n.execution_id,n.attempt,n.fence,n.phase,n.evidence_json "
+                "FROM settlement_lifecycle_receipts r JOIN settlement_notes n ON n.sequence=r.note_sequence "
+                "WHERE r.store_id=? AND r.outbox_sequence=?",
+                (store_id, event["sequence"])).fetchone()
+        import json
+        self.assertEqual(receipt[:4], (event["execution_id"], event["attempt"], event["fence"], event["phase"]))
+        self.assertEqual(json.loads(receipt[4]), event["payload"])
 
     def test_real_worker_registration_and_cleanup_receipts_survive_reopen(self):
         self.submit("real-worker")

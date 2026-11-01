@@ -14,8 +14,10 @@ import threading
 import time
 from typing import Any, Callable, Protocol
 
-from .runtime import InProcessRuntime
+from .runtime import InProcessRuntime, _UnpersistedDiagnosticsError
 from .errors import BudgetScanContinuation
+
+_DIAGNOSTIC_CLOSE_RETRY_SECONDS = 5.0
 
 
 class RuntimeHostBridge(Protocol):
@@ -604,7 +606,24 @@ class RuntimeHost:
                 self._finish_stop_phase("final_pump", skipped=True)
             self._start_stop_phase("runtime_close")
             try:
-                self.runtime.close()
+                diagnostic_deadline = None
+                while True:
+                    try:
+                        self.runtime.close()
+                        break
+                    except _UnpersistedDiagnosticsError:
+                        # The owner has its own bounded retry window. A caller
+                        # may time out and later continue waiting for it.
+                        if diagnostic_deadline is None:
+                            diagnostic_deadline = time.monotonic() + _DIAGNOSTIC_CLOSE_RETRY_SECONDS
+                        remaining = diagnostic_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise
+                        # Runtime.close retries its retained handoffs and only
+                        # returns when their durable receipts are acknowledged.
+                        time.sleep(min(0.05, remaining))
+                        if time.monotonic() >= diagnostic_deadline:
+                            raise
             except BaseException as exc:
                 self._finish_stop_phase("runtime_close", error=exc)
                 self._record_error("runtime_close", exc)

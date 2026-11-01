@@ -355,6 +355,7 @@ class WaitObservationTests(unittest.TestCase):
         self.assertEqual(self.journal.inspect('work')['waits'][0]['state'], 'waiting')
 
     def test_independent_collector_close_and_authoritative_child_wait_remain_separate(self):
+        self.journal.options = ObservationOptions(write_timeout=1)
         recorder = self.recorder(source_id='owner')
         other = self.recorder(source_id='other')
         recorder.phase('handler_entered')
@@ -367,9 +368,12 @@ class WaitObservationTests(unittest.TestCase):
         # activation/replay is separately covered by test_stall_supervision.
         row = self.identity.to_dict()
         status = self.kernel.supervision_status('work')
-        with recorder.wait('memory'):
-            recorder.flush()
+        with recorder.wait('memory') as wait:
+            self.assertEqual(wait['state'], 'captured')
+            self.assertEqual(recorder.flush()['state'], 'persisted')
             report = self.journal.inspect('work')
+            self.assertTrue(any(item['wait_id'] == wait['wait_id'] and item['state'] == 'waiting'
+                for item in report['waits']))
             self.assertEqual(service._observed(row, policy, status, report), (None, 'wait_exempt', 'memory'))
         recorder.flush()
         recorder.close(timeout=1)

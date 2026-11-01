@@ -5,7 +5,7 @@
 These principles make durable SDK integrations easier to operate and review.
 They describe application discipline; the SDK still owns execution, storage,
 leases and delivery, while the application owns business meaning and product
-acceptance. The [full guide](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/INTEGRATION_PRINCIPLES.md) contains the
+acceptance. The [full guide](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/INTEGRATION_PRINCIPLES.md) contains the
 definitions and checklists.
 
 | Principle | Practice |
@@ -24,8 +24,8 @@ definitions and checklists.
 
 Write down the question, the acceptance criteria, the identity of the candidate
 and the evidence level that will answer it. Keep a matching deployment available
-for active durable work. Read [storage and upgrades](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/STORAGE_AND_UPGRADES.md)
-before reusing a database and [recovery](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_RECOVERY.md) before retrying
+for active durable work. Read [storage and upgrades](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/STORAGE_AND_UPGRADES.md)
+before reusing a database and [recovery](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK_RECOVERY.md) before retrying
 an interrupted effect.
 
 ## Before reporting success
@@ -36,4 +36,4 @@ dependency, generated artifact or acceptance rule changed. A green test count,
 stable hash or Agent self-report is only as strong as the evidence level and
 authority behind it.
 
-For coding-agent workflows, use the [verification checklist](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/DocsforAgents/VERIFICATION.md).
+For coding-agent workflows, use the [verification checklist](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/DocsforAgents/VERIFICATION.md).

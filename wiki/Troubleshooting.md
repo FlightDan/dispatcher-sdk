@@ -28,18 +28,18 @@
 | Final activity is persisted but process telemetry is incomplete | Inspect the close receipt's process observer completion, worker state and collection error. A persisted batch or closed source does not certify process collection; later ownership drain cannot upgrade that receipt. |
 | Sandbox cleanup remains pending | Inspect the journal and provider, then run bounded recovery. Disposal does not settle external business effects. |
 
-See [submission](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/TASK_SUBMISSION.md), [recovery](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_RECOVERY.md),
-[inbox](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/NOTIFICATION_INBOX.md), [storage](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/STORAGE_AND_UPGRADES.md),
-[local recovery](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/LOCAL_RECOVERY.md) and [sandbox runtime](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SANDBOX_RUNTIME.md)
+See [submission](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/TASK_SUBMISSION.md), [recovery](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK_RECOVERY.md),
+[inbox](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/NOTIFICATION_INBOX.md), [storage](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/STORAGE_AND_UPGRADES.md),
+[local recovery](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/LOCAL_RECOVERY.md) and [sandbox runtime](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SANDBOX_RUNTIME.md)
 for exact contracts and recovery procedures. For observation gaps or stall notices,
-see [execution activity and supervision](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/EXECUTION_OBSERVABILITY.md).
+see [execution activity and supervision](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/EXECUTION_OBSERVABILITY.md).
 
 When reporting a problem, include the SDK version or commit, Python version,
 platform, isolation mode, relevant IDs and states, and a minimal reproduction.
-The [public observability consumer](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/sdk_observability_acceptance.py)
+The [public observability consumer](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/examples/sdk_observability_acceptance.py)
 retains raw child-call and progress-call tracebacks, SQLite error codes and
 original budgets. Pass `--evidence-dir <new-empty-directory>` to choose its
 evidence directory; the diagnostic records do not retry the failed call.
 Remove credentials and private payloads. Use
 [GitHub Issues](https://github.com/FlightDan/dispatcher-sdk/issues) for bugs and
-[security reporting](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/SECURITY.md) for vulnerabilities.
+[security reporting](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/SECURITY.md) for vulnerabilities.

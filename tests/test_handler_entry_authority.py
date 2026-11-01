@@ -668,6 +668,7 @@ class AdmissionContentionTests(unittest.TestCase):
             'task_timeout': 5, 'startup_timeout': .25, 'phases': [],
             'diagnostic_errors': []}
         results, errors = [], []
+        classified_results = []
         driver = healthy = None
 
         def error_fact(error):
@@ -725,6 +726,7 @@ class AdmissionContentionTests(unittest.TestCase):
 
         def outcome(*args):
             value = traced('classified_outcome', original_outcome, *args)
+            classified_results.append(value)
             classified.set()
             return value
 
@@ -748,8 +750,27 @@ class AdmissionContentionTests(unittest.TestCase):
                 driver.join(2)
                 self.assertFalse(driver.is_alive())
                 self.assertEqual(errors, [])
-                self.assertEqual(results[0].state, "failed")
-                self.assertEqual(results[0].result.error.code, "entry_admission_timeout")
+                diagnostic(lambda: evidence.update(first_return=results[0].to_dict()))
+                self.assertIn(results[0].state, {"running", "failed"})
+                settlement_deadline = time.monotonic() + 10
+                def bounded_snapshot():
+                    remaining = max(.001, settlement_deadline - time.monotonic())
+                    with runtime.kernel._control_lock(remaining):
+                        return runtime.kernel.get(identifier)
+                settled = bounded_snapshot()
+                settlement_reports = []
+                while settled.state == "running" and time.monotonic() < settlement_deadline:
+                    settlement_reports.extend(runtime.recover_completions(
+                        timeout_seconds=min(2, max(.001, settlement_deadline - time.monotonic())),
+                        max_record_bytes=512 * 1024))
+                    settled = bounded_snapshot()
+                diagnostic(lambda: evidence.update(settlement_reports=settlement_reports,
+                    settled_result=settled.to_dict()))
+                self.assertEqual(settled.state, "failed")
+                self.assertEqual(settled.result.error.code, "entry_admission_timeout")
+                self.assertEqual(len(classified_results), 1)
+                self.assertEqual(settled.result.to_dict(), classified_results[0].to_dict())
+                self.assertFalse(marker.exists())
                 healthy = self.submit(runtime, "healthy")
                 successor = traced('healthy_run_once', runtime.run_once, execution_id=healthy)
                 diagnostic(lambda: evidence.update(healthy_result=successor.to_dict()))

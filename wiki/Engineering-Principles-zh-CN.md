@@ -4,7 +4,7 @@
 
 这些原则让持久化 SDK 接入更容易运行和审查。
 它们约束的是应用的工程流程；SDK 仍负责执行、存储、租约和投递，
-应用负责业务含义和产品验收。完整定义和检查项见[详细指南](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/INTEGRATION_PRINCIPLES.md)。
+应用负责业务含义和产品验收。完整定义和检查项见[详细指南](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/INTEGRATION_PRINCIPLES.md)。
 
 | 原则 | 做法 |
 | --- | --- |
@@ -21,8 +21,8 @@
 ## 开始工作前
 
 写下要回答的问题、验收条件、候选身份，以及能回答这个问题的证据等级。
-为正在进行的持久化工作保留匹配的部署。复用数据库前阅读[存储与升级](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/STORAGE_AND_UPGRADES.md)，
-重试中断的 Effect（外部操作记录）前阅读[恢复指南](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_RECOVERY.md)。
+为正在进行的持久化工作保留匹配的部署。复用数据库前阅读[存储与升级](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/STORAGE_AND_UPGRADES.md)，
+重试中断的 Effect（外部操作记录）前阅读[恢复指南](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK_RECOVERY.md)。
 
 ## 报告成功前
 
@@ -30,4 +30,4 @@
 候选、依赖、生成产物或验收规则只要有一项变化，就重新执行最终检查。
 绿色测试数量、稳定摘要或 Agent 自报，只能证明实际完成的验证等级。
 
-编程 Agent 请使用[验证检查清单](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/DocsforAgents/VERIFICATION.md)。
+编程 Agent 请使用[验证检查清单](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/DocsforAgents/VERIFICATION.md)。

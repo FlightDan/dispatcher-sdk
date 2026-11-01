@@ -42,9 +42,9 @@ Dispatcher 在 Python 应用中运行函数和脚本，控制超时与取消，�
 - SDK 不能撤销已经发生的写入或 API 调用。结果不确定时必须先核对再恢复；不能保证任意操作只发生一次。
 - `Dispatcher` 内置收件箱负责通知的持久化接收和去重。业务回调仍为至少一次调用；外部请求需要幂等键。本地业务 SQL 可用 `consume_results` 与消费标记一起提交。
 
-当前工作区为基于 `0.7.2` 的未发布开发版本 `0.7.3.dev1`，要求 Python 3.10+。
-0.7.2 改进及其验收尚未完成。已发布的 0.7.2 包不一定包含本工作区描述的开发接口；
-请使用与实际安装版本对应的文档。
+当前工作区版本为 `0.7.3`，要求 Python 3.10+。是否正式发布请查看
+[GitHub Releases](https://github.com/FlightDan/dispatcher-sdk/releases)。真实 ModPort 旧 Run
+接入和宿主验收与 SDK 发布分别核对；请使用与实际安装版本对应的文档。
 Kernel 存储使用 schema 12，Orchestrator 存储使用 schema 6，新建 Settlement Journal 使用 schema 4。旧数据库需要显式升级，
 打开前请阅读[存储与升级](docs/STORAGE_AND_UPGRADES.md)和[兼容性说明](docs/PUBLIC_API.md)。
 [实施记录](docs/SDK_0_7_2_IMPLEMENTATION_STATUS.md)区分本地验证、平台覆盖、宿主接入和真实 Run 验收。

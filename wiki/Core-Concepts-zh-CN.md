@@ -44,7 +44,7 @@ Run 恢复保留原有身份和历史，再以新的 generation 重新打开符�
 
 `Task.observe()` 和 `Task.events()` 只读取已保存的执行事实，不会领取任务或修改时限。
 Handler 通过 `HandlerContext.activity` 报告执行活动。观测的边界和可选停滞处理流程见
-[执行观测与监督](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/EXECUTION_OBSERVABILITY.md)。
+[执行观测与监督](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/EXECUTION_OBSERVABILITY.md)。
 
-详细规则见 [SDK 契约](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK.md)、[恢复指南](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_RECOVERY.md)
-和[输出校验](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_OUTPUT_CONTRACTS.md)。
+详细规则见 [SDK 契约](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK.md)、[恢复指南](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK_RECOVERY.md)
+和[输出校验](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK_OUTPUT_CONTRACTS.md)。

@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from dispatcher_sdk.execution_kernel import ExecutionCommandV2, Kernel, RetryPolicy
 from dispatcher_sdk.execution_kernel.host import RuntimeHost
+from dispatcher_sdk.execution_kernel.runtime import _UnpersistedDiagnosticsError
 
 
 def echo_handler(payload, _context):
@@ -222,6 +223,36 @@ class RuntimeHostTests(unittest.TestCase):
                         host.stop(timeout=1.0)
                 self.assertEqual(host.health().state, "failed")
                 runtime.close.assert_called_once_with()
+
+    def test_unpersisted_diagnostic_retry_is_bounded_and_sticky(self) -> None:
+        runtime = SimpleNamespace(reap=lambda: [], run_once=lambda: None,
+            close=unittest.mock.Mock(side_effect=_UnpersistedDiagnosticsError("pending")))
+        host = RuntimeHost(runtime, RecordingBridge())
+        with patch("dispatcher_sdk.execution_kernel.host._DIAGNOSTIC_CLOSE_RETRY_SECONDS", 0.15):
+            self.assertFalse(host.stop(timeout=0.01))
+            self.assertTrue(host.join(timeout=2))
+        attempts = runtime.close.call_count
+        self.assertGreater(attempts, 1)
+        with self.assertRaisesRegex(RuntimeError, "cleanup failed.*pending"):
+            host.stop(timeout=1)
+        self.assertEqual(runtime.close.call_count, attempts)
+
+    def test_short_stop_can_continue_waiting_for_diagnostic_retry(self) -> None:
+        first_attempt = threading.Event()
+        allow_receipt = threading.Event()
+
+        def close():
+            first_attempt.set()
+            if not allow_receipt.is_set():
+                raise _UnpersistedDiagnosticsError("pending")
+
+        runtime = SimpleNamespace(reap=lambda: [], run_once=lambda: None, close=close)
+        host = RuntimeHost(runtime, RecordingBridge())
+        self.assertFalse(host.stop(timeout=0))
+        self.assertTrue(first_attempt.wait(1))
+        allow_receipt.set()
+        self.assertTrue(host.stop(timeout=2))
+        self.assertEqual(host.health().state, "stopped")
 
     def test_kernel_repeated_close_propagates_original_cleanup_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

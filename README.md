@@ -50,11 +50,11 @@ Integration boundaries:
 - The SDK cannot undo a write or API call that has already happened. Uncertain outcomes require verification before recovery; arbitrary operations are not guaranteed to happen exactly once.
 - `Dispatcher` durably accepts and deduplicates notifications in its built-in inbox. User callbacks remain at-least-once; external calls need idempotency. Use `consume_results` for atomic local SQL and receipt settlement.
 
-This checkout identifies itself as the `0.7.3` release candidate based on
-`0.7.2` and requires Python 3.10+. Acceptance and publication remain separate
-from the package version. Do not assume that a
-published 0.7.2 package contains the development APIs described in this checkout;
-read the documentation shipped with the version you install.
+This checkout identifies itself as `0.7.3` and requires Python 3.10+.
+Check [GitHub Releases](https://github.com/FlightDan/dispatcher-sdk/releases)
+for its publication status. Real ModPort old-Run adoption and host acceptance
+remain separate from the SDK release. Read the documentation shipped with the
+version you install.
 Kernel storage uses schema 12; Orchestrator storage uses schema 6; new
 Settlement Journals use schema 4. Older databases
 need an explicit upgrade. Read [storage and upgrades](docs/STORAGE_AND_UPGRADES.md)

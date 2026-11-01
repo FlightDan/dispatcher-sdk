@@ -51,8 +51,8 @@ new work.
 
 `Task.observe()` and `Task.events()` read persisted execution facts without
 claiming work or changing its deadline. Handlers report activity through
-`HandlerContext.activity`; see [execution activity and supervision](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/EXECUTION_OBSERVABILITY.md)
+`HandlerContext.activity`; see [execution activity and supervision](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/EXECUTION_OBSERVABILITY.md)
 for the limits of those facts and the optional stall workflow.
 
-See [SDK contracts](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK.md), [recovery](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_RECOVERY.md) and
-[output validation](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_OUTPUT_CONTRACTS.md) for the detailed rules.
+See [SDK contracts](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK.md), [recovery](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK_RECOVERY.md) and
+[output validation](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK_OUTPUT_CONTRACTS.md) for the detailed rules.

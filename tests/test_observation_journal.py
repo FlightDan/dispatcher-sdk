@@ -714,8 +714,8 @@ class ObservationJournalTests(unittest.TestCase):
 
     def test_report_bounding_honors_caller_inspection_budget(self):
         from dispatcher_sdk._inspection import InspectionBudget
-        self.journal.phase(self.identity, "handler_entered")
-        report = self.journal.inspect("execution")
+        self.journal.phase(self.identity, "handler_entered", timeout_seconds=1)
+        report = self.journal.inspect("execution", timeout=1)
         report["runtime_metadata"] = {"enabled": True}
         report.update(diagnostics={"evidence": "d" * 1900},
             settlement_obligations=[{"evidence": "s" * 1900}],

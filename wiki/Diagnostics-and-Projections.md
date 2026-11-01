@@ -24,7 +24,7 @@ count, not zero.
 
 Execution observations follow the same read-only rule. They report recorded facts
 without claiming work, renewing a lease or cleaning up a process. See [execution
-activity and supervision](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/EXECUTION_OBSERVABILITY.md) for deadlines,
+activity and supervision](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/EXECUTION_OBSERVABILITY.md) for deadlines,
 child calls and optional stall notifications.
 
 Runtime cancellation evidence can be persisted with explicit
@@ -41,7 +41,7 @@ foreign notes stay unknown. Confirmed local process cleanup does not resolve a
 pending sandbox-disposal obligation.
 Stopping a Task does not finish its Run.
 
-See the [API guide](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/SDK_DIAGNOSTICS_AND_PROJECTIONS.md),
-[journal design](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/docs/CANCELLATION_EVIDENCE.md),
-[projection example](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/projection_consumer.py) and
-[diagnostic example](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.2/examples/capability_diagnostics.py).
+See the [API guide](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/SDK_DIAGNOSTICS_AND_PROJECTIONS.md),
+[journal design](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/docs/CANCELLATION_EVIDENCE.md),
+[projection example](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/examples/projection_consumer.py) and
+[diagnostic example](https://github.com/FlightDan/dispatcher-sdk/blob/v0.7.3/examples/capability_diagnostics.py).
