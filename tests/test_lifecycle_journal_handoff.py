@@ -468,8 +468,12 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
             self.assertFalse(self.runtime._diagnostic_note(identity, "worker_tree_cleanup_observed", evidence))
             self.assertEqual(journal.inspect_supervisor_handoff(identity, timeout_seconds=1)
                              ["facts"]["worker_tree_cleanup"]["state"], "unknown")
-        self.runtime._retry_diagnostic_notes(time.monotonic() + 2)
-        fact = journal.inspect_supervisor_handoff(identity, timeout_seconds=1)["facts"]["worker_tree_cleanup"]
+        deadline = time.monotonic() + 10
+        while True:
+            self.runtime._retry_diagnostic_notes(min(deadline, time.monotonic() + 2), wait_for_writer=True)
+            fact = journal.inspect_supervisor_handoff(identity, timeout_seconds=1)["facts"]["worker_tree_cleanup"]
+            if fact.get("evidence") == evidence or time.monotonic() >= deadline:
+                break
         self.assertEqual(fact["evidence"], evidence)
         other = {**identity, "fence": identity["fence"] + 1}
         self.assertEqual(journal.inspect_supervisor_handoff(other, timeout_seconds=1)
@@ -487,8 +491,12 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
             self.assertFalse(self.runtime._diagnostic_note(identity, "worker_tree_cleanup_observed", evidence))
             self.assertEqual(journal.inspect_supervisor_handoff(identity, timeout_seconds=1)
                              ["facts"]["worker_tree_cleanup"]["state"], "unknown")
-        self.runtime._retry_diagnostic_notes(time.monotonic() + 2)
-        fact = journal.inspect_supervisor_handoff(identity, timeout_seconds=1)["facts"]["worker_tree_cleanup"]
+        deadline = time.monotonic() + 10
+        while True:
+            self.runtime._retry_diagnostic_notes(min(deadline, time.monotonic() + 2), wait_for_writer=True)
+            fact = journal.inspect_supervisor_handoff(identity, timeout_seconds=1)["facts"]["worker_tree_cleanup"]
+            if fact.get("evidence") == evidence or time.monotonic() >= deadline:
+                break
         self.assertEqual(fact["evidence"], evidence)
         wrong = {**identity, "fence": identity["fence"] + 1}
         self.assertEqual(journal.inspect_supervisor_handoff(wrong, timeout_seconds=1)
@@ -600,6 +608,14 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
             self.assertFalse(self.runtime._diagnostics_block_admission("independent"))
             self.assertTrue(self.runtime._diagnostics_block_admission())
             result = self.runtime.run_once()
+            self.assertEqual(result.execution_id, "independent")
+            # A busy completion writer can defer the business CAS after the
+            # independent handler has run. Its retained result must still
+            # settle while the unrelated diagnostic remains unavailable.
+            deadline = time.monotonic() + 15
+            while result.state == "running" and time.monotonic() < deadline:
+                self.runtime.recover_completions(timeout_seconds=.5)
+                result = self.runtime.kernel.get("independent")
             self.assertEqual(result.state, "succeeded")
             self.assertIn("execution_claimed", [note["phase"] for note in self.reopen_notes("independent")])
         deadline = time.monotonic() + 15

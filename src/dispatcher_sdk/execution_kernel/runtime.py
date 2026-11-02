@@ -1465,13 +1465,33 @@ class InProcessRuntime:
         self._start_services()
         return result
 
-    def cancel_if_stalled(self, notification: dict[str, Any], *, reason: str = "stall disposition"):
+    def cancel_if_stalled(self, notification: dict[str, Any], *, reason: str = "stall disposition",
+                          timeout_seconds: float = 1):
         if notification.get("kind") != "stalled" or type(notification.get("disposition")) is not dict:
             raise ValueError("expected an SDK stall notification with disposition authority")
         token = notification["disposition"]
-        current = self.kernel.supervision_status(token["execution_id"])
-        return self.cancel(token["execution_id"], expected_revision=current["execution_revision"],
-            reason=reason, expected_supervision=token)
+        duration = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
+        deadline = time.monotonic() + duration
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Kernel control admission budget elapsed")
+            try:
+                current = self.kernel.supervision_status(token["execution_id"], timeout_seconds=remaining)
+                break
+            except (TimeoutError, sqlite3.OperationalError) as error:
+                if not (is_sqlite_contention(error) or
+                        isinstance(error, TimeoutError) and str(error) in (
+                            "Kernel control lock admission timed out", "Kernel control admission budget elapsed")):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(.005, max(0, deadline - time.monotonic())))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Kernel control admission budget elapsed")
+        return self._cancel_with_deadline(token["execution_id"], expected_revision=current["execution_revision"],
+            reason=reason, expected_supervision=token, control_deadline=deadline, duration=duration)
 
     def stall_notifications(self, *, limit: int = 50):
         """Read durable notifications before their orchestration handoff."""
@@ -1902,17 +1922,33 @@ class InProcessRuntime:
         timeout_seconds: float = 1,
     ):
         """Cancel while retaining ownership of all resulting diagnostics."""
-        with self._lifecycle_condition:
+        duration = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
+        return self._cancel_with_deadline(execution_id, expected_revision=expected_revision,
+            reason=reason, expected_supervision=expected_supervision,
+            control_deadline=time.monotonic() + duration, duration=duration)
+
+    def _cancel_with_deadline(self, execution_id: str, *, expected_revision: int,
+                              reason: str, expected_supervision: dict[str, Any] | None,
+                              control_deadline: float, duration: float):
+        remaining = control_deadline - time.monotonic()
+        if remaining <= 0 or not self._lifecycle_condition.acquire(timeout=remaining):
+            raise TimeoutError("execution lifecycle admission timed out; cancellation was not submitted")
+        try:
+            if time.monotonic() >= control_deadline:
+                raise TimeoutError("execution lifecycle admission timed out; cancellation was not submitted")
             if self._closed:
                 raise RuntimeError("runtime is closed")
             self._active_runs += 1
+        finally:
+            self._lifecycle_condition.release()
         try:
             self._lifecycle_context.cancellation = True
             self._lifecycle_context.producer = None
             self._lifecycle_context.uncertain = False
             self._lifecycle_context.evidence_lost = False
             return self._cancel_active(execution_id, expected_revision=expected_revision,
-                reason=reason, expected_supervision=expected_supervision, timeout_seconds=timeout_seconds)
+                reason=reason, expected_supervision=expected_supervision,
+                control_deadline=control_deadline, duration=duration)
         finally:
             producer = getattr(self._lifecycle_context, 'producer', None)
             if producer is not None and not getattr(self._lifecycle_context, 'uncertain', False):
@@ -1934,7 +1970,8 @@ class InProcessRuntime:
         expected_revision: int,
         reason: str = "execution cancelled",
         expected_supervision: dict[str, Any] | None = None,
-        timeout_seconds: float = 1,
+        control_deadline: float,
+        duration: float,
     ):
         """Externally cancel one execution with revision-CAS authority.
 
@@ -1947,8 +1984,6 @@ class InProcessRuntime:
         recovery_error: EffectRecoveryRequiredError | None = None
         receipt_id = None
         evidence_errors: list[Exception] = []
-        duration = self.kernel._positive_duration(timeout_seconds, "timeout_seconds")
-        control_deadline = time.monotonic() + duration
         if type(expected_supervision) is dict:
             expected_supervision = dict(expected_supervision)
         cancellation_identity: ObservationIdentity | None = None

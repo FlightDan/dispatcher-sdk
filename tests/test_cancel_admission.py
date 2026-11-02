@@ -12,6 +12,7 @@ from unittest.mock import patch
 from tests._acceptance_evidence import retained_directory
 
 from dispatcher_sdk.execution_kernel import Kernel
+from dispatcher_sdk.application import Task
 from dispatcher_sdk.observability import ObservationOptions
 from dispatcher_sdk.execution_kernel.errors import CASConflictError, EffectRecoveryRequiredError
 import dispatcher_sdk.execution_kernel.runtime as runtime_module
@@ -70,6 +71,94 @@ class CancelAdmissionTests(unittest.TestCase):
         connection = sqlite3.connect(self.runtime.kernel.db_path, timeout=.1, check_same_thread=False)
         connection.execute('BEGIN IMMEDIATE')
         return connection
+
+    def test_stall_disposition_waits_for_transient_control_lock(self):
+        locked, release = threading.Event(), threading.Event()
+        def holder():
+            with self.runtime.kernel._control_lock(1):
+                locked.set()
+                release.wait(2)
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.assertTrue(locked.wait(1))
+        timer = threading.Timer(.22, release.set)
+        timer.start()
+        try:
+            result = self.runtime.cancel_if_stalled(
+                {'kind': 'stalled', 'disposition': self.token}, timeout_seconds=2)
+            self.assertEqual(result.state, 'cancelled')
+        finally:
+            release.set()
+            thread.join(2)
+            timer.cancel()
+
+    def test_stall_disposition_timeout_does_not_cancel(self):
+        locked, release = threading.Event(), threading.Event()
+        def holder():
+            with self.runtime.kernel._control_lock(1):
+                locked.set()
+                release.wait(2)
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.assertTrue(locked.wait(1))
+        try:
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                self.runtime.cancel_if_stalled({'kind': 'stalled', 'disposition': self.token}, timeout_seconds=.15)
+            self.assertLess(time.monotonic() - started, 1)
+        finally:
+            release.set()
+            thread.join(2)
+        self.assertEqual(self.runtime.kernel.get('parent').state, 'running')
+
+    def test_stall_disposition_lifecycle_condition_respects_original_deadline(self):
+        locked, release = threading.Event(), threading.Event()
+        def holder():
+            with self.runtime._lifecycle_condition:
+                locked.set()
+                release.wait(2)
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.assertTrue(locked.wait(1))
+        try:
+            started = time.monotonic()
+            with self.assertRaisesRegex(TimeoutError, 'lifecycle admission timed out'):
+                self.runtime.cancel_if_stalled({'kind': 'stalled', 'disposition': self.token}, timeout_seconds=.15)
+            self.assertLess(time.monotonic() - started, 1)
+        finally:
+            release.set()
+            thread.join(2)
+        self.assertEqual(self.runtime.kernel.get('parent').state, 'running')
+        self.assertEqual(self.runtime._active_runs, 0)
+
+    def test_task_forwards_conditional_cancel_timeout(self):
+        calls = []
+        notice = {'kind': 'stalled', 'execution_id': 'parent', 'disposition': self.token}
+        fake = SimpleNamespace(_snapshot=lambda request_id: {'command': {'execution_id': 'parent'}},
+            runtime=SimpleNamespace(cancel_if_stalled=lambda *args, **kwargs: calls.append((args, kwargs))))
+        Task(fake, 'request').cancel_if_stalled(notice, reason='test', timeout_seconds=.7)
+        self.assertEqual(calls, [((notice,), {'reason': 'test', 'timeout_seconds': .7})])
+
+    def test_stall_disposition_rechecks_progress_after_control_wait(self):
+        locked, release = threading.Event(), threading.Event()
+        def holder():
+            with self.runtime.kernel._control_lock(1):
+                locked.set()
+                release.wait(2)
+                self.runtime.kernel.confirm_progress(self.lease, 'new-progress')
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.assertTrue(locked.wait(1))
+        timer = threading.Timer(.22, release.set)
+        timer.start()
+        try:
+            with self.assertRaises(CASConflictError):
+                self.runtime.cancel_if_stalled({'kind': 'stalled', 'disposition': self.token}, timeout_seconds=2)
+            self.assertEqual(self.runtime.kernel.get('parent').state, 'running')
+        finally:
+            release.set()
+            thread.join(2)
+            timer.cancel()
 
     def actual_busy(self):
         path = self.root/'busy.sqlite3'

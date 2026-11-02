@@ -201,10 +201,11 @@ class Task:
         current = self.dispatcher.runtime.kernel.get(execution_id)
         return self.dispatcher.runtime.cancel(execution_id, expected_revision=current.revision, reason=reason)
 
-    def cancel_if_stalled(self, notification: dict[str, Any], *, reason: str = "stall disposition"):
+    def cancel_if_stalled(self, notification: dict[str, Any], *, reason: str = "stall disposition",
+                          timeout_seconds: float = 1):
         if notification.get("execution_id") != self.snapshot["command"]["execution_id"]:
             raise ValueError("notification belongs to another task execution")
-        return self.dispatcher.runtime.cancel_if_stalled(notification, reason=reason)
+        return self.dispatcher.runtime.cancel_if_stalled(notification, reason=reason, timeout_seconds=timeout_seconds)
 
     def wait(self, *, timeout: float = 30) -> dict[str, Any]:
         """Wait for the result without consuming notifications or retrying work.

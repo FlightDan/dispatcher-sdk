@@ -267,6 +267,10 @@ If the application authorizes cancellation for a stall, use
 policy and progress revision in the cancellation transaction. A confirmed
 progress commit that wins the race rejects the stale disposition. Ordinary
 `task.cancel()` retains explicit cancellation semantics.
+The optional `timeout_seconds` (default 1 second) bounds the Kernel authority
+read and cancellation admission together. If that read cannot acquire control
+within the window, cancellation is not submitted. A successful read does not
+itself authorize cancellation: the Kernel rechecks the token at commit.
 Cancellation retries temporary control-storage contention only when it can prove
 that the attempt made no writes. All such attempts share the original caller
 window and the same revision and supervision token. Cleanup and evidence

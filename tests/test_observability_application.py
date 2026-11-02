@@ -361,6 +361,11 @@ class ObservabilityApplicationTests(unittest.TestCase):
                     correlation_id='test', payload={}, timeout_seconds=2)
                 runtime.submit(command)
                 result = runtime.run_once()
+                deadline = time.monotonic() + 10
+                while result.result is None and time.monotonic() < deadline:
+                    runtime.recover_completions(timeout_seconds=.5)
+                    result = runtime.kernel.get('advance')
+                self.assertIsNotNone(result.result)
                 self.assertEqual(result.result.status, 'timed_out')
                 self.assertEqual(result.result.error.code, 'handler_timeout')
 
