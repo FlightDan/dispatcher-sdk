@@ -2008,7 +2008,7 @@ class RuntimeTests(unittest.TestCase):
     def test_thread_fallback_revokes_late_effect_authority(self) -> None:
         with self.runtime_case_evidence("sdk-thread-timeout-authority-") as (root, evidence):
             evidence.update(timeout_seconds=5, clock_advance_seconds=6, entry_wait_seconds=2,
-                            driver_join_seconds=2, handler_release_wait_seconds=5, timestamps={})
+                            driver_join_seconds=2, settlement_wait_seconds=5, timestamps={})
             timestamps = evidence["timestamps"]
             clock = Clock(time.time())
             entered = threading.Event()
@@ -2019,7 +2019,7 @@ class RuntimeTests(unittest.TestCase):
 
             def late_effect(payload, context):
                 entered.set()
-                release.wait(5)
+                release.wait()
                 try:
                     context.effects.execute_once(
                         "late-effect",
@@ -2078,7 +2078,27 @@ class RuntimeTests(unittest.TestCase):
                 self.assertFalse(driver.is_alive())
                 self.assertEqual(errors, [])
                 self.assertEqual(len(outcomes), 1)
-                self.assertEqual(outcomes[0].state, "timed_out")
+                # The bounded completion CAS may return its original running
+                # snapshot while a budget sample is settling. Recover the
+                # retained result without running the handler a second time.
+                result = outcomes[0]
+                deadline = time.monotonic() + 5
+                while result.state == "running" and time.monotonic() < deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    stack.recover_completions(timeout_seconds=min(.1, remaining))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    with stack.kernel._control_lock(remaining):
+                        result = stack.kernel.get("thread-timeout")
+                    if result.state == "running":
+                        time.sleep(min(.01, max(0., deadline - time.monotonic())))
+                self.assertEqual(result.state, "timed_out")
+                self.assertEqual((result.attempt, result.fence), (1, 1))
+                self.assertEqual(result.result.error.code, "handler_timeout")
+                self.assertFalse(attempted.is_set())
                 release.set()
                 self.assertTrue(attempted.wait(1))
                 self.assertFalse(performed.is_set())

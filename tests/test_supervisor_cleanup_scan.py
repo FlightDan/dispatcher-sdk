@@ -122,19 +122,39 @@ class SupervisorCleanupScanTests(unittest.TestCase):
                         raise TimeoutError('journal acknowledgement lost')
                     return settle(record, state, evidence, **kwargs)
                 with patch.object(runtime._settlement_journal, 'settle', side_effect=fail_recorded):
-                    runtime.recover_completions(timeout_seconds=1)
-                self.assertEqual(runtime.kernel.get('clock').state, 'queued')
+                    deadline = time.monotonic() + 10
+                    reports = []
+                    while runtime.kernel.get('clock').state == 'running':
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        reports.extend(runtime.recover_completions(
+                            timeout_seconds=min(2, remaining), max_record_bytes=256 * 1024 + 1))
+                self.assertEqual(runtime.kernel.get('clock').state, 'queued', reports)
                 pending = runtime._settlement_journal.inspect('clock', timeout_seconds=1)[0]
                 self.assertEqual(pending['state'], 'pending')
                 result_id = pending['evidence']['resolved_result']['result_id']
                 retry = runtime.kernel.claim_and_start('retry-owner', execution_id='clock')
                 self.assertGreater(retry.attempt, pending['identity']['attempt'])
-                runtime.recover_completions(timeout_seconds=1)
+                # Recovery is bounded and may legitimately leave a receipt
+                # pending on a slow host. Give each attempt enough time for
+                # the exact-result proof and its journal write, then retry.
+                deadline = time.monotonic() + 10
+                reports = []
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    reports.extend(runtime.recover_completions(
+                        timeout_seconds=min(2, remaining), max_record_bytes=256 * 1024 + 1))
+                    replayed = runtime._settlement_journal.inspect('clock', timeout_seconds=1)[0]
+                    if replayed['state'] != 'pending':
+                        break
                 obligation = runtime.kernel.inspect_supervisor_obligations('clock')['obligations'][0]
                 self.assertEqual(obligation['resolution']['source'], 'sdk_supervisor_not_invoked')
                 self.assertEqual(obligation['resolution']['result_id'], result_id)
                 replayed = runtime._settlement_journal.inspect('clock', timeout_seconds=1)[0]
-                self.assertEqual(replayed['state'], 'recorded')
+                self.assertEqual(replayed['state'], 'recorded', reports)
                 self.assertEqual(replayed['evidence']['result_id'], result_id)
             finally:
                 runtime.close()

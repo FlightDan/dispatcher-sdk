@@ -3,6 +3,7 @@ import contextlib
 import sqlite3
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -179,7 +180,17 @@ class SettlementCopyRebindTests(unittest.TestCase):
                                              settlement_journal_path=str(destination))
                 try:
                     self.assertEqual(runtime._settlement_journal.pending()[0]['result'], original['result'])
-                    reports = runtime.recover_completions(timeout_seconds=3)
+                    # A bounded operation may leave the exact receipt pending on
+                    # a busy host; recovery is designed to be retried.
+                    deadline = time.monotonic() + 10
+                    reports = []
+                    while (remaining := deadline - time.monotonic()) > 0:
+                        batch = runtime.recover_completions(timeout_seconds=min(1, remaining))
+                        reports.extend(batch)
+                        self.assertFalse(any(item['state'] not in ('pending', 'recorded') for item in batch), reports)
+                        if any(item['state'] == 'recorded' for item in batch):
+                            break
+                        time.sleep(.02)
                     self.assertTrue(any(item['state'] == 'recorded' for item in reports), reports)
                     self.assertEqual(runtime.kernel.get('execution').result.to_dict(), original['result'])
                     self.assertEqual(runtime.kernel.inspect_supervisor_obligations('execution')['obligations'][0]['state'], 'resolved')

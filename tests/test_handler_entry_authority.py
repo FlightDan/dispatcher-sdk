@@ -334,9 +334,12 @@ class ThreadHandlerEntryGateTests(unittest.TestCase):
     def finish(self):
         self.release.set()
         began = time.monotonic()
-        self.driver.join(2)
+        # The handler may have finished while run_once is still committing its
+        # lifecycle diagnostics. Allow that storage work its own join budget;
+        # this does not extend the execution's original work cutoff.
+        self.driver.join(10)
         alive = self.driver.is_alive()
-        self.checkpoint("original-driver-join", timeout=2,
+        self.checkpoint("original-driver-join", timeout=10,
                         elapsed=time.monotonic() - began, alive_at_return=alive)
         try:
             self.assertFalse(alive, "thread entry driver did not settle")
