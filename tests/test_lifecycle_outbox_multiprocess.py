@@ -1,7 +1,7 @@
 """Crash-window and concurrent delivery checks for lifecycle diagnostics."""
 import multiprocessing
 import os
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 import tempfile
 import threading
 import time
@@ -27,10 +27,11 @@ def _producer_then_die(path, conn):
 
 def _receiver_commit_then_die(path, journal_path, conn):
     kernel = SQLiteKernel(path)
-    journal = SettlementJournal.open_existing(journal_path, source_id='test', kernel_path=path)
+    journal = SettlementJournal.open_existing(journal_path, source_id='test', kernel_path=path,
+                                              timeout_seconds=5)
     event = kernel.lifecycle_peek()
     journal.note({k: event[k] for k in ('execution_id', 'attempt', 'fence')},
-                 event['phase'], event['payload'], note_id=event['event_id'])
+                 event['phase'], event['payload'], note_id=event['event_id'], timeout_seconds=5)
     conn.send(event['sequence'])
     conn.close()
     os._exit(0)
@@ -50,43 +51,60 @@ def _blocking_handler(payload, context):
 
 
 class LifecycleOutboxMultiprocessTests(unittest.TestCase):
+    def _run_crashing_child(self, target, args, label):
+        ctx = multiprocessing.get_context('spawn')
+        parent, child = ctx.Pipe(False)
+        process = ctx.Process(target=target, args=(*args, child))
+        try:
+            process.start()
+            child.close()
+            self.assertTrue(parent.poll(15), f'{label} did not send its committed sequence')
+            try:
+                sequence = parent.recv()
+            except EOFError:
+                process.join(15)
+                self.fail(f'{label} exited before sending its committed sequence (exitcode={process.exitcode})')
+            process.join(15)
+            self.assertEqual(process.exitcode, 0, f'{label} did not exit after sending')
+            return sequence
+        finally:
+            parent.close()
+            child.close()
+            if process.pid is not None:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(5)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(5)
+                else:
+                    process.join()
+                process.close()
+
     def test_crashed_producer_and_receiver_ack_loss_replay(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             path = str(Path(directory) / 'kernel.sqlite')
             journal_path = str(Path(directory) / 'settlements.sqlite')
             kernel = SQLiteKernel(path)
+            cleanup.callback(kernel.close)
             kernel.submit(make_command('job'))
-            journal = SettlementJournal(journal_path, source_id='test', kernel_path=path)
-            ctx = multiprocessing.get_context('spawn')
-            parent, child = ctx.Pipe(False)
-            producer = ctx.Process(target=_producer_then_die, args=(path, child))
-            producer.start()
-            child.close()
-            self.assertTrue(parent.poll(15), 'producer did not durably append')
-            sequence = parent.recv()
-            producer.join(15)
-            self.assertEqual(producer.exitcode, 0)
+            journal = SettlementJournal(journal_path, source_id='test', kernel_path=path,
+                                        timeout_seconds=5)
+            sequence = self._run_crashing_child(_producer_then_die, (path,), 'producer')
             self.assertIsNone(kernel.claim_and_start('other', registry_revision='registry-1',
                                                     execution_id='job'))
-            parent, child = ctx.Pipe(False)
-            receiver = ctx.Process(target=_receiver_commit_then_die, args=(path, journal_path, child))
-            receiver.start()
-            child.close()
-            self.assertTrue(parent.poll(15), 'receiver did not commit')
-            self.assertEqual(parent.recv(), sequence)
-            receiver.join(15)
-            self.assertEqual(receiver.exitcode, 0)
+            self.assertEqual(self._run_crashing_child(_receiver_commit_then_die,
+                                                      (path, journal_path), 'receiver'), sequence)
             event = kernel.lifecycle_peek()
             self.assertEqual(event['event_id'], 'first')
             journal.note({k: event[k] for k in ('execution_id', 'attempt', 'fence')},
-                         event['phase'], event['payload'], note_id=event['event_id'])
+                         event['phase'], event['payload'], note_id=event['event_id'], timeout_seconds=5)
             self.assertTrue(kernel.lifecycle_ack(event['sequence'], event['event_id']))
-            notes = journal.inspect_notes('job')['notes']
+            notes = journal.inspect_notes('job', timeout_seconds=5)['notes']
             self.assertEqual([note['note_id'] for note in notes], ['first'])
             # An unclosed crashed producer still fences admission after delivery.
             self.assertIsNone(kernel.claim_and_start('other', registry_revision='registry-1',
                                                     execution_id='job'))
-            kernel.close()
 
     def test_oldest_event_must_be_acknowledged_first(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -209,8 +227,10 @@ class LifecycleOutboxMultiprocessTests(unittest.TestCase):
                 with self.assertRaises(ProcessLookupError):
                     os.kill(worker_pid, 0)
             finally:
-                runtime.close()
-                driver.join(10)
+                try:
+                    runtime.close()
+                finally:
+                    driver.join(10)
 
     @unittest.skipUnless(os.name == 'posix', 'requires POSIX process supervisor')
     def test_cancellation_stops_process_when_diagnostic_reserve_fails(self):
