@@ -69,7 +69,7 @@ class SupervisorSettlementHandoffTests(unittest.TestCase):
                      'watchdog_clock_unknown', 'watchdog_startup_expired', 'watchdog_startup_returned',
                      'watchdog_delayed_return', 'watchdog_unreadable', 'timestamp_missing', 'timestamp_invalid', 'timestamp_nan'):
             with self.subTest(mode=mode):
-                roots, events, watchdogs = [], [], []
+                roots, events, watchdogs, entry_times = [], [], [], []
                 command = ExecutionCommandV2('exec', 'idempotency', 'revision', 'run', None,
                                              'handler', 1, RetryPolicy(), 10, {})
                 lease = ExecutionLease('exec', 'lease', 'owner', 2, 1, 9999999999, 1)
@@ -82,6 +82,7 @@ class SupervisorSettlementHandoffTests(unittest.TestCase):
                     def __init__(self, *args): pass
                     def resume(self):
                         start = time.monotonic()
+                        entry_times.append(start)
                         envelope = BudgetEnvelope((), sample_clock(), time.time()).to_dict()
                         (roots[0] / 'ready').write_text(json.dumps({'worker_pid': 7}))
                         (roots[0] / 'entered.json').write_text(json.dumps({'worker_pid': 7,
@@ -102,7 +103,8 @@ class SupervisorSettlementHandoffTests(unittest.TestCase):
                         if mode.startswith('watchdog_'):
                             if mode in ('watchdog_delayed_return', 'watchdog_unreadable'):
                                 (roots[0] / 'returned.json').write_text(json.dumps({
-                                    'completed_monotonic': time.monotonic(), 'outcome_json': '{"kind":"ok"}'}))
+                                    'completed_monotonic': entry_times[0] + 1, 'outcome_json': '{"kind":"ok"}'}))
+                                events.append('delayed_return')
                             watchdogs[0].expired = True
                             watchdogs[0].business_cutoff = not mode.startswith('watchdog_startup_')
                             if mode == 'watchdog_clock_unknown':
@@ -133,6 +135,8 @@ class SupervisorSettlementHandoffTests(unittest.TestCase):
                     def close(self): pass
                 read_text = Path.read_text
                 def read_publication(path, *args, **kwargs):
+                    if path.name == 'returned.json' and 'close' in events:
+                        events.append('return_observed_after_close')
                     if mode == 'watchdog_unreadable' and path.name == 'returned.json':
                         raise PermissionError('unreadable')
                     return read_text(path, *args, **kwargs)
@@ -206,14 +210,11 @@ class SupervisorSettlementHandoffTests(unittest.TestCase):
                                     runtime.kernel._positive_duration.return_value = 1
                                     runtime.kernel.get.return_value = SimpleNamespace(attempt=lease.attempt,
                                         fence=lease.fence, state='running')
-                                    if mode == 'watchdog_unreadable':
-                                        # This real journal must durably archive the unknown
-                                        # disposition; give its bounded SQLite operations
-                                        # enough of the caller's explicit recovery window.
-                                        reports = runtime.recover_completions(
-                                            timeout_seconds=5, max_record_bytes=512 * 1024)
-                                    else:
-                                        reports = runtime.recover_completions(timeout_seconds=1)
+                                    # These real journal operations must durably archive the
+                                    # unknown disposition. Explicitly budget the recovery
+                                    # operation for slow Windows filesystem and SQLite I/O.
+                                    reports = runtime.recover_completions(
+                                        timeout_seconds=5, max_record_bytes=512 * 1024)
                                     self.assertEqual(reports[0]['state'], 'unknown')
                                     if mode == 'watchdog_unreadable':
                                         settled = runtime._settlement_journal.inspect(
@@ -238,6 +239,10 @@ class SupervisorSettlementHandoffTests(unittest.TestCase):
                     self.assertLess(events.index('cleanup'), events.index('supervisor_result_accepted'))
                 else:
                     self.assertNotIn('supervisor_result_accepted', events)
+                if mode in ('watchdog_delayed_return', 'watchdog_unreadable'):
+                    self.assertLess(events.index('delayed_return'), events.index('terminate'))
+                    self.assertLess(events.index('terminate'), events.index('close'))
+                    self.assertLess(events.index('close'), events.index('return_observed_after_close'))
 
     def test_recovery_uses_only_original_durable_exact_proof(self):
         lease = ExecutionLease('exec', 'lease', 'owner', 2, 1, 9999999999, 1)
