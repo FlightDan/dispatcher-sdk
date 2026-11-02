@@ -191,7 +191,11 @@ class ChildStorageContentionTests(unittest.TestCase):
         runtime = self.runtime(parent, child)
         with patch.object(HandlerChildren, "_await", gated_await):
             driver, outcomes, errors = self.drive(runtime, timeout=18)
-            self.witness_readiness(waiting, 2, runtime, driver, outcomes, errors,
+            # The parent must durably sample its budget before entering the
+            # child await. A loaded runner can take longer than two seconds
+            # to commit that sample; the parent and child deadlines still
+            # bound the actual operation and are not extended by this wait.
+            self.witness_readiness(waiting, 8, runtime, driver, outcomes, errors,
                 parent_timeout=18, child_timeout=12, calls=calls, await_rows=row_seen)
             self.poll(lambda: self.requests(runtime)[0]["state"] == "completed", seconds=10)
             raw_result = runtime.kernel.get(row_seen[0]["child_execution_id"]).result.to_dict()

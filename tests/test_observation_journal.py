@@ -149,6 +149,10 @@ class ObservationJournalTests(unittest.TestCase):
         self.assertNotIn("stderr_bytes", report["metrics"])
 
     def test_oversized_event_metadata_is_bounded_and_cursor_advances(self):
+        # This batch intentionally persists 10 KiB of event metadata. Give the
+        # write a finite allowance independent of the fixture's 30 ms pressure
+        # budget so the test reaches its read-side truncation and cursor checks.
+        self.journal.options = ObservationOptions(tail_bytes=self.options.tail_bytes, write_timeout=2)
         self.journal.write_batch(self.identity, source_id="source", sequence=1,
             metrics={}, tails={}, captured_at=100, gaps=0,
             events=({"kind": "x" * 10000, "captured_at": 100, "details": {}},))

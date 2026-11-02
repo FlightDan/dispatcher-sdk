@@ -108,8 +108,19 @@ class RecoveryPendingFairPaginationTests(unittest.TestCase):
                 try:
                     with reopened._settlement_journal._connection(1) as connection:
                         self.assertEqual(tuple(connection.execute('SELECT last_rowid FROM settlement_recovery_cursor').fetchone()), prior_cursor)
-                    after_restart = reopened.recover_completions(limit=50, timeout_seconds=.5)
-                    self.assertTrue(any(item.get("execution_id", "").startswith("blocked-") and item["state"] == "pending" for item in after_restart))
+                    # Recovery has a bounded time budget, including startup
+                    # reconciliation and lock admission. A single pass may
+                    # expire before it reads a receipt on a loaded machine.
+                    after_restart = []
+                    for _ in range(120):
+                        after_restart.extend(reopened.recover_completions(limit=50, timeout_seconds=.5))
+                        if any(item.get("execution_id", "").startswith("blocked-")
+                               and item["state"] == "pending"
+                               and "BudgetClockUnknownError" in item.get("error", "")
+                               for item in after_restart):
+                            break
+                    else:
+                        self.fail(f"no retained unknown-clock receipt recovered after restart: {after_restart}")
                 finally:
                     reopened.close()
             finally:
