@@ -2284,11 +2284,26 @@ class RuntimeTests(unittest.TestCase):
                 self.assertFalse(driver.is_alive())
                 self.assertEqual(errors, [])
                 self.assertEqual(len(outcomes), 1)
-                self.assertEqual(outcomes[0].state, "timed_out")
                 self.assertFalse(finished.is_set())
 
                 # The timed-out Python call still owns the only slot.  The
                 # second item must remain queued and its handler must not run.
+                self.assertIsNone(stack.run_once())
+                self.assertEqual(stack.kernel.get("blocked-2").state, "queued")
+
+                # A bounded completion attempt can return the running snapshot
+                # while retaining the timeout for settlement. Recover that
+                # result without releasing the blocked handler or rerunning it.
+                terminal = outcomes[0]
+                settlement_deadline = time.monotonic() + 10
+                while terminal.state == "running" and time.monotonic() < settlement_deadline:
+                    remaining = max(.001, settlement_deadline - time.monotonic())
+                    stack.recover_completions(timeout_seconds=min(.1, remaining))
+                    with stack.kernel._control_lock(max(.001, settlement_deadline - time.monotonic())):
+                        terminal = stack.kernel.get("blocked-1")
+                self.assertEqual(terminal.state, "timed_out")
+                self.assertEqual(terminal.result.error.code, "handler_timeout")
+                self.assertFalse(finished.is_set())
                 self.assertIsNone(stack.run_once())
                 self.assertEqual(stack.kernel.get("blocked-2").state, "queued")
 

@@ -401,7 +401,15 @@ class ThreadHandlerEntryGateTests(unittest.TestCase):
             raise
         self.assertFalse(self.called.is_set())
         terminal = self.finish()
-        self.assertEqual(terminal.state, "timed_out", terminal.result.error)
+        # A bounded publication attempt may return the running snapshot while
+        # retaining the already observed timeout for later settlement.
+        settlement_deadline = time.monotonic() + 10
+        while terminal.state == "running" and time.monotonic() < settlement_deadline:
+            remaining = max(.001, settlement_deadline - time.monotonic())
+            self.runtime.recover_completions(timeout_seconds=min(.1, remaining))
+            with self.runtime.kernel._control_lock(max(.001, settlement_deadline - time.monotonic())):
+                terminal = self.runtime.kernel.get("thread-entry")
+        self.assertEqual(terminal.state, "timed_out")
         self.assertEqual(terminal.result.error.code, "handler_timeout")
         persisted = self.runtime.kernel.get_execution_limits("thread-entry")["envelope"]["constraints"]
         self.assertEqual(persisted, [item.to_dict() for item in cutoff])

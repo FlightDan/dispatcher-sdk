@@ -682,25 +682,52 @@ class CompletionClockTests(unittest.TestCase):
             self.kernel._finish_budget_sample(token, "original", self.envelope)
 
     def test_actual_released_reader_contention_reuses_original_return_sample(self):
+        floor = self.floor()
         writer = self.rollback_journal_writer()
         original_wall = self.wall[0]
         calls_before = self.wall_calls
+        contention = threading.Event()
+        samples = []
+        read_floor = completion_clock_module._read_floor
+
+        def sample(**kwargs):
+            result = sample_clock(**kwargs)
+            samples.append(result)
+            return result
+
+        def observe_contention(*args, **kwargs):
+            try:
+                return read_floor(*args, **kwargs)
+            except sqlite3.OperationalError as error:
+                if completion_clock_module.is_sqlite_contention(error):
+                    contention.set()
+                raise
 
         def release():
-            time.sleep(.035)
+            contention.wait(1)
             self.wall[0] = original_wall + 1000
             writer.rollback()
 
         releaser = threading.Thread(target=release)
         releaser.start()
         try:
-            completed_at = capture_completion_time(self.context)
+            with patch.object(completion_clock_module, "sample_clock", side_effect=sample), \
+                    patch.object(completion_clock_module, "_read_floor", side_effect=observe_contention):
+                completed_at = capture_completion_time(self.context)
         finally:
-            releaser.join(1)
+            releaser.join(2)
+        self.assertFalse(releaser.is_alive())
+        self.assertTrue(contention.is_set())
         self.assertEqual(1, self.wall_calls - calls_before)
-        self.assertLess(completed_at, original_wall + 1)
+        self.assertEqual(1, len(samples))
+        self.assertEqual(original_wall, samples[0].wall_at)
+        expected = max(samples[0].wall_at,
+            self.envelope.recheckpoint(sample=samples[0]).checkpoint.wall_at, floor)
+        self.assertEqual(expected, completed_at)
         self.evidence["records"].append({"original_wall": original_wall,
-            "later_wall": self.wall[0], "completed_at": completed_at, "wall_samples": 1})
+            "later_wall": self.wall[0], "completed_at": completed_at,
+            "sample": samples[0].to_dict(), "watermark": floor,
+            "contention_observed": True, "wall_samples": 1})
 
     def test_revoked_original_lease_still_has_factual_return_time(self):
         self.kernel.cancel("original", lease=self.lease, reason="actual original cancellation")

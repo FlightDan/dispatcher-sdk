@@ -957,13 +957,15 @@ class SettlementJournal:
                     'SELECT sequence,length(CAST(evidence_json AS BLOB)) AS bytes FROM settlement_notes WHERE '
                     + selector + ' ORDER BY sequence DESC LIMIT 1', parameters).fetchone()
                 if row is None and label == 'worker_tree_cleanup':
-                    # Windows Job observations use the durable lifecycle
-                    # outbox, whose receipt ID is not the POSIX canonical ID.
+                    # Parent lifecycle outbox observations use a distinct
+                    # receipt ID on both POSIX and Windows. Accept only the
+                    # two exact containment facts for this invocation.
                     row = connection.execute(
                         'SELECT sequence,length(CAST(evidence_json AS BLOB)) AS bytes FROM settlement_notes '
-                        'WHERE execution_id=? AND attempt=? AND fence=? AND phase=? AND evidence_json=? '
+                        'WHERE execution_id=? AND attempt=? AND fence=? AND phase=? AND evidence_json IN (?,?) '
                         'ORDER BY sequence DESC LIMIT 1',
-                        (*key, phase, _json({'state': 'confirmed', 'source': 'windows_job_containment'}))).fetchone()
+                        (*key, phase, _json({'state': 'confirmed', 'source': 'windows_job_containment'}),
+                         _json({'state': 'confirmed', 'source': 'posix_supervisor_containment'}))).fetchone()
                 fact = {'state': 'unknown', 'reason': 'observation_not_available'}
                 if row is not None:
                     if row['bytes'] > max_bytes:

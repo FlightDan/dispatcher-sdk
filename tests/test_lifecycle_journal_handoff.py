@@ -477,6 +477,42 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
         entry = journal.scan_supervisor_cleanup(timeout_seconds=1)["registrations"][0]
         self.assertEqual(entry["worker_tree_cleanup"], "confirmed")
 
+    def test_posix_parent_containment_outbox_is_visible_to_exact_handoff_inspection(self):
+        self.submit("posix-containment")
+        lease = self.runtime.kernel.claim_and_start("worker", execution_id="posix-containment")
+        identity = {"execution_id": lease.execution_id, "attempt": lease.attempt, "fence": lease.fence}
+        evidence = {"state": "confirmed", "source": "posix_supervisor_containment"}
+        journal = self.runtime._settlement_journal
+        with patch.object(journal, "lifecycle_note", side_effect=OSError("journal unavailable")):
+            self.assertFalse(self.runtime._diagnostic_note(identity, "worker_tree_cleanup_observed", evidence))
+            self.assertEqual(journal.inspect_supervisor_handoff(identity, timeout_seconds=1)
+                             ["facts"]["worker_tree_cleanup"]["state"], "unknown")
+        self.runtime._retry_diagnostic_notes(time.monotonic() + 2)
+        fact = journal.inspect_supervisor_handoff(identity, timeout_seconds=1)["facts"]["worker_tree_cleanup"]
+        self.assertEqual(fact["evidence"], evidence)
+        wrong = {**identity, "fence": identity["fence"] + 1}
+        self.assertEqual(journal.inspect_supervisor_handoff(wrong, timeout_seconds=1)
+                         ["facts"]["worker_tree_cleanup"]["state"], "unknown")
+
+    def test_scoped_diagnostic_retries_transient_write_within_original_window(self):
+        self.submit("transient-diagnostic")
+        identity = {"execution_id": "transient-diagnostic", "attempt": 0, "fence": 0}
+        journal = self.runtime._settlement_journal
+        original = journal.lifecycle_note
+        attempts = []
+
+        def once_busy(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise TimeoutError("transient writer contention")
+            return original(*args, **kwargs)
+
+        with patch.object(journal, "lifecycle_note", side_effect=once_busy):
+            self.assertTrue(self.runtime._diagnostic_note(identity, "receipt", {"state": "observed"},
+                                                          timeout_seconds=1))
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual([note["phase"] for note in self.reopen_notes("transient-diagnostic")], ["receipt"])
+
     def test_close_waits_for_diagnostic_writer_and_persists_retained_note(self):
         self.submit("close-writer")
         identity = {"execution_id": "close-writer", "attempt": 0, "fence": 0}

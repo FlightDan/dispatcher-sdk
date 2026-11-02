@@ -378,6 +378,8 @@ class SupervisorOutcomeHandoffTests(unittest.TestCase):
             lock.rollback()
         self.assertEqual(result['kind'], 'ok', result)
         self.assertEqual(cleanup, [True])
+        self.assertIn(('worker_tree_cleanup_observed', {
+            'state': 'confirmed', 'source': 'posix_supervisor_containment'}), phases)
         self.assertLess(float(journal_path.read_text()), float(entry_path.read_text()) + .09)
         self.assertGreaterEqual(time.monotonic(), float(entry_path.read_text()) + .09)
         handoff = next(details for phase, details in phases if phase == 'supervisor_outcome_observed')

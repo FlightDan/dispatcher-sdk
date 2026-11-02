@@ -115,6 +115,17 @@ def _observe_phase(callback: Callable[[str, dict[str, Any]], None] | None,
             pass
 
 
+def _report_worker_tree_cleanup(callback, *packets) -> None:
+    """Retain only explicit containment from this invocation's supervisor."""
+    kinds = {"handler_contained", "handler_completed", "handler_entry_failed",
+             "handler_timed_out", "handler_failed", "handler_start_failed"}
+    if any(type(packet) is dict and packet.get("kind") in kinds
+           and packet.get("cleanup_confirmed") is True
+           and packet.get("worker_tree_existed") is True for packet in packets):
+        _observe_phase(callback, 'worker_tree_cleanup_observed', {
+            'state': 'confirmed', 'source': 'posix_supervisor_containment'})
+
+
 def _serialize_handler_outcome(
     outcome: dict[str, Any], effects: HandlerEffects
 ) -> str:
@@ -1232,6 +1243,8 @@ def _supervisor_entry(
             return {'state': 'unknown', 'reason': 'journal_write_failed', 'outcome_json': raw}
 
     def send_parent(packet: dict[str, Any]) -> None:
+        if packet.get("cleanup_confirmed") is True:
+            packet = {**packet, "worker_tree_existed": worker_pid is not None}
         if (guard is not None and packet.get("cleanup_confirmed") is True
                 and packet.get('kind') != 'handler_contained'):
             # The tree is already contained. This bounded exact-token ACK
@@ -1863,7 +1876,7 @@ def invoke_process_handler(
                 hard_deadline = float(available.get("hard_deadline_monotonic", deadline))
                 tracker.entered(BudgetEnvelope.from_dict(available["budget_envelope"]))
             if (type(available) is dict and available.get("cleanup_confirmed") is True
-                    and available.get("kind") in ("handler_completed", "handler_entry_failed",
+                    and available.get("kind") in ("handler_contained", "handler_completed", "handler_entry_failed",
                         "handler_timed_out", "handler_failed", "handler_start_failed")):
                 cleanup_fact = available
             if (recover_acceptance and type(available) is dict
@@ -1879,6 +1892,12 @@ def invoke_process_handler(
     cleanup_allowed = (type(terminal) is dict and terminal.get("cleanup_confirmed") is True
         or cleanup_fact is not None and cleanup_fact.get("cleanup_confirmed") is True
         or contained_result is not None and contained_result.get("cleanup_confirmed") is True)
+
+    # The supervisor may exit before its bounded journal write completes, or
+    # that write may fail. Retain its explicit post-containment packet through
+    # the parent's lifecycle outbox as well. This happens after the business
+    # deadline and supervisor reap; a missing packet never implies containment.
+    _report_worker_tree_cleanup(on_phase, terminal, cleanup_fact, contained_result)
 
     budget_envelope = tracker.envelope
     observed_budget = terminal.get("observed_budget_envelope") if type(terminal) is dict else None

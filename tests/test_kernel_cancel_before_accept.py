@@ -3,6 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from dispatcher_sdk.execution_kernel import (
     Kernel, RetryPolicy, SQLiteKernel,
 )
 from dispatcher_sdk.orchestrator import Orchestrator
+from dispatcher_sdk.execution_kernel.runtime import _UnpersistedDiagnosticsError
 
 
 def echo(payload, context):
@@ -24,7 +26,7 @@ class KernelCancelBeforeAcceptTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.path = self.root / "kernel.db"
         self.runtime = Kernel.open_sqlite(self.path, {"echo": echo}, isolation_mode="thread")
-        self.addCleanup(self.runtime.close)
+        self.addCleanup(self.close_runtime)
         self.kernel = self.runtime.kernel
         self.command = ExecutionCommandV2(
             execution_id="task", idempotency_key="task-key",
@@ -32,6 +34,19 @@ class KernelCancelBeforeAcceptTests(unittest.TestCase):
             correlation_id="run", causation_id=None, handler_id="echo", handler_contract_version=1,
             retry_policy=RetryPolicy(max_attempts=1), timeout_seconds=5, payload={"value": 1},
         )
+
+    def close_runtime(self):
+        # A close with outstanding diagnostic facts retains the Kernel so a
+        # subsequent close can finish persisting them and release its files.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                self.runtime.close()
+                return
+            except _UnpersistedDiagnosticsError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(.02, max(0, deadline - time.monotonic())))
 
     def test_new_command_cancels_with_normal_events_result_and_durable_idempotency(self):
         result = self.kernel.cancel_before_accept(self.command, reason="stop before acceptance")
@@ -68,7 +83,8 @@ class KernelCancelBeforeAcceptTests(unittest.TestCase):
         before = self.kernel.get("task")
         self.assertEqual(self.kernel.cancel_before_accept(self.command), before)
         self.assertEqual(self.kernel.get("task"), before)
-        self.assertEqual(self.runtime.cancel("task", expected_revision=before.revision).state,
+        self.assertEqual(self.runtime.cancel("task", expected_revision=before.revision,
+                                             timeout_seconds=10).state,
                          "cancelled")
 
     def test_outbox_failure_rolls_back_submission_and_cancellation_together(self):

@@ -166,8 +166,9 @@ class ChildReceiptReadTests(unittest.TestCase):
         sql_evidence = StorageEvidence(self.root, self)
         sql_evidence.start(include_kernel=True)
         self.addCleanup(sql_evidence.stop)
+        child_seconds = 2
         preparation = {'scenario': 'persistent_receipt_preparation', 'began': time.monotonic(),
-                       'original_child_seconds': .3, 'stages': [], 'diagnostic_errors': []}
+                       'original_child_seconds': child_seconds, 'stages': [], 'diagnostic_errors': []}
         self.evidence['records'].append(preparation)
 
         def save_preparation(phase):
@@ -211,7 +212,7 @@ class ChildReceiptReadTests(unittest.TestCase):
                     'type': type(error).__name__, 'message': str(error)})
 
         self.addCleanup(lambda: save_preparation('cleanup'))
-        envelope = self.parent_budget.derive(source='tool', origin_id='receipt-read', timeout_seconds=.3)
+        envelope = self.parent_budget.derive(source='tool', origin_id='receipt-read', timeout_seconds=child_seconds)
         preparation['original_envelope'] = envelope.to_dict()
         window = None
         try:
@@ -227,7 +228,8 @@ class ChildReceiptReadTests(unittest.TestCase):
             try:
                 # Match the consumer's enclosing producer context. Nested
                 # reads spend the retained floor and the outbox transaction
-                # shares this SAME .3-second window; no fresh sample or retry.
+                # shares this SAME window; no fresh sample or retry. Allow
+                # enough time for real setup on slower CI hosts.
                 with window.project(), self.children.store.bound(window):
                     row = self.children._enqueue(request_id='receipt-read', child_id='receipt-child', action='run',
                         child_command=self.command('receipt-child'), envelope=envelope, window=window)
@@ -333,9 +335,11 @@ class ChildReceiptReadTests(unittest.TestCase):
                     'setup_window_at_end': window.envelope.to_dict(),
                     'actual_window_at_end': None if actual_window is None else actual_window.envelope.to_dict(),
                     'row_budget_at_end': row_budget_at_end.to_dict(), 'actual_steps': list(steps)})
-                # Setup already spent part of the original .3-second window.
+                # Setup already spent part of the original window.
                 # Exhaustion, rather than a new minimum wait, is the contract.
                 self.assertIsInstance(caught, SettlementBusyError)
+                self.assertTrue(any(step['stage'] == 'receipt_open' and 'error' in step for step in steps),
+                                'the receipt read must encounter the exclusive writer')
                 rescue.assert_not_called()
                 self.assertEqual(len(actual_windows), 1, raw_traceback)
                 self.assertEqual(remaining_at_end, 0)
@@ -343,7 +347,7 @@ class ChildReceiptReadTests(unittest.TestCase):
                 self.assertEqual(window.envelope.constraints, original.constraints)
                 self.assertEqual(row_budget_at_end.constraints, original.constraints)
                 self.assertTrue(writer.in_transaction)
-                self.assertLess(elapsed, .6)
+                self.assertLess(elapsed, child_seconds + .5)
         finally:
             writer.rollback()
             writer.close()

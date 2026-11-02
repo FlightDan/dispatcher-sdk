@@ -1086,10 +1086,15 @@ class InProcessRuntime:
                 retained = True
             # One ordered writer drains the queue; later notes must never
             # bypass a failed earlier fact, even while another worker retries.
-            self._retry_diagnostic_notes(time.monotonic() + timeout_seconds, wait_for_writer=True,
-                                         priority_execution_id=execution_id)
-            with self._diagnostic_pending_lock:
-                saved = note_id not in self._diagnostic_pending or note_id in self._diagnostic_received
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                self._retry_diagnostic_notes(deadline, wait_for_writer=True,
+                                             priority_execution_id=execution_id)
+                with self._diagnostic_pending_lock:
+                    saved = note_id not in self._diagnostic_pending or note_id in self._diagnostic_received
+                if saved or time.monotonic() >= deadline:
+                    break
+                time.sleep(min(.01, max(0., deadline - time.monotonic())))
             if not saved and self._settlement_journal is None:
                 self._diagnostic_errors[execution_id] = self._settlement_error or "diagnostic journal unavailable"
             return saved

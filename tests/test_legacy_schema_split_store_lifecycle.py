@@ -229,3 +229,19 @@ class LegacySchemaSplitStoreLifecycleTests(unittest.TestCase):
                 with sdk._transaction() as db:
                     self.assertEqual(db.execute("SELECT kind FROM sdk_events WHERE run_id='legacy' ORDER BY sequence LIMIT 1").fetchone()[0], "legacy.waiting")
             queue.close()
+
+    def test_parent_retains_only_explicit_supervisor_containment(self):
+        from dispatcher_sdk.execution_kernel._process_runtime import _report_worker_tree_cleanup
+        observed = []
+        callback = lambda phase, evidence: observed.append((phase, evidence))
+        _report_worker_tree_cleanup(callback, None, {"kind": "handler_completed"},
+                                    {"kind": "handler_contained", "cleanup_confirmed": False},
+                                    {"kind": "worker_ready", "cleanup_confirmed": True},
+                                    {"kind": "handler_start_failed", "cleanup_confirmed": True,
+                                     "worker_tree_existed": False})
+        self.assertEqual(observed, [])
+        _report_worker_tree_cleanup(callback, None,
+                                    {"kind": "handler_contained", "cleanup_confirmed": True,
+                                     "worker_tree_existed": True})
+        self.assertEqual(observed, [("worker_tree_cleanup_observed", {
+            "state": "confirmed", "source": "posix_supervisor_containment"})])
