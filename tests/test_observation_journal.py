@@ -522,8 +522,12 @@ class ObservationJournalTests(unittest.TestCase):
         self.assertLessEqual(snapshot["queued_items"], 3)
         self.assertLessEqual(snapshot["queued_bytes"], 1024)
         self.assertGreater(snapshot["dropped_events"], 0)
-        recorder.flush()
-        recorder.flush()
+        # A bounded write may fail under slow storage. Drain the retained
+        # three events before testing pagination of the durable rows.
+        deadline = time.monotonic() + 5
+        while recorder.snapshot()["queued_items"] and time.monotonic() < deadline:
+            recorder.flush()
+        self.assertEqual(recorder.snapshot()["queued_items"], 0)
         reader = self.open_journal(writer=False, options=options)
         page = reader.events("execution", limit=999)
         self.assertLessEqual(len(page["events"]), 2)
