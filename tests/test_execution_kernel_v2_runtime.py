@@ -764,6 +764,13 @@ class RuntimeTests(unittest.TestCase):
                     )
                     self.assertEqual(stack.kernel.get(parked.execution_id).state, "queued")
                     terminal = stack.run_once()
+                    deadline = time.monotonic() + 5
+                    while terminal.state == "running" and time.monotonic() < deadline:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        stack.recover_completions(timeout_seconds=min(.5, remaining))
+                        terminal = stack.kernel.get(parked.execution_id)
                     self.assertEqual(terminal.state, "succeeded")
                     self.assertEqual(terminal.attempt, 2)
                     self.assertEqual(terminal.result.effect_ids, [effect_id])

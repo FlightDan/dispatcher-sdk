@@ -590,15 +590,18 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
     def test_fresh_final_parent_read_observes_actual_cancel_committed_during_child_read(self):
         row, window, _ = self.completed_child()
         original_read = factual._read_child_snapshot
-        def cancel_between_reads(*args):
-            result = original_read(*args)
-            with SQLiteKernel(self.kernel.db_path) as other:
+        with SQLiteKernel(self.kernel.db_path) as other:
+            def cancel_between_reads(*args):
+                result = original_read(*args)
                 other.cancel('parent', lease=self.lease, reason='concurrent parent cancellation')
-            return result
-        with patch.object(factual, '_read_child_snapshot', side_effect=cancel_between_reads) as child_read:
-            with self.assertRaises(ChildExecutionError) as caught:
-                self.children._completed_result(row, window)
-            child_read.assert_called_once()
+                return result
+            # This test checks ordering with a real committed cancellation;
+            # it does not test the default 100 ms delivery timeout.
+            window._delivery_deadline = time.monotonic() + 2
+            with patch.object(factual, '_read_child_snapshot', side_effect=cancel_between_reads) as child_read:
+                with self.assertRaises(ChildExecutionError) as caught:
+                    self.children._completed_result(row, window)
+                child_read.assert_called_once()
         self.assertEqual(caught.exception.code, 'parent_authority_revoked')
 
     def test_shared_kernel_lock_cannot_block_independent_factual_result(self):

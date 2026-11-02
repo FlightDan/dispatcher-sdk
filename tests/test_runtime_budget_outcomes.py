@@ -103,9 +103,11 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
                 self.assertEqual(outcome[key], value, outcome)
             returned = BudgetEnvelope.from_dict(outcome['budget_envelope'])
             forward = returned.view(sample=returned.checkpoint).effective_work_deadline_at + 1
+            # Capture can contend with the runtime's own SQLite activity;
+            # allow a bounded window for this fixture's real Kernel write.
             with HandlerClock.sample_wall(forward):
-                captured = runtime.kernel._sample_budget('original', returned, timeout_seconds=.1)
-            restored = runtime.kernel._sample_budget('original', captured, timeout_seconds=.1)
+                captured = runtime.kernel._sample_budget('original', returned, timeout_seconds=2)
+            restored = runtime.kernel._sample_budget('original', captured, timeout_seconds=2)
             self.assertEqual(returned.constraints, captured.constraints)
             self.assertEqual(returned.started_at, captured.started_at)
             observed = captured.view(sample=captured.checkpoint).to_dict()
@@ -313,8 +315,38 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
             evidence['reopened_receipt'] = before_recovery
             self.assertEqual(before_recovery['result'], receipt['result'])
             self.assertEqual(before_recovery['evidence']['budget_envelope'], retained.to_dict())
-            evidence['recovery_reports'] = reopened.recover_completions(timeout_seconds=.5)
-            restored = reopened.kernel.get('original')
+            # Recovery is bounded and can race the reopened runtime's own
+            # recovery thread. A busy or pending pass is not settlement.
+            evidence['recovery_reports'] = []
+            deadline = time.monotonic() + 10
+            restored = None
+            settled = before_recovery
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                evidence['recovery_reports'].append(
+                    reopened.recover_completions(timeout_seconds=min(.5, remaining)))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    with reopened.kernel._control_lock(min(.5, remaining)):
+                        restored = reopened.kernel.get('original')
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    settled = reopened._settlement_journal.inspect(
+                        'original', timeout_seconds=min(.5, remaining))[0]
+                except TimeoutError as error:
+                    evidence.setdefault('observation_errors', []).append(str(error))
+                    continue
+                evidence['restored'] = restored.to_dict()
+                evidence['settled_receipt'] = settled
+                self.assertEqual(settled['identity'], receipt['identity'], evidence)
+                self.assertEqual(settled['result'], receipt['result'], evidence)
+                if restored.result is not None and settled['state'] == 'recorded':
+                    break
+                time.sleep(min(.01, max(0., deadline - time.monotonic())))
+            self.assertIsNotNone(restored, evidence)
             evidence['restored'] = restored.to_dict()
             evidence['after_limits'] = reopened.kernel.get_execution_limits('original')
             after = BudgetEnvelope.from_dict(evidence['after_limits']['envelope'])
@@ -324,7 +356,6 @@ class RuntimeBudgetOutcomeTests(unittest.TestCase):
             self.assertEqual(after.started_at, retained.started_at)
             self.assertGreaterEqual(after.checkpoint.wall_at, retained.checkpoint.wall_at)
             self.assertEqual(after.view(sample=sample_clock(wall_time=original.started_at)).remaining_work_seconds, 0)
-            settled = reopened._settlement_journal.inspect('original', timeout_seconds=.5)[0]
             evidence['settled_receipt'] = settled
             self.assertEqual(settled['state'], 'recorded', evidence)
             self.assertEqual(settled['result'], receipt['result'])

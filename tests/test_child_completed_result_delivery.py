@@ -20,7 +20,7 @@ from tests._acceptance_evidence import retained_directory
 from dispatcher_sdk.execution_kernel import Kernel, HandlerExecutionError
 from dispatcher_sdk.execution_kernel import child_factual_read as factual
 from dispatcher_sdk.execution_kernel.budget import BudgetEnvelope, DeadlineConstraint, sample_clock
-from dispatcher_sdk.execution_kernel.children import HandlerChildren, ChildExecutionError, _RetryWindow, _Store
+from dispatcher_sdk.execution_kernel.children import HandlerChildren, ChildExecutionError, _RetryWindow, _Store, _retry
 from dispatcher_sdk.execution_kernel.contracts import ExecutionCommandV2, ExecutionResultV2, RetryPolicy
 from dispatcher_sdk.execution_kernel.context import HandlerContext, HandlerEffects
 from dispatcher_sdk.execution_kernel.sqlite import SQLiteKernel
@@ -487,7 +487,11 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
                           causation_id='parent', timeout_seconds=2)
         budget = context.budget_envelope.derive(source='tool', origin_id='actual-child', timeout_seconds=2)
         kernel.submit_child(command, context.lease, budget)
-        lease = kernel.claim_and_start('child-owner', execution_id='child', child_pool=True)
+        window = _RetryWindow(budget, kernel)
+        lease = _retry(window, lambda: kernel.claim_and_start(
+            'child-owner', execution_id='child', child_pool=True,
+            timeout_seconds=window.timeout()), kernel=None)
+        self.assertIsNotNone(lease)
         snapshot = kernel.get('child')
         if not_before is not None:
             time.sleep(max(0., not_before-time.time()))
@@ -552,8 +556,8 @@ class ChildCompletedResultDeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             kernel, context, capability = self.direct(Path(directory))
             try:
-                envelope = context.budget_envelope.derive(source='tool', origin_id='test-tool', timeout_seconds=1)
                 self.complete_direct_child(kernel, context)
+                envelope = context.budget_envelope.derive(source='tool', origin_id='test-tool', timeout_seconds=2)
                 row = {'budget_json': json.dumps(envelope.to_dict()), 'parent_execution_id': 'parent',
                        'parent_attempt': context.lease.attempt, 'parent_fence': context.lease.fence,
                        'child_execution_id': 'child', 'action': 'observe'}

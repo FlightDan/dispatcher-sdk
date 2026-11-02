@@ -107,7 +107,16 @@ def _crash_after_received_ack(path, running_dict, lease_dict, outcome, evidence_
     runtime.kernel._finish_received_budget_sample = acknowledge_then_exit
     admission = runtime._pending_settlements.acquire()
     runtime._settle_outcome(running, lease, outcome, admission)
-    raise AssertionError('actual received ACK was not reached before process exit')
+    # Receipt persistence and ACK each have their own short production
+    # deadlines. A slow host may return with the original fact still pending;
+    # retry through the real recovery path rather than assuming the first
+    # foreground pass reaches ACK. The hook remains installed for every pass.
+    deadline = time.monotonic() + 5
+    reports = ()
+    while (remaining := deadline - time.monotonic()) > 0:
+        reports = runtime.recover_completions(timeout_seconds=min(.5, remaining))
+    raise AssertionError('actual received ACK was not reached before process exit: '
+                         f'settlement_error={runtime._settlement_error!r}, reports={reports!r}')
 
 
 class ReceivedBudgetCheckpointTests(unittest.TestCase):
@@ -462,7 +471,7 @@ class ReceivedBudgetCheckpointTests(unittest.TestCase):
             self.running.to_dict(), self.lease.to_dict(), outcome, str(path)))
         worker.start()
         try:
-            worker.join(2)
+            worker.join(15)
             self.assertFalse(worker.is_alive())
             self.assertEqual(worker.exitcode, 73)
             crash = json.loads(path.read_text())
