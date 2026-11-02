@@ -6,6 +6,27 @@ provider requests and changes to other projects have separate acceptance require
 The historical integration records below remain available; they do not satisfy the
 revised SDK-only A16.
 
+## 0.7.3 release evidence, 2026-11-02
+
+Formal tag [`v0.7.3`](https://github.com/FlightDan/dispatcher-sdk/releases/tag/v0.7.3)
+points to commit `f95807ca3e11dfc3375be3bc18ae2e7e52e6b42e`. The original
+[SDK CI run 41387700503](https://github.com/FlightDan/dispatcher-sdk/actions/runs/41387700503),
+attempt 1, completed with 18/18 successful jobs: the candidate/history checks
+and all 16 Linux/Windows x64/ARM Python 3.10–3.13 matrix environments.
+Windows ARM-host Python 3.10 used x64 emulation, as specified by the matrix.
+The release workflow
+[41389838449](https://github.com/FlightDan/dispatcher-sdk/actions/runs/41389838449)
+succeeded at the same commit and published the original tested wheel and sdist
+from CI artifact `release-packages-41387700503-1` (artifact ID `13116014114`).
+The Release is public and is neither draft nor prerelease. The English and
+Chinese GitHub Wiki updates were pushed at Wiki commit `77c87a2`.
+
+This is SDK package and platform acceptance. The actual carried-forward
+ModPort old Run has not been connected or resumed against 0.7.3; its real
+two-cycle host dispatch, handler, result-consume, and next-submit acceptance
+remains the ModPort integration step. No old Run acceptance is inferred from
+the isolated SDK and installed-consumer tests above.
+
 ## Current 0.7.2 status, 2026-10-11
 
 SDK-only `0.7.2` acceptance: **accepted**. T01–T09,
