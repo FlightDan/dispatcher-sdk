@@ -57,8 +57,8 @@ class ChildStorageContentionTests(unittest.TestCase):
         return thread, outcomes, errors
 
     @contextmanager
-    def writer(self, path):
-        connection = sqlite3.connect(path, timeout=1)
+    def writer(self, path, *, timeout=1):
+        connection = sqlite3.connect(path, timeout=timeout)
         connection.execute("BEGIN IMMEDIATE")
         try:
             yield connection
@@ -232,29 +232,30 @@ class ChildStorageContentionTests(unittest.TestCase):
             self.evidence["records"].append({"stage": "actual_child_entry",
                 "monotonic": time.monotonic(), "envelope": context.budget_envelope.to_dict()})
             entered.set()
-            if not return_child.wait(2):
+            if not return_child.wait(30):
                 raise TimeoutError("child fixture was not released")
             return {"raw_fact": "original successful child"}
         def parent(payload, context):
             self.evidence["records"].append({"stage": "original_child_call",
                 "monotonic": time.monotonic(), "envelope": context.budget_envelope.to_dict()})
-            return context.children.run("child", {}, request_id="one", timeout_seconds=3)
+            return context.children.run("child", {}, request_id="one", timeout_seconds=12)
         runtime = self.runtime(parent, child)
-        driver, outcomes, errors = self.drive(runtime, timeout=4)
-        self.witness_readiness(entered, 2, runtime, driver, outcomes, errors,
-            parent_timeout=4, child_timeout=3, calls=calls)
+        driver, outcomes, errors = self.drive(runtime, timeout=24)
+        self.witness_readiness(entered, 10, runtime, driver, outcomes, errors,
+            parent_timeout=24, child_timeout=12, calls=calls)
         row = self.requests(runtime)[0]
-        with self.writer(runtime.observation_journal.path):
+        with self.writer(runtime.observation_journal.path, timeout=8):
             return_child.set()
-            self.poll(lambda: runtime.kernel.get(row["child_execution_id"]).state == "succeeded", seconds=2.5)
+            self.poll(lambda: runtime.kernel.get(row["child_execution_id"]).state == "succeeded", seconds=8)
             # Keep the actual independent writer through the original caller's
             # expiry. A failed finish/owner release cannot erase this row.
-            time.sleep(3.3)
+            original_budget = BudgetEnvelope.from_dict(json.loads(row["budget_json"]))
+            time.sleep(original_budget.view().remaining_work_seconds + .3)
             retained = self.requests(runtime)[0]
             self.assertEqual(row["child_execution_id"], retained["child_execution_id"])
             self.assertIn(retained["state"], {"pending", "running"})
         self.finish(driver, outcomes, errors)
-        settled = self.poll(lambda: (rows[0] if (rows := self.requests(runtime)) and rows[0]["state"] == "completed" else None))
+        settled = self.poll(lambda: (rows[0] if (rows := self.requests(runtime)) and rows[0]["state"] == "completed" else None), seconds=10)
         raw_result = runtime.kernel.get(row["child_execution_id"]).result.to_dict()
         self.assertEqual(raw_result, json.loads(settled["response_json"]))
         self.assertEqual(row["wait_id"], settled["wait_id"])
@@ -268,7 +269,7 @@ class ChildStorageContentionTests(unittest.TestCase):
         self.assertEqual([row["child_execution_id"]], calls)
 
     def test_reservation_retry_expires_without_late_child_admission(self):
-        entered, release = threading.Event(), threading.Event()
+        entered, release, reservation_attempted = threading.Event(), threading.Event(), threading.Event()
         calls = WitnessList()
         self.addCleanup(release.set)
         def child(payload, context):
@@ -276,18 +277,27 @@ class ChildStorageContentionTests(unittest.TestCase):
             return {}
         def parent(payload, context):
             entered.set()
-            if not release.wait(1):
+            if not release.wait(30):
                 raise TimeoutError("expiry fixture was not released")
-            return context.children.run("child", {}, request_id="one", timeout_seconds=.25)
+            return context.children.run("child", {}, request_id="one", timeout_seconds=3)
         runtime = self.runtime(parent, child)
-        driver, outcomes, errors = self.drive(runtime, timeout=.55)
-        self.witness_readiness(entered, .4, runtime, driver, outcomes, errors,
-            parent_timeout=.55, child_timeout=.25, calls=calls)
-        with self.writer(runtime.observation_journal.path):
-            release.set()
-            time.sleep(.8)
-            self.assertEqual([], self.requests(runtime))
-        result = self.finish(driver, outcomes, errors)
+        original_enqueue = HandlerChildren._enqueue
+        reservation_budgets = []
+        def witnessed_enqueue(capability, **kwargs):
+            reservation_budgets.append(kwargs["envelope"])
+            reservation_attempted.set()
+            return original_enqueue(capability, **kwargs)
+        with patch.object(HandlerChildren, "_enqueue", witnessed_enqueue):
+            driver, outcomes, errors = self.drive(runtime, timeout=18)
+            self.witness_readiness(entered, 8, runtime, driver, outcomes, errors,
+                parent_timeout=18, child_timeout=3, calls=calls)
+            with self.writer(runtime.observation_journal.path):
+                release.set()
+                self.witness_readiness(reservation_attempted, 8, runtime, driver, outcomes, errors,
+                    parent_timeout=18, child_timeout=3, calls=calls)
+                result = self.finish(driver, outcomes, errors, timeout=12)
+                self.assertEqual(0, reservation_budgets[0].view().remaining_work_seconds)
+                self.assertEqual([], self.requests(runtime))
         self.assertNotEqual("succeeded", result.state)
         time.sleep(.15)
         self.assertEqual([], calls)

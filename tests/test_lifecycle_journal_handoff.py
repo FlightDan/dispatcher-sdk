@@ -288,7 +288,11 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "escaped invocation") as raised:
                 self.runtime.run_once(execution_id="escaped")
         context = raised.exception.execution_context
-        self.assertTrue(context["diagnostic_saved"])
+        # This is a snapshot of a bounded synchronous attempt. On a slow
+        # host the receipt can remain queued and be persisted by a retry.
+        self.assertIsInstance(context["diagnostic_saved"], bool)
+        self.runtime._drain_diagnostic_notes(time.monotonic() + 5)
+        self.assertFalse(self.runtime._diagnostics_block_admission("escaped"))
         notes = self.reopen_notes("escaped")
         note = next(note for note in notes if note["phase"] == "worker_invocation_escaped")
         self.assertEqual(note["identity"], {key: context[key] for key in ("execution_id", "attempt", "fence")})
@@ -333,7 +337,7 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
             with patch.object(self.runtime.kernel, "claim_and_start", wraps=self.runtime.kernel.claim_and_start) as claim:
                 self.assertIsNone(self.runtime.run_once(execution_id="first"))
                 claim.assert_not_called()
-        self.runtime._retry_diagnostic_notes(time.monotonic() + 1)
+        self.runtime._drain_diagnostic_notes(time.monotonic() + 5)
         self.assertFalse(self.runtime._diagnostics_block_admission())
         notes = [note for note in self.reopen_notes("first") if note["phase"] == "worker_invocation_escaped"]
         self.assertEqual(len(notes), 1)

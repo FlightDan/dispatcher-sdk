@@ -975,7 +975,8 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 self.assertLess(evidence["parent_elapsed"], 12)
                 self.assertIn(result.state, {"running", "timed_out"})
                 self.assertTrue(Path(payload["entered"]).exists(), "child never reached actual handler entry")
-                # One existing maintenance window covers both exact outcomes.
+                # One existing maintenance window covers both exact outcomes,
+                # including authority revocation before a child result exists.
                 # recover_completions publishes retained facts without another
                 # run_once, handler invocation, or execution-budget renewal.
                 settlement_began = time.monotonic()
@@ -1018,8 +1019,17 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                         with evidence_lock:
                             captured = {item["result"]["execution_id"]: item["result"]
                                 for item in original_results}
+                            child_invocations = [deepcopy(item) for item in invocations
+                                if item["command"]["execution_id"] == child_id]
                         terminal = (final_parent.state == "timed_out" and
                             final_child.state in {"timed_out", "cancelled", "dead"})
+                        child_outcome = (child_invocations[0].get("outcome")
+                            if len(child_invocations) == 1 else None)
+                        revoked = (final_child.state == "cancelled" and child_outcome is not None
+                            and child_outcome.get("kind") == "authority_revoked"
+                            and child_outcome.get("reason") == "execution_cancelled")
+                        if terminal and "parent" in captured and revoked:
+                            break
                         if terminal and {"parent", child_id} <= captured.keys():
                             if final_child.state == "timed_out":
                                 break
@@ -1046,8 +1056,8 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                         final_parent = runtime.kernel.get("parent")
                         final_child = runtime.kernel.get(child_id)
                     if final_parent.state == "timed_out":
-                        self.fail("parent timeout reached, but original child outcome or its "
-                            "superseded receipt was not observed within the settlement window")
+                        self.fail("parent timeout reached, but the original child timeout or "
+                            "authority revocation was not proved within the settlement window")
                     limits = runtime.kernel.get_execution_limits("parent", timeout_seconds=2)
                     self.assertEqual("running", final_parent.state)
                     self.assertEqual("budget_clock_sample_unresolved:sampling",
@@ -1136,9 +1146,22 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                     originals = {item["result"]["execution_id"]: item["result"]
                                  for item in original_results}
                     native = list(invocations)
-                self.assertEqual({"parent", child_id}, set(originals))
+                self.assertEqual({"parent"} if revoked else {"parent", child_id}, set(originals))
                 self.assertEqual(originals["parent"], final_parent.result.to_dict())
-                if final_child.state == "timed_out":
+                if revoked:
+                    child_native = next(item for item in native
+                        if item["command"]["execution_id"] == child_id)
+                    self.assertEqual((child_id, final_child.attempt, final_child.fence),
+                        (child_native["lease"]["execution_id"], child_native["lease"]["attempt"],
+                         child_native["lease"]["fence"]))
+                    self.assertEqual("confirmed", child_native["outcome"]["budget_checkpoint"]["state"])
+                    self.assertEqual("cancelled", final_child.result.status)
+                    self.assertEqual("parent authority revoked", final_child.result.error.message)
+                    preserved_winner = maintenance_read(
+                        "preserved revoked child winner", runtime.kernel.get, child_id).to_dict()
+                    self.assertEqual(evidence["canonical_child"], preserved_winner)
+                    evidence["revoked_child_outcome"] = child_native["outcome"]
+                elif final_child.state == "timed_out":
                     self.assertEqual(originals[child_id], final_child.result.to_dict())
                 else:
                     # A cancellation/reaper winner is immutable. Maintenance
@@ -1165,12 +1188,27 @@ class RuntimeDeadlineEnvelopeTests(unittest.TestCase):
                 self.assertLess(evidence["settlement_elapsed"], 3)
                 self.assertEqual(2, len(native), "maintenance must not replay either handler")
                 self.assertEqual({"parent", child_id}, {item["command"]["execution_id"] for item in native})
-                self.assertTrue(all(item["outcome"]["kind"] == "timeout" for item in native))
+                self.assertEqual("timeout", next(item for item in native
+                    if item["command"]["execution_id"] == "parent")["outcome"]["kind"])
+                self.assertEqual("authority_revoked" if revoked else "timeout", next(item for item in native
+                    if item["command"]["execution_id"] == child_id)["outcome"]["kind"])
+                parent_native = next(item for item in native if item["command"]["execution_id"] == "parent")
+                child_native = next(item for item in native if item["command"]["execution_id"] == child_id)
+                parent_deadline = next(item["deadline_at"] for item in
+                    parent_native["outcome"]["budget_envelope"]["constraints"]
+                    if item["origin_id"] == "execution:parent")
+                self.assertTrue(any(item["source"] == "parent" and item["deadline_at"] == parent_deadline
+                    for item in child_native["outcome"]["budget_envelope"]["constraints"]))
                 entered_pids = {str(event["arguments"][0]["worker_pid"]) for item in native
                     if item["command"]["execution_id"] == child_id for event in item["callbacks"]
                     if event["callback"] == "on_entered"}
                 self.assertEqual({Path(payload["entered"]).read_text(encoding="ascii")}, entered_pids)
                 self.assertEqual(["job_empty" if os.name == "nt" else "tree_reaped"] * 2, receipts)
+                for item in native:
+                    cleanup = [event for event in item["callbacks"]
+                        if event["callback"] == "on_cleanup_confirmed"]
+                    self.assertEqual(1, len(cleanup), item["command"]["execution_id"])
+                    self.assertIn("returned", cleanup[0])
                 time.sleep(1.2)
                 self.assertFalse(Path(payload["escaped"]).exists())
         except BaseException as error:

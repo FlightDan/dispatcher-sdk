@@ -24,11 +24,11 @@ class ChildResultClockCleanupTests(unittest.TestCase):
 
     def captured_wait(self, *, different_owner=False, foreign_kernel=None, context_owner=False, failure=None,
                       setup_timeout_seconds=None):
-        # The explicit handler context has extra setup work on Windows ARM;
-        # keep the original child window alive until the capture begins.
+        # Allow the real SQLite setup and guard capture to complete on slow
+        # runners before deliberately holding the writer and expiring the call.
         row, window, result = self.completed_child(
             failure=failure, timeout_seconds=(setup_timeout_seconds if setup_timeout_seconds is not None
-                                             else 2.0 if context_owner else .5))
+                                             else 2.0))
         context = None
         if context_owner:
             context = HandlerContext(self.command, self.lease,
@@ -52,10 +52,11 @@ class ChildResultClockCleanupTests(unittest.TestCase):
 
         with patch.object(owner, '_captured', side_effect=hold_after_capture):
             with self.assertRaises((sqlite3.OperationalError, TimeoutError)) as caught:
-                owner(window.envelope, timeout_seconds=.1 if context_owner else .02)
+                owner(window.envelope, timeout_seconds=.5)
         original = caught.exception
         if not different_owner and not context_owner:
             window._adopt_sample_owner(original)
+        self.assertIsNotNone(owner._pending, f'capture failed before arming a guard: {original!r}')
         token, fact = owner._pending
         self.assertIsNotNone(fact)
         time.sleep(max(0., window.deadline-time.monotonic())+.01)

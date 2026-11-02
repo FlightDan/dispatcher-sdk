@@ -303,9 +303,11 @@ class LifecycleReceiptTests(unittest.TestCase):
             identity = {'execution_id': 'job', 'attempt': 0, 'fence': 0}
             old.note(identity, 'old', {}, note_id='old-id')
             with self.assertRaises(SettlementBindingError):
-                old.lifecycle_note(identity, 'phase', {}, store_id=store, outbox_sequence=1)
+                old.lifecycle_note(identity, 'phase', {}, store_id=store, outbox_sequence=1,
+                                   timeout_seconds=5)
             new = SettlementJournal.upgrade_v3_copy(source, destination, source_id='source', kernel_path=kernel)
-            new.lifecycle_note(identity, 'phase', {}, store_id=store, outbox_sequence=1)
+            new.lifecycle_note(identity, 'phase', {}, store_id=store, outbox_sequence=1,
+                               timeout_seconds=5)
             self.assertEqual(len(new.inspect_notes('job')['notes']), 2)
             self.assertEqual(len(old.inspect_notes('job')['notes']), 1)
 

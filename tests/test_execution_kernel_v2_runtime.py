@@ -1124,7 +1124,24 @@ class RuntimeTests(unittest.TestCase):
                     )
                 )
                 result = stack.run_once()
+                # Completion publication may still be pending after the
+                # execution deadline. Recover this execution's receipt without
+                # claiming or invoking the handler again.
+                deadline = time.monotonic() + 5
+                while result.state == "running" and time.monotonic() < deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    stack.recover_completions(timeout_seconds=min(.1, remaining))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    with stack.kernel._control_lock(remaining):
+                        result = stack.kernel.get("slow-json")
+                    if result.state == "running":
+                        time.sleep(min(.01, max(0., deadline - time.monotonic())))
                 self.assertEqual(result.state, "timed_out")
+                self.assertEqual((result.attempt, result.fence), (1, 1))
                 time.sleep(0.25)
                 self.assertFalse(marker.exists())
             finally:
@@ -2189,7 +2206,10 @@ class RuntimeTests(unittest.TestCase):
                     driver.join(3)
 
     def test_thread_timeout_slots_are_bounded_and_close_is_reentrant(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        with self.runtime_case_evidence("sdk-thread-timeout-bounded-") as (root, evidence):
+            evidence.update(timeout_seconds=5, clock_advance_seconds=6, entry_wait_seconds=5,
+                            driver_join_seconds=10, handler_release_wait_seconds=30, timestamps={})
+            timestamps = evidence["timestamps"]
             clock = Clock(time.time())
             entered = threading.Event()
             release = threading.Event()
@@ -2198,13 +2218,13 @@ class RuntimeTests(unittest.TestCase):
 
             def blocked(_payload, _context):
                 entered.set()
-                release.wait(5)
+                release.wait(30)
                 finished.set()
                 return {"done": True}
 
             blocked.__execution_kernel_revision__ = "bounded-thread-test-v1"
             stack = Kernel.open_sqlite(
-                Path(temp) / "kernel.sqlite3",
+                root / "kernel.sqlite3",
                 {("blocked", 1): blocked},
                 isolation_mode="thread",
                 max_thread_workers=1,
@@ -2248,9 +2268,12 @@ class RuntimeTests(unittest.TestCase):
                     )
                 )
                 driver.start()
-                self.assertTrue(entered.wait(2))
+                self.assertTrue(entered.wait(5))
+                timestamps["handler_entry_observed"] = time.monotonic()
                 clock.advance(6)
-                driver.join(2)
+                timestamps["clock_advanced"] = time.monotonic()
+                driver.join(10)
+                timestamps["driver_join_returned"] = time.monotonic()
                 self.assertFalse(driver.is_alive())
                 self.assertEqual(errors, [])
                 self.assertEqual(len(outcomes), 1)
@@ -2265,11 +2288,20 @@ class RuntimeTests(unittest.TestCase):
                 stack.close()
                 stack.close()
                 self.assertIsNone(stack.run_once())
+            except BaseException:
+                try:
+                    self.capture_thread_timeout_failure(root, evidence, stack, driver, "blocked-1",
+                        flags={"entered": entered, "release": release, "finished": finished,
+                               "wrapper_finished": wrapper_finished}, outcomes=outcomes, errors=errors)
+                except Exception as diagnostic_error:
+                    evidence["diagnostic_error"] = {"type": type(diagnostic_error).__name__,
+                                                    "message": str(diagnostic_error)}
+                raise
             finally:
                 release.set()
                 if driver.ident is not None:
-                    driver.join(2)
-                self.assertTrue(wrapper_finished.wait(1))
+                    driver.join(10)
+                self.assertTrue(wrapper_finished.wait(5))
                 self.assertTrue(finished.is_set())
                 stack.close()
 

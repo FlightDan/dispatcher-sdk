@@ -119,9 +119,9 @@ class SelectedSettlementConsumerTests(unittest.TestCase):
                 runtime.cancel('x', expected_revision=runtime.kernel.get('x').revision)
                 identity = {'execution_id': 'x', 'attempt': lease.attempt, 'fence': lease.fence}
                 proof = {'state': 'confirmed', 'source': 'runtime_supervisor_reaped'}
-                default.note(identity, 'process_cleanup', proof)
+                default.note(identity, 'process_cleanup', proof, timeout_seconds=5)
                 self.assertNotEqual(sdk.inspect_cancellation('run').executions[0].local_process_tree_reaped.status, 'confirmed')
-                selected.note(identity, 'process_cleanup', proof)
+                selected.note(identity, 'process_cleanup', proof, timeout_seconds=5)
                 report = sdk.inspect_cancellation('run').executions[0]
                 self.assertEqual(report.local_process_tree_reaped.status, 'confirmed')
                 self.assertEqual(report.local_process_tree_reaped.source, 'settlement_journal')
