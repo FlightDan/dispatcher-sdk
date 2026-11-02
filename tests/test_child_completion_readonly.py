@@ -719,7 +719,9 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
                     child_read.assert_not_called()
 
     def test_expired_parent_uses_durable_watermark_even_after_wall_rollback(self):
-        row, window, _ = self.completed_child()
+        # This case expires the parent explicitly after child setup. Give the
+        # real child claim enough of its original window on slow ARM hosts.
+        row, window, _ = self.completed_child(timeout_seconds=2)
         self.wall[0] = self.lease.expires_at + 1
         with self.assertRaises(StaleFenceError):
             self.kernel.verify(self.lease)
