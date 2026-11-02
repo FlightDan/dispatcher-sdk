@@ -104,12 +104,14 @@ class SettlementCopyRebindTests(unittest.TestCase):
             source_kernel.backup(destination_kernel)
         journal = SettlementJournal(self.source, source_id='origin', kernel_path=self.old_kernel)
         identity = {'execution_id': 'exec', 'attempt': 0, 'fence': 0}
-        original = journal.lifecycle_note(identity, 'phase', {'fact': 1}, store_id=store_id, outbox_sequence=sequence)
+        original = journal.lifecycle_note(identity, 'phase', {'fact': 1}, store_id=store_id,
+            outbox_sequence=sequence, timeout_seconds=2)
         result = self.copy()
         self.assertEqual((result['source_version'], result['target_version']), (4, 4))
         copied = SettlementJournal.open_existing(self.dest, source_id='origin', kernel_path=self.new_kernel)
-        self.assertEqual(copied.lifecycle_note(identity, 'phase', {'fact': 1}, store_id=store_id, outbox_sequence=sequence), original)
-        self.assertEqual(len(copied.inspect_notes('exec')['notes']), 1)
+        self.assertEqual(copied.lifecycle_note(identity, 'phase', {'fact': 1}, store_id=store_id,
+            outbox_sequence=sequence, timeout_seconds=2), original)
+        self.assertEqual(len(copied.inspect_notes('exec', timeout_seconds=2)['notes']), 1)
 
     def test_existing_target_and_kernel_alias_are_rejected(self):
         self.create_source(3)
