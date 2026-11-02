@@ -2877,6 +2877,7 @@ class SQLiteKernel(
         if execution_id is not None:
             with self._control_lock(timeout_seconds):
                 deadline = self._control_deadline
+                unbounded_sample = deadline is None
                 limits = self._connection.execute(
                     "SELECT parent_execution_id,envelope_json FROM kernel_execution_limits WHERE execution_id=?",
                     (execution_id,)).fetchone()
@@ -2894,12 +2895,15 @@ class SQLiteKernel(
                     if work is not None:
                         work_deadline = time.monotonic() + work
                         deadline = work_deadline if deadline is None else min(deadline, work_deadline)
+                    # A caller/configured control deadline owns the admission
+                    # window. Unbounded calls retain the short sampling cap,
+                    # even when the child has a long finite work budget.
                     remaining = .1 if deadline is None else deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("Kernel control admission budget elapsed")
                     capture = _KernelBudgetCapture(self, limits[0])
                     try:
-                        capture(projected, timeout_seconds=min(.1, remaining))
+                        capture(projected, timeout_seconds=min(.1, remaining) if unbounded_sample else remaining)
                     except BaseException as exc:
                         if getattr(exc, "budget_sample_token", None) is not None:
                             # Transfer this exact live obligation to the caller's

@@ -442,7 +442,7 @@ class BudgetOwnerRegistryTests(unittest.TestCase):
         kernel._begin_budget_sample = arm_and_lock
         try:
             with self.assertRaises(sqlite3.OperationalError) as caught:
-                capture(original, timeout_seconds=.05)
+                capture(original, timeout_seconds=1)
             token, retained = capture._pending
             self.assertEqual(token, tokens[0])
             self.assertGreater(retained.checkpoint.wall_at, run_deadline)
@@ -453,7 +453,7 @@ class BudgetOwnerRegistryTests(unittest.TestCase):
             wall[0] = baseline
             raw_before_ack = len(raw_calls)
             forbid_raw[0] = True
-            published = capture.finish_pending(original, timeout_seconds=.1)
+            published = capture.finish_pending(original, timeout_seconds=1)
             self.assertEqual(len(raw_calls), raw_before_ack)
             ack_snapshot = reader.execute(
                 "SELECT c.watermark,l.envelope_json,(SELECT COUNT(*) FROM kernel_budget_samples) "

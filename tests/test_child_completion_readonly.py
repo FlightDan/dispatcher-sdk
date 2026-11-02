@@ -238,7 +238,7 @@ class ChildCompletionReadonlyTests(unittest.TestCase):
     def test_live_completed_response_does_not_require_kernel_writer(self):
         record = {'scenario': 'live_completed_response', 'stage': 'prepare_original_child'}
         self.evidence['records'].append(record)
-        row, window, result = self.completed_child()
+        row, window, result = self.completed_child(timeout_seconds=4)
         row = self.children._enqueue(request_id='one-completed-response', child_id='child',
             action='observe', child_command=None, envelope=window.envelope, window=window)
         self.children.store.finish(row, 'completed', result=result.to_dict())

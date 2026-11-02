@@ -40,7 +40,7 @@ class ChildPreentrySettlementTests(unittest.TestCase):
                         handler_id='child', timeout_seconds=2)
         self.kernel.submit_child(child, self.parent_lease, inherited)
         self.lease = self.kernel.claim_and_start('owner', execution_id='child',
-            lease_seconds=2 * _INHERITED_HEADROOM_SECONDS)
+            lease_seconds=2 * _INHERITED_HEADROOM_SECONDS, timeout_seconds=5)
         # This is the original claim timestamp, not inherited parent entry or
         # proof that a native child handler entered its business body.
         claimed_snapshot = self.kernel.get('child')

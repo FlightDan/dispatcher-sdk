@@ -201,7 +201,7 @@ class LegacyMembershipGateTests(unittest.TestCase):
                 kernel.close()
                 kernel = SQLiteKernel(path, authority_verifier=verifier, worker_credential="worker")
                 kernel._now = lambda: clock[0]
-                drain["expires_at"] = time.time() - 1
+                drain["expires_at"] = clock[0] - 1
                 with self.assertRaises(StorageIsolationError):
                     kernel.claim("worker", execution_id=work.execution_id)
                 drain["expires_at"] = expiry

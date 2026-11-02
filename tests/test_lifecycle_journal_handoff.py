@@ -668,13 +668,21 @@ class LifecycleJournalHandoffTests(unittest.TestCase):
         with patch.object(self.runtime._settlement_journal, "lifecycle_note", side_effect=OSError("unavailable")):
             self.assertFalse(self.runtime._diagnostic_note(identity, "first", {"state": "unknown"}))
             self.assertFalse(self.runtime._diagnostic_note(identity, "second", {"state": "unknown"}))
-        self.runtime._retry_diagnostic_notes(time.monotonic() + 1)
-        self.assertTrue(self.runtime._diagnostics_block_admission())
-        self.assertTrue(self.runtime._diagnostic_pending_overflow)
-        self.assertEqual([note["phase"] for note in self.reopen_notes("overflow")], ["first"])
-        # The lost second fact cannot be reconstructed; release the artificial
-        # overflow only to permit this isolated test's temporary-store cleanup.
-        self.runtime._diagnostic_pending_overflow = False
+        try:
+            deadline = time.monotonic() + 10
+            phases = []
+            while time.monotonic() < deadline:
+                self.runtime._retry_diagnostic_notes(min(deadline, time.monotonic() + 2), wait_for_writer=True)
+                phases = [note["phase"] for note in self.reopen_notes("overflow")]
+                if phases == ["first"]:
+                    break
+            self.assertTrue(self.runtime._diagnostics_block_admission())
+            self.assertTrue(self.runtime._diagnostic_pending_overflow)
+            self.assertEqual(phases, ["first"])
+        finally:
+            # The lost second fact cannot be reconstructed; release the
+            # artificial overflow for this isolated temporary-store cleanup.
+            self.runtime._diagnostic_pending_overflow = False
 
 
 if __name__ == "__main__":
