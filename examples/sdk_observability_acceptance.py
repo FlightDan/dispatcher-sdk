@@ -202,7 +202,8 @@ def child(payload, context):
     context.activity.enable_stream('stdout')
     context.activity.enable_stream('stderr')
     tool_budget = context.derive_budget(source='tool', origin_id='local-tool',
-                                       timeout_seconds=payload['tool_timeout'], reserve_seconds=.1)
+                                       timeout_seconds=payload['tool_timeout'],
+                                       reserve_seconds=payload['tool_reserve'])
     supplied = {'input': payload['input'], 'mode': payload['mode'], 'budget': tool_budget.to_dict()}
     mark(root, 'child-entered', execution_id=context.command.execution_id,
          budget=context.budget.to_dict(), tool_budget=tool_budget.to_dict())
@@ -373,13 +374,20 @@ for handler in (parent, child, silent):
 
 def parent_child_case(root, mode):
     root.mkdir(parents=True, exist_ok=True)
+    # On slow hosts the control calls and process startup consume the same real
+    # deadline as the tool. Leave time to enter the blocked tool and to observe
+    # its termination within the cleanup reserve.
+    blocked = mode == 'blocked'
     payload = {'root': str(root), 'input': 'original-consumer-input', 'mode': mode,
-               'child_timeout': 20, 'tool_timeout': 4 if mode != 'blocked' else 1.2}
-    save(root / 'configuration.json', {'payload': payload, 'execution_timeout': 40,
-                                     'caller_timeout': 45, 'child_capacity': 1})
+               'child_timeout': 35 if blocked else 20, 'tool_timeout': 15 if blocked else 4,
+               'tool_reserve': 5 if blocked else .1}
+    execution_timeout = 60 if blocked else 40
+    caller_timeout = execution_timeout + 5
+    save(root / 'configuration.json', {'payload': payload, 'execution_timeout': execution_timeout,
+                                     'caller_timeout': caller_timeout, 'child_capacity': 1})
     with Dispatcher(root / 'application.sqlite3', {'parent': parent, 'child': child},
                     isolation_mode='process', child_capacity=1, observation_options=OPTIONS) as app:
-        task = app.submit('parent', payload, request_id='parent-' + mode, timeout_seconds=40)
+        task = app.submit('parent', payload, request_id='parent-' + mode, timeout_seconds=execution_timeout)
         if mode == 'success':
             first = await_marker(root / 'first-reported.json', seconds=20)
             entered = read_json(root / 'child-entered.json')
@@ -389,7 +397,7 @@ def parent_child_case(root, mode):
             check(not (root / 'tool-write-last.json').exists(), 'tool completed before partial observation')
             (root / 'release-tool').touch()
             check(first['bytes'] == [65, 255], 'first raw bytes differ')
-        result = task.wait(timeout=45)
+        result = task.wait(timeout=caller_timeout)
         observation = task.observe()
         save(root / 'caller-result.json', result)
         save(root / 'parent-observation.json', observation)
@@ -400,7 +408,8 @@ def parent_child_case(root, mode):
             child_observation = app.runtime.observe(entered['execution_id'])
             save(root / 'child-observation.json', child_observation)
         check(result['status'] == 'succeeded', 'parent did not return its causal child outcome')
-        check(received['input'] == payload['input'], 'original input did not reach local tool')
+        check(received is not None and received['input'] == payload['input'],
+              'original input did not reach local tool')
         check(received['envelope'] == entered['tool_budget'], 'tool received a different budget')
         calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
         check([item['phase'] for item in calls] == ['parent', 'child', 'tool'],
