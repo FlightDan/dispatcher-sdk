@@ -1,5 +1,7 @@
 # Execution Kernel v2
 
+> Some sections describe the local 0.8.0 development candidate. Check the installed SDK version before using candidate-only interfaces.
+
 Install the `dispatcher-sdk` distribution and import this package as
 `dispatcher_sdk.execution_kernel`. The SDK package root is lightweight;
 importing the Kernel does not load the Orchestrator or host application.
@@ -10,9 +12,19 @@ fields, non-finite values, stale leases, and result identity conflicts as hard
 failures.
 
 Version 2 refers to the public execution-record contract. The current SQLite
-storage layout is a separate version, schema 12.
+storage layout is a separate version, schema 13.
 
 ## Storage and delivery assumptions
+
+Persistent thread runtimes can opt into SDK-owned v8 completion delivery with
+`managed_delivery=True` (default: `False`). This is mutually exclusive with a
+caller-owned `delivery_activation`. AgentApp enables it automatically. The SDK
+creates or validates `<kernel-path>.delivery.sqlite3` and owns its activation
+through runtime cleanup. Preserve that journal with the Kernel database;
+a missing journal with existing execution history is rejected. This option
+does not migrate an existing legacy settlement journal. An empty execution
+history alone cannot detect a previously deleted journal, so arbitrary journal
+deletion or replacement is outside this creation protocol.
 
 - `Kernel.open_sqlite(path, handlers)` opens the complete local stack. A restart
   with the same handler implementation fingerprint resumes durable queued work.

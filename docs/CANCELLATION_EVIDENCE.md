@@ -1,5 +1,7 @@
 # Cancellation evidence and recovery reports
 
+> Some sections describe the local 0.8.0 development candidate. Check the installed SDK version before applying its recovery procedures.
+
 Cancellation is a sequence of facts: an intent can be committed before delivery,
 execution authority can be revoked before process cleanup finishes, and an
 external effect can remain unknown after a local process exits. The report records these facts separately and identifies the exact execution
@@ -41,6 +43,28 @@ execution or replaces revision/fence checks.
   The Runtime attempts cleanup and reports the evidence-write failure; callers
   must re-read authority before retrying. Failure to persist the initial request
   stops the journal-enabled operation before Kernel cancellation.
+- If cancellation requires explicit effect recovery and a later evidence write
+  also fails, the exact `EffectRecoveryRequiredError` remains the raised error.
+  Its cause reports the evidence-write failure and retains that failure's cause.
+  Required cleanup is attempted first; neither error authorizes replay.
+- Diagnostic and receipt admission share the original control deadline, including
+  the final producer drain. Expired work remains pending or explicitly local;
+  a new storage admission does not receive a fresh timeout. In-flight operations
+  and required cleanup can still finish after that deadline, so it is not a hard
+  wall-clock limit on the entire cancellation call.
+- Optional phase diagnostics share one 0.1-second flush allowance within that
+  deadline. Later facts stay queued for a future drain, with bounded local facts
+  exposed when persistence is unconfirmed. The explicitly configured cancellation
+  journal keeps its required evidence contract and original remaining allowance.
+- Process completion callbacks and the parent's outcome notification retain
+  optional lifecycle facts without synchronous journal I/O. The owned background
+  and close drains preserve their producer identity and order; execution-claim
+  and pre-spawn obligations still require durable admission. A fact queued only
+  in memory is not durable proof: a crash before its outbox append leaves it
+  unknown. After an evidence-write error, physical reaping can therefore already
+  be complete while a read-only cleanup report remains unknown. Confirm it only
+  after the exact-generation receipt is actually persisted; result publication
+  and cancellation cleanup do not wait for an optional diagnostic writer.
 - Receipt identity includes the original fence. Old-generation cleanup evidence
   cannot establish cleanup for a newly claimed execution.
 - Cancellation reports can supplement cancellation receipts with a read-only

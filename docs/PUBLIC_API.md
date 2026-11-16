@@ -1,5 +1,7 @@
 # Public API and compatibility
 
+> This page includes API notes for the local 0.8.0 development candidate. Check the installed SDK version before using candidate-only interfaces.
+
 Start with `Dispatcher` and `Task` from `dispatcher_sdk` for managed local tasks.
 See [the application API](MANAGED_APPLICATION.md) and [0.7 migration](DEV_0_7.md).
 Import advanced execution and orchestration APIs from `dispatcher_sdk.execution_kernel`
@@ -60,10 +62,16 @@ names in `__all__`; underscore-prefixed modules are implementation details.
 | `inspect_cancellation`, `CancellationRecoveryReport`, `ExecutionCancellationReport`, `CancellationFact` | Read-only phase and generation evidence; also available as an Orchestrator method |
 | `CancellationJournal`, `inspect_cancellation_journal`, `CancellationReceipt` (execution package) | Explicit, separate durable cancellation evidence component and its read-only reader |
 
-This table describes the current `0.7.3` candidate tree; it is not an API
-inventory of the released 0.7.2 artifact. See
+This table describes the `0.8.0.dev1` development tree; it is not an API
+inventory of an earlier released artifact. See
 [development-tree integration](SDK_DEVELOPMENT_INTEGRATION.md) before relying
 on newer interfaces or schema versions.
+
+`Runtime` / `Kernel.open_sqlite` accept `managed_delivery=False` by default.
+Setting it to `True` requires file-backed thread isolation and excludes an
+explicit `delivery_activation`. AgentApp enables SDK-owned delivery; preserve
+the companion `.delivery.sqlite3` journal across restarts. Missing journals
+with existing Kernel executions are rejected rather than recreated or migrated.
 
 `ApplicationBudget` is separate from Kernel claim budgets. For an existing Run,
 `import_legacy()` requires the host's authoritative settled usage, the complete
@@ -81,6 +89,20 @@ archive settled records in bounded batches while preserving request replay.
 The host must also maintain a trustworthy deadline
 clock, including across downtime; the stored clock watermark cannot detect a
 rollback that occurs before a later observation.
+
+`reserve_group()` atomically reserves the same bound in the explicitly supplied
+scopes, up to 64 distinct owners. The host supplies the complete scope set;
+the ledger does not discover ancestors or verify provider limits. The first
+successful commit returns `spend_authorized=True`; a replay never authorizes
+another operation. `settle_group()` records an actual amount no greater than
+the reservation, or `None` for an unknown outcome. `reconcile_group()` resolves
+an unknown only when the host has authoritative usage. Use these group methods
+for grouped reservations: individual settlement and archival do not process
+them. Group entries remain in each scope's unarchived history and therefore
+count toward its 10,000-record limit. Grouped reservations use budget schema 4;
+earlier schemas are upgraded on open, and earlier SDK versions cannot open the
+upgraded ledger. This facility is not connected to Agent token limits and does
+not itself enforce a provider-side limit.
 
 See [execution activity and supervision](EXECUTION_OBSERVABILITY.md) for task
 reads, handler activity, child calls and managed stall handlers. These are

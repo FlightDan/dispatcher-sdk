@@ -1,5 +1,7 @@
 # Execution activity, deadlines and supervision
 
+> Changes under development are documented here for the local 0.8.0 candidate. The published SDK and the main branch may expose an earlier interface.
+
 The `0.7.1` implementation adds execution observations, inherited deadlines,
 bounded child execution and optional durable stall notifications. Current SDK
 and platform acceptance is tracked separately in
@@ -114,6 +116,8 @@ and is inherited once. A tool adapter must use the derived envelope at its actua
 request and blocking wait; deriving it alone does not supervise an external
 provider.
 
+Commands may additionally set `deadline_at` to a positive finite Unix timestamp, for example `runtime.command(..., timeout_seconds=30, deadline_at=accepted_at + 30)`. It defaults to `None` and is omitted from the serialized legacy command when unset. The immutable command retains this absolute cutoff across queue residence, retries and restart; SDK admission composes it as `command:<execution_id>` with source `tool`. The earliest command, handler, parent or managed Run constraint wins. An already expired command does not enter business code. Changing the bound under the same execution/idempotency identity is a conflict. A new command carrying this field requires an SDK version that understands it.
+
 The first actual handler entry establishes the execution cutoff. Retry, restart
 and lease renewal preserve it. Native same-boot elapsed time establishes
 continuity across processes where supported. An unprovable clock domain or
@@ -138,9 +142,12 @@ A completion read refused by a transient sampling guard can retain its exact
 original sample after successful physical reader close. Recovery retries that
 sample under one bounded control window, after all guards permit the snapshot;
 it takes no new wall sample and never repeats business. A later committed floor
-past the original work cutoff produces a timeout. The exact resolved result is
-saved in the existing settlement receipt before Kernel completion, so a crash
-replays the same result. Outcomes without the original sample remain unknown.
+past the original work cutoff produces a timeout. The normal settlement path
+saves the resolved result before Kernel completion; the owned-thread fast path
+can commit first. If that commit finishes after its coordinator has returned,
+the current runtime may lack the settlement receipt after reopening. Outcomes
+without the original sample remain unknown; this late-commit recovery gap is
+tracked in `SDK_0_8_0_COMPLETION_DELIVERY_DESIGN.md`.
 Resolving an uncertain Effect does not acknowledge a clock sample or clear its
 guard. The original response remains saved, but a recovered execution stays
 fenced while its clock fact is unknown, even if its Effect recovery target is queued.
@@ -364,15 +371,19 @@ stale. A PID alone, an inaccessible namespace or an unregistered external child
 does not prove current liveness or exit. A process exit does not by itself prove
 that all descendants were cleaned up. Exit 137 is not sufficient evidence of OOM.
 
-After a real handler returns, the runtime retains its immutable original result
-and attempts an independent, full-sync settlement receipt before bounded Kernel
-completion. Admission reserves one of 64 local outcome slots before claiming
+After a real handler returns, the normal settlement path retains its immutable
+original result and attempts an independent, full-sync settlement receipt before
+bounded Kernel completion. The owned-thread fast path can instead commit the
+Kernel result first; if that commit completes after the coordinator returns, the
+exact settlement receipt may be missing after reopening. Admission reserves one
+of 64 local outcome slots before claiming
 work; additional executions remain queued while all slots are occupied. If the
 Kernel writer is busy, `run_once` may return the existing
 `running` snapshot. `observe` then exposes `settlement_obligations`; a pending
-receipt proves retention, not terminal acceptance. SDK maintenance retries the
-same result during operation and after reopening. `recover_completions` can also
-request a bounded maintenance pass. It never invokes the handler. A cancellation,
+receipt proves retention, not terminal acceptance. When the receipt was saved,
+SDK maintenance can retry the same result during operation and after reopening.
+`recover_completions` can also request a bounded maintenance pass. It never
+invokes the handler. A cancellation,
 reaper or newer attempt that already won remains authoritative; the original
 receipt is retained as superseded only after its archival transaction commits.
 If bounded archival cannot finish, recovery returns `pending` with the original
@@ -431,6 +442,13 @@ Available cancellation stages, the actual handler outcome and the driver close
 receipt remain separately queryable when the activity writer is locked. Lost details or an
 unconfirmed final flush make the observation incomplete even after the execution
 becomes terminal. Settlement updates retain the original diagnostic evidence.
+Independent `inspect_execution()` also requires the selected positive execution
+generation's delivered `driver_close` fact before reporting complete telemetry.
+If that receipt is absent, it reports `complete=False` and
+`unknown_reason="driver_close_unobserved"` unless a stronger unknown reason
+already applies. Raw `ObservationJournal.inspect()` retains its collector view.
+Driver finalization does not prove that concurrent lifecycle or cancellation
+producers have finished or that every later fact has been delivered.
 Cancellation retains the original requested/revoked timestamps but writes
 optional diagnostics after local revocation, so writer pressure cannot delay
 process termination. Those optional writes share the remaining cancellation
@@ -454,6 +472,24 @@ another attempt. Native filesystem durability I/O cannot be preempted by a Pytho
 wait deadline. A successful late COMMIT retains its actual receipt; it never
 justifies replaying business. Storage still owned by a stopped SDK worker remains
 pending cleanup as described above.
+
+
+Runtime close drains lifecycle receipts in ordered prefixes from one execution,
+at most eight events and 262144 encoded payload bytes per batch. A single
+oversized head can advance up to the existing 1048576-byte event limit. The
+receiver records exact per-event receipts in one transaction; Kernel ACKs the
+prefix in a separate transaction after per-event authorization. These are not
+atomic across stores. Lost replies retain local ownership until exact durable
+receipt/status reconciliation; they do not authorize business replay.
+`SettlementJournal.lifecycle_note_batch()` rejects cyclic payloads, more than
+64 nested containers, or more JSON values than its payload byte ceiling before
+writer admission. Unsupported payloads remain pending; the ordinary background
+singleton path retains its existing contract. Close uses the bounded batch path
+also for a single event, with the original remaining deadline and no renewed
+window. A verifier returning after cutoff cannot admit another verifier or
+commit ACK changes. Rollback may still finish the already-admitted transaction's
+clock-only maintenance to preserve the observed logical clock floor; it cannot
+commit ACKs or start a new transaction after that cutoff.
 
 A final activity batch and a closed source do not certify that process collection
 finished. Close receipts retain the process observer's completion and worker state;

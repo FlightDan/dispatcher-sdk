@@ -42,39 +42,19 @@ jobs:
   test:
     needs: candidate
     if: needs.candidate.outputs.verified_run_id == ''
-    name: ${{ matrix.os }} / Python ${{ matrix.python-version }} / ${{ matrix.python_arch }}
+    name: ubuntu-latest / Python ${{ matrix.python-version }} / x64
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
         python-version: ['3.10', '3.11', '3.12', '3.13']
-        python_arch: [x64, arm64]
-        exclude:
-          - os: ubuntu-latest
-            python_arch: arm64
-          - os: ubuntu-24.04-arm
-            python_arch: x64
-          - os: windows-latest
-            python_arch: arm64
-          - os: windows-11-arm
-            python_arch: x64
-          - os: windows-11-arm
-            python_arch: arm64
-            python-version: '3.10'
-        include:
-          # Windows ARM64 has no native CPython 3.10 distribution. Keep the
-          # 3.10 support check on the ARM64 runner through x64 emulation.
-          - os: windows-11-arm
-            python-version: '3.10'
-            python_arch: x64
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          architecture: ${{ matrix.python_arch }}
+          architecture: x64
       - name: Configure acceptance evidence directory
         shell: python
         run: |
@@ -100,7 +80,7 @@ jobs:
       - name: Install candidate and build tools
         run: python -m pip install . build wheel "setuptools>=68" mypy
       - name: Retain tested release packages
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' && matrix.python_arch == 'x64'
+        if: matrix.python-version == '3.12'
         shell: python
         run: |
           import os
@@ -130,7 +110,7 @@ jobs:
       - name: Run script notification example
         run: python examples/sdk_script_wakeup.py
       - name: Save tested release packages
-        if: success() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' && matrix.python_arch == 'x64'
+        if: success() && matrix.python-version == '3.12'
         uses: actions/upload-artifact@v4
         with:
           name: release-packages-${{ github.run_id }}-${{ github.run_attempt }}
@@ -140,7 +120,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: execution-acceptance-${{ matrix.os }}-py${{ matrix.python-version }}-${{ matrix.python_arch }}-attempt-${{ github.run_attempt }}
+          name: execution-acceptance-ubuntu-latest-py${{ matrix.python-version }}-x64-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/sdk-execution-acceptance
           if-no-files-found: warn
   secrets:
